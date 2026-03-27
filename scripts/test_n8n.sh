@@ -28,7 +28,7 @@ echo ""
 echo "Test 2: Test webhook roundtrip"
 RESPONSE=$(curl -sf -X POST "${BASE}/webhook-test/test" \
   -H "Content-Type: application/json" \
-  -d '{"message": "ping", "source": "test-n8n-script"}' 2>&1) || RESPONSE=""
+  -d '{"message": "ping", "source": "test-n8n-script"}' 2>/dev/null) || RESPONSE=""
 
 if echo "$RESPONSE" | grep -qi "received"; then
   pass "Test webhook responded"
@@ -44,7 +44,7 @@ echo ""
 echo "Test 3: Lead status lookup"
 RESPONSE=$(curl -sf -X POST "${BASE}/webhook-test/lead-status" \
   -H "Content-Type: application/json" \
-  -d '{"name": "John Smith", "phone": "903-555-0100"}' 2>&1) || RESPONSE=""
+  -d '{"name": "John Smith", "phone": "903-555-0100"}' 2>/dev/null) || RESPONSE=""
 
 if echo "$RESPONSE" | grep -qi "John Smith"; then
   pass "Lead lookup found John Smith"

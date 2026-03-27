@@ -17,7 +17,6 @@ DEERFLOW_PORT="${DEERFLOW_PORT:-2026}"
 
 RESULTS=()
 PASSED=0
-TOTAL=6
 
 pass() { RESULTS+=("PASS"); PASSED=$((PASSED + 1)); echo "  PASS"; }
 fail() { RESULTS+=("FAIL"); echo "  FAIL"; }
@@ -63,7 +62,7 @@ echo "Test 2 — OpenClaw Connectivity"
 RESPONSE=$(curl -sf -X POST "http://localhost:${OPENCLAW_PORT}/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer ${OPENCLAW_GATEWAY_TOKEN:-testbed-token-change-me}" \
-  -d '{"model": "openclaw:main", "messages": [{"role": "user", "content": "What financing options does Longview Home Center offer?"}]}' 2>&1) || RESPONSE=""
+  -d '{"model": "openclaw:main", "messages": [{"role": "user", "content": "What financing options does Longview Home Center offer?"}]}' 2>/dev/null) || RESPONSE=""
 
 echo "  Response: $(echo "$RESPONSE" | head -c 200)"
 if echo "$RESPONSE" | grep -qiE "FHA|VA|conventional|in-house|financ"; then
@@ -79,7 +78,7 @@ echo ""
 echo "Test 3 — n8n Webhook Roundtrip"
 RESPONSE=$(curl -sf -X POST "http://localhost:${N8N_PORT}/webhook-test/test" \
   -H "Content-Type: application/json" \
-  -d '{"message": "ping", "source": "openclaw-test"}' 2>&1) || RESPONSE=""
+  -d '{"message": "ping", "source": "openclaw-test"}' 2>/dev/null) || RESPONSE=""
 
 echo "  Response: $(echo "$RESPONSE" | head -c 200)"
 if echo "$RESPONSE" | grep -qi "received"; then
@@ -94,7 +93,7 @@ echo ""
 echo "Test 4 — Lead Status Lookup"
 RESPONSE=$(curl -sf -X POST "http://localhost:${N8N_PORT}/webhook-test/lead-status" \
   -H "Content-Type: application/json" \
-  -d '{"name": "John Smith", "phone": "903-555-0100"}' 2>&1) || RESPONSE=""
+  -d '{"name": "John Smith", "phone": "903-555-0100"}' 2>/dev/null) || RESPONSE=""
 
 echo "  Response: $(echo "$RESPONSE" | head -c 200)"
 if echo "$RESPONSE" | grep -qi "John Smith"; then
@@ -112,7 +111,7 @@ echo "Test 5 — Morning Briefing (manual trigger)"
 # so we test by calling the n8n execution API if available.
 # Fallback: check if the workflow exists.
 RESPONSE=$(curl -sf "http://localhost:${N8N_PORT}/api/v1/workflows" \
-  -H "Accept: application/json" 2>&1) || RESPONSE=""
+  -H "Accept: application/json" 2>/dev/null) || RESPONSE=""
 
 if echo "$RESPONSE" | grep -qi "Morning Briefing"; then
   echo "  Morning Briefing workflow found in n8n."
@@ -151,14 +150,16 @@ fi
 echo ""
 
 # ─── Summary ────────────────────────────────────────────────────────
+TOTAL=${#RESULTS[@]}
+
 echo "============================================="
 echo " STACK VALIDATION REPORT"
 echo "============================================="
 
 LABELS=("Stack Health" "OpenClaw Response" "n8n Roundtrip" "Lead Lookup" "Morning Briefing" "DeerFlow Research")
-for i in 0 1 2 3 4 5; do
+for i in $(seq 0 $((TOTAL - 1))); do
   STATUS="${RESULTS[$i]:-N/A}"
-  printf "  Test %d — %-20s [%s]\n" $((i + 1)) "${LABELS[$i]}" "$STATUS"
+  printf "  Test %d — %-20s [%s]\n" $((i + 1)) "${LABELS[$i]:-Test $((i+1))}" "$STATUS"
 done
 
 echo "============================================="

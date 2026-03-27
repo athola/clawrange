@@ -76,8 +76,12 @@ def check_env_example() -> TestResult:
     """Verify .env.example has all required keys."""
     result = TestResult("Env Template")
     path = os.path.join(PROJECT_ROOT, ".env.example")
-    with open(path) as f:
-        content = f.read()
+    try:
+        with open(path) as f:
+            content = f.read()
+    except FileNotFoundError:
+        result.fail_(".env.example not found")
+        return result
     required_keys = ["OPENROUTER_API_KEY", "OPENCLAW_GATEWAY_TOKEN", "N8N_ENCRYPTION_KEY", "TIMEZONE"]
     missing = [k for k in required_keys if k not in content]
     if missing:
@@ -132,8 +136,12 @@ def check_openclaw_config() -> TestResult:
     """Validate openclaw.json has required configuration."""
     result = TestResult("OpenClaw Config")
     path = os.path.join(PROJECT_ROOT, "openclaw", "config", "openclaw.json")
-    with open(path) as f:
-        data = json.load(f)
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        result.fail_(str(e))
+        return result
     errors = []
     if "models" not in data:
         errors.append("missing 'models' section")
@@ -155,8 +163,12 @@ def check_deerflow_data_sovereignty() -> TestResult:
     """Verify DeerFlow config routes all calls through OpenRouter."""
     result = TestResult("Data Sovereignty")
     path = os.path.join(PROJECT_ROOT, "deerflow", "config.yaml")
-    with open(path) as f:
-        lines = f.readlines()
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        result.fail_("deerflow/config.yaml not found")
+        return result
     # Only check non-comment lines for blocked endpoints
     config_lines = " ".join(line for line in lines if not line.strip().startswith("#"))
     blocklist = ["doubao", "volcengine", "bytedance", "deepseek.com"]
@@ -174,8 +186,12 @@ def check_soul_md() -> TestResult:
     """Verify soul.md has required persona sections."""
     result = TestResult("Soul.md Persona")
     path = os.path.join(PROJECT_ROOT, "openclaw", "soul.md")
-    with open(path) as f:
-        content = f.read().lower()
+    try:
+        with open(path) as f:
+            content = f.read().lower()
+    except FileNotFoundError:
+        result.fail_("openclaw/soul.md not found")
+        return result
     required = ["longview home center", "jessup", "titanium", "fha", "va"]
     missing = [r for r in required if r not in content]
     if missing:
