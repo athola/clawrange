@@ -23,6 +23,11 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! docker compose version >/dev/null 2>&1; then
+  echo "ERROR: 'docker compose' plugin not found. Install Docker Compose V2."
+  exit 1
+fi
+
 if ! docker info >/dev/null 2>&1; then
   echo "ERROR: Docker daemon is not running. Start Docker Desktop or dockerd."
   exit 1
@@ -34,21 +39,19 @@ if [ ! -f .env ]; then
   exit 1
 fi
 
-# Check for required API key
-if grep -q '^OPENROUTER_API_KEY=$' .env 2>/dev/null; then
-  echo "WARNING: OPENROUTER_API_KEY is empty in .env — LLM calls will fail."
+# Check for required API key (catch empty and placeholder values)
+OPENROUTER_VAL=$(grep '^OPENROUTER_API_KEY=' .env | cut -d= -f2- || true)
+if [ -z "$OPENROUTER_VAL" ] || echo "$OPENROUTER_VAL" | grep -qi "your-key\|example\|placeholder"; then
+  echo "WARNING: OPENROUTER_API_KEY is empty or still a placeholder in .env — LLM calls will fail."
   echo "  Get a key at https://openrouter.ai/settings/keys"
 fi
 
-# Generate n8n encryption key if missing
-if grep -q '^N8N_ENCRYPTION_KEY=$' .env 2>/dev/null; then
+# Generate n8n encryption key if missing or still placeholder
+N8N_KEY_VAL=$(grep '^N8N_ENCRYPTION_KEY=' .env | cut -d= -f2- || true)
+if [ -z "$N8N_KEY_VAL" ] || echo "$N8N_KEY_VAL" | grep -qi "replace-with"; then
   KEY=$(openssl rand -hex 32)
-  # POSIX-portable sed in-place (macOS needs -i '', Linux needs -i)
-  if sed --version >/dev/null 2>&1; then
-    sed -i "s/^N8N_ENCRYPTION_KEY=$/N8N_ENCRYPTION_KEY=${KEY}/" .env
-  else
-    sed -i '' "s/^N8N_ENCRYPTION_KEY=$/N8N_ENCRYPTION_KEY=${KEY}/" .env
-  fi
+  # Portable sed: use temp file instead of -i (avoids macOS/Linux divergence)
+  sed "s|^N8N_ENCRYPTION_KEY=.*|N8N_ENCRYPTION_KEY=${KEY}|" .env > .env.tmp && mv .env.tmp .env
   echo "Generated N8N_ENCRYPTION_KEY automatically."
 fi
 
@@ -63,11 +66,13 @@ if [ "$WITH_DEERFLOW" = true ]; then
     git clone --depth 1 https://github.com/bytedance/deer-flow.git deer-flow
   fi
 
-  # Copy our OpenRouter config into DeerFlow
+  # Copy our OpenRouter config into DeerFlow and replace API key placeholder
+  OPENROUTER_KEY=$(grep '^OPENROUTER_API_KEY=' .env | cut -d= -f2- || true)
   cp deerflow/config.yaml deer-flow/config.yaml
+  sed "s|\\\$OPENROUTER_API_KEY|${OPENROUTER_KEY}|g" deer-flow/config.yaml > deer-flow/config.yaml.tmp \
+    && mv deer-flow/config.yaml.tmp deer-flow/config.yaml
 
   # Create DeerFlow .env from our .env
-  OPENROUTER_KEY=$(grep '^OPENROUTER_API_KEY=' .env | sed 's/^OPENROUTER_API_KEY=//')
   cat > deer-flow/.env <<EOF
 OPENAI_API_KEY=${OPENROUTER_KEY}
 OPENAI_API_BASE=https://openrouter.ai/api/v1
@@ -91,10 +96,15 @@ TRIES=0
 MAX_TRIES=30
 
 while [ $TRIES -lt $MAX_TRIES ]; do
-  OPENCLAW_OK=$(curl -sf http://localhost:${OPENCLAW_PORT:-3000}/healthz 2>/dev/null && echo "1" || echo "0")
-  N8N_OK=$(curl -sf http://localhost:${N8N_PORT:-5678}/healthz 2>/dev/null && echo "1" || echo "0")
+  OPENCLAW_OK=$(curl -sf --connect-timeout 5 http://localhost:${OPENCLAW_PORT:-3000}/healthz 2>/dev/null && echo "1" || echo "0")
+  N8N_OK=$(curl -sf --connect-timeout 5 http://localhost:${N8N_PORT:-5678}/healthz 2>/dev/null && echo "1" || echo "0")
 
-  if [ "$OPENCLAW_OK" = "1" ] && [ "$N8N_OK" = "1" ]; then
+  DEERFLOW_OK="1"
+  if [ "$WITH_DEERFLOW" = true ]; then
+    DEERFLOW_OK=$(curl -sf --connect-timeout 5 http://localhost:${DEERFLOW_PORT:-2026}/api/health 2>/dev/null && echo "1" || echo "0")
+  fi
+
+  if [ "$OPENCLAW_OK" = "1" ] && [ "$N8N_OK" = "1" ] && [ "$DEERFLOW_OK" = "1" ]; then
     echo ""
     echo "Stack is healthy!"
     echo "  OpenClaw: http://localhost:${OPENCLAW_PORT:-3000}"
@@ -113,6 +123,7 @@ while [ $TRIES -lt $MAX_TRIES ]; do
 done
 
 echo ""
-echo "WARNING: Services did not become healthy within 60 seconds."
+echo "ERROR: Services did not become healthy within 60 seconds."
 echo "Check logs with: docker compose logs"
 docker compose ps
+exit 1

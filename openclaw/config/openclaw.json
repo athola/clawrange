@@ -1,5 +1,4 @@
 {
-  "$schema": "https://github.com/openclaw/openclaw",
   "_comment": "OpenClaw configuration for AI MSP Testbed. All LLM calls route through OpenRouter.",
 
   "gateway": {

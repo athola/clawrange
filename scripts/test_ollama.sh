@@ -33,7 +33,13 @@ echo "Ollama found: $(ollama --version)"
 if ! ollama list >/dev/null 2>&1; then
   echo "Ollama daemon is not running. Starting it..."
   ollama serve &
-  sleep 3
+  OLLAMA_PID=$!
+  trap 'kill $OLLAMA_PID 2>/dev/null || true' EXIT
+  # Poll for readiness instead of fixed sleep
+  for _i in 1 2 3 4 5 6 7 8 9 10; do
+    ollama list >/dev/null 2>&1 && break
+    sleep 1
+  done
 fi
 
 # Step 3: Check for llama3.2:3b model
@@ -53,12 +59,14 @@ echo ""
 echo "Running inference test..."
 PROMPT="You are a helpful AI assistant for a manufactured home dealer. A customer asks: What financing options do you offer? Respond in 2 sentences."
 
-START_TIME=$(date +%s%N)
+# Portable timing: use date +%s (seconds). macOS does not support %N.
+START_TIME=$(date +%s)
 
 RESPONSE=$(ollama run "${MODEL}" "${PROMPT}" 2>&1)
 
-END_TIME=$(date +%s%N)
-ELAPSED_MS=$(( (END_TIME - START_TIME) / 1000000 ))
+END_TIME=$(date +%s)
+ELAPSED_S=$(( END_TIME - START_TIME ))
+ELAPSED_MS=$(( ELAPSED_S * 1000 ))
 
 echo ""
 echo "--- Response ---"
@@ -67,13 +75,13 @@ echo "----------------"
 
 # Step 5: Report performance
 echo ""
-echo "Inference completed in ${ELAPSED_MS}ms"
+echo "Inference completed in ${ELAPSED_S}s"
 
 # Estimate tokens (rough: ~1.3 tokens per word)
 WORD_COUNT=$(echo "$RESPONSE" | wc -w | tr -d ' ')
 APPROX_TOKENS=$(( WORD_COUNT * 13 / 10 ))
-if [ "$ELAPSED_MS" -gt 0 ]; then
-  TPS=$(( APPROX_TOKENS * 1000 / ELAPSED_MS ))
+if [ "$ELAPSED_S" -gt 0 ]; then
+  TPS=$(( APPROX_TOKENS / ELAPSED_S ))
   echo "Approximate output: ~${APPROX_TOKENS} tokens at ~${TPS} tokens/second"
 else
   echo "Approximate output: ~${APPROX_TOKENS} tokens (too fast to measure)"

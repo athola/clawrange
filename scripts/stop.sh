@@ -10,9 +10,7 @@ docker compose down 2>/dev/null || true
 # Stop DeerFlow if running
 if [ -d deer-flow ] && [ -f deer-flow/docker/docker-compose.yaml ]; then
   echo "Stopping DeerFlow..."
-  cd deer-flow
-  COMPOSE_FILE=docker/docker-compose.yaml docker compose down 2>/dev/null || true
-  cd ..
+  (cd deer-flow && COMPOSE_FILE=docker/docker-compose.yaml docker compose down 2>/dev/null || true)
 fi
 
 echo "All services stopped."

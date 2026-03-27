@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 # Test n8n workflows only.
 set -euo pipefail
+cd "$(dirname "$0")/.."
+
+# Source .env for port configuration
+if [ -f .env ]; then
+  set -a
+  . ./.env
+  set +a
+fi
 
 PORT="${N8N_PORT:-5678}"
 BASE="http://localhost:${PORT}"
@@ -15,7 +23,7 @@ echo "=== n8n Tests ==="
 # Test 1: Health check
 echo ""
 echo "Test 1: Health check"
-if curl -sf "${BASE}/healthz" >/dev/null 2>&1; then
+if curl -sf --connect-timeout 5 --max-time 10 "${BASE}/healthz" >/dev/null 2>&1; then
   pass "n8n is healthy at ${BASE}"
 else
   fail "n8n health check failed at ${BASE}"
@@ -26,7 +34,7 @@ fi
 # Test 2: Test webhook (connectivity canary)
 echo ""
 echo "Test 2: Test webhook roundtrip"
-RESPONSE=$(curl -sf -X POST "${BASE}/webhook-test/test" \
+RESPONSE=$(curl -sf --connect-timeout 5 --max-time 15 -X POST "${BASE}/webhook-test/test" \
   -H "Content-Type: application/json" \
   -d '{"message": "ping", "source": "test-n8n-script"}' 2>/dev/null) || RESPONSE=""
 
@@ -42,7 +50,7 @@ fi
 # Test 3: Lead status lookup
 echo ""
 echo "Test 3: Lead status lookup"
-RESPONSE=$(curl -sf -X POST "${BASE}/webhook-test/lead-status" \
+RESPONSE=$(curl -sf --connect-timeout 5 --max-time 15 -X POST "${BASE}/webhook-test/lead-status" \
   -H "Content-Type: application/json" \
   -d '{"name": "John Smith", "phone": "903-555-0100"}' 2>/dev/null) || RESPONSE=""
 
@@ -57,4 +65,4 @@ fi
 
 echo ""
 echo "n8n Tests: ${PASS} passed, ${FAIL} failed"
-exit "$FAIL"
+if [ "$FAIL" -gt 0 ]; then exit 1; else exit 0; fi

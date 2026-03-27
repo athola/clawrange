@@ -34,6 +34,18 @@ jobs:
         run: |
           docker compose -f docker-compose.yml config --quiet
 
+      - name: Scan for secrets
+        run: |
+          FOUND=0
+          for pattern in 'sk-or-v1-[a-zA-Z0-9]' 'AKIA[0-9A-Z]' 'ghp_[a-zA-Z0-9]'; do
+            if grep -rn "$pattern" --include='*.yml' --include='*.yaml' --include='*.json' --include='*.sh' --include='*.py' . 2>/dev/null | grep -v '.env.example' | grep -v '.git/'; then
+              echo "FAIL: Possible secret matching pattern '$pattern'"
+              FOUND=1
+            fi
+          done
+          if [ "$FOUND" = "1" ]; then exit 1; fi
+          echo "OK: No secrets detected"
+
   python-tests:
     name: Python validation suite
     runs-on: ubuntu-latest
@@ -44,5 +56,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Syntax check
-        run: python3 -m py_compile tests/validate_stack.py
+      - name: Run validation suite
+        run: python3 tests/validate_stack.py
+
+      - name: Run unit tests
+        run: |
+          pip install --quiet pytest
+          python3 -m pytest tests/test_validate_stack.py -v

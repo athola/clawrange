@@ -17,7 +17,7 @@ Docker-based testbed for an AI-powered MSP business. Validates the OpenClaw + n8
 ## Key Conventions
 
 - All LLM calls route through **OpenRouter** — never call Anthropic/DeepSeek/ByteDance directly
-- Shell scripts must be **POSIX-compatible** (macOS + Ubuntu)
+- Shell scripts use **Bash** (`#!/usr/bin/env bash`) and must work on macOS + Ubuntu
 - Docker images use `:latest` for testing — pin versions before production
 - `.env` is gitignored; `.env.example` is the template
 - OpenClaw runs internally on port 18789, mapped to host port 3000
