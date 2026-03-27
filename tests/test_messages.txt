@@ -1,0 +1,47 @@
+# Sample client messages for testing the OpenClaw agent.
+# Each line is a message to send. Expected behavior in comments.
+
+# Basic greeting — should respond warmly, mention Longview Home Center
+Hi there, I'm looking for a new home.
+
+# Hours question — should state Mon-Sat 9-5
+What are your hours?
+
+# Brand question — should mention Jessup and Titanium
+What kind of homes do y'all carry?
+
+# Financing — should list FHA, VA, conventional, in-house
+Do you offer financing?
+
+# VA-specific — should confirm VA loans available
+I'm a veteran. Can I use my VA benefits?
+
+# Rate question — should decline and offer to connect with finance team
+What's the interest rate on a 3-bedroom?
+
+# Appointment scheduling — should offer to set up a visit
+Can I come see the homes this Saturday?
+
+# Out-of-scope — should acknowledge limits and offer human handoff
+Can you tell me my credit score?
+
+# Inventory question — should describe general availability, not specific units
+Do you have any 4-bedroom homes in stock?
+
+# Location question — should mention Longview, TX
+Where are y'all located?
+
+# After-hours test — should trigger after-hours message if outside 9-5 Mon-Sat
+Hello? Anyone there?
+
+# Spanish language — should respond helpfully (may respond in English)
+Hola, tienen casas disponibles?
+
+# Aggressive/rude message — should remain professional
+This is ridiculous, your prices are way too high!
+
+# Competitor comparison — should not badmouth competitors
+How do you compare to Clayton Homes?
+
+# Legal question — should decline and refer to professional
+What are the tax implications of buying a manufactured home?

@@ -1,0 +1,29 @@
+# Secrets — NEVER commit
+.env
+
+# DeerFlow cloned repo
+deer-flow/
+
+# n8n persistent data
+n8n_data/
+
+# Ollama models
+ollama_models/
+
+# DeerFlow output
+deerflow-output/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.venv/

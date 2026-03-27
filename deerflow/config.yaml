@@ -1,0 +1,74 @@
+# DeerFlow Configuration — AI MSP Testbed
+# config_version: 3 (DeerFlow v2.0 schema)
+#
+# DATA SOVEREIGNTY: All LLM calls route through OpenRouter (https://openrouter.ai).
+# This ensures client data NEVER touches ByteDance/Doubao/Volcengine infrastructure.
+# OpenRouter acts as a proxy — we choose which downstream model handles the request,
+# and OpenRouter's privacy policy governs data handling (no training on API data).
+# This is a hard requirement for MSP clients in regulated industries.
+
+config_version: 3
+
+log_level: info
+
+# Disable any telemetry or usage reporting back to ByteDance
+# DeerFlow is MIT-licensed OSS; we run it, we control the data flow.
+token_usage: false
+
+models:
+  # Researcher: cost-effective model for gathering and synthesizing information
+  - name: researcher
+    display_name: DeepSeek Chat (OpenRouter)
+    use: langchain_openai:ChatOpenAI
+    model: deepseek/deepseek-chat
+    api_key: $OPENROUTER_API_KEY
+    base_url: https://openrouter.ai/api/v1
+    max_tokens: 4096
+    temperature: 0.3
+
+  # Writer: drafts reports and summaries from research findings
+  - name: writer
+    display_name: Claude Haiku 4.5 (OpenRouter)
+    use: langchain_openai:ChatOpenAI
+    model: anthropic/claude-haiku-4-5
+    api_key: $OPENROUTER_API_KEY
+    base_url: https://openrouter.ai/api/v1
+    max_tokens: 4096
+    temperature: 0.5
+
+  # Reviewer: evaluates and refines the writer's output
+  - name: reviewer
+    display_name: Claude Haiku 4.5 (OpenRouter)
+    use: langchain_openai:ChatOpenAI
+    model: anthropic/claude-haiku-4-5
+    api_key: $OPENROUTER_API_KEY
+    base_url: https://openrouter.ai/api/v1
+    max_tokens: 2048
+    temperature: 0.2
+
+tools:
+  web_search:
+    enabled: true
+  web_fetch:
+    enabled: true
+  image_search:
+    enabled: false  # Not needed for MSP research tasks
+
+# Keep test runs fast — 5 results per search
+tool_groups:
+  - name: web
+    max_search_results: 5
+
+# Output directory for generated reports
+sandbox:
+  mode: local
+  working_dir: /tmp/deerflow-output
+
+# Summarization settings
+summarization:
+  enabled: true
+  max_tokens_threshold: 8000
+  retention_fraction: 0.5
+
+# No external channel integrations for testbed
+channels: {}
