@@ -1,0 +1,58 @@
+{
+  "name": "Test Webhook (Connectivity Canary)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "test",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Test Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "test"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Echo webhook — connectivity canary.\n// If this responds, the OpenClaw -> n8n integration layer works.\n\nconst input = $input.first().json;\nconst body = input.body || input;\nconst now = new Date().toISOString();\n\n// Summarize the incoming payload\nconst keys = Object.keys(body);\nconst summary = keys.length > 0\n  ? keys.map(k => `${k}=${JSON.stringify(body[k])}`).join(', ')\n  : '(empty payload)';\n\nreturn [{\n  json: {\n    status: 'ok',\n    message: `n8n received: ${summary}`,\n    receivedAt: now,\n    payloadKeys: keys,\n    echo: body\n  }\n}];"
+      },
+      "id": "echo-payload",
+      "name": "Log and Echo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}"
+      },
+      "id": "respond",
+      "name": "Return Echo",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [680, 300]
+    }
+  ],
+  "connections": {
+    "Test Webhook": {
+      "main": [
+        [{ "node": "Log and Echo", "type": "main", "index": 0 }]
+      ]
+    },
+    "Log and Echo": {
+      "main": [
+        [{ "node": "Return Echo", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Chicago"
+  },
+  "active": false,
+  "tags": [{ "name": "msp-testbed" }]
+}

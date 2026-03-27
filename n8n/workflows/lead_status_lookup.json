@@ -1,0 +1,73 @@
+{
+  "name": "Lead Status Lookup",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lead-status",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Lead Status Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "lead-status"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Look up a lead by name or phone in mock CRM data.\n// In production, this would query your actual CRM API.\n\nconst mockLeads = [\n  {\n    name: 'John Smith',\n    phone: '903-555-0100',\n    status: 'New Lead',\n    lastContact: '2026-03-24',\n    interest: '3BR Jessup single-section',\n    nextStep: 'Schedule lot visit',\n    assignedTo: 'Mike (Sales)'\n  },\n  {\n    name: 'Maria Garcia',\n    phone: '903-555-0200',\n    status: 'Finance Review',\n    lastContact: '2026-03-22',\n    interest: 'Titanium 4BR multi-section',\n    nextStep: 'Waiting on FHA pre-approval',\n    assignedTo: 'Sarah (Finance)'\n  },\n  {\n    name: 'Robert Johnson',\n    phone: '903-555-0300',\n    status: 'Appointment Set — Mar 28',\n    lastContact: '2026-03-25',\n    interest: 'Jessup 2BR starter home',\n    nextStep: 'Lot walkthrough Friday 10 AM',\n    assignedTo: 'Mike (Sales)'\n  }\n];\n\nconst body = $input.first().json.body || $input.first().json;\nconst searchName = (body.name || '').toLowerCase();\nconst searchPhone = (body.phone || '').replace(/\\D/g, '');\n\nconst match = mockLeads.find(lead => {\n  const nameMatch = lead.name.toLowerCase().includes(searchName);\n  const phoneMatch = lead.phone.replace(/\\D/g, '') === searchPhone;\n  return (searchName && nameMatch) || (searchPhone && phoneMatch);\n});\n\nif (match) {\n  return [{ json: { found: true, lead: match } }];\n} else {\n  return [{ json: { found: false, message: `No lead found matching name \"${body.name}\" or phone \"${body.phone}\".` } }];\n}"
+      },
+      "id": "lookup-lead",
+      "name": "Lookup Lead in CRM",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Format the lookup result as a customer-friendly status message.\n\nconst data = $input.first().json;\n\nif (!data.found) {\n  return [{ json: { status: 'not_found', message: data.message } }];\n}\n\nconst lead = data.lead;\nconst message = [\n  `Lead Status for ${lead.name}`,\n  `Phone: ${lead.phone}`,\n  `Current Status: ${lead.status}`,\n  `Interest: ${lead.interest}`,\n  `Last Contact: ${lead.lastContact}`,\n  `Next Step: ${lead.nextStep}`,\n  `Assigned To: ${lead.assignedTo}`\n].join('\\n');\n\nreturn [{ json: { status: 'found', message, lead } }];"
+      },
+      "id": "format-response",
+      "name": "Format Status Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}"
+      },
+      "id": "respond",
+      "name": "Return Status",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [900, 300]
+    }
+  ],
+  "connections": {
+    "Lead Status Webhook": {
+      "main": [
+        [{ "node": "Lookup Lead in CRM", "type": "main", "index": 0 }]
+      ]
+    },
+    "Lookup Lead in CRM": {
+      "main": [
+        [{ "node": "Format Status Message", "type": "main", "index": 0 }]
+      ]
+    },
+    "Format Status Message": {
+      "main": [
+        [{ "node": "Return Status", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Chicago"
+  },
+  "active": false,
+  "tags": [{ "name": "msp-testbed" }]
+}
