@@ -38,7 +38,7 @@ echo "Test 3: Send test message"
 RESPONSE=$(curl -sf -X POST "${BASE}/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer ${OPENCLAW_GATEWAY_TOKEN:-testbed-token-change-me}" \
-  -d '{"model": "openclaw:main", "messages": [{"role": "user", "content": "What financing options does Longview Home Center offer?"}]}' 2>&1) || RESPONSE=""
+  -d '{"model": "openclaw:main", "messages": [{"role": "user", "content": "What financing options does Longview Home Center offer?"}]}' 2>/dev/null) || RESPONSE=""
 
 if echo "$RESPONSE" | grep -qiE "FHA|VA|conventional|in-house|financing"; then
   pass "Got relevant financing response"

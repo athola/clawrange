@@ -26,7 +26,7 @@ fi
 # Test 2: Models endpoint
 echo ""
 echo "Test 2: Available models"
-RESPONSE=$(curl -sf "${BASE}/api/models" 2>&1) || RESPONSE=""
+RESPONSE=$(curl -sf "${BASE}/api/models" 2>/dev/null) || RESPONSE=""
 if [ -n "$RESPONSE" ] && echo "$RESPONSE" | grep -qi "openrouter\|researcher\|writer"; then
   pass "Models endpoint returned OpenRouter-configured models"
 else
@@ -45,7 +45,7 @@ RESPONSE=$(curl -sf -X POST "${BASE}/api/langgraph/runs" \
       "messages": [{"role": "user", "content": "What are the top 3 manufactured home lenders in Texas for FHA loans?"}]
     },
     "config": {}
-  }' 2>&1) || RESPONSE=""
+  }' 2>/dev/null) || RESPONSE=""
 
 if echo "$RESPONSE" | grep -qiE "lender|FHA|Texas|mortgage|manufactured"; then
   pass "Research request returned relevant results"

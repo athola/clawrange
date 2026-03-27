@@ -43,7 +43,12 @@ fi
 # Generate n8n encryption key if missing
 if grep -q '^N8N_ENCRYPTION_KEY=$' .env 2>/dev/null; then
   KEY=$(openssl rand -hex 32)
-  sed -i "s/^N8N_ENCRYPTION_KEY=$/N8N_ENCRYPTION_KEY=${KEY}/" .env
+  # POSIX-portable sed in-place (macOS needs -i '', Linux needs -i)
+  if sed --version >/dev/null 2>&1; then
+    sed -i "s/^N8N_ENCRYPTION_KEY=$/N8N_ENCRYPTION_KEY=${KEY}/" .env
+  else
+    sed -i '' "s/^N8N_ENCRYPTION_KEY=$/N8N_ENCRYPTION_KEY=${KEY}/" .env
+  fi
   echo "Generated N8N_ENCRYPTION_KEY automatically."
 fi
 
@@ -62,7 +67,7 @@ if [ "$WITH_DEERFLOW" = true ]; then
   cp deerflow/config.yaml deer-flow/config.yaml
 
   # Create DeerFlow .env from our .env
-  OPENROUTER_KEY=$(grep '^OPENROUTER_API_KEY=' .env | cut -d= -f2)
+  OPENROUTER_KEY=$(grep '^OPENROUTER_API_KEY=' .env | sed 's/^OPENROUTER_API_KEY=//')
   cat > deer-flow/.env <<EOF
 OPENAI_API_KEY=${OPENROUTER_KEY}
 OPENAI_API_BASE=https://openrouter.ai/api/v1
@@ -70,10 +75,8 @@ PORT=${DEERFLOW_PORT:-2026}
 EOF
 
   echo "Starting DeerFlow..."
-  cd deer-flow
-  # Connect DeerFlow to our shared network
-  COMPOSE_FILE=docker/docker-compose.yaml docker compose up -d
-  cd ..
+  # Run DeerFlow compose in a subshell to avoid cd side effects
+  (cd deer-flow && COMPOSE_FILE=docker/docker-compose.yaml docker compose up -d)
 
   # Connect DeerFlow containers to msp-network if not already
   for container in $(docker ps --filter "name=deer-flow" --format '{{.Names}}' 2>/dev/null); do
