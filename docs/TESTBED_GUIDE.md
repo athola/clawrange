@@ -8,30 +8,27 @@ Local validation environment for the AI-powered MSP stack: OpenClaw + n8n + Deer
 # 1. Clone or navigate to the testbed
 cd ~/clawrange
 
-# 2. Create your environment file
-cp .env.example .env
-
-# 3. Fill in your OpenRouter API key (required)
-#    Get one at https://openrouter.ai/settings/keys
-#    Keep balance above $10 for testing
+# 2. Create your environment file and fill in your OpenRouter API key
+#    Get one at https://openrouter.ai/settings/keys — keep balance above $10
+make setup
 nano .env
 
-# 4. Start the core stack (OpenClaw + n8n)
-./scripts/start.sh
+# 3. Start the core stack (OpenClaw + n8n)
+make start
 
-# 5. Open n8n and activate the workflows
+# 4. Open n8n and activate the workflows
 #    Go to http://localhost:5678
 #    Import workflows from n8n/workflows/ if not auto-loaded
 #    Toggle each workflow to "Active"
 
-# 6. Run validation tests
-./scripts/test_all.sh
+# 5. Run validation tests
+make test
 
-# 7. (Optional) Start with DeerFlow research layer
-./scripts/start.sh --with-deerflow
+# 6. (Optional) Start with DeerFlow research layer
+make start-full
 
-# 8. (Optional) Test local Ollama inference
-./scripts/test_ollama.sh
+# 7. (Optional) Test local Ollama inference
+make test-ollama
 ```
 
 Total setup time: under 10 minutes (excluding Docker image pulls).

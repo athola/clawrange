@@ -116,26 +116,6 @@ RESPONSE=$(curl -sf "http://localhost:${N8N_PORT}/api/v1/workflows" \
 
 if echo "$RESPONSE" | grep -qi "Morning Briefing"; then
   echo "  Morning Briefing workflow found in n8n."
-
-  # Try to execute it via API
-  WF_ID=$(echo "$RESPONSE" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    workflows = data.get('data', data) if isinstance(data, dict) else data
-    if isinstance(workflows, list):
-        for wf in workflows:
-            if 'morning' in wf.get('name','').lower():
-                print(wf.get('id',''))
-                break
-except: pass
-" 2>/dev/null) || WF_ID=""
-
-  if [ -n "$WF_ID" ]; then
-    EXEC_RESPONSE=$(curl -sf -X POST "http://localhost:${N8N_PORT}/api/v1/workflows/${WF_ID}/run" \
-      -H "Content-Type: application/json" 2>&1) || EXEC_RESPONSE=""
-    echo "  Execution response: $(echo "$EXEC_RESPONSE" | head -c 200)"
-  fi
   pass
 else
   fail

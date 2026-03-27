@@ -16,9 +16,6 @@ SHELL := /bin/bash
 start: ## Start core stack (OpenClaw + n8n)
 	@./scripts/start.sh
 
-start-minimal: ## Start minimal stack (OpenClaw + n8n only, same as start)
-	@./scripts/start.sh --minimal
-
 start-full: ## Start full stack including DeerFlow research layer
 	@./scripts/start.sh --with-deerflow
 
@@ -52,7 +49,7 @@ test-deerflow: ## Test DeerFlow research layer
 test-ollama: ## Test local Ollama inference
 	@./scripts/test_ollama.sh
 
-test-python: ## Run Python validation suite
+validate: ## Validate config files and project structure
 	@python3 tests/validate_stack.py
 
 # ─── Docker Inspection ────────────────────────────────────────────
@@ -107,15 +104,11 @@ env-check: ## Validate .env has required values
 
 # ─── Cleanup ──────────────────────────────────────────────────────
 
-.PHONY: clean clean-volumes clean-all
-
-clean: stop ## Stop services (alias for stop)
+.PHONY: clean-volumes
 
 clean-volumes: ## Remove Docker volumes (n8n data)
 	@docker volume rm msp-n8n-data 2>/dev/null || true
 	@echo "Volumes removed."
-
-clean-all: reset ## Full reset (alias for reset)
 
 # ─── Help ─────────────────────────────────────────────────────────
 

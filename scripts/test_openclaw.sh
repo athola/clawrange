@@ -51,3 +51,4 @@ fi
 
 echo ""
 echo "OpenClaw Tests: ${PASS} passed, ${FAIL} failed"
+exit "$FAIL"

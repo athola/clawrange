@@ -57,3 +57,4 @@ fi
 
 echo ""
 echo "n8n Tests: ${PASS} passed, ${FAIL} failed"
+exit "$FAIL"

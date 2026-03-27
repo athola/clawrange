@@ -1,19 +1,16 @@
 #!/usr/bin/env bash
 # Start the AI MSP Testbed stack.
-# Usage: ./scripts/start.sh [--minimal] [--with-deerflow]
+# Usage: ./scripts/start.sh [--with-deerflow]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-MINIMAL=false
 WITH_DEERFLOW=false
 
 for arg in "$@"; do
   case "$arg" in
-    --minimal)      MINIMAL=true ;;
     --with-deerflow) WITH_DEERFLOW=true ;;
     -h|--help)
-      echo "Usage: ./scripts/start.sh [--minimal] [--with-deerflow]"
-      echo "  --minimal       Start OpenClaw + n8n only"
+      echo "Usage: ./scripts/start.sh [--with-deerflow]"
       echo "  --with-deerflow Also start DeerFlow research layer"
       exit 0
       ;;
@@ -51,13 +48,8 @@ if grep -q '^N8N_ENCRYPTION_KEY=$' .env 2>/dev/null; then
 fi
 
 # ─── Start OpenClaw + n8n ──────────────────────────────────────────
-if [ "$MINIMAL" = true ]; then
-  echo "Starting minimal stack (OpenClaw + n8n)..."
-  docker compose -f docker-compose.minimal.yml up -d
-else
-  echo "Starting core stack (OpenClaw + n8n)..."
-  docker compose up -d
-fi
+echo "Starting core stack (OpenClaw + n8n)..."
+docker compose up -d
 
 # ─── Optionally start DeerFlow ─────────────────────────────────────
 if [ "$WITH_DEERFLOW" = true ]; then
