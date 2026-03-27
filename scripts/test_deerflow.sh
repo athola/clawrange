@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 # Test the DeerFlow research layer.
 set -euo pipefail
+cd "$(dirname "$0")/.."
+
+# Source .env for port configuration
+if [ -f .env ]; then
+  set -a
+  . ./.env
+  set +a
+fi
 
 PORT="${DEERFLOW_PORT:-2026}"
 BASE="http://localhost:${PORT}"
@@ -15,7 +23,7 @@ echo "=== DeerFlow Tests ==="
 # Test 1: Health check
 echo ""
 echo "Test 1: Health check"
-if curl -sf "${BASE}/api/health" >/dev/null 2>&1; then
+if curl -sf --connect-timeout 5 --max-time 10 "${BASE}/api/health" >/dev/null 2>&1; then
   pass "DeerFlow is healthy at ${BASE}"
 else
   fail "DeerFlow health check failed at ${BASE}"
@@ -26,7 +34,7 @@ fi
 # Test 2: Models endpoint
 echo ""
 echo "Test 2: Available models"
-RESPONSE=$(curl -sf "${BASE}/api/models" 2>/dev/null) || RESPONSE=""
+RESPONSE=$(curl -sf --connect-timeout 5 --max-time 10 "${BASE}/api/models" 2>/dev/null) || RESPONSE=""
 if [ -n "$RESPONSE" ] && echo "$RESPONSE" | grep -qi "openrouter\|researcher\|writer"; then
   pass "Models endpoint returned OpenRouter-configured models"
 else
@@ -37,9 +45,8 @@ fi
 # Test 3: Research request
 echo ""
 echo "Test 3: Research request (may take 30-60 seconds)"
-RESPONSE=$(curl -sf -X POST "${BASE}/api/langgraph/runs" \
+RESPONSE=$(curl -sf --connect-timeout 5 --max-time 120 -X POST "${BASE}/api/langgraph/runs" \
   -H "Content-Type: application/json" \
-  --max-time 120 \
   -d '{
     "input": {
       "messages": [{"role": "user", "content": "What are the top 3 manufactured home lenders in Texas for FHA loans?"}]
@@ -58,4 +65,4 @@ fi
 
 echo ""
 echo "DeerFlow Tests: ${PASS} passed, ${FAIL} failed"
-exit "$FAIL"
+if [ "$FAIL" -gt 0 ]; then exit 1; else exit 0; fi

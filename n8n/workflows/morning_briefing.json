@@ -7,13 +7,13 @@
           "interval": [
             {
               "field": "cronExpression",
-              "expression": "0 8 * * 1-5"
+              "expression": "0 8 * * 1-6"
             }
           ]
         }
       },
       "id": "cron-trigger",
-      "name": "Weekday 8AM Trigger",
+      "name": "Business Day 8AM Trigger",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
       "position": [240, 300]
@@ -21,13 +21,13 @@
     {
       "parameters": {
         "method": "GET",
-        "url": "http://localhost:8081/mock/leads",
+        "url": "={{ $env.CRM_API_URL || 'http://mock-crm:8081/leads' }}",
         "options": {
           "timeout": 5000
         }
       },
       "id": "fetch-leads",
-      "name": "Fetch Leads from CRM",
+      "name": "Fetch Leads from CRM (mock in testbed)",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [460, 300],
@@ -42,33 +42,17 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [680, 300]
-    },
-    {
-      "parameters": {
-        "respondWith": "json",
-        "responseBody": "={{ JSON.stringify($json) }}"
-      },
-      "id": "respond",
-      "name": "Return Briefing",
-      "type": "n8n-nodes-base.respondToWebhook",
-      "typeVersion": 1.1,
-      "position": [900, 300]
     }
   ],
   "connections": {
-    "Weekday 8AM Trigger": {
+    "Business Day 8AM Trigger": {
       "main": [
-        [{ "node": "Fetch Leads from CRM", "type": "main", "index": 0 }]
+        [{ "node": "Fetch Leads from CRM (mock in testbed)", "type": "main", "index": 0 }]
       ]
     },
-    "Fetch Leads from CRM": {
+    "Fetch Leads from CRM (mock in testbed)": {
       "main": [
         [{ "node": "Format Briefing", "type": "main", "index": 0 }]
-      ]
-    },
-    "Format Briefing": {
-      "main": [
-        [{ "node": "Return Briefing", "type": "main", "index": 0 }]
       ]
     }
   },

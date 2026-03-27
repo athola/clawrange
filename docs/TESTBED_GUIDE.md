@@ -72,9 +72,11 @@ You can also run individual test scripts:
 ./scripts/test_ollama.sh      # Local Ollama inference
 ```
 
-Or use the Python suite:
+Or use the Python validation suite (offline, no services required):
 ```bash
-python3 tests/validate_stack.py
+make validate                                    # config checks + unit tests
+python3 tests/validate_stack.py                  # config checks only
+python3 -m pytest tests/test_validate_stack.py   # unit tests only
 ```
 
 ## Common Issues

@@ -45,7 +45,12 @@ def check_required_files() -> TestResult:
         "n8n/workflows/test_webhook.json",
         "scripts/start.sh",
         "scripts/stop.sh",
+        "scripts/reset.sh",
         "scripts/test_all.sh",
+        "scripts/test_openclaw.sh",
+        "scripts/test_n8n.sh",
+        "scripts/test_deerflow.sh",
+        "scripts/test_ollama.sh",
     ]
     missing = [f for f in required if not os.path.exists(os.path.join(PROJECT_ROOT, f))]
     if missing:
@@ -95,9 +100,14 @@ def check_env_not_committed() -> TestResult:
     """Verify .env is gitignored."""
     result = TestResult("Env Security")
     gitignore_path = os.path.join(PROJECT_ROOT, ".gitignore")
-    with open(gitignore_path) as f:
-        content = f.read()
-    if ".env" in content:
+    try:
+        with open(gitignore_path) as f:
+            content = f.read()
+    except FileNotFoundError:
+        result.fail_(".gitignore not found")
+        return result
+    lines = content.splitlines()
+    if any(line.strip() in (".env", "/.env") for line in lines):
         result.pass_(".env is in .gitignore")
     else:
         result.fail_(".env is NOT gitignored — secrets may leak")
@@ -170,15 +180,22 @@ def check_deerflow_data_sovereignty() -> TestResult:
         result.fail_("deerflow/config.yaml not found")
         return result
     # Only check non-comment lines for blocked endpoints
-    config_lines = " ".join(line for line in lines if not line.strip().startswith("#"))
+    config_lines = [line for line in lines if not line.strip().startswith("#")]
+    config_text = " ".join(config_lines).lower()
     blocklist = ["doubao", "volcengine", "bytedance", "deepseek.com"]
-    violations = [endpoint for endpoint in blocklist if endpoint in config_lines.lower()]
+    violations = [endpoint for endpoint in blocklist if endpoint in config_text]
     if violations:
         result.fail_(f"Direct endpoints found: {', '.join(violations)} — must route through OpenRouter")
-    elif "openrouter.ai" not in config_lines:
-        result.fail_("No OpenRouter base_url found — all models must use OpenRouter")
+        return result
+    # Check that base_url values specifically contain openrouter.ai
+    base_urls = [line.strip() for line in config_lines if "base_url:" in line]
+    if not base_urls:
+        result.fail_("No base_url entries found — all models must specify a base_url")
+    elif all("openrouter.ai" in url for url in base_urls):
+        result.pass_("All model base_url entries route through OpenRouter")
     else:
-        result.pass_("All model endpoints route through OpenRouter")
+        non_or = [url for url in base_urls if "openrouter.ai" not in url]
+        result.fail_(f"Non-OpenRouter base_url found: {', '.join(non_or)}")
     return result
 
 

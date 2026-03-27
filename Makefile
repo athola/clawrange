@@ -7,11 +7,10 @@
 #   make test               # validate the stack
 
 .DEFAULT_GOAL := help
-SHELL := /bin/bash
 
 # ─── Stack Lifecycle ──────────────────────────────────────────────
 
-.PHONY: start stop restart reset
+.PHONY: start start-full stop stop-clean restart reset
 
 start: ## Start core stack (OpenClaw + n8n)
 	@./scripts/start.sh
@@ -25,14 +24,16 @@ stop: ## Stop all services
 stop-clean: ## Stop all services and remove volumes
 	@./scripts/stop.sh --all
 
-restart: stop start ## Restart core stack
+restart: ## Restart core stack
+	@$(MAKE) stop
+	@$(MAKE) start
 
 reset: ## Wipe all data and start fresh (interactive confirmation)
 	@./scripts/reset.sh
 
 # ─── Testing ──────────────────────────────────────────────────────
 
-.PHONY: test test-openclaw test-n8n test-deerflow test-ollama test-python
+.PHONY: test test-openclaw test-n8n test-deerflow test-ollama validate
 
 test: ## Run full validation suite (6 tests)
 	@./scripts/test_all.sh
@@ -51,6 +52,9 @@ test-ollama: ## Test local Ollama inference
 
 validate: ## Validate config files and project structure
 	@python3 tests/validate_stack.py
+	@if command -v pytest >/dev/null 2>&1; then \
+		python3 -m pytest tests/test_validate_stack.py -q; \
+	fi
 
 # ─── Docker Inspection ────────────────────────────────────────────
 
@@ -58,8 +62,8 @@ validate: ## Validate config files and project structure
 
 ps: ## Show running containers
 	@docker compose ps 2>/dev/null; \
-	if [ -d deer-flow ]; then \
-		cd deer-flow && COMPOSE_FILE=docker/docker-compose.yaml docker compose ps 2>/dev/null; \
+	if [ -d deerflow ]; then \
+		(cd deer-flow 2>/dev/null && COMPOSE_FILE=docker/docker-compose.yaml docker compose ps 2>/dev/null) || true; \
 	fi
 
 logs: ## Tail logs from all services
@@ -72,9 +76,29 @@ logs-n8n: ## Tail n8n logs
 	@docker compose logs -f --tail=50 n8n
 
 health: ## Quick health check (no test logic, just curl)
-	@printf "OpenClaw: "; curl -sf http://localhost:$${OPENCLAW_PORT:-3000}/healthz && echo "OK" || echo "DOWN"
-	@printf "n8n:      "; curl -sf http://localhost:$${N8N_PORT:-5678}/healthz && echo "OK" || echo "DOWN"
-	@printf "DeerFlow: "; curl -sf http://localhost:$${DEERFLOW_PORT:-2026}/api/health && echo "OK" || echo "DOWN (optional)"
+	@[ -f .env ] && set -a && . ./.env && set +a || true; \
+	printf "OpenClaw: "; curl -sf --connect-timeout 5 http://localhost:$${OPENCLAW_PORT:-3000}/healthz && echo "OK" || echo "DOWN"
+	@[ -f .env ] && set -a && . ./.env && set +a || true; \
+	printf "n8n:      "; curl -sf --connect-timeout 5 http://localhost:$${N8N_PORT:-5678}/healthz && echo "OK" || echo "DOWN"
+	@[ -f .env ] && set -a && . ./.env && set +a || true; \
+	printf "DeerFlow: "; curl -sf --connect-timeout 5 http://localhost:$${DEERFLOW_PORT:-2026}/api/health && echo "OK" || echo "DOWN (optional)"
+
+# ─── Linting ─────────────────────────────────────────────────────
+
+.PHONY: lint format
+
+lint: ## Run ShellCheck on scripts (install: apt install shellcheck)
+	@if command -v shellcheck >/dev/null 2>&1; then \
+		shellcheck scripts/*.sh && echo "All scripts pass ShellCheck"; \
+	else \
+		echo "shellcheck not installed (skipping — install with: apt install shellcheck)"; \
+	fi
+
+format: ## Check YAML/JSON formatting
+	@command -v yamllint >/dev/null 2>&1 && yamllint -d relaxed docker-compose.yml deerflow/config.yaml || echo "yamllint not installed (skipping)"
+	@for f in n8n/workflows/*.json openclaw/config/openclaw.json; do \
+		python3 -m json.tool "$$f" > /dev/null && echo "OK: $$f" || echo "FAIL: $$f"; \
+	done
 
 # ─── Setup ────────────────────────────────────────────────────────
 
@@ -84,22 +108,30 @@ setup: .env ## One-time setup: create .env and generate encryption key
 	@echo "Setup complete. Fill in OPENROUTER_API_KEY in .env, then run: make start"
 
 .env: .env.example
+	@if [ -f .env ]; then echo ".env already exists. Remove it first to regenerate."; exit 1; fi
 	@cp .env.example .env
-	@KEY=$$(openssl rand -hex 32) && sed -i "s/^N8N_ENCRYPTION_KEY=.*/N8N_ENCRYPTION_KEY=$${KEY}/" .env
+	@KEY=$$(openssl rand -hex 32) && \
+		sed "s/^N8N_ENCRYPTION_KEY=.*/N8N_ENCRYPTION_KEY=$${KEY}/" .env > .env.tmp && \
+		mv .env.tmp .env
 	@echo "Created .env with generated N8N_ENCRYPTION_KEY."
 	@echo "Edit .env and add your OPENROUTER_API_KEY."
 
 env-check: ## Validate .env has required values
 	@if [ ! -f .env ]; then echo "FAIL: .env not found. Run: make setup"; exit 1; fi
-	@if grep -q '^OPENROUTER_API_KEY=$$' .env; then \
-		echo "WARN: OPENROUTER_API_KEY is empty in .env"; \
+	@if grep -q '^OPENROUTER_API_KEY=$$' .env || grep -q 'your-key-here' .env; then \
+		echo "WARN: OPENROUTER_API_KEY is empty or still has placeholder value"; \
 	else \
 		echo "OK: OPENROUTER_API_KEY is set"; \
 	fi
-	@if grep -q '^N8N_ENCRYPTION_KEY=$$' .env; then \
-		echo "WARN: N8N_ENCRYPTION_KEY is empty"; \
+	@if grep -q '^N8N_ENCRYPTION_KEY=$$' .env || grep -q 'replace-with' .env; then \
+		echo "WARN: N8N_ENCRYPTION_KEY is empty or still has placeholder value"; \
 	else \
 		echo "OK: N8N_ENCRYPTION_KEY is set"; \
+	fi
+	@if grep -q 'testbed-token-change-me' .env; then \
+		echo "WARN: OPENCLAW_GATEWAY_TOKEN still has default value — change it"; \
+	else \
+		echo "OK: OPENCLAW_GATEWAY_TOKEN is set"; \
 	fi
 
 # ─── Cleanup ──────────────────────────────────────────────────────
@@ -107,7 +139,7 @@ env-check: ## Validate .env has required values
 .PHONY: clean-volumes
 
 clean-volumes: ## Remove Docker volumes (n8n data)
-	@docker volume rm msp-n8n-data 2>/dev/null || true
+	@docker compose down -v 2>/dev/null || true
 	@echo "Volumes removed."
 
 # ─── Help ─────────────────────────────────────────────────────────
