@@ -6,7 +6,6 @@ cd "$(dirname "$0")/.."
 
 echo "Stopping core stack (OpenClaw + n8n)..."
 docker compose down 2>/dev/null || true
-docker compose -f docker-compose.minimal.yml down 2>/dev/null || true
 
 # Stop DeerFlow if running
 if [ -d deer-flow ] && [ -f deer-flow/docker/docker-compose.yaml ]; then

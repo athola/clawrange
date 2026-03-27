@@ -7,7 +7,6 @@ Docker-based testbed for an AI-powered MSP business. Validates the OpenClaw + n8
 ## Project Structure
 
 - `docker-compose.yml` — OpenClaw + n8n orchestration
-- `docker-compose.minimal.yml` — lightweight variant (same services)
 - `openclaw/` — AI agent config: soul.md (persona), openclaw.json (routing)
 - `n8n/workflows/` — importable n8n workflow JSON files
 - `deerflow/` — DeerFlow research agent config (OpenRouter, not ByteDance)

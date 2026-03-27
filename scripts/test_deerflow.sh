@@ -58,3 +58,4 @@ fi
 
 echo ""
 echo "DeerFlow Tests: ${PASS} passed, ${FAIL} failed"
+exit "$FAIL"

@@ -1,52 +1,17 @@
 """
-AI MSP Testbed — Stack Validation Suite
+AI MSP Testbed — Structural and Config Validation
+
+Validates project files, configs, and conventions without running services.
+For live HTTP endpoint tests, use: ./scripts/test_all.sh
 
 Run with: python3 tests/validate_stack.py
-Requires: pip install requests (or use the shell scripts instead)
 """
 
 import json
 import os
 import sys
-from urllib.error import URLError
-from urllib.request import Request, urlopen
 
-OPENCLAW_PORT = os.getenv("OPENCLAW_PORT", "3000")
-N8N_PORT = os.getenv("N8N_PORT", "5678")
-DEERFLOW_PORT = os.getenv("DEERFLOW_PORT", "2026")
-GATEWAY_TOKEN = os.getenv("OPENCLAW_GATEWAY_TOKEN", "testbed-token-change-me")
-
-OPENCLAW_BASE = f"http://localhost:{OPENCLAW_PORT}"
-N8N_BASE = f"http://localhost:{N8N_PORT}"
-DEERFLOW_BASE = f"http://localhost:{DEERFLOW_PORT}"
-
-
-def http_get(url: str, timeout: int = 10) -> tuple[int, str]:
-    """GET request, returns (status_code, body)."""
-    try:
-        req = Request(url)
-        with urlopen(req, timeout=timeout) as resp:
-            return resp.status, resp.read().decode()
-    except URLError as e:
-        return 0, str(e)
-    except Exception as e:
-        return 0, str(e)
-
-
-def http_post(url: str, data: dict, headers: dict | None = None, timeout: int = 30) -> tuple[int, str]:
-    """POST JSON request, returns (status_code, body)."""
-    try:
-        body = json.dumps(data).encode()
-        hdrs = {"Content-Type": "application/json"}
-        if headers:
-            hdrs.update(headers)
-        req = Request(url, data=body, headers=hdrs, method="POST")
-        with urlopen(req, timeout=timeout) as resp:
-            return resp.status, resp.read().decode()
-    except URLError as e:
-        return 0, str(e)
-    except Exception as e:
-        return 0, str(e)
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 class TestResult:
@@ -54,172 +19,205 @@ class TestResult:
         self.name = name
         self.passed = False
         self.message = ""
-        self.response = ""
 
-    def pass_(self, msg: str = "", response: str = ""):
+    def pass_(self, msg: str = ""):
         self.passed = True
         self.message = msg
-        self.response = response
 
-    def fail_(self, msg: str = "", response: str = ""):
+    def fail_(self, msg: str = ""):
         self.passed = False
         self.message = msg
-        self.response = response
 
 
-def test_stack_health() -> TestResult:
-    result = TestResult("Stack Health")
-
-    status_oc, _ = http_get(f"{OPENCLAW_BASE}/healthz")
-    status_n8n, _ = http_get(f"{N8N_BASE}/healthz")
-
-    if status_oc == 200 and status_n8n == 200:
-        result.pass_(f"OpenClaw={status_oc}, n8n={status_n8n}")
+def check_required_files() -> TestResult:
+    """Verify all required project files exist."""
+    result = TestResult("Required Files")
+    required = [
+        "docker-compose.yml",
+        ".env.example",
+        ".gitignore",
+        "Makefile",
+        "openclaw/soul.md",
+        "openclaw/config/openclaw.json",
+        "deerflow/config.yaml",
+        "n8n/workflows/morning_briefing.json",
+        "n8n/workflows/lead_status_lookup.json",
+        "n8n/workflows/test_webhook.json",
+        "scripts/start.sh",
+        "scripts/stop.sh",
+        "scripts/test_all.sh",
+    ]
+    missing = [f for f in required if not os.path.exists(os.path.join(PROJECT_ROOT, f))]
+    if missing:
+        result.fail_(f"Missing: {', '.join(missing)}")
     else:
-        result.fail_(f"OpenClaw={status_oc}, n8n={status_n8n}")
-
+        result.pass_(f"All {len(required)} required files present")
     return result
 
 
-def test_openclaw_response() -> TestResult:
-    result = TestResult("OpenClaw Response")
-
-    status, body = http_post(
-        f"{OPENCLAW_BASE}/v1/chat/completions",
-        {
-            "model": "openclaw:main",
-            "messages": [{"role": "user", "content": "What financing options does Longview Home Center offer?"}],
-        },
-        headers={"Authorization": f"Bearer {GATEWAY_TOKEN}"},
-    )
-
-    keywords = ["fha", "va", "conventional", "in-house", "financing"]
-    body_lower = body.lower()
-    if any(kw in body_lower for kw in keywords):
-        result.pass_("Contains financing keywords", body[:200])
+def check_scripts_executable() -> TestResult:
+    """Verify shell scripts have execute permission."""
+    result = TestResult("Script Permissions")
+    scripts_dir = os.path.join(PROJECT_ROOT, "scripts")
+    not_exec = []
+    for f in os.listdir(scripts_dir):
+        if f.endswith(".sh"):
+            path = os.path.join(scripts_dir, f)
+            if not os.access(path, os.X_OK):
+                not_exec.append(f)
+    if not_exec:
+        result.fail_(f"Not executable: {', '.join(not_exec)}")
     else:
-        result.fail_("No financing keywords in response", body[:300])
-
+        result.pass_("All scripts executable")
     return result
 
 
-def test_n8n_roundtrip() -> TestResult:
-    result = TestResult("n8n Roundtrip")
-
-    status, body = http_post(
-        f"{N8N_BASE}/webhook-test/test",
-        {"message": "ping", "source": "python-test"},
-    )
-
-    if "received" in body.lower():
-        result.pass_("Webhook echoed payload", body[:200])
+def check_env_example() -> TestResult:
+    """Verify .env.example has all required keys."""
+    result = TestResult("Env Template")
+    path = os.path.join(PROJECT_ROOT, ".env.example")
+    with open(path) as f:
+        content = f.read()
+    required_keys = ["OPENROUTER_API_KEY", "OPENCLAW_GATEWAY_TOKEN", "N8N_ENCRYPTION_KEY", "TIMEZONE"]
+    missing = [k for k in required_keys if k not in content]
+    if missing:
+        result.fail_(f"Missing keys in .env.example: {', '.join(missing)}")
     else:
-        result.fail_("No 'received' in response", body[:300])
-
+        result.pass_(f"All {len(required_keys)} required keys present")
     return result
 
 
-def test_lead_lookup() -> TestResult:
-    result = TestResult("Lead Lookup")
-
-    status, body = http_post(
-        f"{N8N_BASE}/webhook-test/lead-status",
-        {"name": "John Smith", "phone": "903-555-0100"},
-    )
-
-    if "john smith" in body.lower():
-        result.pass_("Found John Smith", body[:200])
+def check_env_not_committed() -> TestResult:
+    """Verify .env is gitignored."""
+    result = TestResult("Env Security")
+    gitignore_path = os.path.join(PROJECT_ROOT, ".gitignore")
+    with open(gitignore_path) as f:
+        content = f.read()
+    if ".env" in content:
+        result.pass_(".env is in .gitignore")
     else:
-        result.fail_("John Smith not in response", body[:300])
-
+        result.fail_(".env is NOT gitignored — secrets may leak")
     return result
 
 
-def test_morning_briefing() -> TestResult:
-    result = TestResult("Morning Briefing")
-
-    status, body = http_get(f"{N8N_BASE}/api/v1/workflows")
-    if "morning" in body.lower():
-        result.pass_("Morning Briefing workflow exists in n8n")
+def check_n8n_workflows() -> TestResult:
+    """Validate n8n workflow JSON structure."""
+    result = TestResult("n8n Workflows")
+    workflows_dir = os.path.join(PROJECT_ROOT, "n8n", "workflows")
+    errors = []
+    for f in os.listdir(workflows_dir):
+        if not f.endswith(".json"):
+            continue
+        path = os.path.join(workflows_dir, f)
+        with open(path) as fh:
+            try:
+                data = json.load(fh)
+            except json.JSONDecodeError as e:
+                errors.append(f"{f}: invalid JSON — {e}")
+                continue
+        if "name" not in data:
+            errors.append(f"{f}: missing 'name' field")
+        if "nodes" not in data:
+            errors.append(f"{f}: missing 'nodes' field")
+        if "connections" not in data:
+            errors.append(f"{f}: missing 'connections' field")
+    if errors:
+        result.fail_("; ".join(errors))
     else:
-        result.fail_("Morning Briefing workflow not found")
-
+        result.pass_("All workflows valid JSON with required fields")
     return result
 
 
-def test_deerflow_research() -> TestResult:
-    result = TestResult("DeerFlow Research")
-
-    status, _ = http_get(f"{DEERFLOW_BASE}/health")
-    if status != 200:
-        result.message = "DeerFlow not running (optional)"
-        result.response = "SKIP"
-        return result
-
-    status, body = http_post(
-        f"{DEERFLOW_BASE}/api/langgraph/runs",
-        {
-            "input": {
-                "messages": [
-                    {"role": "user", "content": "Top 3 manufactured home lenders in Texas for FHA loans"}
-                ]
-            },
-            "config": {},
-        },
-        timeout=120,
-    )
-
-    keywords = ["lender", "fha", "texas", "mortgage", "manufactured"]
-    body_lower = body.lower()
-    if any(kw in body_lower for kw in keywords):
-        result.pass_("Research returned relevant results", body[:200])
+def check_openclaw_config() -> TestResult:
+    """Validate openclaw.json has required configuration."""
+    result = TestResult("OpenClaw Config")
+    path = os.path.join(PROJECT_ROOT, "openclaw", "config", "openclaw.json")
+    with open(path) as f:
+        data = json.load(f)
+    errors = []
+    if "models" not in data:
+        errors.append("missing 'models' section")
+    if "activeHours" not in data:
+        errors.append("missing 'activeHours' section")
+    if "integrations" not in data:
+        errors.append("missing 'integrations' section")
+    n8n_url = data.get("integrations", {}).get("n8n", {}).get("webhookBaseUrl", "")
+    if "localhost" in n8n_url:
+        errors.append(f"n8n webhookBaseUrl uses localhost ({n8n_url}) — should use Docker service name")
+    if errors:
+        result.fail_("; ".join(errors))
     else:
-        result.fail_("No relevant keywords in response", body[:300])
+        result.pass_("Config valid with models, activeHours, integrations")
+    return result
 
+
+def check_deerflow_data_sovereignty() -> TestResult:
+    """Verify DeerFlow config routes all calls through OpenRouter."""
+    result = TestResult("Data Sovereignty")
+    path = os.path.join(PROJECT_ROOT, "deerflow", "config.yaml")
+    with open(path) as f:
+        lines = f.readlines()
+    # Only check non-comment lines for blocked endpoints
+    config_lines = " ".join(line for line in lines if not line.strip().startswith("#"))
+    blocklist = ["doubao", "volcengine", "bytedance", "deepseek.com"]
+    violations = [endpoint for endpoint in blocklist if endpoint in config_lines.lower()]
+    if violations:
+        result.fail_(f"Direct endpoints found: {', '.join(violations)} — must route through OpenRouter")
+    elif "openrouter.ai" not in config_lines:
+        result.fail_("No OpenRouter base_url found — all models must use OpenRouter")
+    else:
+        result.pass_("All model endpoints route through OpenRouter")
+    return result
+
+
+def check_soul_md() -> TestResult:
+    """Verify soul.md has required persona sections."""
+    result = TestResult("Soul.md Persona")
+    path = os.path.join(PROJECT_ROOT, "openclaw", "soul.md")
+    with open(path) as f:
+        content = f.read().lower()
+    required = ["longview home center", "jessup", "titanium", "fha", "va"]
+    missing = [r for r in required if r not in content]
+    if missing:
+        result.fail_(f"Missing references: {', '.join(missing)}")
+    else:
+        result.pass_("Persona includes dealership, brands, and financing")
     return result
 
 
 def main():
     print("=" * 50)
-    print(" AI MSP TESTBED — PYTHON VALIDATION SUITE")
+    print(" CLAWRANGE — CONFIG VALIDATION")
     print("=" * 50)
     print()
 
     tests = [
-        test_stack_health,
-        test_openclaw_response,
-        test_n8n_roundtrip,
-        test_lead_lookup,
-        test_morning_briefing,
-        test_deerflow_research,
+        check_required_files,
+        check_scripts_executable,
+        check_env_example,
+        check_env_not_committed,
+        check_n8n_workflows,
+        check_openclaw_config,
+        check_deerflow_data_sovereignty,
+        check_soul_md,
     ]
 
     results: list[TestResult] = []
     for test_fn in tests:
-        print(f"Running: {test_fn.__name__}...")
         r = test_fn()
         results.append(r)
-        status = "PASS" if r.passed else ("SKIP" if r.response == "SKIP" else "FAIL")
+        status = "PASS" if r.passed else "FAIL"
         print(f"  [{status}] {r.name}: {r.message}")
-        if r.response and r.response != "SKIP":
-            print(f"  Response: {r.response}")
-        print()
 
-    # Summary
     passed = sum(1 for r in results if r.passed)
     total = len(results)
 
+    print()
     print("=" * 50)
-    print(" STACK VALIDATION REPORT")
-    print("=" * 50)
-    for i, r in enumerate(results, 1):
-        status = "PASS" if r.passed else ("SKIP" if r.response == "SKIP" else "FAIL")
-        print(f"  Test {i} — {r.name:20s} [{status}]")
-    print("=" * 50)
-    print(f"  OVERALL: {passed}/{total} tests passed")
+    print(f"  {passed}/{total} checks passed")
     print("=" * 50)
 
-    sys.exit(0 if passed >= 5 else 1)
+    sys.exit(0 if passed == total else 1)
 
 
 if __name__ == "__main__":

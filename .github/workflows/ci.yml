@@ -22,7 +22,7 @@ jobs:
       - name: Validate YAML
         run: |
           pip install --quiet yamllint
-          yamllint -d relaxed docker-compose.yml docker-compose.minimal.yml deerflow/config.yaml
+          yamllint -d relaxed docker-compose.yml deerflow/config.yaml
 
       - name: Validate JSON
         run: |
@@ -33,7 +33,6 @@ jobs:
       - name: Validate Docker Compose
         run: |
           docker compose -f docker-compose.yml config --quiet
-          docker compose -f docker-compose.minimal.yml config --quiet
 
   python-tests:
     name: Python validation suite
