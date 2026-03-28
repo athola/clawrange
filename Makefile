@@ -1,9 +1,9 @@
 # ClawRange — AI MSP Testbed
-# Local validation environment: OpenClaw + n8n + DeerFlow + Ollama
+# Local validation environment: OpenClaw + Workflows + DeerFlow + Ollama
 #
 # Quick start:
 #   cp .env.example .env   # fill in OPENROUTER_API_KEY
-#   make start              # bring up OpenClaw + n8n
+#   make start              # bring up OpenClaw + Workflows
 #   make test               # validate the stack
 
 .DEFAULT_GOAL := help
@@ -12,7 +12,7 @@
 
 .PHONY: start start-full stop stop-clean restart reset
 
-start: ## Start core stack (OpenClaw + n8n)
+start: ## Start core stack (OpenClaw + Workflows)
 	@./scripts/start.sh
 
 start-full: ## Start full stack including DeerFlow research layer
@@ -35,11 +35,11 @@ PROD_COMPOSE := -f docker-compose.yml -f docker-compose.prod.yml
 .PHONY: start-prod start-prod-full stop-prod
 
 start-prod: ## Start core stack bound to Tailscale + localhost only
-	@BIND_ADDR=127.0.0.1 docker compose $(PROD_COMPOSE) up -d
+	@BIND_ADDR=127.0.0.1 docker compose $(PROD_COMPOSE) up -d --build
 	@echo "Services bound to 127.0.0.1 + $${TAILSCALE_IP} (Tailscale)"
 
 start-prod-full: ## Start full stack (prod mode) including DeerFlow
-	@BIND_ADDR=127.0.0.1 docker compose $(PROD_COMPOSE) up -d
+	@BIND_ADDR=127.0.0.1 docker compose $(PROD_COMPOSE) up -d --build
 	@./scripts/start.sh --with-deerflow --skip-core
 
 stop-prod: ## Stop production stack
@@ -50,7 +50,7 @@ reset: ## Wipe all data and start fresh (interactive confirmation)
 
 # ─── Testing ──────────────────────────────────────────────────────
 
-.PHONY: test test-openclaw test-n8n test-deerflow test-ollama validate
+.PHONY: test test-openclaw test-workflows test-deerflow test-ollama test-unit validate
 
 test: ## Run full validation suite (6 tests)
 	@./scripts/test_all.sh
@@ -58,14 +58,17 @@ test: ## Run full validation suite (6 tests)
 test-openclaw: ## Test OpenClaw layer only
 	@./scripts/test_openclaw.sh
 
-test-n8n: ## Test n8n workflows only
-	@./scripts/test_n8n.sh
+test-workflows: ## Test workflow endpoints
+	@./scripts/test_workflows.sh
 
 test-deerflow: ## Test DeerFlow research layer
 	@./scripts/test_deerflow.sh
 
 test-ollama: ## Test local Ollama inference
 	@./scripts/test_ollama.sh
+
+test-unit: ## Run Python unit tests (no containers needed)
+	@python3 -m pytest workflows/tests/ -v
 
 validate: ## Validate config files and project structure
 	@python3 tests/validate_stack.py
@@ -75,7 +78,7 @@ validate: ## Validate config files and project structure
 
 # ─── Docker Inspection ────────────────────────────────────────────
 
-.PHONY: ps logs logs-openclaw logs-n8n health
+.PHONY: ps logs logs-openclaw logs-workflows health
 
 ps: ## Show running containers
 	@docker compose ps 2>/dev/null; \
@@ -89,22 +92,22 @@ logs: ## Tail logs from all services
 logs-openclaw: ## Tail OpenClaw logs
 	@docker compose logs -f --tail=50 openclaw
 
-logs-n8n: ## Tail n8n logs
-	@docker compose logs -f --tail=50 n8n
+logs-workflows: ## Tail Workflows logs
+	@docker compose logs -f --tail=50 workflows
 
 health: ## Quick health check (no test logic, just curl)
 	@[ -f .env ] && set -a && . ./.env && set +a || true; \
-	printf "OpenClaw: "; curl -sf --connect-timeout 5 http://localhost:$${OPENCLAW_PORT:-3000}/healthz && echo "OK" || echo "DOWN"
+	printf "OpenClaw:  "; curl -sf --connect-timeout 5 http://localhost:$${OPENCLAW_PORT:-3000}/healthz && echo " OK" || echo "DOWN"
 	@[ -f .env ] && set -a && . ./.env && set +a || true; \
-	printf "n8n:      "; curl -sf --connect-timeout 5 http://localhost:$${N8N_PORT:-5678}/healthz && echo "OK" || echo "DOWN"
+	printf "Workflows: "; curl -sf --connect-timeout 5 http://localhost:$${WORKFLOWS_PORT:-5678}/healthz && echo " OK" || echo "DOWN"
 	@[ -f .env ] && set -a && . ./.env && set +a || true; \
-	printf "DeerFlow: "; curl -sf --connect-timeout 5 http://localhost:$${DEERFLOW_PORT:-2026}/api/health && echo "OK" || echo "DOWN (optional)"
+	printf "DeerFlow:  "; curl -sf --connect-timeout 5 http://localhost:$${DEERFLOW_PORT:-2026}/api/health && echo " OK" || echo "DOWN (optional)"
 
 # ─── Linting ─────────────────────────────────────────────────────
 
 .PHONY: lint format
 
-lint: ## Run ShellCheck on scripts (install: apt install shellcheck)
+lint: ## Run ShellCheck on scripts
 	@if command -v shellcheck >/dev/null 2>&1; then \
 		shellcheck scripts/*.sh && echo "All scripts pass ShellCheck"; \
 	else \
@@ -113,7 +116,7 @@ lint: ## Run ShellCheck on scripts (install: apt install shellcheck)
 
 format: ## Check YAML/JSON formatting
 	@command -v yamllint >/dev/null 2>&1 && yamllint -d relaxed docker-compose.yml deerflow/config.yaml || echo "yamllint not installed (skipping)"
-	@for f in n8n/workflows/*.json openclaw/config/openclaw.json; do \
+	@for f in openclaw/config/openclaw.json; do \
 		python3 -m json.tool "$$f" > /dev/null && echo "OK: $$f" || echo "FAIL: $$f"; \
 	done
 
@@ -121,16 +124,16 @@ format: ## Check YAML/JSON formatting
 
 .PHONY: setup env-check
 
-setup: .env ## One-time setup: create .env and generate encryption key
+setup: .env ## One-time setup: create .env and generate gateway token
 	@echo "Setup complete. Fill in OPENROUTER_API_KEY in .env, then run: make start"
 
 .env: .env.example
 	@if [ -f .env ]; then echo ".env already exists. Remove it first to regenerate."; exit 1; fi
 	@cp .env.example .env
-	@KEY=$$(openssl rand -hex 32) && \
-		sed "s/^N8N_ENCRYPTION_KEY=.*/N8N_ENCRYPTION_KEY=$${KEY}/" .env > .env.tmp && \
+	@TOKEN=$$(openssl rand -base64 32 | tr -d '/+=' | head -c 40) && \
+		sed "s/^OPENCLAW_GATEWAY_TOKEN=.*/OPENCLAW_GATEWAY_TOKEN=$${TOKEN}/" .env > .env.tmp && \
 		mv .env.tmp .env
-	@echo "Created .env with generated N8N_ENCRYPTION_KEY."
+	@echo "Created .env with generated OPENCLAW_GATEWAY_TOKEN."
 	@echo "Edit .env and add your OPENROUTER_API_KEY."
 
 env-check: ## Validate .env has required values
@@ -139,11 +142,6 @@ env-check: ## Validate .env has required values
 		echo "WARN: OPENROUTER_API_KEY is empty or still has placeholder value"; \
 	else \
 		echo "OK: OPENROUTER_API_KEY is set"; \
-	fi
-	@if grep -q '^N8N_ENCRYPTION_KEY=$$' .env || grep -q 'replace-with' .env; then \
-		echo "WARN: N8N_ENCRYPTION_KEY is empty or still has placeholder value"; \
-	else \
-		echo "OK: N8N_ENCRYPTION_KEY is set"; \
 	fi
 	@if grep -q 'testbed-token-change-me' .env; then \
 		echo "WARN: OPENCLAW_GATEWAY_TOKEN still has default value — change it"; \
@@ -155,7 +153,7 @@ env-check: ## Validate .env has required values
 
 .PHONY: clean-volumes
 
-clean-volumes: ## Remove Docker volumes (n8n data)
+clean-volumes: ## Remove Docker volumes
 	@docker compose down -v 2>/dev/null || true
 	@echo "Volumes removed."
 
