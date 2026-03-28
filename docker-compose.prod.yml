@@ -1,0 +1,15 @@
+# Production override — binds services to Tailscale + localhost only.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Set TAILSCALE_IP in .env to your node's Tailscale IP (run: tailscale ip -4).
+# Result: services listen on 127.0.0.1 + $TAILSCALE_IP only.
+# NOT reachable from LAN or public internet.
+
+services:
+  openclaw:
+    ports:
+      - "${TAILSCALE_IP:?Set TAILSCALE_IP in .env}:${OPENCLAW_PORT:-3000}:18789"
+
+  n8n:
+    ports:
+      - "${TAILSCALE_IP}:${N8N_PORT:-5678}:5678"
