@@ -28,6 +28,23 @@ restart: ## Restart core stack
 	@$(MAKE) stop
 	@$(MAKE) start
 
+# ─── Production (Tailscale-secured) ──────────────────────────────
+
+PROD_COMPOSE := -f docker-compose.yml -f docker-compose.prod.yml
+
+.PHONY: start-prod start-prod-full stop-prod
+
+start-prod: ## Start core stack bound to Tailscale + localhost only
+	@BIND_ADDR=127.0.0.1 docker compose $(PROD_COMPOSE) up -d
+	@echo "Services bound to 127.0.0.1 + $${TAILSCALE_IP} (Tailscale)"
+
+start-prod-full: ## Start full stack (prod mode) including DeerFlow
+	@BIND_ADDR=127.0.0.1 docker compose $(PROD_COMPOSE) up -d
+	@./scripts/start.sh --with-deerflow --skip-core
+
+stop-prod: ## Stop production stack
+	@docker compose $(PROD_COMPOSE) down
+
 reset: ## Wipe all data and start fresh (interactive confirmation)
 	@./scripts/reset.sh
 

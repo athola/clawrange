@@ -15,7 +15,7 @@ services:
     image: ghcr.io/openclaw/openclaw:latest  # TODO: Pin to specific version before production deploy
     container_name: msp-openclaw
     ports:
-      - "${OPENCLAW_PORT:-3000}:18789"  # Map host 3000 → container's default 18789
+      - "${BIND_ADDR:-0.0.0.0}:${OPENCLAW_PORT:-3000}:18789"
     volumes:
       - ./openclaw/soul.md:/home/node/.openclaw/soul.md:ro
       - ./openclaw/config/openclaw.json:/home/node/.openclaw/openclaw.json:ro
@@ -49,7 +49,7 @@ services:
     image: n8nio/n8n:latest  # TODO: Pin to specific version before production deploy
     container_name: msp-n8n
     ports:
-      - "${N8N_PORT:-5678}:5678"
+      - "${BIND_ADDR:-0.0.0.0}:${N8N_PORT:-5678}:5678"
     volumes:
       - n8n_data:/home/node/.n8n
       - ./n8n/workflows:/home/node/workflows:ro
