@@ -1,69 +1,26 @@
 {
-  "_comment": "OpenClaw configuration for AI MSP Testbed. All LLM calls route through OpenRouter.",
-
   "gateway": {
     "port": 18789,
-    "bind": "0.0.0.0"
-  },
-
-  "providers": {
-    "openrouter": {
-      "apiKey": "${OPENROUTER_API_KEY}",
-      "baseUrl": "https://openrouter.ai/api/v1"
+    "mode": "local",
+    "bind": "lan",
+    "auth": {
+      "mode": "token"
     }
   },
 
-  "models": {
-    "_comment": "Fast model for simple queries (greetings, hours, basic FAQ). Reasoning model for drafting and complex tasks.",
-    "fast": {
-      "provider": "openrouter",
-      "model": "anthropic/claude-haiku-4-5",
-      "maxTokens": 1024,
-      "temperature": 0.3
-    },
-    "reasoning": {
-      "provider": "openrouter",
-      "model": "anthropic/claude-sonnet-4-5",
-      "maxTokens": 4000,
-      "temperature": 0.5
-    },
-    "default": "fast"
-  },
-
-  "activeHours": {
-    "_comment": "Agent responds during business hours only. Outside hours, returns an after-hours message.",
-    "timezone": "America/Chicago",
-    "schedule": {
-      "monday":    { "start": "09:00", "end": "17:00" },
-      "tuesday":   { "start": "09:00", "end": "17:00" },
-      "wednesday": { "start": "09:00", "end": "17:00" },
-      "thursday":  { "start": "09:00", "end": "17:00" },
-      "friday":    { "start": "09:00", "end": "17:00" },
-      "saturday":  { "start": "09:00", "end": "17:00" }
-    },
-    "afterHoursMessage": "Thanks for reaching out to Longview Home Center! We're currently closed. Our hours are Monday through Saturday, 9 AM to 5 PM. We'll get back to you first thing next business day."
-  },
-
-  "integrations": {
-    "n8n": {
-      "_comment": "Webhook base URL for n8n inside Docker network. Use service name, not localhost.",
-      "webhookBaseUrl": "http://n8n:5678",
-      "endpoints": {
-        "leadStatus": "/webhook/lead-status",
-        "morningBriefing": "/webhook/morning-briefing",
-        "testWebhook": "/webhook/test"
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "openrouter/anthropic/claude-haiku-4-5"
+      },
+      "models": {
+        "openrouter/anthropic/claude-haiku-4-5": {},
+        "openrouter/anthropic/claude-sonnet-4-5": {}
       }
     }
   },
 
-  "context": {
-    "_comment": "Max 4000 tokens to keep test costs low. Increase for production.",
-    "maxTokens": 4000,
-    "systemPromptFile": "soul.md"
-  },
-
   "logging": {
-    "level": "info",
-    "includeTokenUsage": true
+    "level": "info"
   }
 }

@@ -40,15 +40,15 @@ def check_required_files() -> TestResult:
         "openclaw/soul.md",
         "openclaw/config/openclaw.json",
         "deerflow/config.yaml",
-        "n8n/workflows/morning_briefing.json",
-        "n8n/workflows/lead_status_lookup.json",
-        "n8n/workflows/test_webhook.json",
+        "workflows/app.py",
+        "workflows/Dockerfile",
+        "workflows/requirements.txt",
         "scripts/start.sh",
         "scripts/stop.sh",
         "scripts/reset.sh",
         "scripts/test_all.sh",
         "scripts/test_openclaw.sh",
-        "scripts/test_n8n.sh",
+        "scripts/test_workflows.sh",
         "scripts/test_deerflow.sh",
         "scripts/test_ollama.sh",
     ]
@@ -87,7 +87,7 @@ def check_env_example() -> TestResult:
     except FileNotFoundError:
         result.fail_(".env.example not found")
         return result
-    required_keys = ["OPENROUTER_API_KEY", "OPENCLAW_GATEWAY_TOKEN", "N8N_ENCRYPTION_KEY", "TIMEZONE"]
+    required_keys = ["OPENROUTER_API_KEY", "OPENCLAW_GATEWAY_TOKEN", "WORKFLOWS_PORT", "TIMEZONE"]
     missing = [k for k in required_keys if k not in content]
     if missing:
         result.fail_(f"Missing keys in .env.example: {', '.join(missing)}")
@@ -115,30 +115,25 @@ def check_env_not_committed() -> TestResult:
 
 
 def check_n8n_workflows() -> TestResult:
-    """Validate n8n workflow JSON structure."""
-    result = TestResult("n8n Workflows")
-    workflows_dir = os.path.join(PROJECT_ROOT, "n8n", "workflows")
+    """Validate workflow service has required files and endpoints."""
+    result = TestResult("Workflow Service")
+    app_path = os.path.join(PROJECT_ROOT, "workflows", "app.py")
     errors = []
-    for f in os.listdir(workflows_dir):
-        if not f.endswith(".json"):
-            continue
-        path = os.path.join(workflows_dir, f)
-        with open(path) as fh:
-            try:
-                data = json.load(fh)
-            except json.JSONDecodeError as e:
-                errors.append(f"{f}: invalid JSON — {e}")
-                continue
-        if "name" not in data:
-            errors.append(f"{f}: missing 'name' field")
-        if "nodes" not in data:
-            errors.append(f"{f}: missing 'nodes' field")
-        if "connections" not in data:
-            errors.append(f"{f}: missing 'connections' field")
+    if not os.path.exists(app_path):
+        errors.append("workflows/app.py not found")
+    else:
+        with open(app_path) as f:
+            source = f.read()
+        for endpoint in ["/webhook/test", "/webhook/lead-status", "/webhook/morning-briefing", "/healthz"]:
+            if endpoint not in source:
+                errors.append(f"missing endpoint: {endpoint}")
+    dockerfile = os.path.join(PROJECT_ROOT, "workflows", "Dockerfile")
+    if not os.path.exists(dockerfile):
+        errors.append("workflows/Dockerfile not found")
     if errors:
         result.fail_("; ".join(errors))
     else:
-        result.pass_("All workflows valid JSON with required fields")
+        result.pass_("Workflow service has all required endpoints and Dockerfile")
     return result
 
 
@@ -153,19 +148,29 @@ def check_openclaw_config() -> TestResult:
         result.fail_(str(e))
         return result
     errors = []
-    if "models" not in data:
-        errors.append("missing 'models' section")
-    if "activeHours" not in data:
-        errors.append("missing 'activeHours' section")
-    if "integrations" not in data:
-        errors.append("missing 'integrations' section")
-    n8n_url = data.get("integrations", {}).get("n8n", {}).get("webhookBaseUrl", "")
-    if "localhost" in n8n_url:
-        errors.append(f"n8n webhookBaseUrl uses localhost ({n8n_url}) — should use Docker service name")
+    # v2026.3+ schema: gateway, agents.defaults.model required
+    if "gateway" not in data:
+        errors.append("missing 'gateway' section")
+    else:
+        gw = data["gateway"]
+        if "mode" not in gw:
+            errors.append("missing 'gateway.mode'")
+        if "bind" not in gw:
+            errors.append("missing 'gateway.bind'")
+        if "port" not in gw:
+            errors.append("missing 'gateway.port'")
+        if gw.get("auth", {}).get("mode") != "token":
+            errors.append("gateway.auth.mode should be 'token'")
+    if "agents" not in data:
+        errors.append("missing 'agents' section")
+    else:
+        primary = data.get("agents", {}).get("defaults", {}).get("model", {}).get("primary", "")
+        if not primary:
+            errors.append("missing 'agents.defaults.model.primary'")
     if errors:
         result.fail_("; ".join(errors))
     else:
-        result.pass_("Config valid with models, activeHours, integrations")
+        result.pass_("Config valid with gateway (mode/bind/auth) and agent model")
     return result
 
 
