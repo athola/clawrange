@@ -1,29 +1,29 @@
 # AI MSP Testbed — Full Stack
-# OpenClaw (AI gateway) + n8n (workflow automation) + DeerFlow (research agent)
+# OpenClaw (AI gateway) + Workflows (webhook/CRM service) + DeerFlow (research agent)
 #
 # DeerFlow NOTE: DeerFlow is a multi-service app (frontend + backend + langgraph + nginx).
 # It runs via its own docker-compose in ./deer-flow/docker/.
 # The start.sh script orchestrates both stacks on a shared network.
-# This file handles OpenClaw + n8n. DeerFlow connects to msp-network externally.
+# This file handles OpenClaw + Workflows. DeerFlow connects to msp-network externally.
 
 services:
   # ─── OpenClaw: AI Assistant Gateway ───────────────────────────────
   # Routes client messages through LLM providers via OpenRouter.
   # Web UI + API at http://localhost:3000
-  # Docs: https://github.com/openclaw/openclaw
   openclaw:
-    image: ghcr.io/openclaw/openclaw:latest  # TODO: Pin to specific version before production deploy
+    image: ghcr.io/openclaw/openclaw:2026.3.24
     container_name: msp-openclaw
     ports:
       - "${BIND_ADDR:-0.0.0.0}:${OPENCLAW_PORT:-3000}:18789"
     volumes:
+      - openclaw_state:/home/node/.openclaw
       - ./openclaw/soul.md:/home/node/.openclaw/soul.md:ro
-      - ./openclaw/config/openclaw.json:/home/node/.openclaw/openclaw.json:ro
+      - ./openclaw/config/openclaw.json:/home/node/.openclaw/openclaw.json
     environment:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - OPENCLAW_TZ=${TIMEZONE:-America/Chicago}
       - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
-    command: ["node", "dist/index.js", "gateway", "--bind", "lan", "--port", "18789"]
+    command: ["node", "--max-old-space-size=1536", "dist/index.js", "gateway", "--bind", "lan", "--port", "18789"]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:18789/healthz').then(r=>{if(!r.ok)throw 1})"]
@@ -32,52 +32,41 @@ services:
       retries: 3
       start_period: 15s
     depends_on:
-      n8n:
+      workflows:
         condition: service_healthy
     deploy:
       resources:
         limits:
-          memory: 512M
+          memory: 2048M
     networks:
       - msp-network
 
-  # ─── n8n: Workflow Automation Engine ──────────────────────────────
-  # Handles webhooks, scheduled tasks, lead lookups, morning briefings.
-  # Dashboard at http://localhost:5678
-  # Docs: https://docs.n8n.io/
-  n8n:
-    image: n8nio/n8n:latest  # TODO: Pin to specific version before production deploy
-    container_name: msp-n8n
+  # ─── Workflows: Webhook + CRM Service ─────────────────────────────
+  # Handles webhooks, lead lookups, morning briefings.
+  # Replaces n8n with testable Python endpoints.
+  # API at http://localhost:5678
+  workflows:
+    build: ./workflows
+    container_name: msp-workflows
     ports:
-      - "${BIND_ADDR:-0.0.0.0}:${N8N_PORT:-5678}:5678"
-    volumes:
-      - n8n_data:/home/node/.n8n
-      - ./n8n/workflows:/home/node/workflows:ro
-    environment:
-      - N8N_HOST=0.0.0.0
-      - N8N_PORT=5678
-      - N8N_PROTOCOL=http
-      - WEBHOOK_URL=http://n8n:5678
-      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
-      - GENERIC_TIMEZONE=${TIMEZONE:-America/Chicago}
-      - N8N_DEFAULT_BINARY_DATA_MODE=filesystem
+      - "${BIND_ADDR:-0.0.0.0}:${WORKFLOWS_PORT:-5678}:5678"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:5678/healthz || exit 1"]
-      interval: 30s
-      timeout: 10s
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5678/healthz')"]
+      interval: 15s
+      timeout: 5s
       retries: 3
-      start_period: 20s
+      start_period: 5s
     deploy:
       resources:
         limits:
-          memory: 512M
+          memory: 128M
     networks:
       - msp-network
 
 volumes:
-  n8n_data:
-    name: msp-n8n-data
+  openclaw_state:
+    name: msp-openclaw-state
 
 networks:
   msp-network:

@@ -10,6 +10,6 @@ services:
     ports:
       - "${TAILSCALE_IP:?Set TAILSCALE_IP in .env}:${OPENCLAW_PORT:-3000}:18789"
 
-  n8n:
+  workflows:
     ports:
-      - "${TAILSCALE_IP}:${N8N_PORT:-5678}:5678"
+      - "${TAILSCALE_IP}:${WORKFLOWS_PORT:-5678}:5678"

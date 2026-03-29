@@ -1,0 +1,24 @@
+{
+  "// INSTRUCTIONS": "Paste this into https://login.tailscale.com/admin/acls",
+  "// THEN tag devices": "sudo tailscale up --advertise-tags=tag:node --ssh (on node) and sudo tailscale up --advertise-tags=tag:gateway (on gateway)",
+
+  "tagOwners": {
+    "tag:gateway": ["autogroup:owner"],
+    "tag:node": ["autogroup:owner"]
+  },
+
+  "acls": [
+    {
+      "// comment": "Gateway can only reach node service ports",
+      "action": "accept",
+      "src": ["tag:gateway"],
+      "dst": ["tag:node:3000", "tag:node:5678", "tag:node:2026"]
+    },
+    {
+      "// comment": "Owner devices (phone, laptop) can reach everything",
+      "action": "accept",
+      "src": ["autogroup:owner"],
+      "dst": ["*:*"]
+    }
+  ]
+}

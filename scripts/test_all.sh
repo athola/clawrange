@@ -12,7 +12,7 @@ if [ -f .env ]; then
 fi
 
 OPENCLAW_PORT="${OPENCLAW_PORT:-3000}"
-N8N_PORT="${N8N_PORT:-5678}"
+WORKFLOWS_PORT="${WORKFLOWS_PORT:-5678}"
 DEERFLOW_PORT="${DEERFLOW_PORT:-2026}"
 
 # POSIX-compatible results tracking (no arrays)
@@ -42,8 +42,8 @@ else
   T1_OK=false
 fi
 
-printf "  n8n (localhost:${N8N_PORT}): "
-if curl -sf --connect-timeout 5 --max-time 10 "http://localhost:${N8N_PORT}/healthz" >/dev/null 2>&1; then
+printf "  Workflows (localhost:${WORKFLOWS_PORT}): "
+if curl -sf --connect-timeout 5 --max-time 10 "http://localhost:${WORKFLOWS_PORT}/healthz" >/dev/null 2>&1; then
   echo "UP"
 else
   echo "DOWN"
@@ -77,9 +77,9 @@ else
 fi
 echo ""
 
-# ─── Test 3: n8n Webhook Roundtrip ─────────────────────────────────
-echo "Test 3 — n8n Webhook Roundtrip"
-RESPONSE=$(curl -sf --connect-timeout 5 --max-time 15 -X POST "http://localhost:${N8N_PORT}/webhook-test/test" \
+# ─── Test 3: Webhook Roundtrip ─────────────────────────────────────
+echo "Test 3 — Webhook Roundtrip"
+RESPONSE=$(curl -sf --connect-timeout 5 --max-time 15 -X POST "http://localhost:${WORKFLOWS_PORT}/webhook-test/test" \
   -H "Content-Type: application/json" \
   -d '{"message": "ping", "source": "openclaw-test"}' 2>/dev/null) || RESPONSE=""
 
@@ -88,13 +88,13 @@ if echo "$RESPONSE" | grep -qi "received"; then
   pass
 else
   fail
-  echo "  Ensure the 'Test Webhook' workflow is activated in n8n UI."
+  echo "  Check workflows service: docker compose logs workflows"
 fi
 echo ""
 
 # ─── Test 4: Lead Status Lookup ─────────────────────────────────────
 echo "Test 4 — Lead Status Lookup"
-RESPONSE=$(curl -sf --connect-timeout 5 --max-time 15 -X POST "http://localhost:${N8N_PORT}/webhook-test/lead-status" \
+RESPONSE=$(curl -sf --connect-timeout 5 --max-time 15 -X POST "http://localhost:${WORKFLOWS_PORT}/webhook-test/lead-status" \
   -H "Content-Type: application/json" \
   -d '{"name": "John Smith", "phone": "903-555-0100"}' 2>/dev/null) || RESPONSE=""
 
@@ -103,38 +103,20 @@ if echo "$RESPONSE" | grep -qi "John Smith"; then
   pass
 else
   fail
-  echo "  Ensure the 'Lead Status Lookup' workflow is activated in n8n UI."
+  echo "  Check workflows service: docker compose logs workflows"
 fi
 echo ""
 
 # ─── Test 5: Morning Briefing ──────────────────────────────────────
-echo "Test 5 — Morning Briefing (workflow existence check)"
+echo "Test 5 — Morning Briefing"
+RESPONSE=$(curl -sf --connect-timeout 5 --max-time 15 "http://localhost:${WORKFLOWS_PORT}/webhook/morning-briefing" 2>/dev/null) || RESPONSE=""
 
-# n8n API requires auth; use API key if available, otherwise note limitation
-RESPONSE=""
-if [ -n "${N8N_API_KEY:-}" ]; then
-  RESPONSE=$(curl -sf --connect-timeout 5 --max-time 10 "http://localhost:${N8N_PORT}/api/v1/workflows" \
-    -H "Accept: application/json" \
-    -H "X-N8N-API-KEY: ${N8N_API_KEY}" 2>/dev/null) || RESPONSE=""
-fi
-
-if echo "$RESPONSE" | grep -qi "Morning Briefing"; then
-  echo "  Morning Briefing workflow found in n8n."
+echo "  Response: $(echo "$RESPONSE" | head -c 200)"
+if echo "$RESPONSE" | grep -qi "MORNING BRIEFING"; then
   pass
 else
-  if [ -z "${N8N_API_KEY:-}" ]; then
-    echo "  N8N_API_KEY not set — cannot query n8n API. Checking workflow file exists locally."
-    if [ -f n8n/workflows/morning_briefing.json ]; then
-      echo "  morning_briefing.json exists locally."
-      pass
-    else
-      fail
-      echo "  morning_briefing.json not found."
-    fi
-  else
-    fail
-    echo "  Morning Briefing workflow not found. Import workflows from n8n/workflows/."
-  fi
+  fail
+  echo "  Check workflows service: docker compose logs workflows"
 fi
 echo ""
 
@@ -164,7 +146,7 @@ fi
 echo ""
 
 # ─── Summary ────────────────────────────────────────────────────────
-LABELS="Stack Health|OpenClaw Response|n8n Roundtrip|Lead Lookup|Morning Briefing|DeerFlow Research"
+LABELS="Stack Health|OpenClaw Response|Webhook Roundtrip|Lead Lookup|Morning Briefing|DeerFlow Research"
 
 echo "============================================="
 echo " STACK VALIDATION REPORT"
