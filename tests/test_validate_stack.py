@@ -41,15 +41,15 @@ def _create_minimal_project(root):
         "openclaw/soul.md",
         "openclaw/config/openclaw.json",
         "deerflow/config.yaml",
-        "n8n/workflows/morning_briefing.json",
-        "n8n/workflows/lead_status_lookup.json",
-        "n8n/workflows/test_webhook.json",
+        "workflows/app.py",
+        "workflows/Dockerfile",
+        "workflows/requirements.txt",
         "scripts/start.sh",
         "scripts/stop.sh",
         "scripts/reset.sh",
         "scripts/test_all.sh",
         "scripts/test_openclaw.sh",
-        "scripts/test_n8n.sh",
+        "scripts/test_workflows.sh",
         "scripts/test_deerflow.sh",
         "scripts/test_ollama.sh",
     ]
@@ -244,31 +244,29 @@ class TestCheckOpenclawConfig:
     """Tests for OpenClaw config validation."""
 
     def test_pass_with_valid_config(self, project_tree):
-        """GIVEN a valid openclaw.json with all required sections
+        """GIVEN a valid openclaw.json with v2026.3 schema
         THEN the check should pass."""
         config_dir = project_tree / "openclaw" / "config"
         config_dir.mkdir(parents=True, exist_ok=True)
         (config_dir / "openclaw.json").write_text(json.dumps({
-            "models": {"fast": {}},
-            "activeHours": {"timezone": "America/Chicago"},
-            "integrations": {"n8n": {"webhookBaseUrl": "http://n8n:5678"}},
+            "gateway": {"port": 18789, "mode": "local", "bind": "lan", "auth": {"mode": "token"}},
+            "agents": {"defaults": {"model": {"primary": "openrouter/anthropic/claude-haiku-4-5"}}},
         }))
         result = validate_stack.check_openclaw_config()
         assert result.passed is True
 
-    def test_fail_with_localhost_webhook(self, project_tree):
-        """GIVEN webhookBaseUrl uses localhost
+    def test_fail_with_missing_gateway_auth(self, project_tree):
+        """GIVEN gateway.auth.mode is not token
         THEN the check should fail."""
         config_dir = project_tree / "openclaw" / "config"
         config_dir.mkdir(parents=True, exist_ok=True)
         (config_dir / "openclaw.json").write_text(json.dumps({
-            "models": {},
-            "activeHours": {},
-            "integrations": {"n8n": {"webhookBaseUrl": "http://localhost:5678"}},
+            "gateway": {"port": 18789, "mode": "local", "bind": "lan"},
+            "agents": {"defaults": {"model": {"primary": "test"}}},
         }))
         result = validate_stack.check_openclaw_config()
         assert result.passed is False
-        assert "localhost" in result.message
+        assert "token" in result.message
 
     def test_fail_with_missing_sections(self, project_tree):
         """GIVEN openclaw.json is missing required sections
@@ -278,8 +276,8 @@ class TestCheckOpenclawConfig:
         (config_dir / "openclaw.json").write_text(json.dumps({}))
         result = validate_stack.check_openclaw_config()
         assert result.passed is False
-        assert "models" in result.message
-        assert "activeHours" in result.message
+        assert "gateway" in result.message
+        assert "agents" in result.message
 
     def test_fail_with_invalid_json(self, project_tree):
         """GIVEN openclaw.json contains invalid JSON
@@ -303,7 +301,7 @@ class TestCheckEnvExample:
         (project_tree / ".env.example").write_text(
             "OPENROUTER_API_KEY=test\n"
             "OPENCLAW_GATEWAY_TOKEN=test\n"
-            "N8N_ENCRYPTION_KEY=test\n"
+            "WORKFLOWS_PORT=5678\n"
             "TIMEZONE=America/Chicago\n"
         )
         result = validate_stack.check_env_example()
@@ -315,7 +313,7 @@ class TestCheckEnvExample:
         (project_tree / ".env.example").write_text(
             "OPENROUTER_API_KEY=test\n"
             "OPENCLAW_GATEWAY_TOKEN=test\n"
-            "N8N_ENCRYPTION_KEY=test\n"
+            "WORKFLOWS_PORT=5678\n"
         )
         result = validate_stack.check_env_example()
         assert result.passed is False
@@ -378,74 +376,58 @@ class TestCheckScriptsExecutable:
         assert result.passed is True
 
 
-# ─── check_n8n_workflows ──────────────────────────────────────────
+# ─── check_n8n_workflows (now checks workflow service) ───────────
 
 
 class TestCheckN8nWorkflows:
-    """Tests for n8n workflow JSON structure validation."""
+    """Tests for workflow service validation."""
 
-    def test_pass_with_valid_workflows(self, project_tree):
-        """GIVEN workflow JSON files with name, nodes, and connections
+    def test_pass_with_valid_service(self, project_tree):
+        """GIVEN workflows/app.py with all required endpoints and Dockerfile
         THEN the check should pass."""
-        wf_dir = project_tree / "n8n" / "workflows"
+        wf_dir = project_tree / "workflows"
         wf_dir.mkdir(parents=True, exist_ok=True)
-        (wf_dir / "test.json").write_text(json.dumps({
-            "name": "Test Workflow",
-            "nodes": [{"type": "n8n-nodes-base.start"}],
-            "connections": {},
-        }))
+        (wf_dir / "app.py").write_text(
+            '"/webhook/test"\n"/webhook/lead-status"\n'
+            '"/webhook/morning-briefing"\n"/healthz"\n'
+        )
+        (wf_dir / "Dockerfile").write_text("FROM python:3.12-slim\n")
         result = validate_stack.check_n8n_workflows()
         assert result.passed is True
 
-    def test_fail_with_missing_name(self, project_tree):
-        """GIVEN a workflow JSON missing the 'name' field
+    def test_fail_with_missing_endpoint(self, project_tree):
+        """GIVEN app.py is missing an endpoint
         THEN the check should fail."""
-        wf_dir = project_tree / "n8n" / "workflows"
+        wf_dir = project_tree / "workflows"
         wf_dir.mkdir(parents=True, exist_ok=True)
-        (wf_dir / "bad.json").write_text(json.dumps({
-            "nodes": [],
-            "connections": {},
-        }))
+        (wf_dir / "app.py").write_text('"/webhook/test"\n"/healthz"\n')
+        (wf_dir / "Dockerfile").write_text("FROM python:3.12-slim\n")
         result = validate_stack.check_n8n_workflows()
         assert result.passed is False
-        assert "name" in result.message
+        assert "lead-status" in result.message
 
-    def test_fail_with_missing_nodes(self, project_tree):
-        """GIVEN a workflow JSON missing the 'nodes' field
+    def test_fail_with_missing_app(self, project_tree):
+        """GIVEN workflows/app.py does not exist
         THEN the check should fail."""
-        wf_dir = project_tree / "n8n" / "workflows"
+        wf_dir = project_tree / "workflows"
         wf_dir.mkdir(parents=True, exist_ok=True)
-        (wf_dir / "bad.json").write_text(json.dumps({
-            "name": "Test",
-            "connections": {},
-        }))
+        (wf_dir / "Dockerfile").write_text("FROM python:3.12-slim\n")
         result = validate_stack.check_n8n_workflows()
         assert result.passed is False
-        assert "nodes" in result.message
+        assert "app.py" in result.message
 
-    def test_fail_with_invalid_json(self, project_tree):
-        """GIVEN a workflow file with invalid JSON
-        THEN the check should fail gracefully."""
-        wf_dir = project_tree / "n8n" / "workflows"
+    def test_fail_with_missing_dockerfile(self, project_tree):
+        """GIVEN workflows/Dockerfile does not exist
+        THEN the check should fail."""
+        wf_dir = project_tree / "workflows"
         wf_dir.mkdir(parents=True, exist_ok=True)
-        (wf_dir / "broken.json").write_text("{not valid json")
+        (wf_dir / "app.py").write_text(
+            '"/webhook/test"\n"/webhook/lead-status"\n'
+            '"/webhook/morning-briefing"\n"/healthz"\n'
+        )
         result = validate_stack.check_n8n_workflows()
         assert result.passed is False
-        assert "invalid JSON" in result.message
-
-    def test_ignores_non_json_files(self, project_tree):
-        """GIVEN the workflows dir contains a non-.json file
-        THEN it should be skipped without error."""
-        wf_dir = project_tree / "n8n" / "workflows"
-        wf_dir.mkdir(parents=True, exist_ok=True)
-        (wf_dir / "README.md").write_text("# Workflows")
-        (wf_dir / "test.json").write_text(json.dumps({
-            "name": "Test",
-            "nodes": [],
-            "connections": {},
-        }))
-        result = validate_stack.check_n8n_workflows()
-        assert result.passed is True
+        assert "Dockerfile" in result.message
 
 
 # ─── check_soul_md ────────────────────────────────────────────────
