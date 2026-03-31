@@ -1,0 +1,1100 @@
+"""LLM proxy with three-tier fallback and Telegram notifications.
+
+Sits between OpenClaw and LLM providers. Tries each tier in order,
+notifies via Telegram on fallback transitions, and returns the first
+successful response in OpenAI-compatible format (streaming or non-streaming).
+"""
+
+import asyncio
+import json
+import logging
+import os
+import re
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import httpx
+from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from telegram import delete_message, edit_status, notify, send_status, send_typing
+
+logger = logging.getLogger("clawrange.llm_proxy")
+
+router = APIRouter()
+
+# ─── Auth ──────────────────────────────────────────────────────────
+
+PROXY_AUTH_TOKEN = os.getenv("PROXY_AUTH_TOKEN", "")
+
+# ─── Tier Tracking ───────────────────────────────────────────────
+
+_last_tier_used: str | None = None
+
+# ─── Config Loading (once at startup) ─────────────────────────────
+
+MODELS_CONFIG_PATH = Path(__file__).parent / "models.json"
+
+
+def _load_config() -> dict:
+    with open(MODELS_CONFIG_PATH) as f:
+        return json.load(f)
+
+
+CONFIG = _load_config()
+
+# ─── Request Body Allowlist ────────────────────────────────────────
+
+ALLOWED_BODY_FIELDS = {
+    "messages",
+    "temperature",
+    "max_tokens",
+    "top_p",
+    "stop",
+    "frequency_penalty",
+    "presence_penalty",
+    "stream",
+}
+
+# ─── Circuit Breaker State ─────────────────────────────────────────
+
+_circuit_state: dict[str, dict] = {}
+CIRCUIT_FAILURE_THRESHOLD = 3
+CIRCUIT_COOLDOWN_SECONDS = 60
+
+
+def _circuit_open(tier_name: str) -> bool:
+    """Check if a tier's circuit breaker is open (should be skipped)."""
+    state = _circuit_state.get(tier_name)
+    if not state:
+        return False
+    if state["failures"] >= CIRCUIT_FAILURE_THRESHOLD:
+        elapsed = time.monotonic() - state["last_failure"]
+        if elapsed < CIRCUIT_COOLDOWN_SECONDS:
+            return True
+        _circuit_state.pop(tier_name, None)
+    return False
+
+
+def _record_failure(tier_name: str) -> None:
+    state = _circuit_state.setdefault(tier_name, {"failures": 0, "last_failure": 0})
+    state["failures"] += 1
+    state["last_failure"] = time.monotonic()
+
+
+def _record_success(tier_name: str) -> None:
+    _circuit_state.pop(tier_name, None)
+
+
+def _record_rate_limit(tier_name: str) -> None:
+    """Trip circuit breaker immediately — a 429 is an explicit 'stop calling'."""
+    _circuit_state[tier_name] = {
+        "failures": CIRCUIT_FAILURE_THRESHOLD,
+        "last_failure": time.monotonic(),
+    }
+
+
+# ─── Balance Guard (protect $10 free-tier threshold) ─────────────
+
+OPENROUTER_CREDIT_BALANCE = float(os.getenv("OPENROUTER_CREDIT_BALANCE", "0"))
+OPENROUTER_BALANCE_FLOOR = float(os.getenv("OPENROUTER_BALANCE_FLOOR", "10.0"))
+
+_balance_cache: dict[str, float | None] = {"remaining": None, "checked_at": 0.0}
+_BALANCE_CHECK_INTERVAL = 300  # re-check at most every 5 minutes
+
+
+async def _check_openrouter_balance() -> float | None:
+    """Return estimated remaining OpenRouter balance, or None if unknown.
+
+    Calls the /auth/key endpoint at most once per _BALANCE_CHECK_INTERVAL.
+    """
+    now = time.monotonic()
+    if now - (_balance_cache.get("checked_at") or 0) < _BALANCE_CHECK_INTERVAL:
+        return _balance_cache.get("remaining")
+
+    api_key = os.getenv("OPENROUTER_API_KEY", "")
+    if not api_key or not OPENROUTER_CREDIT_BALANCE:
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://openrouter.ai/api/v1/auth/key",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            if resp.status_code == 200:
+                usage = resp.json().get("data", {}).get("usage", 0)
+                remaining = OPENROUTER_CREDIT_BALANCE - usage
+                _balance_cache["remaining"] = remaining
+                _balance_cache["checked_at"] = now
+                return remaining
+    except httpx.HTTPError:
+        pass
+
+    return _balance_cache.get("remaining")
+
+
+# ─── Notification Debouncing ──────────────────────────────────────
+
+_notification_last_sent: dict[str, float] = {}
+_NOTIFICATION_DEBOUNCE_SECONDS = 120
+
+
+def _should_notify(tier_name: str) -> bool:
+    """Return True if enough time has passed since last notification for this tier."""
+    now = time.monotonic()
+    last = _notification_last_sent.get(tier_name, 0)
+    if now - last < _NOTIFICATION_DEBOUNCE_SECONDS:
+        return False
+    _notification_last_sent[tier_name] = now
+    return True
+
+
+def _background_notify(tier_name: str, message: str) -> None:
+    """Log tier events without sending to Telegram.
+
+    Telegram notifications go to the user's conversation chat and look like
+    garbled bot responses. Rate limit events are logged for debugging only.
+    Explicit admin alerts (balance guard) use notify() directly.
+    """
+    if not _should_notify(tier_name):
+        return
+    clean = message.replace("*", "").replace("`", "")
+    logger.info("[tier] %s", clean)
+
+
+async def _safe_notify(message: str) -> None:
+    """Fire-and-forget wrapper that logs failures instead of raising."""
+    try:
+        await notify(message)
+    except Exception:
+        logger.exception("Notification delivery failed")
+
+
+# ─── Auto-Retry ──────────────────────────────────────────────────
+
+MAX_AUTO_RETRY_WAIT = 30  # seconds — max hold time before returning synthetic response
+PROVIDER_TIMEOUT = 45  # per-provider HTTP timeout (seconds) — was 90
+REQUEST_DEADLINE = 60  # hard ceiling for the entire chat request (seconds)
+
+
+# ─── Rate Limit Detection ─────────────────────────────────────────
+
+_RATE_LIMIT_KEYWORDS = ("rate limit", "rate_limit", "ratelimit", "too many requests")
+
+
+def _is_rate_limited(resp: httpx.Response) -> bool:
+    """Detect rate limiting from status code or response body keywords."""
+    if resp.status_code == 429:
+        return True
+    if resp.status_code in (400, 403):
+        try:
+            body = resp.json()
+            error = body.get("error", {})
+            msg = error.get("message", "") if isinstance(error, dict) else str(error)
+            return any(kw in msg.lower() for kw in _RATE_LIMIT_KEYWORDS)
+        except Exception:
+            pass
+    return False
+
+
+def _get_reset_info(resp: httpx.Response) -> str:
+    """Extract rate limit reset time as a human-readable string.
+
+    Checks retry-after (seconds), x-ratelimit-reset-* (epoch/ISO),
+    response body metadata, and error message text. Returns '' if nothing found.
+    """
+    # retry-after header — seconds until reset
+    retry_after = resp.headers.get("retry-after")
+    if retry_after:
+        try:
+            seconds = int(retry_after)
+            if seconds < 120:
+                return f"in {seconds}s"
+            return f"in ~{seconds // 60}min"
+        except ValueError:
+            pass
+
+    # Reset timestamp headers (epoch or ISO)
+    for header in (
+        "x-ratelimit-reset-requests",
+        "x-ratelimit-reset",
+        "ratelimit-reset",
+    ):
+        value = resp.headers.get(header)
+        if not value:
+            continue
+        # Try epoch seconds
+        try:
+            reset_dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
+            delta = reset_dt - datetime.now(timezone.utc)
+            if delta > timedelta(0):
+                mins = int(delta.total_seconds()) // 60
+                return f"at {reset_dt.strftime('%H:%M UTC')} (~{mins}min)"
+            return f"at {reset_dt.strftime('%H:%M UTC')}"
+        except (ValueError, OSError):
+            pass
+        # Try ISO timestamp
+        try:
+            reset_dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return f"at {reset_dt.strftime('%H:%M UTC')}"
+        except (ValueError, AttributeError):
+            pass
+
+    # Check response body — metadata fields and error message text
+    try:
+        body = resp.json()
+        error = body.get("error", {})
+        if isinstance(error, dict):
+            meta = error.get("metadata", {})
+            if isinstance(meta, dict):
+                # Explicit reset fields
+                raw = meta.get("ratelimit_reset") or meta.get("retry_after")
+                if raw:
+                    return f"at {raw}"
+                # OpenRouter puts provider error in metadata.raw
+                raw_msg = meta.get("raw", "")
+                if raw_msg:
+                    parsed = _parse_reset_from_message(raw_msg)
+                    if parsed:
+                        return parsed
+            # Fallback: extract timing from the top-level error message
+            msg = error.get("message", "")
+            if msg:
+                parsed = _parse_reset_from_message(msg)
+                if parsed:
+                    return parsed
+    except Exception:
+        pass
+
+    return ""
+
+
+# Patterns to extract timing from OpenRouter error messages
+_RESET_SECONDS_RE = re.compile(r"(\d+)\s*(?:second|sec|s\b)", re.IGNORECASE)
+_RESET_MINUTES_RE = re.compile(r"(\d+)\s*(?:minute|min|m\b)", re.IGNORECASE)
+_RESET_HOURS_RE = re.compile(r"(\d+)\s*(?:hour|hr|h\b)", re.IGNORECASE)
+
+
+def _parse_reset_from_message(msg: str) -> str:
+    """Extract reset timing from an error message string."""
+    hours = _RESET_HOURS_RE.search(msg)
+    if hours:
+        h = int(hours.group(1))
+        reset_dt = datetime.now(timezone.utc) + timedelta(hours=h)
+        return f"at ~{reset_dt.strftime('%H:%M UTC')} (~{h}h)"
+
+    minutes = _RESET_MINUTES_RE.search(msg)
+    if minutes:
+        m = int(minutes.group(1))
+        return f"in ~{m}min"
+
+    seconds = _RESET_SECONDS_RE.search(msg)
+    if seconds:
+        s = int(seconds.group(1))
+        return f"in {s}s"
+
+    # Daily limit — no specific time given
+    if "day" in msg.lower() or "daily" in msg.lower():
+        return "daily limit — resets in up to 24h"
+
+    # Upstream provider throttling — transient, no specific reset time
+    if "upstream" in msg.lower() or "retry shortly" in msg.lower():
+        return "upstream provider throttled — retry in a few minutes"
+
+    return ""
+
+
+def _parse_reset_seconds_from_message(msg: str) -> int | None:
+    """Extract reset time in seconds from error message text."""
+    hours = _RESET_HOURS_RE.search(msg)
+    if hours:
+        return int(hours.group(1)) * 3600
+
+    minutes = _RESET_MINUTES_RE.search(msg)
+    if minutes:
+        return int(minutes.group(1)) * 60
+
+    seconds = _RESET_SECONDS_RE.search(msg)
+    if seconds:
+        return int(seconds.group(1))
+
+    if "day" in msg.lower() or "daily" in msg.lower():
+        return 86400
+
+    if "upstream" in msg.lower() or "retry shortly" in msg.lower():
+        return 20  # transient upstream throttle — conservative estimate
+
+    return None
+
+
+def _get_reset_seconds(resp: httpx.Response) -> int | None:
+    """Extract rate limit reset time in seconds, or None if unknown."""
+    retry_after = resp.headers.get("retry-after")
+    if retry_after:
+        try:
+            return max(int(retry_after), 1)
+        except ValueError:
+            pass
+
+    for header in (
+        "x-ratelimit-reset-requests",
+        "x-ratelimit-reset",
+        "ratelimit-reset",
+    ):
+        value = resp.headers.get(header)
+        if not value:
+            continue
+        try:
+            reset_dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
+            delta = reset_dt - datetime.now(timezone.utc)
+            if delta > timedelta(0):
+                return max(int(delta.total_seconds()), 1)
+        except (ValueError, OSError):
+            pass
+
+    try:
+        body = resp.json()
+        error = body.get("error", {})
+        if isinstance(error, dict):
+            meta = error.get("metadata", {})
+            if isinstance(meta, dict):
+                raw = meta.get("retry_after")
+                if raw:
+                    try:
+                        return max(int(raw), 1)
+                    except ValueError:
+                        pass
+                raw_msg = meta.get("raw", "")
+                if raw_msg:
+                    secs = _parse_reset_seconds_from_message(raw_msg)
+                    if secs is not None:
+                        return secs
+            msg = error.get("message", "")
+            if msg:
+                secs = _parse_reset_seconds_from_message(msg)
+                if secs is not None:
+                    return secs
+    except Exception:
+        pass
+
+    return None
+
+
+def _get_rate_limit_detail(resp: httpx.Response) -> str:
+    """Extract provider name and reason from a rate limit response."""
+    try:
+        body = resp.json()
+        error = body.get("error", {})
+        if isinstance(error, dict):
+            meta = error.get("metadata", {})
+            if isinstance(meta, dict):
+                provider = meta.get("provider_name", "")
+                raw = meta.get("raw", "")
+                if provider and raw:
+                    return f"({provider}: {raw[:120]})"
+                if provider:
+                    return f"(provider: {provider})"
+                if raw:
+                    return f"({raw[:120]})"
+    except Exception:
+        pass
+    return ""
+
+
+# ─── Provider Calls ───────────────────────────────────────────────
+
+# ─── Response Sanitization ────────────────────────────────────────
+
+# Tool keywords the model commonly hallucinates
+_TOOL_KEYWORDS = (
+    r"exec|web_search|web_fetch|cron|write|read|edit|search|browse|"
+    r"tool_call|function_call|subagents?|web_browse"
+)
+
+# Closed blocks: [[keyword ... ]] or [[keyword ... [/keyword]]
+_CLOSED_TOOL_BLOCK = re.compile(
+    rf"\[\[(?:{_TOOL_KEYWORDS})\b[\s\S]*?(?:\]\]|\[/\w+\]\]?)",
+    re.IGNORECASE,
+)
+# Unclosed blocks: [[keyword ... (runs to end of string)
+_UNCLOSED_TOOL_BLOCK = re.compile(
+    rf"\[\[(?:{_TOOL_KEYWORDS})\b[\s\S]*$",
+    re.IGNORECASE,
+)
+# Orphaned inner tags: [command]...[/command], [query]...[/query], etc.
+_INNER_TAG = re.compile(
+    r"\[(?:command|query|filename|content|action)(?:=[^\]]*)?\]"
+    r"[\s\S]*?"
+    r"\[/(?:command|query|filename|content|action)\]",
+    re.IGNORECASE,
+)
+
+
+# XML-style hallucinated tool tags: <exec command="..."></exec>, <tool_call>...</tool_call>, etc.
+_XML_TOOL_TAG = re.compile(
+    r"<(?:exec|tool_call|function_call|search|browse|cron|write|read|subagents?)\b[^>]*>"
+    r"[\s\S]*?"
+    r"</(?:exec|tool_call|function_call|search|browse|cron|write|read|subagents?)>",
+    re.IGNORECASE,
+)
+# Self-closing XML tags: <exec command="..."/>
+_XML_SELF_CLOSING = re.compile(
+    r"<(?:exec|tool_call|function_call|search|browse|cron|write|read|subagents?)\b[^/]*/\s*>",
+    re.IGNORECASE,
+)
+# Unclosed XML tool tags: <exec ...> or <exec ... (runs to end of string)
+_XML_UNCLOSED_TAG = re.compile(
+    rf"<(?:{_TOOL_KEYWORDS})\b[\s\S]*$",
+    re.IGNORECASE,
+)
+# Hallucinated metadata tags: <session_status>...</session_status>, <system>...</system>, etc.
+_XML_META_TAG = re.compile(
+    r"<(?:session_status|system_status|thinking|internal_monologue)\b[^>]*>"
+    r"[\s\S]*?"
+    r"</(?:session_status|system_status|thinking|internal_monologue)>",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_response(text: str) -> str:
+    """Strip hallucinated tool-call blocks from LLM output."""
+    cleaned = _CLOSED_TOOL_BLOCK.sub("", text)
+    cleaned = _UNCLOSED_TOOL_BLOCK.sub("", cleaned)
+    cleaned = _INNER_TAG.sub("", cleaned)
+    cleaned = _XML_TOOL_TAG.sub("", cleaned)
+    cleaned = _XML_SELF_CLOSING.sub("", cleaned)
+    cleaned = _XML_UNCLOSED_TAG.sub("", cleaned)
+    cleaned = _XML_META_TAG.sub("", cleaned)
+    # Collapse excessive blank lines left by removals
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _is_garbled(text: str) -> bool:
+    """Detect responses with missing spaces (common GLM tokenization issue).
+
+    Normal English has ~15-20% spaces. Below 5% on a 50+ char response is garbled.
+    """
+    if len(text) < 50:
+        return False
+    return text.count(" ") / len(text) < 0.05
+
+
+# ── Non-answer detection ────────────────────────────────────────
+#
+# Free models hallucinate agent behavior — they promise to "research",
+# "read files", "do startup" instead of answering.
+#
+# Detection counts how many DEFERRAL SIGNALS appear in a short response.
+# Each signal is a compiled regex that handles verb conjugation
+# (read/reading, load/loading, etc.). 3+ signals = non-answer.
+
+_DEFERRAL_SIGNALS = [
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        # Deferral structure
+        r"\blet me\b",
+        r"\bi'?ll\b",
+        r"\bi (?:need|have|want) to\b",
+        r"\bfirst\b",
+        r"\bthen\b",
+        r"\bbefore i\b",
+        r"\bhold on\b",
+        # Agent actions (with conjugation)
+        r"\bstartup\b",
+        r"\bstart(?:ing)?\s+(?:up|by|with)\b",
+        r"\bresearch",
+        r"\bread(?:ing)?\s+(?:my|the|some|required)\b",
+        r"\bload(?:ing)?\s+(?:my|the)\b",
+        r"\bcatch(?:ing)?\s+up\b",
+        r"\binitializ",
+        r"\bboot",
+        r"\bunderstand(?:ing)?\s+(?:my|the|who|your)\b",
+        r"\bprepare?\b",
+        r"\bgather(?:ing)?\b",
+        # Agent objects
+        r"\bcontext\b",
+        r"\b(?:config|configuration)\b",
+        r"\bidentity\b",
+        # Meta qualifiers (padding without substance)
+        r"\bproperly\b",
+        r"\bthoroughly?\b",
+        r"\bcarefully\b",
+        r"\b(?:real|right|good|proper)\s+answer\b",
+    )
+]
+
+# Customer-facing actions exempt a response from non-answer detection
+_CUSTOMER_ACTIONS = re.compile(
+    r"call you|reach out|connect you|send you|text you|"
+    r"schedule|appointment|come by|visit the lot",
+    re.IGNORECASE,
+)
+
+
+def _is_non_answer(text: str) -> bool:
+    """Detect short responses where the model defers instead of answering.
+
+    Counts deferral signal matches (compiled regexes that handle verb
+    conjugation). 3+ signals in a response under 300 chars with no
+    customer-facing action = non-answer.
+    """
+    if len(text) > 300:
+        return False
+    if _CUSTOMER_ACTIONS.search(text):
+        return False
+    hits = sum(1 for signal in _DEFERRAL_SIGNALS if signal.search(text))
+    return hits >= 3
+
+
+PROVIDER_URLS = {
+    "openrouter": "https://openrouter.ai/api/v1/chat/completions",
+    "zai": "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
+}
+
+
+async def _call_provider(
+    provider: str, models: list[str], body: dict, api_key: str
+) -> httpx.Response:
+    """Call a provider with the given body. Returns the raw response."""
+    url = PROVIDER_URLS[provider]
+    payload = {**body, "model": models[0]}
+    if provider == "openrouter" and len(models) > 1:
+        payload["models"] = models
+
+    async with httpx.AsyncClient(timeout=PROVIDER_TIMEOUT) as client:
+        return await client.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+
+
+# ─── Tier Routing Hints ────────────────────────────────────────────
+
+TIER_HINTS = {
+    "z.ai": "zai-direct",
+    "zai": "zai-direct",
+    "zhipu": "zai-direct",
+    "glm": "zai-direct",
+    "bigmodel": "zai-direct",
+    "paid": "openrouter-paid",
+    "claude": "openrouter-paid",
+}
+
+
+def _detect_tier_hint(messages: list[dict]) -> str | None:
+    """Check the last user message for an explicit ``!keyword`` routing command.
+
+    Only matches keywords prefixed with ``!`` (e.g. ``!paid``, ``!claude``,
+    ``!zai``).  The sender metadata block is stripped first so that
+    incidental mentions of provider names in conversation context never
+    trigger routing.
+    """
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            text = msg.get("content", "")
+            if isinstance(text, list):
+                text = " ".join(b.get("text", "") for b in text if isinstance(b, dict))
+            # Strip sender metadata blocks to avoid false matches
+            text = re.sub(
+                r"sender \(untrusted metadata\):.*?```.*?```",
+                "",
+                text,
+                flags=re.DOTALL,
+            )
+            text_lower = text.lower()
+            for keyword, tier in TIER_HINTS.items():
+                if f"!{keyword}" in text_lower:
+                    return tier
+            break
+    return None
+
+
+# ─── Synthetic Response Helper ────────────────────────────────────
+
+
+def _synthetic_response(text: str) -> JSONResponse:
+    """Return a synthetic OpenAI-compatible chat response (no LLM call)."""
+    return JSONResponse(
+        content={
+            "id": "clawrange-synthetic",
+            "object": "chat.completion",
+            "choices": [{"message": {"role": "assistant", "content": text}}],
+        }
+    )
+
+
+def _wrap_json_as_sse(json_response: JSONResponse) -> StreamingResponse:
+    """Wrap a non-streaming JSONResponse as SSE for clients that requested streaming.
+
+    Converts the full JSON chat completion into token-by-token SSE chunks
+    so OpenAI-compatible clients (like OpenClaw) can parse it correctly.
+    """
+    data = json.loads(bytes(json_response.body))
+    completion_id = data.get("id", "clawrange-fallback")
+    model = data.get("model", "unknown")
+    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    tier = data.get("_clawrange_tier", "")
+
+    def _make_chunk(delta: dict, finish_reason: str | None = None) -> str:
+        chunk = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        if tier:
+            chunk["_clawrange_tier"] = tier
+        return f"data: {json.dumps(chunk)}\n\n"
+
+    async def _generate():
+        # Role chunk (no content)
+        yield _make_chunk({"role": "assistant"})
+        # Token-by-token content — split on space boundaries, preserve spaces
+        for i, word in enumerate(content.split(" ")):
+            token = f" {word}" if i > 0 else word
+            yield _make_chunk({"content": token})
+        # Final chunk
+        yield _make_chunk({}, finish_reason="stop")
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# Regex to strip OpenClaw's metadata prefix from user messages.
+# Format: "<label> (untrusted metadata):\n```json\n{...}\n```\n<actual message>"
+_OPENCLAW_META_RE = re.compile(
+    r"^[^\n]*\(untrusted metadata\)\s*:\s*```json\s*\{.*?\}\s*```\s*",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _get_last_user_message(messages: list[dict]) -> str:
+    """Extract the text of the last user message, stripping OpenClaw metadata."""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    b.get("text", "") for b in content if isinstance(b, dict)
+                )
+            if not isinstance(content, str):
+                return ""
+            # Strip OpenClaw conversation metadata prefix
+            content = _OPENCLAW_META_RE.sub("", content)
+            return content.strip()
+    return ""
+
+
+# ─── /tier Command ───────────────────────────────────────────────
+
+
+async def _handle_tier_command() -> JSONResponse:
+    """Return current tier status, balance, and circuit breaker state."""
+    lines = ["Tier Status\n"]
+    for tier in CONFIG["tiers"]:
+        name = tier["name"]
+        if _circuit_open(name):
+            marker = "TRIPPED"
+        elif name == _last_tier_used:
+            marker = "ACTIVE"
+        else:
+            marker = "ready"
+        lines.append(f"  [{marker}] {name} — {tier['description']}")
+
+    remaining = await _check_openrouter_balance()
+    lines.append("")
+    if remaining is not None:
+        lines.append(
+            f"Balance: ${remaining:.2f} remaining (floor: ${OPENROUTER_BALANCE_FLOOR:.2f})"
+        )
+    else:
+        lines.append("Balance: not configured (set OPENROUTER_CREDIT_BALANCE)")
+
+    if _last_tier_used:
+        lines.append(f"Last used: {_last_tier_used}")
+    else:
+        lines.append("Last used: none yet")
+
+    lines.append("Paid auto-fallback: off (send !paid or !claude to enable)")
+    return _synthetic_response("\n".join(lines))
+
+
+# ─── Tier Helpers ─────────────────────────────────────────────────
+
+
+async def _notify_tier_change(tier_name: str) -> None:
+    """Notify via Telegram when the serving tier changes."""
+    global _last_tier_used
+    if _last_tier_used is not None and _last_tier_used != tier_name:
+        _background_notify(
+            f"tier-change:{_last_tier_used}:{tier_name}",
+            f"*Tier switch*: `{_last_tier_used}` -> `{tier_name}`",
+        )
+    _last_tier_used = tier_name
+
+
+# ─── Single-Tier Attempt ─────────────────────────────────────────
+
+
+async def _try_single_tier(
+    tier: dict, body: dict, status_msg_id: int | None = None
+) -> tuple[JSONResponse | None, tuple[str, int | None] | None]:
+    """Attempt one provider tier. Returns (response, rate_limit_info).
+
+    On success: (JSONResponse, None)
+    On rate limit: (None, (tier_name, reset_seconds))
+    On other failure: (None, None)
+    """
+    tier_name = tier["name"]
+    provider = tier["provider"]
+    models = tier["models"]
+    provider_config = CONFIG["providers"][provider]
+    api_key = os.getenv(provider_config["env_key"], "")
+
+    if status_msg_id:
+        asyncio.create_task(send_typing())
+        asyncio.create_task(edit_status(status_msg_id, f"\u23f3 {tier['description']}"))
+
+    try:
+        non_stream_body = {**body, "stream": False}
+        resp = await _call_provider(provider, models, non_stream_body, api_key)
+
+        if resp.status_code == 200:
+            data = resp.json()
+            for choice in data.get("choices", []):
+                msg = choice.get("message", {})
+                if not msg.get("content") and msg.get("reasoning_content"):
+                    msg["content"] = msg["reasoning_content"]
+                if "content" in msg and isinstance(msg["content"], str):
+                    msg["content"] = _sanitize_response(msg["content"])
+                msg.pop("reasoning", None)
+                msg.pop("reasoning_content", None)
+                msg.pop("reasoning_details", None)
+                msg.pop("refusal", None)
+                choice.pop("native_finish_reason", None)
+
+            first_content = ""
+            if data.get("choices"):
+                first_content = (
+                    data["choices"][0].get("message", {}).get("content") or ""
+                )
+
+            if _is_garbled(first_content):
+                print(
+                    f"[PROXY] garbled response from {tier_name} — skipping", flush=True
+                )
+                _record_failure(tier_name)
+                return None, None
+
+            if not first_content.strip():
+                print(
+                    f"[PROXY] empty response from {tier_name} after sanitization — skipping",
+                    flush=True,
+                )
+                _record_failure(tier_name)
+                return None, None
+
+            if _is_non_answer(first_content):
+                print(
+                    f"[PROXY] non-answer from {tier_name}: {first_content[:80]!r} — skipping",
+                    flush=True,
+                )
+                # Don't _record_failure — the provider worked fine, the content
+                # was just bad. Tripping the circuit breaker would lock out a
+                # working provider and force expensive paid-tier fallback.
+                return None, None
+
+            _record_success(tier_name)
+            data["_clawrange_tier"] = tier_name
+            print(
+                f"[PROXY] response via {tier_name} ({len(first_content)} chars)",
+                flush=True,
+            )
+            return JSONResponse(content=data), None
+
+        if _is_rate_limited(resp):
+            _record_rate_limit(tier_name)
+            try:
+                print(
+                    f"[PROXY] 429 on {tier_name} — headers: {dict(resp.headers)} body: {resp.text[:500]}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+            reset = _get_reset_info(resp)
+            detail = _get_rate_limit_detail(resp)
+            _background_notify(
+                tier_name,
+                f"*Rate limited* on `{tier_name}`"
+                + (f"\nResets {reset}" if reset else "")
+                + (f"\n{detail}" if detail else ""),
+            )
+            return None, (tier_name, _get_reset_seconds(resp))
+
+        _record_failure(tier_name)
+        _background_notify(
+            tier_name,
+            f"*Error* on `{tier_name}` (HTTP {resp.status_code})",
+        )
+        return None, None
+
+    except httpx.HTTPError as exc:
+        _record_failure(tier_name)
+        _background_notify(tier_name, f"*Network error* on `{tier_name}`: {exc}")
+        return None, None
+
+
+# ─── Proxy Endpoint ───────────────────────────────────────────────
+
+
+@router.post("/v1/chat/completions")
+async def chat_completions(
+    request: Request,
+    authorization: str | None = Header(None),
+):
+    # Auth check — if PROXY_AUTH_TOKEN is set, require it
+    if PROXY_AUTH_TOKEN:
+        if not authorization or authorization != f"Bearer {PROXY_AUTH_TOKEN}":
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+    raw_body = await request.json()
+    messages = raw_body.get("messages", [])
+    is_stream = raw_body.get("stream", False)
+
+    # Intercept status commands before they hit the LLM
+    last_user_msg = _get_last_user_message(messages)
+    msg_lower = last_user_msg.lower().strip()
+    print(f"[PROXY] extracted msg: {msg_lower[:200]!r}", flush=True)
+    tier_commands = (
+        "/tier",
+        "!tier",
+        "tier",
+        "tier?",
+        "tier status",
+        "/status",
+        "!status",
+        "status",
+        "status?",
+        "claw status",
+        "clawstatus",
+        "proxy status",
+        "proxy?",
+        "which tier",
+        "what tier",
+        "what's the status",
+        "whats the status",
+        "what is the status",
+        "what's the status?",
+        "whats the status?",
+        "what is the status?",
+        "whats your status",
+        "what's your status",
+        "whats your status?",
+        "what's your status?",
+        "your status",
+        "your status?",
+    )
+    # Also check last line — handles cases where metadata stripping fails
+    last_line = msg_lower.rstrip().rsplit("\n", 1)[-1].strip()
+    if msg_lower in tier_commands or last_line in tier_commands:
+        return await _handle_tier_command()
+
+    # Strip poisoned assistant messages from conversation history.
+    # Uses both static markers (synthetic responses, tool hallucinations)
+    # AND the deferral detector — any assistant message that would fail
+    # _is_non_answer() gets stripped so the model doesn't see its own
+    # previous failures and generate apologies or continued deferrals.
+    _POISON_MARKERS = (
+        "temporarily on pause",
+        "took too long to respond",
+        "<exec",
+        "[[exec",
+        "<tool_call",
+    )
+    messages = [
+        msg
+        for msg in messages
+        if not (
+            msg.get("role") == "assistant"
+            and isinstance(msg.get("content"), str)
+            and (
+                any(marker in msg["content"] for marker in _POISON_MARKERS)
+                or _is_non_answer(msg["content"])
+            )
+        )
+    ]
+
+    # Allowlist body fields
+    body = {k: v for k, v in raw_body.items() if k in ALLOWED_BODY_FIELDS}
+    body["messages"] = messages
+
+    # Inject anti-hallucination reinforcement as a TRAILING system message.
+    # LLMs weight instructions near the end of context most heavily.
+    # Placing it at the start (where soul.md lives) gets lost — placing it
+    # after the last user message means the model sees it right before generating.
+    _ANTI_HALLUCINATION = (
+        "[SYSTEM] Respond to the customer now in plain text. "
+        "No startup. No initialization. No reading files. No researching. "
+        "You have zero tools. Answer their question directly."
+    )
+    messages.append({"role": "system", "content": _ANTI_HALLUCINATION})
+
+    # Tier routing — explicit !keyword overrides, otherwise default to z.ai
+    forced_tier = _detect_tier_hint(messages)
+    if forced_tier:
+        print(f"[PROXY] tier hint detected: {forced_tier}", flush=True)
+    else:
+        forced_tier = "zai-direct"
+        print(f"[PROXY] no tier hint — defaulting to {forced_tier}", flush=True)
+
+    # Show typing indicator and send a transient status message
+    asyncio.create_task(send_typing())
+    status_msg_id = await send_status("\u23f3")
+
+    # Always use non-streaming internally for full sanitization + garbled
+    # detection, then re-wrap as SSE if the client requested streaming.
+    # Hard deadline prevents the proxy from blocking OpenClaw indefinitely.
+    try:
+        result = await asyncio.wait_for(
+            _handle_non_streaming(body, forced_tier, status_msg_id=status_msg_id),
+            timeout=REQUEST_DEADLINE,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("Request exceeded %ds deadline", REQUEST_DEADLINE)
+        result = _synthetic_response(
+            "I took too long to respond — the LLM providers might be slow. "
+            "Please try again in a moment."
+        )
+
+    # Remove the status message — OpenClaw delivers the real response
+    if status_msg_id:
+        asyncio.create_task(delete_message(status_msg_id))
+
+    if is_stream and isinstance(result, JSONResponse):
+        return _wrap_json_as_sse(result)
+    return result
+
+
+async def _handle_non_streaming(
+    body: dict,
+    forced_tier: str | None = None,
+    _attempt: int = 0,
+    status_msg_id: int | None = None,
+):
+    """Handle non-streaming requests — race available tiers concurrently.
+
+    Instead of trying tiers sequentially (where each 45s timeout compounds),
+    all available free tiers are dispatched simultaneously. The first
+    successful response wins and the remaining requests are cancelled.
+    """
+    # Determine which tiers are available right now
+    available: list[dict] = []
+    for tier in CONFIG["tiers"]:
+        tier_name = tier["name"]
+        if forced_tier and tier_name != forced_tier:
+            continue
+        provider = tier["provider"]
+        provider_config = CONFIG["providers"][provider]
+        api_key = os.getenv(provider_config["env_key"], "")
+        if not api_key or _circuit_open(tier_name):
+            continue
+        if provider not in PROVIDER_URLS:
+            continue
+        if tier_name == "openrouter-paid" and not forced_tier:
+            continue
+        if tier_name == "openrouter-paid":
+            remaining = await _check_openrouter_balance()
+            if remaining is not None and remaining <= OPENROUTER_BALANCE_FLOOR:
+                await notify(
+                    f"*Balance guard* — ${remaining:.2f} remaining"
+                    f"\nSkipping `{tier_name}` to protect free-tier quota"
+                )
+                continue
+        available.append(tier)
+
+    if not available:
+        print("[PROXY] no tiers available", flush=True)
+        return _synthetic_response(
+            "I'm temporarily on pause — no LLM tiers are available right now. "
+            "Try again later."
+        )
+
+    # Race all available tiers concurrently — first success wins
+    tasks = {
+        asyncio.create_task(
+            _try_single_tier(tier, body, status_msg_id),
+            name=f"tier:{tier['name']}",
+        ): tier["name"]
+        for tier in available
+    }
+    print(f"[PROXY] racing {len(tasks)} tiers: {list(tasks.values())}", flush=True)
+
+    rate_limit_resets: list[tuple[str, int | None]] = []
+
+    try:
+        pending = set(tasks.keys())
+        while pending:
+            done, pending = await asyncio.wait(
+                pending,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done:
+                try:
+                    response, rl_info = task.result()
+                except Exception:
+                    logger.exception("Unexpected error in tier %s", tasks[task])
+                    continue
+                if response is not None:
+                    winner = tasks[task]
+                    await _notify_tier_change(winner)
+                    return response
+                if rl_info is not None:
+                    rate_limit_resets.append(rl_info)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+    # All tiers failed — auto-retry if a short reset window exists
+    if _attempt == 0 and rate_limit_resets:
+        known = [secs for _, secs in rate_limit_resets if secs is not None]
+        if known:
+            wait = max(min(known), 2)  # at least 2s to avoid hammering
+            if wait <= MAX_AUTO_RETRY_WAIT:
+                print(f"[PROXY] auto-retrying in {wait}s", flush=True)
+                _background_notify(
+                    "auto-retry",
+                    f"All tiers rate-limited — auto-retrying in {wait}s",
+                )
+                if status_msg_id:
+                    asyncio.create_task(
+                        edit_status(
+                            status_msg_id, f"\u23f3 Rate limited — retrying in {wait}s"
+                        )
+                    )
+                await asyncio.sleep(wait)
+                for name, _ in rate_limit_resets:
+                    _circuit_state.pop(name, None)
+                return await _handle_non_streaming(
+                    body,
+                    forced_tier,
+                    _attempt=1,
+                    status_msg_id=status_msg_id,
+                )
+
+    print("[PROXY] all tiers exhausted — returning synthetic response", flush=True)
+    return _synthetic_response(
+        "I'm temporarily on pause — the free API tiers are rate-limited right now. "
+        "Send !paid or !claude to use the paid tier, or try again later."
+    )

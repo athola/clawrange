@@ -1,0 +1,15 @@
+repos:
+  - repo: local
+    hooks:
+      - id: validate-stack
+        name: validate stack config
+        entry: python3 tests/validate_stack.py
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: unit-tests
+        name: run unit tests
+        entry: python3 -m pytest workflows/tests/ -q
+        language: system
+        pass_filenames: false
+        always_run: true
