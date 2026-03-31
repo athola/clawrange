@@ -6,7 +6,7 @@ repos:
       - id: shellcheck
         args: [--severity=warning]
 
-  # YAML validation (docker-compose, configs)
+  # General file hygiene + basic secret detection
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
@@ -18,9 +18,23 @@ repos:
       - id: check-merge-conflict
       - id: detect-private-key
 
+  # Secret scanning — catches API keys, tokens, passwords
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.24.3
+    hooks:
+      - id: gitleaks
+
+  # Python linting
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.11.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
   # Docker compose validation
   - repo: https://github.com/IamTheFij/docker-pre-commit
     rev: v3.0.1
     hooks:
       - id: docker-compose-check
-        files: docker-compose.*\.yml$
+        files: ^docker-compose\.yml$

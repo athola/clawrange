@@ -173,9 +173,7 @@ class TestCheckDataSovereignty:
         config_dir = project_tree / "deerflow"
         config_dir.mkdir(exist_ok=True)
         (config_dir / "config.yaml").write_text(
-            "models:\n"
-            "  - name: researcher\n"
-            "    model: deepseek/deepseek-chat\n"
+            "models:\n  - name: researcher\n    model: deepseek/deepseek-chat\n"
         )
         result = validate_stack.check_deerflow_data_sovereignty()
         assert result.passed is False
@@ -248,10 +246,25 @@ class TestCheckOpenclawConfig:
         THEN the check should pass."""
         config_dir = project_tree / "openclaw" / "config"
         config_dir.mkdir(parents=True, exist_ok=True)
-        (config_dir / "openclaw.json").write_text(json.dumps({
-            "gateway": {"port": 18789, "mode": "local", "bind": "lan", "auth": {"mode": "token"}},
-            "agents": {"defaults": {"model": {"primary": "openrouter/anthropic/claude-haiku-4-5"}}},
-        }))
+        (config_dir / "openclaw.json").write_text(
+            json.dumps(
+                {
+                    "gateway": {
+                        "port": 18789,
+                        "mode": "local",
+                        "bind": "lan",
+                        "auth": {"mode": "token"},
+                    },
+                    "agents": {
+                        "defaults": {
+                            "model": {
+                                "primary": "openrouter/anthropic/claude-haiku-4-5"
+                            }
+                        }
+                    },
+                }
+            )
+        )
         result = validate_stack.check_openclaw_config()
         assert result.passed is True
 
@@ -260,10 +273,14 @@ class TestCheckOpenclawConfig:
         THEN the check should fail."""
         config_dir = project_tree / "openclaw" / "config"
         config_dir.mkdir(parents=True, exist_ok=True)
-        (config_dir / "openclaw.json").write_text(json.dumps({
-            "gateway": {"port": 18789, "mode": "local", "bind": "lan"},
-            "agents": {"defaults": {"model": {"primary": "test"}}},
-        }))
+        (config_dir / "openclaw.json").write_text(
+            json.dumps(
+                {
+                    "gateway": {"port": 18789, "mode": "local", "bind": "lan"},
+                    "agents": {"defaults": {"model": {"primary": "test"}}},
+                }
+            )
+        )
         result = validate_stack.check_openclaw_config()
         assert result.passed is False
         assert "token" in result.message

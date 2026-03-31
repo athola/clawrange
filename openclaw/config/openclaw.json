@@ -11,12 +11,57 @@
   "agents": {
     "defaults": {
       "model": {
-        "primary": "openrouter/anthropic/claude-haiku-4-5"
+        "primary": "clawrange-proxy/default"
       },
       "models": {
-        "openrouter/anthropic/claude-haiku-4-5": {},
-        "openrouter/anthropic/claude-sonnet-4-5": {}
+        "clawrange-proxy/default": { "alias": "proxy" }
       }
+    }
+  },
+
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "clawrange-proxy": {
+        "baseUrl": "http://msp-workflows:5678/v1",
+        "apiKey": "${PROXY_AUTH_TOKEN}",
+        "authHeader": true,
+        "models": [
+          {
+            "id": "default",
+            "name": "ClawRange LLM Proxy (auto-tier)",
+            "api": "openai-completions",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 65536,
+            "maxTokens": 4096
+          }
+        ]
+      }
+    }
+  },
+
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "botToken": "${TELEGRAM_BOT_TOKEN}",
+      "dmPolicy": "allowlist",
+      "allowFrom": ["${TELEGRAM_CHAT_ID}"],
+      "groupPolicy": "disabled",
+      "streaming": "off"
+    }
+  },
+
+  "tools": {
+    "sandbox": {
+      "tools": {
+        "allow": [],
+        "deny": ["exec", "process", "read", "write", "edit", "apply_patch", "image", "browser", "canvas", "nodes", "cron", "gateway", "subagents", "session_status", "sessions_list", "sessions_history", "sessions_send", "sessions_spawn", "sessions_yield"]
+      }
+    },
+    "elevated": {
+      "enabled": false
     }
   },
 

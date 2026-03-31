@@ -1,6 +1,5 @@
 """Tests for the ClawRange workflow service."""
 
-import pytest
 from fastapi.testclient import TestClient
 
 from app import app
