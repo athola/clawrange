@@ -15,8 +15,45 @@
       },
       "models": {
         "clawrange-proxy/default": { "alias": "proxy" }
+      },
+      "sandbox": {
+        "mode": "off"
       }
-    }
+    },
+    "list": [
+      {
+        "id": "max",
+        "tools": {
+          "deny": ["exec", "process", "read", "write", "edit", "apply_patch",
+                   "image", "browser", "canvas", "nodes", "cron", "gateway",
+                   "subagents", "session_status", "sessions_list",
+                   "sessions_history", "sessions_send", "sessions_spawn",
+                   "sessions_yield"]
+        }
+      },
+      {
+        "id": "max-ops",
+        "sandbox": {
+          "mode": "off",
+          "workspaceAccess": "ro"
+        },
+        "heartbeat": {
+          "every": "5m",
+          "target": "telegram",
+          "to": "8724904275",
+          "activeHours": { "start": "07:00", "end": "22:00" },
+          "isolatedSession": true,
+          "lightContext": false
+        },
+        "tools": {
+          "deny": ["exec", "process", "write", "edit", "apply_patch",
+                   "image", "image_generate", "browser", "canvas", "nodes",
+                   "gateway", "subagents", "code_execution", "message",
+                   "x_search", "sessions_spawn", "sessions_send",
+                   "sessions_yield"]
+        }
+      }
+    ]
   },
 
   "models": {
@@ -56,8 +93,10 @@
   "tools": {
     "sandbox": {
       "tools": {
-        "allow": [],
-        "deny": ["exec", "process", "read", "write", "edit", "apply_patch", "image", "browser", "canvas", "nodes", "cron", "gateway", "subagents", "session_status", "sessions_list", "sessions_history", "sessions_send", "sessions_spawn", "sessions_yield"]
+        "deny": ["exec", "process", "write", "edit", "apply_patch",
+                 "browser", "canvas", "nodes", "gateway",
+                 "sessions_spawn", "sessions_send", "sessions_yield",
+                 "subagents"]
       }
     },
     "elevated": {

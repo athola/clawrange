@@ -40,6 +40,8 @@ services:
       - ./data/openclaw-tmp:/tmp
       # Config templates — read-only
       - ./openclaw/soul.md:/home/node/.openclaw/soul.md:ro
+      - ./openclaw/soul-ops.md:/home/node/.openclaw/soul-ops.md:ro
+      - ./openclaw/HEARTBEAT.md:/home/node/.openclaw/HEARTBEAT.md:ro
       - ./openclaw/config/openclaw.json:/opt/openclaw.json.template:ro
       # Host home — read-only access for agent file reads
       - ${HOME}:/mnt/host-home:ro
@@ -96,9 +98,15 @@ services:
     volumes:
       # Dev hot-reload — mount source so uvicorn --reload picks up changes
       - ./workflows/app.py:/app/app.py:ro
+      - ./workflows/brain.py:/app/brain.py:ro
+      - ./workflows/brain_db.py:/app/brain_db.py:ro
       - ./workflows/telegram.py:/app/telegram.py:ro
       - ./workflows/llm_proxy.py:/app/llm_proxy.py:ro
       - ./workflows/models.json:/app/models.json:ro
+      # Soul — gives Max its persona context for self-directed tasks
+      - ./openclaw/soul.md:/app/soul.md:ro
+      # Brain — persistent knowledge storage
+      - ./data/brain:/data
     tmpfs:
       - /tmp:size=32M
     environment:
