@@ -1210,11 +1210,16 @@ def _has_recent_task(queue: list[dict], keyword: str, hours: int = 24) -> bool:
     return False
 
 
-async def _llm_call(prompt: str, max_tokens: int = 100) -> str | None:
+async def _llm_call(
+    prompt: str, max_tokens: int = 100, web_search: bool = False
+) -> str | None:
     """Send a focused prompt to the first available LLM tier.
 
     Returns the response text, or None on failure. Used for both
     task suggestions (thinking) and task execution (working).
+
+    When web_search=True, enables GLM's server-side web search tool
+    for Z.AI tiers so the model can fetch live data.
     """
     for tier in CONFIG["tiers"]:
         if _circuit_open(tier["name"]):
@@ -1225,11 +1230,17 @@ async def _llm_call(prompt: str, max_tokens: int = 100) -> str | None:
         if not api_key:
             continue
 
-        body = {
+        body: dict = {
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
             "temperature": 0.7,
         }
+
+        # GLM built-in web_search — executed server-side by Z.AI,
+        # no tool_call/tool_result round-trip needed.
+        if web_search and provider == "zai":
+            body["tools"] = [{"type": "web_search", "web_search": {"enable": True}}]
+
         try:
             resp = await _call_provider(provider, tier["models"], body, api_key)
             if resp.status_code == 200:
@@ -1322,21 +1333,50 @@ async def _build_work_prompt(task_description: str) -> str:
         f"You have been assigned this task:\n"
         f'"{task_description}"\n\n'
         "RULES:\n"
-        "- Only reference real data from the system state and brain above.\n"
+        "- Reference real data from the system state, brain, and web search results.\n"
         "- Do NOT invent client names, people, emails, or events that aren't listed.\n"
-        "- If the task requires information you don't have, say exactly what's missing "
-        "and what Alex needs to provide.\n"
+        "- If you have web search, use it to find live data before answering.\n"
         "- If the task requires an action you can't perform (sending email, making calls), "
         "describe what you prepared and what Alex needs to do to finish it.\n"
         "- Be honest. 'I don't have this data yet' is better than making something up.\n\n"
-        "Provide a concise result (2-4 sentences)."
+        "Provide a concise result. Include specific links or references when available."
     )
+
+
+_WEB_SEARCH_KEYWORDS = {
+    "reddit",
+    "search",
+    "rundown",
+    "news",
+    "trending",
+    "posts",
+    "online",
+    "web",
+    "latest",
+    "recent",
+    "scan",
+    "find online",
+    "hacker news",
+    "hn",
+    "lobsters",
+    "twitter",
+    "x.com",
+}
+
+
+def _task_needs_web(description: str) -> bool:
+    """Return True if the task description suggests it needs live web data."""
+    desc_lower = description.lower()
+    return any(kw in desc_lower for kw in _WEB_SEARCH_KEYWORDS)
 
 
 async def _llm_work_task(description: str) -> str:
     """Ask the LLM to actually work on a task. Returns the result text."""
+    needs_web = _task_needs_web(description)
     prompt = await _build_work_prompt(description)
-    result = await _llm_call(prompt, max_tokens=300)
+    if needs_web:
+        print(f"[PROXY] task needs web search: {description[:80]!r}", flush=True)
+    result = await _llm_call(prompt, max_tokens=500, web_search=needs_web)
     if result:
         print(f"[PROXY] LLM worked task: {result[:100]!r}", flush=True)
         return result
@@ -1511,9 +1551,13 @@ async def _try_single_tier(
             if has_tool_calls:
                 _record_success(tier_name)
                 data["_clawrange_tier"] = tier_name
+                tool_names = [
+                    tc.get("function", {}).get("name", "?")
+                    for tc in first_msg["tool_calls"]
+                ]
                 print(
                     f"[PROXY] tool_call response via {tier_name} "
-                    f"({len(first_msg['tool_calls'])} calls)",
+                    f"({len(first_msg['tool_calls'])} calls): {tool_names}",
                     flush=True,
                 )
                 return JSONResponse(content=data), None
