@@ -1700,9 +1700,11 @@ async def chat_completions(
     has_tools = bool(body.get("tools"))
     if not has_tools:
         _ANTI_HALLUCINATION = (
-            "[SYSTEM] Respond to the customer now in plain text. "
-            "No startup. No initialization. No reading files. No researching. "
-            "You have zero tools. Answer their question directly."
+            "[SYSTEM] Respond now in plain text. "
+            "No startup sequences. No initialization steps. "
+            "Never output XML tags, bracket syntax, or tool_call blocks — "
+            "those are not real tools and will be stripped. "
+            "Answer directly using your knowledge and conversation context."
         )
         messages.append({"role": "system", "content": _ANTI_HALLUCINATION})
 
