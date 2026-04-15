@@ -1306,7 +1306,7 @@ async def _gather_system_state() -> str:
     )
 
 
-async def _build_work_prompt(task_description: str) -> str:
+async def _build_work_prompt(task_description: str, web_search: bool = False) -> str:
     """Build a prompt for the LLM to work on a specific task, with live system data."""
     soul = _load_soul()
     state = await _gather_system_state()
@@ -1328,6 +1328,19 @@ async def _build_work_prompt(task_description: str) -> str:
     except Exception:
         pass
 
+    format_rules = (
+        (
+            "OUTPUT FORMAT (for Telegram delivery):\n"
+            "- Include full URLs to posts/threads you find.\n"
+            "- For each result: link, why it's relevant, which project it maps to, "
+            "and a suggested comment Alex can post.\n"
+            "- Use numbered items, not bullet nesting.\n"
+            "- Be specific — real post titles, real subreddits, real URLs.\n"
+        )
+        if web_search
+        else ""
+    )
+
     return (
         f"{context}"
         f"{state}\n"
@@ -1337,12 +1350,13 @@ async def _build_work_prompt(task_description: str) -> str:
         f'"{task_description}"\n\n'
         "RULES:\n"
         "- Reference real data from the system state, brain, and web search results.\n"
-        "- Do NOT invent client names, people, emails, or events that aren't listed.\n"
+        "- Do NOT invent URLs, post titles, or usernames. Only cite what you found.\n"
         "- If you have web search, use it to find live data before answering.\n"
         "- If the task requires an action you can't perform (sending email, making calls), "
         "describe what you prepared and what Alex needs to do to finish it.\n"
-        "- Be honest. 'I don't have this data yet' is better than making something up.\n\n"
-        "Provide a concise result. Include specific links or references when available."
+        "- Be honest. 'I found nothing relevant today' is better than fabricating.\n\n"
+        f"{format_rules}"
+        "Provide the result. Include specific links or references when available."
     )
 
 
@@ -1376,10 +1390,11 @@ def _task_needs_web(description: str) -> bool:
 async def _llm_work_task(description: str) -> str:
     """Ask the LLM to actually work on a task. Returns the result text."""
     needs_web = _task_needs_web(description)
-    prompt = await _build_work_prompt(description)
+    prompt = await _build_work_prompt(description, web_search=needs_web)
     if needs_web:
         print(f"[PROXY] task needs web search: {description[:80]!r}", flush=True)
-    result = await _llm_call(prompt, max_tokens=500, web_search=needs_web)
+    max_tok = 1500 if needs_web else 500
+    result = await _llm_call(prompt, max_tokens=max_tok, web_search=needs_web)
     if result:
         print(f"[PROXY] LLM worked task: {result[:100]!r}", flush=True)
         return result
