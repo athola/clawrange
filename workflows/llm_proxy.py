@@ -55,6 +55,8 @@ ALLOWED_BODY_FIELDS = {
     "frequency_penalty",
     "presence_penalty",
     "stream",
+    "tools",
+    "tool_choice",
 }
 
 # ─── Circuit Breaker State ─────────────────────────────────────────
@@ -625,7 +627,13 @@ def _synthetic_response(text: str) -> JSONResponse:
         content={
             "id": "clawrange-synthetic",
             "object": "chat.completion",
-            "choices": [{"message": {"role": "assistant", "content": text}}],
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                }
+            ],
         }
     )
 
@@ -730,6 +738,717 @@ async def _handle_tier_command() -> JSONResponse:
     return _synthetic_response("\n".join(lines))
 
 
+# ─── !help Command ─────────────────────────────────────────────
+
+
+def _handle_help() -> JSONResponse:
+    """Return full command reference — all intercepted commands and brain operations."""
+    text = """ClawRange Command Reference
+
+TASK MANAGEMENT
+  !task <description>      Create a new task (priority 3)
+  !tasks                   Show current task queue
+  !task list               Same as !tasks
+  !task tail               Show recently completed tasks
+  !task cancel <id>        Cancel a pending/active task
+  !task priority <id> <1-5> Change priority (1=urgent, 5=low)
+
+BRAIN (Knowledge)
+  !remember <slug> <info>  Append info to a page's timeline
+  !recall <query>          Search the brain for matching pages
+  !page <slug>             Show a full page with timeline
+
+  Brain slugs use hierarchy: client/acme-corp, incident/wifi-site2, person/bob-smith
+  Page types: client, system, incident, decision, note, person, company, project
+
+SYSTEM STATUS
+  !tier                    Show LLM tier status and balance
+  !status                  Same as !tier
+  !help                    This command reference
+
+BRAIN API (via web_fetch)
+  POST /brain/pages              Create or update a page
+  GET  /brain/pages/{slug}       Get page with timeline + tags
+  DELETE /brain/pages/{slug}     Delete a page
+  GET  /brain/pages              List pages (filter: ?page_type=client)
+  GET  /brain/search?q=...       Hybrid search (modes: keyword, vector, hybrid)
+  POST /brain/pages/{slug}/timeline    Append timeline entry
+  GET  /brain/pages/{slug}/timeline    List timeline entries
+  POST /brain/pages/{slug}/links       Add link to another page
+  GET  /brain/pages/{slug}/links       List links
+  GET  /brain/pages/{slug}/graph       Traverse knowledge graph (?depth=2)
+  POST /brain/pages/{slug}/tags        Set tags
+  GET  /brain/pages/{slug}/versions    Version history
+  GET  /brain/pages/{slug}/chunks      Content chunks
+
+TASK API (via web_fetch)
+  POST /task                     Create task
+  GET  /task                     List tasks (?status=pending)
+  GET  /task/{id}                Get task by ID
+  POST /task/{id}/claim          Mark task active
+  POST /task/{id}/result         Complete task with result
+  DELETE /task/{id}              Cancel task
+
+HEALTH
+  GET  /healthz                  Service health + brain status
+  GET  /tier                     Tier status JSON"""
+    return _synthetic_response(text)
+
+
+# ─── !task Command ──────────────────────────────────────────────
+
+
+_TASK_TRIGGERS = ("!task", "/task", "!tasks", "/tasks")
+_TASK_ACTIONS = ("cancel", "priority", "list", "tail")
+
+
+def _extract_task_command(msg: str) -> dict | None:
+    """Parse task commands. Returns dict with 'type' and relevant fields, or None."""
+    stripped = msg.strip()
+    lower = stripped.lower()
+
+    # !tasks or /tasks → list
+    if lower in ("!tasks", "/tasks", "!task", "/task", "!task list", "/task list"):
+        return {"type": "list"}
+
+    # !task <action> <args>
+    for prefix in ("!task ", "/task "):
+        if lower.startswith(prefix):
+            rest = stripped[len(prefix) :].strip()
+            rest_lower = rest.lower()
+            # Check for sub-actions
+            for action in _TASK_ACTIONS:
+                if rest_lower.startswith(action):
+                    args = rest[len(action) :].strip()
+                    if action == "list":
+                        return {"type": "list"}
+                    if action == "tail":
+                        return {"type": "tail"}
+                    return {"type": "action", "action": action, "args": args}
+            # Default: create a new task
+            if rest:
+                return {"type": "create", "description": rest}
+            return {"type": "list"}
+
+    return None
+
+
+async def _dispatch_task_command(
+    cmd: dict, is_stream: bool
+) -> JSONResponse | StreamingResponse:
+    """Route parsed task commands to handlers."""
+    if cmd["type"] == "list":
+        return await _handle_tasks_list(is_stream)
+    elif cmd["type"] == "tail":
+        return await _handle_tasks_tail(is_stream)
+    elif cmd["type"] == "create":
+        return await _handle_task_command(cmd["description"], is_stream)
+    elif cmd["type"] == "action":
+        return await _handle_task_action(cmd["action"], cmd["args"], is_stream)
+    return _synthetic_response(
+        "Unknown task command. Try: !task <description> or !tasks"
+    )
+
+
+async def _handle_task_command(
+    description: str, is_stream: bool
+) -> JSONResponse | StreamingResponse:
+    """Enqueue a task via the internal API and return confirmation."""
+    from app import TaskCreate as TC
+    from app import create_task
+
+    try:
+        task = create_task(TC(description=description))
+        text = (
+            f"Task queued (#{task['id']})\n"
+            f"  {task['description']}\n"
+            f"  Priority: {task['priority']} | Status: {task['status']}\n"
+            f"Max Ops will pick this up on the next heartbeat cycle."
+        )
+    except Exception as exc:
+        text = f"Failed to queue task: {exc}"
+
+    resp = _synthetic_response(text)
+    if is_stream:
+        return _wrap_json_as_sse(resp)
+    return resp
+
+
+async def _handle_tasks_list(is_stream: bool) -> JSONResponse | StreamingResponse:
+    """Show the current task queue."""
+    from app import list_tasks
+
+    data = list_tasks()
+    tasks = data["tasks"]
+    if not tasks:
+        text = "Task queue is empty. Send !task <description> to add one."
+    else:
+        pending = [t for t in tasks if t["status"] == "pending"]
+        active = [t for t in tasks if t["status"] == "active"]
+        done = [t for t in tasks if t["status"] in ("completed", "failed")]
+
+        lines = [
+            f"Task Queue ({len(pending)} pending, {len(active)} active, {len(done)} done)\n"
+        ]
+
+        if active:
+            lines.append("NOW PROCESSING:")
+            for t in active:
+                src = "ALEX" if t.get("source") == "user" else "SYS"
+                lines.append(
+                    f"  [{src}] #{t['id']} [P{t['priority']}] {t['description'][:55]}"
+                )
+            lines.append("")
+
+        if pending:
+            lines.append("QUEUED:")
+            for t in pending:
+                src = "ALEX" if t.get("source") == "user" else "SYS"
+                lines.append(
+                    f"  [{src}] #{t['id']} [P{t['priority']}] {t['description'][:55]}"
+                )
+            lines.append("")
+
+        if done:
+            lines.append("RECENT:")
+            for t in done[-3:]:  # Show last 3
+                marker = "✅" if t["status"] == "completed" else "❌"
+                lines.append(f"  {marker} #{t['id']} {t['description'][:40]}")
+                if t["result"]:
+                    lines.append(f"     → {t['result'][:80]}")
+
+        lines.append(
+            "\nCommands: !task <desc> | !task cancel <id> | !task priority <id> <1-5>"
+        )
+        text = "\n".join(lines)
+
+    resp = _synthetic_response(text)
+    if is_stream:
+        return _wrap_json_as_sse(resp)
+    return resp
+
+
+async def _handle_tasks_tail(is_stream: bool) -> JSONResponse | StreamingResponse:
+    """Show recently completed/failed tasks with results."""
+    from app import list_tasks
+
+    data = list_tasks()
+    done = [t for t in data["tasks"] if t["status"] in ("completed", "failed")]
+    if not done:
+        text = "No completed tasks yet."
+    else:
+        lines = [f"Recent Tasks ({len(done)} completed)\n"]
+        for t in done[-5:]:  # Last 5
+            marker = "✅" if t["status"] == "completed" else "❌"
+            lines.append(f"{marker} #{t['id']} — {t['description'][:50]}")
+            if t["result"]:
+                lines.append(f"   {t['result'][:120]}")
+            if t["completed_at"]:
+                lines.append(f"   Completed: {t['completed_at'][:19]}")
+            lines.append("")
+        text = "\n".join(lines)
+
+    resp = _synthetic_response(text)
+    if is_stream:
+        return _wrap_json_as_sse(resp)
+    return resp
+
+
+async def _handle_task_action(
+    action: str, args: str, is_stream: bool
+) -> JSONResponse | StreamingResponse:
+    """Handle task management subcommands: cancel, priority."""
+    from app import brain_db
+
+    parts = args.strip().split(None, 1)
+    task_id = parts[0] if parts else ""
+    task = brain_db.get_task(task_id)
+
+    if not task:
+        text = f"Task #{task_id} not found."
+    elif action == "cancel":
+        if task["status"] in ("completed", "failed"):
+            text = f"Task #{task_id} already {task['status']}."
+        else:
+            brain_db.cancel_task(task_id)
+            text = f"Task #{task_id} cancelled."
+    elif action == "priority":
+        new_p = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+        if new_p is None or not 1 <= new_p <= 5:
+            text = f"Usage: !task priority {task_id} <1-5>"
+        else:
+            brain_db.update_priority(task_id, new_p)
+            text = f"Task #{task_id} priority set to {new_p}."
+    else:
+        text = f"Unknown action: {action}. Try: cancel, priority"
+
+    resp = _synthetic_response(text)
+    if is_stream:
+        return _wrap_json_as_sse(resp)
+    return resp
+
+
+# ─── Heartbeat Interceptor ───────────────────────────────────────
+
+
+_HEARTBEAT_MARKER = "read heartbeat.md"
+
+# Track when proactive checks last fired (survives across heartbeat cycles,
+# resets on container restart which is fine — fresh start, fresh initiative).
+_proactive_state: dict[str, float] = {}
+
+# How often each proactive check can fire (seconds).
+_PROACTIVE_INTERVALS = {
+    "stale_tasks": 1800,  # 30 min — nudge about tasks stuck pending
+    "llm_thinking": 900,  # 15 min — balance responsiveness vs churn
+    "pending_reminder": 3600,  # 1 hr — remind Alex about P3+ tasks needing review
+}
+
+# Path to soul.md inside the container (mounted read-only).
+_SOUL_MD_PATH = Path(__file__).parent / "soul.md"
+
+
+def _load_soul() -> str:
+    """Read soul.md for persona context. Returns empty string if missing."""
+    try:
+        return _SOUL_MD_PATH.read_text().strip()
+    except FileNotFoundError:
+        return ""
+
+
+_TASK_CATEGORIES = [
+    "client outreach or relationship building",
+    "financial review (spending, billing, ROI)",
+    "learning or skill development for Alex",
+    "infrastructure optimization or cost reduction",
+    "documentation or knowledge capture",
+    "personal wellness or family reminder",
+    "business development or lead generation",
+    "tooling improvement or workflow automation",
+    "security audit or compliance check",
+    "research into new technologies or services",
+]
+
+# Track which category was last used to rotate through them.
+_last_category_index = 0
+
+
+def _build_thinking_prompt() -> str:
+    """Build the LLM thinking prompt with recent task history and category rotation."""
+    global _last_category_index
+    soul = _load_soul()
+
+    # Gather recent tasks and brain state for grounding
+    recent_descriptions = []
+    brain_summary = "Brain is empty — no entities recorded yet."
+    try:
+        from app import brain_db
+
+        all_tasks = brain_db.list_tasks()
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        for t in all_tasks:
+            try:
+                created = datetime.fromisoformat(t["created_at"])
+                if created > cutoff:
+                    recent_descriptions.append(t["description"])
+            except (ValueError, KeyError):
+                continue
+
+        pages = brain_db.list_pages(limit=20)
+        if pages:
+            by_type: dict[str, list[str]] = {}
+            for p in pages:
+                by_type.setdefault(p["page_type"], []).append(p["slug"])
+            parts = [f"{k}: {', '.join(v)}" for k, v in by_type.items()]
+            brain_summary = "Known entities in brain:\n  " + "\n  ".join(parts)
+    except Exception:
+        pass
+
+    recent_block = ""
+    if recent_descriptions:
+        recent_list = "\n".join(f"  - {d}" for d in recent_descriptions[-10:])
+        recent_block = (
+            f"\n\nTasks already created in the last 24 hours (DO NOT repeat or suggest anything similar):\n"
+            f"{recent_list}\n"
+        )
+
+    # Rotate through categories
+    category = _TASK_CATEGORIES[_last_category_index % len(_TASK_CATEGORIES)]
+    _last_category_index += 1
+
+    if soul:
+        return (
+            f"{soul}\n\n"
+            "---\n"
+            f"Focus area for this cycle: **{category}**\n"
+            f"\n{brain_summary}\n"
+            f"{recent_block}\n"
+            "RULES:\n"
+            "- Only reference clients, people, or systems that exist in the brain above.\n"
+            "- If the brain is empty, suggest tasks that BUILD knowledge: "
+            "record a client, document a system, capture a decision.\n"
+            "- Do NOT invent client names, people, or events.\n"
+            "- Do NOT suggest sending emails or making calls — suggest PREPARING drafts or RESEARCHING info.\n"
+            "- Tasks should be completable by an AI with access to web search and the brain API.\n\n"
+            "Suggest exactly ONE actionable task. "
+            "Respond with ONLY the task description (one sentence, no explanation, no quotes)."
+        )
+    return (
+        f"You are Max, an executive assistant. Focus area: {category}. "
+        "Suggest exactly ONE specific, actionable task that an AI can complete. "
+        "Respond with ONLY the task description (one sentence)."
+    )
+
+
+def _is_heartbeat(msg: str) -> bool:
+    """Detect heartbeat messages from max-ops agent."""
+    return msg.lower().strip().startswith(_HEARTBEAT_MARKER)
+
+
+def _proactive_ready(check_name: str) -> bool:
+    """Return True if enough time has passed since the last run of this check."""
+    interval = _PROACTIVE_INTERVALS.get(check_name, 3600)
+    last_run = _proactive_state.get(check_name, 0.0)
+    return (time.monotonic() - last_run) >= interval
+
+
+def _proactive_mark(check_name: str) -> None:
+    """Record that a proactive check just ran."""
+    _proactive_state[check_name] = time.monotonic()
+
+
+_STOP_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "for",
+        "from",
+        "has",
+        "he",
+        "in",
+        "is",
+        "it",
+        "its",
+        "of",
+        "on",
+        "or",
+        "that",
+        "the",
+        "to",
+        "was",
+        "were",
+        "will",
+        "with",
+        "this",
+        "but",
+        "they",
+        "have",
+        "had",
+        "not",
+        "all",
+        "can",
+        "her",
+        "if",
+        "our",
+        "out",
+        "so",
+        "up",
+        "what",
+        "when",
+        "which",
+        "who",
+        "do",
+        "does",
+        "any",
+        "should",
+        "ensure",
+        "check",
+        "review",
+        "before",
+        "after",
+        "current",
+    }
+)
+
+
+def _extract_keywords(text: str) -> set[str]:
+    """Extract meaningful lowercase words (3+ chars, no stop words)."""
+    words = re.findall(r"[a-z]+", text.lower())
+    return {w for w in words if len(w) >= 3 and w not in _STOP_WORDS}
+
+
+def _has_recent_task(queue: list[dict], keyword: str, hours: int = 24) -> bool:
+    """Check if a semantically similar task exists in the last N hours.
+
+    Uses keyword overlap: if >=2 meaningful words overlap between the new
+    suggestion and an existing task, it's considered a duplicate.  The
+    threshold scales with the smaller keyword set (at least 30% overlap)
+    so short descriptions aren't unfairly penalised.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    new_keywords = _extract_keywords(keyword)
+    if not new_keywords:
+        return False
+    for t in queue:
+        try:
+            created = datetime.fromisoformat(t["created_at"])
+            if created <= cutoff:
+                continue
+        except (ValueError, KeyError):
+            continue
+        existing_keywords = _extract_keywords(t["description"])
+        overlap = new_keywords & existing_keywords
+        smaller = min(len(new_keywords), len(existing_keywords)) or 1
+        if len(overlap) >= max(2, int(smaller * 0.3)):
+            return True
+    return False
+
+
+async def _llm_call(prompt: str, max_tokens: int = 100) -> str | None:
+    """Send a focused prompt to the first available LLM tier.
+
+    Returns the response text, or None on failure. Used for both
+    task suggestions (thinking) and task execution (working).
+    """
+    for tier in CONFIG["tiers"]:
+        if _circuit_open(tier["name"]):
+            continue
+        provider = tier["provider"]
+        provider_config = CONFIG["providers"][provider]
+        api_key = os.getenv(provider_config["env_key"], "")
+        if not api_key:
+            continue
+
+        body = {
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": 0.7,
+        }
+        try:
+            resp = await _call_provider(provider, tier["models"], body, api_key)
+            if resp.status_code == 200:
+                text = (
+                    resp.json()
+                    .get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                    .strip()
+                )
+                if text:
+                    return text
+        except Exception:
+            pass
+    return None
+
+
+async def _llm_suggest_task() -> str | None:
+    """Ask the LLM for one proactive task suggestion."""
+    text = await _llm_call(_build_thinking_prompt(), max_tokens=100)
+    if text:
+        text = text.strip('"')
+        if 10 <= len(text) <= 200 and "\n" not in text:
+            print(f"[PROXY] LLM suggested task: {text!r}", flush=True)
+            return text
+    return None
+
+
+async def _gather_system_state() -> str:
+    """Collect current system state for task context."""
+    from app import brain_db
+
+    # Tier status
+    tier_lines = []
+    for tier in CONFIG["tiers"]:
+        name = tier["name"]
+        status = (
+            "TRIPPED"
+            if _circuit_open(name)
+            else ("ACTIVE" if name == _last_tier_used else "ready")
+        )
+        tier_lines.append(f"  {name}: {status} — {tier['description']}")
+
+    # Balance
+    remaining = await _check_openrouter_balance()
+    balance = f"${remaining:.2f}" if remaining is not None else "not configured"
+
+    # Task queue summary
+    all_tasks = brain_db.list_tasks()
+    pending = sum(1 for t in all_tasks if t["status"] == "pending")
+    active = sum(1 for t in all_tasks if t["status"] == "active")
+    done = sum(1 for t in all_tasks if t["status"] in ("completed", "failed"))
+
+    return (
+        "CURRENT SYSTEM STATE:\n"
+        "Tiers:\n" + "\n".join(tier_lines) + "\n"
+        f"Balance: {balance} (floor: ${OPENROUTER_BALANCE_FLOOR:.2f})\n"
+        f"Last tier used: {_last_tier_used or 'none'}\n"
+        f"Task queue: {pending} pending, {active} active, {done} done"
+    )
+
+
+async def _build_work_prompt(task_description: str) -> str:
+    """Build a prompt for the LLM to work on a specific task, with live system data."""
+    soul = _load_soul()
+    state = await _gather_system_state()
+    context = f"{soul}\n\n---\n" if soul else ""
+
+    # Pull brain pages for grounding (what actually exists)
+    brain_context = ""
+    try:
+        from app import brain_db
+
+        pages = brain_db.list_pages(limit=10)
+        if pages:
+            page_list = ", ".join(f"{p['slug']} ({p['page_type']})" for p in pages)
+            brain_context = f"\nKnown entities in brain: {page_list}\n"
+        else:
+            brain_context = (
+                "\nBrain is empty — no clients, people, or incidents recorded yet.\n"
+            )
+    except Exception:
+        pass
+
+    return (
+        f"{context}"
+        f"{state}\n"
+        f"{brain_context}\n"
+        f"---\n"
+        f"You have been assigned this task:\n"
+        f'"{task_description}"\n\n'
+        "RULES:\n"
+        "- Only reference real data from the system state and brain above.\n"
+        "- Do NOT invent client names, people, emails, or events that aren't listed.\n"
+        "- If the task requires information you don't have, say exactly what's missing "
+        "and what Alex needs to provide.\n"
+        "- If the task requires an action you can't perform (sending email, making calls), "
+        "describe what you prepared and what Alex needs to do to finish it.\n"
+        "- Be honest. 'I don't have this data yet' is better than making something up.\n\n"
+        "Provide a concise result (2-4 sentences)."
+    )
+
+
+async def _llm_work_task(description: str) -> str:
+    """Ask the LLM to actually work on a task. Returns the result text."""
+    prompt = await _build_work_prompt(description)
+    result = await _llm_call(prompt, max_tokens=300)
+    if result:
+        print(f"[PROXY] LLM worked task: {result[:100]!r}", flush=True)
+        return result
+    return f"Could not reach LLM to work this task. Alex should handle manually: {description}"
+
+
+async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse:
+    """Run heartbeat checks in Python instead of relying on the LLM.
+
+    Three layers of initiative:
+    1. Infrastructure monitoring — tripped tiers, low balance (every cycle)
+    2. Task queue awareness — stale task nudges (every 30 min)
+    3. LLM-powered thinking — self-directed task suggestions (every 1 hr)
+    """
+    from app import brain_db
+
+    lines: list[str] = []
+    tasks_created: list[dict] = []
+
+    # ── 1. Tier status ──────────────────────────────────────────
+    tripped = [tier["name"] for tier in CONFIG["tiers"] if _circuit_open(tier["name"])]
+
+    remaining = await _check_openrouter_balance()
+
+    # ── 2. Check for pending tasks ──────────────────────────────
+    # Process one task per cycle — both system-generated and user-created.
+    pending = brain_db.list_tasks(status="pending")
+
+    if pending:
+        task = pending[0]
+        source = task.get("source", "system")
+        label = "ALEX" if source == "user" else "SYSTEM"
+        brain_db.claim_task(task["id"])
+        result = await _llm_work_task(task["description"])
+        brain_db.complete_task(task["id"], result, "completed")
+        lines.append(f"[{label}] #{task['id']}: {task['description']}")
+        lines.append(f"Result: {result}")
+
+        # Direct Telegram notification
+        await notify(
+            f"[{label}] Task completed: #{task['id']}\n"
+            f"{task['description']}\n\n"
+            f"Result: {result}"
+        )
+    else:
+        # ── PROACTIVE SCAN ──────────────────────────────────────
+        all_tasks = brain_db.list_tasks()
+
+        # Layer 1: Infrastructure — every cycle
+        for name in tripped:
+            desc = f"Investigate tier recovery: {name}"
+            if not any(
+                t["description"] == desc and t["status"] == "pending" for t in all_tasks
+            ):
+                t = brain_db.create_task(desc, priority=2)
+                tasks_created.append(t)
+
+        if remaining is not None and remaining < 5.0:
+            desc = f"Low balance alert: ${remaining:.2f} remaining"
+            if not any(
+                "Low balance alert" in t["description"] and t["status"] == "pending"
+                for t in all_tasks
+            ):
+                t = brain_db.create_task(desc, priority=1)
+                tasks_created.append(t)
+
+        # Layer 2: Stale task awareness — every 30 min
+        if _proactive_ready("stale_tasks"):
+            _proactive_mark("stale_tasks")
+            stale_cutoff = datetime.now(timezone.utc) - timedelta(hours=4)
+            stale = [
+                t
+                for t in all_tasks
+                if t["status"] == "pending"
+                and datetime.fromisoformat(t["created_at"]) < stale_cutoff
+            ]
+            if stale and not _has_recent_task(all_tasks, "stale tasks pending"):
+                desc = f"{len(stale)} task(s) pending > 4 hours — review queue"
+                t = brain_db.create_task(desc, priority=2)
+                tasks_created.append(t)
+
+        # Layer 3: LLM self-directed thinking — every 1 hr
+        if not tasks_created and _proactive_ready("llm_thinking"):
+            _proactive_mark("llm_thinking")
+            suggestion = await _llm_suggest_task()
+            if suggestion and not _has_recent_task(all_tasks, suggestion):
+                t = brain_db.create_task(suggestion, priority=3)
+                tasks_created.append(t)
+
+    # ── 3. Build response ───────────────────────────────────────
+    # Only send a visible response when there's something worth reporting.
+    # Empty heartbeat_ok is silent — OpenClaw won't relay it to Telegram.
+    if not lines and not tasks_created:
+        resp = _synthetic_response("")
+    else:
+        if tasks_created:
+            lines.append(f"Created {len(tasks_created)} task(s):")
+            for t in tasks_created:
+                lines.append(f"  #{t['id']} [P{t['priority']}] {t['description'][:60]}")
+
+        if tripped:
+            lines.append(f"Tiers: {', '.join(tripped)} TRIPPED")
+        if remaining is not None:
+            lines.append(f"Balance: ${remaining:.2f}")
+
+        resp = _synthetic_response("\n".join(lines))
+
+    if is_stream:
+        return _wrap_json_as_sse(resp)
+    return resp
+
+
 # ─── Tier Helpers ─────────────────────────────────────────────────
 
 
@@ -784,11 +1503,20 @@ async def _try_single_tier(
                 msg.pop("refusal", None)
                 choice.pop("native_finish_reason", None)
 
-            first_content = ""
-            if data.get("choices"):
-                first_content = (
-                    data["choices"][0].get("message", {}).get("content") or ""
+            first_msg = data.get("choices", [{}])[0].get("message", {})
+            first_content = first_msg.get("content") or ""
+            has_tool_calls = bool(first_msg.get("tool_calls"))
+
+            # Tool-call responses have null content — pass them through
+            if has_tool_calls:
+                _record_success(tier_name)
+                data["_clawrange_tier"] = tier_name
+                print(
+                    f"[PROXY] tool_call response via {tier_name} "
+                    f"({len(first_msg['tool_calls'])} calls)",
+                    flush=True,
                 )
+                return JSONResponse(content=data), None
 
             if _is_garbled(first_content):
                 print(
@@ -875,7 +1603,16 @@ async def chat_completions(
     # Intercept status commands before they hit the LLM
     last_user_msg = _get_last_user_message(messages)
     msg_lower = last_user_msg.lower().strip()
-    print(f"[PROXY] extracted msg: {msg_lower[:200]!r}", flush=True)
+    print(f"[PROXY] extracted msg: {msg_lower[:200]!r} stream={is_stream}", flush=True)
+    # Intercept !help — return full command reference
+    help_commands = ("!help", "/help", "help", "help?", "!commands", "/commands")
+    last_line = msg_lower.rstrip().rsplit("\n", 1)[-1].strip()
+    if msg_lower in help_commands or last_line in help_commands:
+        resp = _handle_help()
+        if is_stream:
+            return _wrap_json_as_sse(resp)
+        return resp
+
     tier_commands = (
         "/tier",
         "!tier",
@@ -905,10 +1642,25 @@ async def chat_completions(
         "your status",
         "your status?",
     )
-    # Also check last line — handles cases where metadata stripping fails
-    last_line = msg_lower.rstrip().rsplit("\n", 1)[-1].strip()
     if msg_lower in tier_commands or last_line in tier_commands:
-        return await _handle_tier_command()
+        resp = await _handle_tier_command()
+        if is_stream:
+            return _wrap_json_as_sse(resp)
+        return resp
+
+    # Intercept heartbeat messages — run checks in Python instead of LLM
+    if _is_heartbeat(last_user_msg):
+        print("[PROXY] heartbeat intercepted — running checks in Python", flush=True)
+        return await _handle_heartbeat(is_stream)
+
+    # Intercept !task commands — enqueue, list, cancel, reprioritize
+    # Check both full message and last line (fallback when metadata stripping fails)
+    raw_last_line = last_user_msg.rstrip().rsplit("\n", 1)[-1].strip()
+    task_action = _extract_task_command(last_user_msg) or _extract_task_command(
+        raw_last_line
+    )
+    if task_action is not None:
+        return await _dispatch_task_command(task_action, is_stream)
 
     # Strip poisoned assistant messages from conversation history.
     # Uses both static markers (synthetic responses, tool hallucinations)
@@ -943,20 +1695,23 @@ async def chat_completions(
     # LLMs weight instructions near the end of context most heavily.
     # Placing it at the start (where soul.md lives) gets lost — placing it
     # after the last user message means the model sees it right before generating.
-    _ANTI_HALLUCINATION = (
-        "[SYSTEM] Respond to the customer now in plain text. "
-        "No startup. No initialization. No reading files. No researching. "
-        "You have zero tools. Answer their question directly."
-    )
-    messages.append({"role": "system", "content": _ANTI_HALLUCINATION})
+    # Skip anti-hallucination when the request includes tool schemas —
+    # the agent legitimately needs to use tools (heartbeat, ops tasks).
+    has_tools = bool(body.get("tools"))
+    if not has_tools:
+        _ANTI_HALLUCINATION = (
+            "[SYSTEM] Respond to the customer now in plain text. "
+            "No startup. No initialization. No reading files. No researching. "
+            "You have zero tools. Answer their question directly."
+        )
+        messages.append({"role": "system", "content": _ANTI_HALLUCINATION})
 
-    # Tier routing — explicit !keyword overrides, otherwise default to z.ai
+    # Tier routing — explicit !keyword overrides, otherwise race all free tiers
     forced_tier = _detect_tier_hint(messages)
     if forced_tier:
         print(f"[PROXY] tier hint detected: {forced_tier}", flush=True)
     else:
-        forced_tier = "zai-direct"
-        print(f"[PROXY] no tier hint — defaulting to {forced_tier}", flush=True)
+        print("[PROXY] no tier hint — racing all free tiers", flush=True)
 
     # Show typing indicator and send a transient status message
     asyncio.create_task(send_typing())

@@ -1,61 +1,95 @@
 """ClawRange Workflow Service — replaces n8n with testable Python endpoints."""
 
+import os
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+from brain import create_brain_router
+from brain_db import BrainDB
 from llm_proxy import router as llm_router
 from telegram import notify
 
-app = FastAPI(title="ClawRange Workflows", version="2.0.0")
+# ─── Database Initialization ─────────────────────────────────────
+
+_db_path = os.environ.get("BRAIN_DB_PATH", "/data/brain.db")
+brain_db = BrainDB(_db_path)
+brain_db.init_db()
+
+app = FastAPI(title="ClawRange Workflows", version="3.0.0")
 app.include_router(llm_router)
+app.include_router(create_brain_router(brain_db), prefix="/brain")
 
-# ─── Mock CRM Data ──────────────────────────────────────────────────
 
-MOCK_LEADS = [
-    {
-        "name": "John Smith",
-        "phone": "903-555-0100",
-        "status": "New Lead",
-        "lastContact": "2026-03-24",
-        "interest": "3BR Jessup single-section",
-        "nextStep": "Schedule lot visit",
-        "assignedTo": "Mike (Sales)",
-        "source": "Facebook Ad",
-    },
-    {
-        "name": "Maria Garcia",
-        "phone": "903-555-0200",
-        "status": "Finance Review",
-        "lastContact": "2026-03-22",
-        "interest": "Titanium 4BR multi-section",
-        "nextStep": "Waiting on FHA pre-approval",
-        "assignedTo": "Sarah (Finance)",
-        "source": "Walk-in",
-    },
-    {
-        "name": "Robert Johnson",
-        "phone": "903-555-0300",
-        "status": "Appointment Set — Mar 28",
-        "lastContact": "2026-03-25",
-        "interest": "Jessup 2BR starter home",
-        "nextStep": "Lot walkthrough Friday 10 AM",
-        "assignedTo": "Mike (Sales)",
-        "source": "Website",
-    },
-    {
-        "name": "Ashley Williams",
-        "phone": "903-555-0400",
-        "status": "Appointment Set",
-        "lastContact": "2026-03-26",
-        "interest": "Titanium energy-efficient 3BR",
-        "nextStep": "Follow-up call Monday",
-        "assignedTo": "Sarah (Finance)",
-        "source": "Referral",
-    },
-]
+# ─── Task Queue (Persistent via BrainDB) ──────────────────────────
+
+
+class TaskCreate(BaseModel):
+    description: str
+    priority: int = 3  # 1=urgent, 3=normal, 5=low
+    source: str = "user"  # user (via !task / API) or system (heartbeat-generated)
+
+
+class TaskResult(BaseModel):
+    result: str
+    status: str = "completed"
+
+
+@app.post("/task")
+def create_task(body: TaskCreate):
+    return brain_db.create_task(body.description, body.priority, body.source)
+
+
+@app.get("/task")
+def list_tasks(status: str | None = None):
+    tasks = brain_db.list_tasks(status)
+    return {"tasks": tasks, "total": len(tasks)}
+
+
+@app.get("/task/{task_id}")
+def get_task(task_id: str):
+    task = brain_db.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
+
+
+@app.post("/task/{task_id}/claim")
+def claim_task(task_id: str):
+    """Mark a pending task as active — called by max-ops at start of execution."""
+    try:
+        return brain_db.claim_task(task_id)
+    except ValueError as e:
+        status_code = 404 if "not found" in str(e) else 409
+        raise HTTPException(status_code=status_code, detail=str(e))
+
+
+@app.post("/task/{task_id}/result")
+def complete_task(task_id: str, body: TaskResult):
+    """Store result and mark task complete — called by max-ops via web_fetch."""
+    if body.status not in ("completed", "failed"):
+        raise HTTPException(
+            status_code=400, detail="Status must be completed or failed"
+        )
+    if not brain_db.get_task(task_id):
+        raise HTTPException(status_code=404, detail="Task not found")
+    try:
+        return brain_db.complete_task(task_id, body.result, body.status)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/task/{task_id}")
+def cancel_task(task_id: str):
+    try:
+        return brain_db.cancel_task(task_id)
+    except ValueError as e:
+        msg = str(e)
+        if "not found" in msg:
+            raise HTTPException(status_code=404, detail=msg)
+        raise HTTPException(status_code=409, detail=msg)
 
 
 # ─── Health ─────────────────────────────────────────────────────────
@@ -63,7 +97,19 @@ MOCK_LEADS = [
 
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok"}
+    try:
+        row = brain_db._conn.execute("SELECT COUNT(*) as cnt FROM pages").fetchone()
+        total_pages = row["cnt"] if row else 0
+    except Exception:
+        total_pages = -1
+    return {
+        "status": "ok",
+        "brain": {
+            "db": "ok" if total_pages >= 0 else "error",
+            "pages": total_pages,
+            "embeddings": brain_db.has_embeddings(),
+        },
+    }
 
 
 # ─── Tier Status (direct endpoint, bypasses OpenClaw) ─────────────
@@ -155,81 +201,4 @@ def test_webhook(body: dict[str, Any] = {}):
         "receivedAt": datetime.now(timezone.utc).isoformat(),
         "payloadKeys": keys,
         "echo": body,
-    }
-
-
-# ─── Lead Status Lookup ────────────────────────────────────────────
-
-
-class LeadQuery(BaseModel):
-    name: str = ""
-    phone: str = ""
-
-
-@app.post("/webhook/lead-status")
-@app.post("/webhook-test/lead-status")
-def lead_status(query: LeadQuery):
-    search_name = query.name.lower()
-    search_phone = "".join(c for c in query.phone if c.isdigit())
-
-    match = None
-    for lead in MOCK_LEADS:
-        name_hit = search_name and search_name in lead["name"].lower()
-        phone_digits = "".join(c for c in lead["phone"] if c.isdigit())
-        phone_hit = search_phone and phone_digits == search_phone
-        if name_hit or phone_hit:
-            match = lead
-            break
-
-    if not match:
-        return {
-            "status": "not_found",
-            "message": f'No lead found matching name "{query.name}" or phone "{query.phone}".',
-        }
-
-    message = "\n".join(
-        [
-            f"Lead Status for {match['name']}",
-            f"Phone: {match['phone']}",
-            f"Current Status: {match['status']}",
-            f"Interest: {match['interest']}",
-            f"Last Contact: {match['lastContact']}",
-            f"Next Step: {match['nextStep']}",
-            f"Assigned To: {match['assignedTo']}",
-        ]
-    )
-    return {"status": "found", "message": message, "lead": match}
-
-
-# ─── Morning Briefing ──────────────────────────────────────────────
-
-
-@app.get("/webhook/morning-briefing")
-@app.post("/webhook/morning-briefing")
-def morning_briefing():
-    now = datetime.now(timezone.utc).strftime("%A, %B %d, %Y")
-    lines = [
-        f"MORNING BRIEFING — {now}",
-        "Longview Home Center",
-        "=" * 40,
-        "",
-        f"Total Active Leads: {len(MOCK_LEADS)}",
-        "",
-    ]
-    for i, lead in enumerate(MOCK_LEADS, 1):
-        lines.extend(
-            [
-                f"{i}. {lead['name']} ({lead['phone']})",
-                f"   Status: {lead['status']}",
-                f"   Interest: {lead['interest']}",
-                f"   Source: {lead['source']}",
-                "",
-            ]
-        )
-    lines.append("---\nGenerated by ClawRange Workflow Service")
-
-    return {
-        "briefing": "\n".join(lines),
-        "leadCount": len(MOCK_LEADS),
-        "generatedAt": datetime.now(timezone.utc).isoformat(),
     }
