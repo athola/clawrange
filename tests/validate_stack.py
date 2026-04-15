@@ -131,9 +131,10 @@ def check_n8n_workflows() -> TestResult:
             source = f.read()
         for endpoint in [
             "/webhook/test",
-            "/webhook/lead-status",
-            "/webhook/morning-briefing",
             "/healthz",
+            "/brain",
+            "/task",
+            "/tier",
         ]:
             if endpoint not in source:
                 errors.append(f"missing endpoint: {endpoint}")
@@ -231,12 +232,12 @@ def check_soul_md() -> TestResult:
     except FileNotFoundError:
         result.fail_("openclaw/soul.md not found")
         return result
-    required = ["longview home center", "jessup", "titanium", "fha", "va"]
+    required = ["john-117", "executive assistant", "clawrange"]
     missing = [r for r in required if r not in content]
     if missing:
         result.fail_(f"Missing references: {', '.join(missing)}")
     else:
-        result.pass_("Persona includes dealership, brands, and financing")
+        result.pass_("Persona includes identity, role, and infrastructure")
     return result
 
 
