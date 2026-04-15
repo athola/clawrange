@@ -24,6 +24,8 @@
       {
         "id": "max",
         "tools": {
+          "allow": ["web_search", "web_fetch", "memory_search", "memory_get",
+                    "message", "tts"],
           "deny": ["exec", "process", "read", "write", "edit", "apply_patch",
                    "image", "browser", "canvas", "nodes", "cron", "gateway",
                    "subagents", "session_status", "sessions_list",
@@ -46,6 +48,8 @@
           "lightContext": false
         },
         "tools": {
+          "allow": ["read", "web_fetch", "web_search", "cron",
+                    "session_status", "memory_search", "memory_get"],
           "deny": ["exec", "process", "write", "edit", "apply_patch",
                    "image", "image_generate", "browser", "canvas", "nodes",
                    "gateway", "subagents", "code_execution", "message",
