@@ -554,6 +554,7 @@ def _is_non_answer(text: str) -> bool:
 PROVIDER_URLS = {
     "openrouter": "https://openrouter.ai/api/v1/chat/completions",
     "zai": "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
+    "zai-search": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
 }
 
 
@@ -1236,13 +1237,15 @@ async def _llm_call(
             "temperature": 0.7,
         }
 
-        # GLM built-in web_search — executed server-side by Z.AI,
-        # no tool_call/tool_result round-trip needed.
+        # GLM built-in web_search — use the standard (non-coding) endpoint
+        # which supports server-side tool execution.
+        call_provider = provider
         if web_search and provider == "zai":
+            call_provider = "zai-search"
             body["tools"] = [{"type": "web_search", "web_search": {"enable": True}}]
 
         try:
-            resp = await _call_provider(provider, tier["models"], body, api_key)
+            resp = await _call_provider(call_provider, tier["models"], body, api_key)
             if resp.status_code == 200:
                 text = (
                     resp.json()

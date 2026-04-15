@@ -36,6 +36,10 @@
     "zai": {
       "base_url": "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
       "env_key": "ZAI_API_KEY"
+    },
+    "zai-search": {
+      "base_url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+      "env_key": "ZAI_API_KEY"
     }
   }
 }
