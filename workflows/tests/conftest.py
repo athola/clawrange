@@ -13,6 +13,14 @@ os.environ["BRAIN_DB_PATH"] = os.path.join(_tmpdir, "test_brain.db")
 import pytest  # noqa: E402
 
 
+@pytest.fixture()
+def client():
+    from fastapi.testclient import TestClient
+    from app import app
+
+    return TestClient(app)
+
+
 @pytest.fixture(autouse=True)
 def _reset_brain_db():
     """Clear all tables between tests for isolation."""
@@ -21,6 +29,9 @@ def _reset_brain_db():
 
     for table in (
         "tasks",
+        "scan_cache",
+        "schedules",
+        "projects",
         "page_tags",
         "tags",
         "links",

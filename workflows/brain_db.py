@@ -9,7 +9,7 @@ import os
 import re
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
 
@@ -249,6 +249,43 @@ class BrainDB:
                 INSERT INTO pages_fts(slug, title, compiled)
                     VALUES (new.slug, new.title, new.compiled);
             END;
+        """)
+
+        # Marketing orchestrator tables
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS projects (
+                slug         TEXT PRIMARY KEY,
+                owner        TEXT NOT NULL,
+                repo         TEXT NOT NULL,
+                topics       TEXT NOT NULL DEFAULT '[]',
+                subreddits   TEXT NOT NULL DEFAULT '[]',
+                search_terms TEXT NOT NULL DEFAULT '[]',
+                posture      TEXT NOT NULL DEFAULT '',
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT NOT NULL,
+                UNIQUE(owner, repo)
+            );
+
+            CREATE TABLE IF NOT EXISTS schedules (
+                id           TEXT PRIMARY KEY,
+                name         TEXT NOT NULL UNIQUE,
+                kind         TEXT NOT NULL,
+                cron         TEXT NOT NULL,
+                kwargs       TEXT NOT NULL DEFAULT '{}',
+                paused       INTEGER NOT NULL DEFAULT 0,
+                last_run     TEXT,
+                last_status  TEXT,
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS scan_cache (
+                kind         TEXT NOT NULL,
+                external_id  TEXT NOT NULL,
+                project_slug TEXT,
+                seen_at      TEXT NOT NULL,
+                PRIMARY KEY(kind, external_id, project_slug)
+            );
         """)
 
         # Migrate: add source column to tasks if missing (existing DBs)
@@ -872,3 +909,172 @@ class BrainDB:
         )
         self._conn.commit()
         return self.get_task(task_id)
+
+    # ─── Projects (marketing orchestrator) ───────────────────────
+
+    def list_projects(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute("SELECT * FROM projects ORDER BY slug").fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
+    def get_project(self, slug: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM projects WHERE slug = ?", (slug,)
+        ).fetchone()
+        return self._row_to_dict(row) if row else None
+
+    def upsert_project(
+        self,
+        slug: str,
+        owner: str,
+        repo: str,
+        topics: list[str] | None = None,
+        subreddits: list[str] | None = None,
+        search_terms: list[str] | None = None,
+        posture: str = "",
+    ) -> dict[str, Any]:
+        import json
+
+        now = _now()
+        self._conn.execute(
+            """INSERT INTO projects (slug, owner, repo, topics, subreddits, search_terms, posture, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(slug) DO UPDATE SET
+                 owner=excluded.owner, repo=excluded.repo,
+                 topics=excluded.topics, subreddits=excluded.subreddits,
+                 search_terms=excluded.search_terms, posture=excluded.posture,
+                 updated_at=excluded.updated_at""",
+            (
+                slug,
+                owner,
+                repo,
+                json.dumps(topics or []),
+                json.dumps(subreddits or []),
+                json.dumps(search_terms or []),
+                posture,
+                now,
+                now,
+            ),
+        )
+        self._conn.commit()
+        return self.get_project(slug)
+
+    def delete_project(self, slug: str) -> bool:
+        cursor = self._conn.execute("DELETE FROM projects WHERE slug = ?", (slug,))
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    # ─── Schedules (marketing orchestrator) ──────────────────────
+
+    def list_schedules(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute("SELECT * FROM schedules ORDER BY name").fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
+    def get_schedule(self, schedule_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM schedules WHERE id = ? OR name = ?",
+            (schedule_id, schedule_id),
+        ).fetchone()
+        return self._row_to_dict(row) if row else None
+
+    def upsert_schedule(
+        self,
+        schedule_id: str,
+        name: str,
+        kind: str,
+        cron: str,
+        kwargs: dict | None = None,
+    ) -> dict[str, Any]:
+        import json
+
+        now = _now()
+        self._conn.execute(
+            """INSERT INTO schedules (id, name, kind, cron, kwargs, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                 name=excluded.name, kind=excluded.kind,
+                 cron=excluded.cron, kwargs=excluded.kwargs,
+                 updated_at=excluded.updated_at""",
+            (schedule_id, name, kind, cron, json.dumps(kwargs or {}), now, now),
+        )
+        self._conn.commit()
+        return self.get_schedule(schedule_id)
+
+    def update_schedule_status(
+        self, schedule_id: str, last_run: str, last_status: str
+    ) -> None:
+        self._conn.execute(
+            "UPDATE schedules SET last_run=?, last_status=?, updated_at=? WHERE id=?",
+            (last_run, last_status, _now(), schedule_id),
+        )
+        self._conn.commit()
+
+    def set_schedule_paused(
+        self, schedule_id: str, paused: bool
+    ) -> dict[str, Any] | None:
+        self._conn.execute(
+            "UPDATE schedules SET paused=?, updated_at=? WHERE id=?",
+            (1 if paused else 0, _now(), schedule_id),
+        )
+        self._conn.commit()
+        return self.get_schedule(schedule_id)
+
+    def delete_schedule(self, schedule_id: str) -> bool:
+        cursor = self._conn.execute(
+            "DELETE FROM schedules WHERE id = ?", (schedule_id,)
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    # ─── Scan Cache (dedup) ─────────────────────────────────────
+
+    def mark_seen(
+        self, kind: str, external_id: str, project_slug: str | None = None
+    ) -> None:
+        self._conn.execute(
+            """INSERT OR IGNORE INTO scan_cache (kind, external_id, project_slug, seen_at)
+               VALUES (?, ?, ?, ?)""",
+            (kind, external_id, project_slug, _now()),
+        )
+        self._conn.commit()
+
+    def is_seen(
+        self, kind: str, external_id: str, project_slug: str | None = None
+    ) -> bool:
+        if project_slug is None:
+            row = self._conn.execute(
+                "SELECT 1 FROM scan_cache WHERE kind=? AND external_id=? AND project_slug IS NULL",
+                (kind, external_id),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT 1 FROM scan_cache WHERE kind=? AND external_id=? AND project_slug=?",
+                (kind, external_id, project_slug),
+            ).fetchone()
+        return row is not None
+
+    def get_unseen(
+        self, kind: str, external_ids: list[str], project_slug: str | None = None
+    ) -> list[str]:
+        if not external_ids:
+            return []
+        placeholders = ",".join("?" * len(external_ids))
+        if project_slug is None:
+            rows = self._conn.execute(
+                f"SELECT external_id FROM scan_cache WHERE kind=? AND project_slug IS NULL AND external_id IN ({placeholders})",
+                (kind, *external_ids),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                f"SELECT external_id FROM scan_cache WHERE kind=? AND project_slug=? AND external_id IN ({placeholders})",
+                (kind, project_slug, *external_ids),
+            ).fetchall()
+        seen = {r["external_id"] for r in rows}
+        return [eid for eid in external_ids if eid not in seen]
+
+    def prune_scan_cache(self, max_age_days: int = 14) -> int:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        cursor = self._conn.execute(
+            "DELETE FROM scan_cache WHERE seen_at < ?", (cutoff.isoformat(),)
+        )
+        self._conn.commit()
+        return cursor.rowcount

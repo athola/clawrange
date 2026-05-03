@@ -792,7 +792,24 @@ TASK API (via web_fetch)
 
 HEALTH
   GET  /healthz                  Service health + brain status
-  GET  /tier                     Tier status JSON"""
+  GET  /tier                     Tier status JSON
+
+MARKETING
+  /projects list                 List tracked GitHub projects
+  /projects show <slug>          Show project details
+  /projects add <slug> <owner>/<repo> [--topics ...] [--subs ...]
+  /projects rm <slug>
+
+  /sched list                    List scheduled jobs
+  /sched add <name> cron "<expr>" -- <generator>
+  /sched pause|resume|rm|run <id|name>
+
+  /scan reddit <topic> [--subs ...] [--project <slug>]
+  /scan github <topic> [--kind repos|issues] [--stars 5]
+  /scan github traffic [slug]    Pull repo traffic stats
+  /scan web <prompt>             LLM web search
+
+  /marketing                     Alias: /sched run morning_scan"""
     return _synthetic_response(text)
 
 
@@ -801,6 +818,453 @@ HEALTH
 
 _TASK_TRIGGERS = ("!task", "/task", "!tasks", "/tasks")
 _TASK_ACTIONS = ("cancel", "priority", "list", "tail")
+
+# ─── Marketing Commands (/sched, /scan, /projects) ──────────────
+
+_MARKETING_PREFIXES = (
+    "/sched",
+    "!sched",
+    "/scan",
+    "!scan",
+    "/projects",
+    "!projects",
+    "/marketing",
+    "!marketing",
+)
+
+
+def _strip_prefix(msg: str) -> str:
+    """Remove leading / or ! from a command message."""
+    msg = msg.strip()
+    if msg and msg[0] in "/!":
+        msg = msg[1:]
+    return msg
+
+
+def _extract_marketing_command(msg: str) -> dict | None:
+    """Parse marketing commands. Returns dict with verb, subcmd, args or None."""
+    stripped = msg.strip()
+    lower = stripped.lower()
+
+    for prefix in _MARKETING_PREFIXES:
+        if lower.startswith(prefix):
+            rest = stripped[len(prefix) :].strip()
+            verb = prefix.lstrip("/!")
+            if verb == "marketing":
+                return {"verb": "sched", "subcmd": "run", "args": "morning_scan"}
+            if not rest:
+                return {"verb": verb, "subcmd": "list", "args": ""}
+            # Parse subcommand
+            parts = rest.split(None, 1)
+            subcmd = parts[0].lower()
+            args = parts[1] if len(parts) > 1 else ""
+            return {"verb": verb, "subcmd": subcmd, "args": args}
+
+    return None
+
+
+async def _dispatch_marketing_command(
+    cmd: dict, is_stream: bool
+) -> JSONResponse | StreamingResponse:
+    """Route parsed marketing commands to handlers."""
+    verb = cmd["verb"]
+    subcmd = cmd["subcmd"]
+    args = cmd["args"]
+
+    try:
+        if verb == "sched":
+            text = await _handle_sched_command(subcmd, args)
+        elif verb == "scan":
+            text = await _handle_scan_command(subcmd, args)
+        elif verb == "projects":
+            text = await _handle_projects_command(subcmd, args)
+        else:
+            text = f"Unknown command: {verb}"
+    except Exception as exc:
+        text = f"Error: {exc}"
+
+    resp = _synthetic_response(text)
+    if is_stream:
+        return _wrap_json_as_sse(resp)
+    return resp
+
+
+async def _handle_sched_command(subcmd: str, args: str) -> str:
+    """Handle /sched subcommands."""
+    from app import brain_db
+
+    if subcmd == "list":
+        scheds = brain_db.list_schedules()
+        if not scheds:
+            return 'No schedules configured. Use /sched add <name> cron "<expr>" -- <generator>'
+        lines = ["Scheduled Jobs:\n"]
+        for s in scheds:
+            status = "PAUSED" if s.get("paused") else "ACTIVE"
+            last = s.get("last_status", "never")
+            lines.append(
+                f"  [{status}] {s['name']} ({s['id']})\n"
+                f"    cron: {s['cron']} | kind: {s['kind']}\n"
+                f"    last: {last or 'never'}"
+            )
+        lines.append("\n/sched show|pause|resume|rm|run <id|name>")
+        return "\n".join(lines)
+
+    if subcmd in ("show", "info"):
+        sched = brain_db.get_schedule(args.strip())
+        if not sched:
+            return f"Schedule not found: {args}"
+        return (
+            f"Schedule: {sched['name']} ({sched['id']})\n"
+            f"  Kind: {sched['kind']}\n"
+            f"  Cron: {sched['cron']}\n"
+            f"  Kwargs: {sched.get('kwargs', '{}')}\n"
+            f"  Paused: {bool(sched.get('paused'))}\n"
+            f"  Last run: {sched.get('last_run', 'never')}\n"
+            f"  Last status: {sched.get('last_status', 'never')}"
+        )
+
+    if subcmd == "add":
+        import shlex
+
+        try:
+            parts = shlex.split(args, posix=True)
+        except ValueError:
+            return 'Parse error. Usage: /sched add <name> cron "<expr>" -- <generator>'
+
+        if "--" in parts:
+            split_idx = parts.index("--")
+            before_dash = parts[:split_idx]
+            after_dash = parts[1 + split_idx :]
+        else:
+            before_dash = parts
+            after_dash = []
+
+        if len(before_dash) < 3:
+            return 'Usage: /sched add <name> cron "<expr>" -- <generator>'
+
+        name = before_dash[0]
+        cron_expr = " ".join(before_dash[2:])
+        kind = after_dash[0] if after_dash else "custom_scan"
+
+        from generators import GENERATORS
+
+        if kind not in GENERATORS:
+            return (
+                f"Unknown generator: {kind}. Available: {', '.join(GENERATORS.keys())}"
+            )
+
+        from scheduler import add_schedule
+        import hashlib
+
+        sched_id = hashlib.md5(name.encode()).hexdigest()[:8]
+
+        await add_schedule(
+            None,
+            brain_db,
+            sched_id,
+            name,
+            kind,
+            cron_expr,
+            {"topic": " ".join(after_dash[1:])} if after_dash[1:] else {},
+        )
+        return (
+            f"Schedule added: {name} ({sched_id})\n  cron: {cron_expr}\n  kind: {kind}"
+        )
+
+    if subcmd in ("pause",):
+        sched = brain_db.get_schedule(args.strip())
+        if not sched:
+            return f"Schedule not found: {args}"
+        brain_db.set_schedule_paused(sched["id"], True)
+        return f"Paused: {sched['name']} ({sched['id']})"
+
+    if subcmd in ("resume",):
+        sched = brain_db.get_schedule(args.strip())
+        if not sched:
+            return f"Schedule not found: {args}"
+        brain_db.set_schedule_paused(sched["id"], False)
+        return f"Resumed: {sched['name']} ({sched['id']})"
+
+    if subcmd in ("rm", "remove", "delete"):
+        from scheduler import remove_schedule
+
+        removed = await remove_schedule(None, brain_db, args.strip())
+        if not removed:
+            return f"Schedule not found: {args}"
+        return f"Removed: {args}"
+
+    if subcmd == "run":
+        from scheduler import run_schedule_now
+
+        try:
+            result = await run_schedule_now(None, brain_db, args.strip())
+            return f"Ran schedule: {result.get('schedule_id', args)} — {result.get('status', 'unknown')}"
+        except ValueError as e:
+            return str(e)
+
+    return (
+        "Usage:\n"
+        "  /sched list [--paused]\n"
+        "  /sched show <id|name>\n"
+        '  /sched add <name> cron "<expr>" -- <generator>\n'
+        "  /sched pause <id|name>\n"
+        "  /sched resume <id|name>\n"
+        "  /sched rm <id|name>\n"
+        "  /sched run <id|name>"
+    )
+
+
+async def _handle_scan_command(subcmd: str, args: str) -> str:
+    """Handle /scan subcommands."""
+    from app import brain_db
+
+    if subcmd == "reddit":
+        # /scan reddit <topic> [--subs ...] [--project <slug>] [--since 7d]
+        topic, subreddits, project_slug, since = _parse_scan_args(args)
+        if not topic:
+            return "Usage: /scan reddit <topic> [--subs sub1,sub2] [--project <slug>]"
+
+        if not subreddits and project_slug:
+            project = brain_db.get_project(project_slug)
+            if project:
+                import json
+
+                subreddits = json.loads(project.get("subreddits", "[]"))
+
+        if not subreddits:
+            subreddits = ["ClaudeAI", "LocalLLaMA", "SideProject"]
+
+        from reddit_search import search_subreddits
+
+        results = await search_subreddits(
+            topic, subreddits, since=since, limit_per_sub=10
+        )
+
+        if not results:
+            return f"No Reddit results for '{topic}' in {subreddits}"
+
+        lines = [f"Reddit scan: {topic} ({len(results)} results)\n"]
+        for i, r in enumerate(results[:10], 1):
+            lines.append(
+                f"{i}. {r.title}\n"
+                f"   r/{r.subreddit} | {r.score}pts | {r.comments} comments\n"
+                f"   {r.url}"
+            )
+            if r.snippet:
+                lines.append(f"   {r.snippet[:120]}")
+
+        if len(results) > 10:
+            lines.append(f"\n... and {len(results) - 10} more")
+
+        return "\n".join(lines)
+
+    if subcmd == "github":
+        # /scan github <topic> [--kind repos|issues] [--stars 5]
+        parts = args.split()
+        topic = parts[0] if parts else ""
+        kind = "repos"
+        min_stars = 0
+
+        for i, p in enumerate(parts):
+            if p == "--kind" and i + 1 < len(parts):
+                kind = parts[i + 1]
+            elif p == "--stars" and i + 1 < len(parts):
+                try:
+                    min_stars = int(parts[i + 1])
+                except ValueError:
+                    pass
+
+        if not topic:
+            return "Usage: /scan github <topic> [--kind repos|issues] [--stars 5]"
+
+        if kind == "issues":
+            from github_search import search_issues
+
+            results = await search_issues(topic)
+        else:
+            from github_search import search_repos
+
+            results = await search_repos(topic, min_stars=min_stars)
+
+        if not results:
+            return f"No GitHub results for '{topic}'"
+
+        lines = [f"GitHub scan ({kind}): {topic} ({len(results)} results)\n"]
+        for i, r in enumerate(results[:10], 1):
+            if hasattr(r, "full_name"):
+                lines.append(
+                    f"{i}. {r.full_name} ({r.stars}*)\n"
+                    f"   {r.description or 'No description'}\n"
+                    f"   {r.url}"
+                )
+            else:
+                lines.append(f"{i}. {r.title}\n   {r.url}")
+
+        return "\n".join(lines)
+
+    if subcmd == "web":
+        if not args:
+            return "Usage: /scan web <prompt>"
+        result = await _llm_call(args, max_tokens=1000, web_search=True)
+        return result or "No results from web search."
+
+    if subcmd == "github" and args.lower().startswith("traffic"):
+        parts = args.split()
+        slug = parts[1] if len(parts) > 1 else ""
+        if not slug:
+            projects = brain_db.list_projects()
+            if not projects:
+                return "No projects tracked. Use /projects add first."
+            lines = []
+            for p in projects:
+                from github_search import get_self_traffic
+
+                traffic = await get_self_traffic(p["owner"], p["repo"])
+                if traffic:
+                    lines.append(
+                        f"{p['owner']}/{p['repo']}\n"
+                        f"  Views: {traffic.views_count} ({traffic.views_uniques} unique)\n"
+                        f"  Clones: {traffic.clones_count} ({traffic.clones_uniques} unique)"
+                    )
+                else:
+                    lines.append(
+                        f"{p['owner']}/{p['repo']}: traffic unavailable (needs GITHUB_PAT)"
+                    )
+            return "\n\n".join(lines) if lines else "No traffic data available."
+
+        project = brain_db.get_project(slug)
+        if not project:
+            return f"Project not found: {slug}"
+        from github_search import get_self_traffic
+
+        traffic = await get_self_traffic(project["owner"], project["repo"])
+        if not traffic:
+            return "Traffic unavailable — needs GITHUB_PAT with repo scope"
+        return (
+            f"Traffic for {project['owner']}/{project['repo']} (14 days)\n"
+            f"  Views: {traffic.views_count} ({traffic.views_uniques} unique)\n"
+            f"  Clones: {traffic.clones_count} ({traffic.clones_uniques} unique)"
+        )
+
+    return (
+        "Usage:\n"
+        "  /scan reddit <topic> [--subs sub1,sub2] [--project <slug>]\n"
+        "  /scan github <topic> [--kind repos|issues] [--stars 5]\n"
+        "  /scan github traffic [project-slug]\n"
+        "  /scan web <prompt>"
+    )
+
+
+def _parse_scan_args(args: str) -> tuple[str, list[str], str | None, str]:
+    """Parse scan arguments, extracting topic, subreddits, project, since."""
+    parts = args.split()
+    topic_parts: list[str] = []
+    subreddits: list[str] = []
+    project_slug = None
+    since = "7d"
+    i = 0
+    while i < len(parts):
+        if parts[i] == "--subs" and i + 1 < len(parts):
+            subreddits = parts[i + 1].split(",")
+            i += 2
+        elif parts[i] == "--project" and i + 1 < len(parts):
+            project_slug = parts[i + 1]
+            i += 2
+        elif parts[i] == "--since" and i + 1 < len(parts):
+            since = parts[i + 1]
+            i += 2
+        else:
+            topic_parts.append(parts[i])
+            i += 1
+    return " ".join(topic_parts), subreddits, project_slug, since
+
+
+async def _handle_projects_command(subcmd: str, args: str) -> str:
+    """Handle /projects subcommands."""
+    from app import brain_db
+
+    if subcmd in ("list", ""):
+        projects = brain_db.list_projects()
+        if not projects:
+            return "No projects tracked. Use /projects add <slug> <owner>/<repo>"
+        lines = ["Tracked Projects:\n"]
+        for p in projects:
+            import json
+
+            subs = json.loads(p.get("subreddits", "[]"))
+            lines.append(
+                f"  {p['slug']} — {p['owner']}/{p['repo']}\n"
+                f"    subs: {', '.join(subs[:5]) or 'none'}\n"
+                f"    posture: {p.get('posture', 'none') or 'none'}"
+            )
+        return "\n".join(lines)
+
+    if subcmd == "show":
+        slug = args.strip()
+        project = brain_db.get_project(slug)
+        if not project:
+            return f"Project not found: {slug}"
+        import json
+
+        return (
+            f"Project: {project['slug']}\n"
+            f"  Repo: {project['owner']}/{project['repo']}\n"
+            f"  Topics: {json.loads(project.get('topics', '[]'))}\n"
+            f"  Subreddits: {json.loads(project.get('subreddits', '[]'))}\n"
+            f"  Search terms: {json.loads(project.get('search_terms', '[]'))}\n"
+            f"  Posture: {project.get('posture', 'none')}"
+        )
+
+    if subcmd == "add":
+        import shlex
+
+        try:
+            parts = shlex.split(args, posix=True)
+        except ValueError:
+            return "Parse error. Usage: /projects add <slug> <owner>/<repo> [--topics ...] [--subs ...]"
+
+        if len(parts) < 2:
+            return 'Usage: /projects add <slug> <owner>/<repo> [--topics ...] [--subs ...] [--posture "..."]'
+
+        slug = parts[0]
+        owner_repo = parts[1]
+        if "/" not in owner_repo:
+            return "Format: owner/repo"
+        owner, repo = owner_repo.split("/", 1)
+
+        topics: list[str] = []
+        subs: list[str] = []
+        posture = ""
+        i = 2
+        while i < len(parts):
+            if parts[i] == "--topics" and i + 1 < len(parts):
+                topics = parts[i + 1].split(",")
+                i += 2
+            elif parts[i] == "--subs" and i + 1 < len(parts):
+                subs = parts[i + 1].split(",")
+                i += 2
+            elif parts[i] == "--posture" and i + 1 < len(parts):
+                posture = parts[i + 1]
+                i += 2
+            else:
+                i += 1
+
+        brain_db.upsert_project(slug, owner, repo, topics, subs, posture=posture)
+        return f"Project added: {slug} ({owner}/{repo})"
+
+    if subcmd in ("rm", "remove"):
+        slug = args.strip()
+        if brain_db.delete_project(slug):
+            return f"Removed project: {slug}"
+        return f"Project not found: {slug}"
+
+    return (
+        "Usage:\n"
+        "  /projects list\n"
+        "  /projects show <slug>\n"
+        '  /projects add <slug> <owner>/<repo> [--topics ...] [--subs ...] [--posture "..."]\n'
+        "  /projects rm <slug>"
+    )
 
 
 def _extract_task_command(msg: str) -> dict | None:
@@ -1219,13 +1683,21 @@ async def _llm_call(
     Returns the response text, or None on failure. Used for both
     task suggestions (thinking) and task execution (working).
 
-    When web_search=True, enables GLM's server-side web search tool
-    for Z.AI tiers so the model can fetch live data.
+    When web_search=True, only Z.AI tiers are used (GLM server-side
+    web search). Other providers lack web access and would return
+    hallucinated or "I can't do that" responses.
     """
     for tier in CONFIG["tiers"]:
         if _circuit_open(tier["name"]):
             continue
         provider = tier["provider"]
+
+        # Only Z.AI supports server-side web search — skip other providers
+        # to avoid getting a useless "I can't access the web" response
+        # that would short-circuit before reaching a capable tier.
+        if web_search and provider != "zai":
+            continue
+
         provider_config = CONFIG["providers"][provider]
         api_key = os.getenv(provider_config["env_key"], "")
         if not api_key:
@@ -1237,28 +1709,46 @@ async def _llm_call(
             "temperature": 0.7,
         }
 
-        # GLM built-in web_search — use the standard (non-coding) endpoint
-        # which supports server-side tool execution.
         call_provider = provider
-        if web_search and provider == "zai":
+        if web_search:
             call_provider = "zai-search"
             body["tools"] = [{"type": "web_search", "web_search": {"enable": True}}]
 
         try:
             resp = await _call_provider(call_provider, tier["models"], body, api_key)
             if resp.status_code == 200:
-                text = (
-                    resp.json()
-                    .get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content", "")
-                    .strip()
-                )
+                data = resp.json()
+                msg = data.get("choices", [{}])[0].get("message", {})
+                text = (msg.get("content") or "").strip()
+
+                # GLM web search returns citations in tool_calls alongside
+                # content. Extract and append them so the result includes
+                # actual URLs instead of bare prose.
+                if web_search and msg.get("tool_calls"):
+                    citations = _extract_web_citations(msg["tool_calls"])
+                    if citations:
+                        text = f"{text}\n\n{citations}" if text else citations
+
                 if text:
                     return text
         except Exception:
             pass
     return None
+
+
+def _extract_web_citations(tool_calls: list[dict]) -> str:
+    """Pull URLs and titles from GLM web_search tool call results."""
+    refs: list[str] = []
+    for tc in tool_calls:
+        if tc.get("type") == "web_search":
+            results = tc.get("web_search", {}).get("search_result", [])
+            for i, hit in enumerate(results, 1):
+                title = hit.get("title", "")
+                link = hit.get("link", "")
+                content = hit.get("content", "")[:120]
+                if link:
+                    refs.append(f"{i}. [{title}]({link})\n   {content}")
+    return "\n".join(refs)
 
 
 async def _llm_suggest_task() -> str | None:
@@ -1341,6 +1831,22 @@ async def _build_work_prompt(task_description: str, web_search: bool = False) ->
         else ""
     )
 
+    # Detect marketing tasks and inject anti-pattern rules
+    marketing_context = ""
+    desc_lower = task_description.lower()
+    marketing_keywords = {
+        "marketing",
+        "awesome-list",
+        "reddit",
+        "subreddit",
+        "comment",
+        "launch",
+        "post",
+        "draft",
+    }
+    if any(kw in desc_lower for kw in marketing_keywords):
+        marketing_context = ANTI_PATTERN_RULES + "\n"
+
     return (
         f"{context}"
         f"{state}\n"
@@ -1348,6 +1854,7 @@ async def _build_work_prompt(task_description: str, web_search: bool = False) ->
         f"---\n"
         f"You have been assigned this task:\n"
         f'"{task_description}"\n\n'
+        f"{marketing_context}"
         "RULES:\n"
         "- Reference real data from the system state, brain, and web search results.\n"
         "- Do NOT invent URLs, post titles, or usernames. Only cite what you found.\n"
@@ -1401,6 +1908,140 @@ async def _llm_work_task(description: str) -> str:
     return f"Could not reach LLM to work this task. Alex should handle manually: {description}"
 
 
+# ─── Marketing Scan Interceptor ──────────────────────────────────
+
+_MARKETING_SCAN_PATTERNS = {
+    "reddit": re.compile(r"Scan reddit for (\S+)", re.IGNORECASE),
+    "github": re.compile(r"Scan github for (\S+)", re.IGNORECASE),
+    "traffic": re.compile(
+        r"(?:Weekly )?traffic snapshot for (\S+)/(\S+)", re.IGNORECASE
+    ),
+    "awesome": re.compile(r"Awesome-list watch: (\S+) not yet listed", re.IGNORECASE),
+}
+
+ANTI_PATTERN_RULES = """
+ANTI-PATTERNS (do not produce text that violates these):
+- Do NOT lead with "I built this with Claude" or similar AI-builder framing
+- Do NOT use superlatives like "fastest", "best", "revolutionary"
+- Do NOT fabricate post titles, subreddit names, usernames, or URLs
+- Do NOT recommend posting in subreddits where self-promotion is banned
+
+POSITIVE RULES:
+- Lead with the user problem solved
+- Include real upvote counts, comment counts, and timestamps when available
+- Cite source URLs for every claim
+- For comment suggestions, anchor in the user's question first; mention the project as a relevant tool second
+"""
+
+
+async def _try_marketing_scan(description: str, brain_db) -> str | None:
+    """Detect and execute structured marketing scan tasks.
+
+    Returns result text if the task matches a scan pattern, None otherwise.
+    """
+    for kind, pattern in _MARKETING_SCAN_PATTERNS.items():
+        match = pattern.search(description)
+        if not match:
+            continue
+
+        if kind == "reddit":
+            slug = match.group(1)
+            project = brain_db.get_project(slug)
+            if not project:
+                return None
+
+            import json
+            from reddit_search import search_subreddits
+
+            topics = json.loads(project.get("topics", "[]"))
+            subreddits = json.loads(project.get("subreddits", "[]"))
+            search_terms = json.loads(project.get("search_terms", "[]"))
+
+            query = (
+                " OR ".join(search_terms[:3]) if search_terms else " ".join(topics[:3])
+            )
+            results = await search_subreddits(
+                query, subreddits or ["ClaudeAI", "LocalLLaMA", "SideProject"]
+            )
+
+            if not results:
+                return f"Reddit scan for {slug}: no new relevant posts found."
+
+            lines = [f"Reddit scan for {slug} ({len(results)} results):\n"]
+            for i, r in enumerate(results[:8], 1):
+                lines.append(
+                    f"{i}. {r.title}\n"
+                    f"   r/{r.subreddit} | {r.score}pts | {r.comments} comments\n"
+                    f"   {r.url}"
+                )
+
+            # Mark results in scan cache
+            for r in results:
+                brain_db.mark_seen("reddit_post", r.id, slug)
+
+            return "\n".join(lines)
+
+        if kind == "github":
+            slug = match.group(1)
+            project = brain_db.get_project(slug)
+            if not project:
+                return None
+
+            import json
+            from github_search import search_repos, search_issues
+
+            search_terms = json.loads(project.get("search_terms", "[]"))
+            topics = json.loads(project.get("topics", "[]"))
+            query = (
+                " OR ".join(search_terms[:3]) if search_terms else " ".join(topics[:3])
+            )
+
+            repos = await search_repos(query, min_stars=5, limit=10)
+            issues = await search_issues(query, limit=10)
+
+            lines = [
+                f"GitHub scan for {slug} ({len(repos)} repos, {len(issues)} issues):\n"
+            ]
+
+            if repos:
+                lines.append("Adjacent repos:")
+                for i, r in enumerate(repos[:5], 1):
+                    lines.append(
+                        f"  {i}. {r.full_name} ({r.stars}*) — {r.description or ''}"
+                    )
+
+            if issues:
+                lines.append("\nRecent issues:")
+                for i, iss in enumerate(issues[:5], 1):
+                    lines.append(f"  {i}. {iss.title} — {iss.repository}#{iss.number}")
+
+            # Mark in cache
+            for r in repos:
+                brain_db.mark_seen("github_repo", str(r.id), slug)
+
+            return "\n".join(lines)
+
+        if kind == "traffic":
+            owner, repo = match.group(1), match.group(2)
+            from github_search import get_self_traffic
+
+            traffic = await get_self_traffic(owner, repo)
+            if not traffic:
+                return f"Traffic for {owner}/{repo}: unavailable (needs GITHUB_PAT with repo scope)"
+
+            return (
+                f"Traffic for {owner}/{repo} (14 days):\n"
+                f"  Views: {traffic.views_count} ({traffic.views_uniques} unique)\n"
+                f"  Clones: {traffic.clones_count} ({traffic.clones_uniques} unique)"
+            )
+
+        if kind == "awesome":
+            # These tasks are typically LLM-generated drafts, let them fall through
+            return None
+
+    return None
+
+
 async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse:
     """Run heartbeat checks in Python instead of relying on the LLM.
 
@@ -1428,7 +2069,14 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
         source = task.get("source", "system")
         label = "ALEX" if source == "user" else "SYSTEM"
         brain_db.claim_task(task["id"])
-        result = await _llm_work_task(task["description"])
+
+        # Check if this is a structured marketing scan task
+        scan_result = await _try_marketing_scan(task["description"], brain_db)
+        if scan_result is not None:
+            result = scan_result
+        else:
+            result = await _llm_work_task(task["description"])
+
         brain_db.complete_task(task["id"], result, "completed")
         lines.append(f"[{label}] #{task['id']}: {task['description']}")
         lines.append(f"Result: {result}")
@@ -1723,6 +2371,11 @@ async def chat_completions(
     )
     if task_action is not None:
         return await _dispatch_task_command(task_action, is_stream)
+
+    # Intercept marketing commands (/sched, /scan, /projects, /marketing)
+    marketing_cmd = _extract_marketing_command(last_user_msg)
+    if marketing_cmd is not None:
+        return await _dispatch_marketing_command(marketing_cmd, is_stream)
 
     # Strip poisoned assistant messages from conversation history.
     # Uses both static markers (synthetic responses, tool hallucinations)

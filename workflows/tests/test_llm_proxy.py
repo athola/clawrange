@@ -2326,3 +2326,146 @@ class TestSemanticDedup:
         from llm_proxy import _PROACTIVE_INTERVALS
 
         assert _PROACTIVE_INTERVALS["llm_thinking"] == 900
+
+
+class TestWebSearchTierSkipping:
+    """Verify web search tasks only use Z.AI (the one tier with web access)."""
+
+    @patch.dict("os.environ", FAKE_ENV)
+    @patch("llm_proxy._call_provider", new_callable=AsyncMock)
+    @patch("llm_proxy._circuit_open", return_value=False)
+    def test_web_search_skips_non_zai_tiers(self, _cb, mock_call):
+        """When web_search=True, openrouter tiers should be skipped entirely."""
+        import asyncio
+
+        from llm_proxy import _llm_call
+
+        mock_call.return_value = httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"role": "assistant", "content": "search results"}}
+                ]
+            },
+        )
+
+        result = asyncio.run(
+            _llm_call("find reddit posts", max_tokens=500, web_search=True)
+        )
+
+        assert result == "search results"
+        # Should have been called once with zai-search, NOT with openrouter
+        assert mock_call.call_count == 1
+        call_args = mock_call.call_args
+        assert call_args[0][0] == "zai-search"  # provider arg
+        assert call_args[0][1] == ["glm-5.1"]  # zai-direct models
+
+    @patch.dict("os.environ", FAKE_ENV)
+    @patch("llm_proxy._call_provider", new_callable=AsyncMock)
+    @patch("llm_proxy._circuit_open", return_value=False)
+    def test_non_web_search_uses_all_tiers(self, _cb, mock_call):
+        """When web_search=False, all tiers are available (first wins)."""
+        import asyncio
+
+        from llm_proxy import _llm_call
+
+        mock_call.return_value = httpx.Response(
+            200,
+            json={"choices": [{"message": {"role": "assistant", "content": "hello"}}]},
+        )
+
+        result = asyncio.run(_llm_call("greet me", max_tokens=100, web_search=False))
+
+        assert result == "hello"
+        assert mock_call.call_count == 1
+        # First tier is openrouter-free
+        assert mock_call.call_args[0][0] == "openrouter"
+
+
+class TestWebCitationExtraction:
+    """Verify GLM web_search tool_call citations are extracted."""
+
+    def test_extracts_citations_from_tool_calls(self):
+        from llm_proxy import _extract_web_citations
+
+        tool_calls = [
+            {
+                "type": "web_search",
+                "web_search": {
+                    "search_result": [
+                        {
+                            "title": "MSP Marketing on Reddit",
+                            "link": "https://reddit.com/r/msp/post1",
+                            "content": "Great tips for MSP lead generation",
+                        },
+                        {
+                            "title": "Another Post",
+                            "link": "https://reddit.com/r/msp/post2",
+                            "content": "Discussion about pricing",
+                        },
+                    ]
+                },
+            }
+        ]
+
+        result = _extract_web_citations(tool_calls)
+        assert "https://reddit.com/r/msp/post1" in result
+        assert "https://reddit.com/r/msp/post2" in result
+        assert "MSP Marketing on Reddit" in result
+        assert "1." in result
+        assert "2." in result
+
+    def test_empty_tool_calls_returns_empty(self):
+        from llm_proxy import _extract_web_citations
+
+        assert _extract_web_citations([]) == ""
+
+    def test_non_web_search_tool_calls_ignored(self):
+        from llm_proxy import _extract_web_citations
+
+        tool_calls = [{"type": "function", "function": {"name": "foo"}}]
+        assert _extract_web_citations(tool_calls) == ""
+
+    @patch.dict("os.environ", FAKE_ENV)
+    @patch("llm_proxy._call_provider", new_callable=AsyncMock)
+    @patch("llm_proxy._circuit_open", return_value=False)
+    def test_citations_appended_to_content(self, _cb, mock_call):
+        """GLM response with both content and tool_calls merges them."""
+        import asyncio
+
+        from llm_proxy import _llm_call
+
+        mock_call.return_value = httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "Here are the results.",
+                            "tool_calls": [
+                                {
+                                    "type": "web_search",
+                                    "web_search": {
+                                        "search_result": [
+                                            {
+                                                "title": "A Post",
+                                                "link": "https://example.com",
+                                                "content": "Relevant info",
+                                            }
+                                        ]
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+        )
+
+        result = asyncio.run(_llm_call("find stuff", max_tokens=500, web_search=True))
+
+        assert result is not None
+        assert "Here are the results." in result
+        assert "https://example.com" in result
+        assert "A Post" in result
