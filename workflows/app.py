@@ -1,6 +1,8 @@
 """ClawRange Workflow Service — replaces n8n with testable Python endpoints."""
 
+import json
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
@@ -18,7 +20,21 @@ _db_path = os.environ.get("BRAIN_DB_PATH", "/data/brain.db")
 brain_db = BrainDB(_db_path)
 brain_db.init_db()
 
-app = FastAPI(title="ClawRange Workflows", version="3.0.0")
+# ─── Scheduler Setup ─────────────────────────────────────────────
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    from scheduler import init_scheduler
+
+    scheduler = init_scheduler(brain_db)
+    app.state.scheduler = scheduler
+    yield
+    if scheduler:
+        scheduler.shutdown(wait=False)
+
+
+app = FastAPI(title="ClawRange Workflows", version="3.0.0", lifespan=lifespan)
 app.include_router(llm_router)
 app.include_router(create_brain_router(brain_db), prefix="/brain")
 
@@ -202,3 +218,280 @@ def test_webhook(body: dict[str, Any] = {}):
         "payloadKeys": keys,
         "echo": body,
     }
+
+
+# ─── Projects (Marketing Orchestrator) ────────────────────────────
+
+
+class ProjectCreate(BaseModel):
+    slug: str
+    owner: str
+    repo: str
+    topics: list[str] = []
+    subreddits: list[str] = []
+    search_terms: list[str] = []
+    posture: str = ""
+
+
+@app.get("/projects")
+def list_projects():
+    return {
+        "projects": brain_db.list_projects(),
+        "total": len(brain_db.list_projects()),
+    }
+
+
+@app.get("/projects/{slug}")
+def get_project(slug: str):
+    project = brain_db.get_project(slug)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
+
+
+@app.post("/projects")
+def upsert_project(body: ProjectCreate):
+    return brain_db.upsert_project(
+        body.slug,
+        body.owner,
+        body.repo,
+        body.topics,
+        body.subreddits,
+        body.search_terms,
+        body.posture,
+    )
+
+
+@app.delete("/projects/{slug}")
+def delete_project(slug: str):
+    if not brain_db.delete_project(slug):
+        raise HTTPException(status_code=404, detail="Project not found")
+    return {"deleted": True}
+
+
+# ─── Schedules (Marketing Orchestrator) ───────────────────────────
+
+
+class ScheduleCreate(BaseModel):
+    id: str
+    name: str
+    kind: str
+    cron: str
+    kwargs: dict = {}
+
+
+class SchedulePatch(BaseModel):
+    cron: str | None = None
+    kwargs: dict | None = None
+    paused: bool | None = None
+
+
+@app.get("/sched")
+async def list_schedules():
+    from scheduler import list_scheduled_jobs
+
+    scheds = brain_db.list_schedules()
+    jobs = (
+        list_scheduled_jobs(app.state.scheduler)
+        if hasattr(app.state, "scheduler")
+        else []
+    )
+    job_map = {j["id"].replace("marketing_", ""): j for j in jobs}
+    for s in scheds:
+        j = job_map.get(s["id"])
+        s["next_fire_time"] = j["next_fire_time"] if j else None
+    return {"schedules": scheds, "total": len(scheds)}
+
+
+@app.get("/sched/{schedule_id}")
+async def get_schedule(schedule_id: str):
+    sched = brain_db.get_schedule(schedule_id)
+    if not sched:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    return sched
+
+
+@app.post("/sched")
+async def create_schedule(body: ScheduleCreate):
+    from scheduler import add_schedule
+
+    sched = await add_schedule(
+        app.state.scheduler if hasattr(app.state, "scheduler") else None,
+        brain_db,
+        body.id,
+        body.name,
+        body.kind,
+        body.cron,
+        body.kwargs,
+    )
+    return sched
+
+
+@app.patch("/sched/{schedule_id}")
+async def update_schedule(schedule_id: str, body: SchedulePatch):
+    from scheduler import pause_schedule, resume_schedule, add_schedule
+
+    if body.paused is not None:
+        if body.paused:
+            return await pause_schedule(
+                app.state.scheduler if hasattr(app.state, "scheduler") else None,
+                brain_db,
+                schedule_id,
+            )
+        else:
+            return await resume_schedule(
+                app.state.scheduler if hasattr(app.state, "scheduler") else None,
+                brain_db,
+                schedule_id,
+            )
+
+    if body.cron is not None or body.kwargs is not None:
+        existing = brain_db.get_schedule(schedule_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Schedule not found")
+        return await add_schedule(
+            app.state.scheduler if hasattr(app.state, "scheduler") else None,
+            brain_db,
+            schedule_id,
+            existing["name"],
+            existing["kind"],
+            body.cron or existing["cron"],
+            body.kwargs
+            if body.kwargs is not None
+            else json.loads(existing.get("kwargs", "{}")),
+        )
+
+    return brain_db.get_schedule(schedule_id)
+
+
+@app.delete("/sched/{schedule_id}")
+async def delete_schedule(schedule_id: str):
+    from scheduler import remove_schedule
+
+    if not await remove_schedule(
+        app.state.scheduler if hasattr(app.state, "scheduler") else None,
+        brain_db,
+        schedule_id,
+    ):
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    return {"deleted": True}
+
+
+@app.post("/sched/{schedule_id}/run")
+async def run_schedule(schedule_id: str):
+    from scheduler import run_schedule_now
+
+    try:
+        return await run_schedule_now(
+            app.state.scheduler if hasattr(app.state, "scheduler") else None,
+            brain_db,
+            schedule_id,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+# ─── Ad-hoc Scans (Marketing Orchestrator) ────────────────────────
+
+
+@app.post("/scan/reddit")
+async def scan_reddit(body: dict[str, Any]):
+    from reddit_search import search_subreddits
+
+    topic = body.get("topic", "")
+    if not topic:
+        raise HTTPException(status_code=400, detail="topic is required")
+
+    subreddits = body.get("subreddits", [])
+    project_slug = body.get("project_slug")
+
+    if not subreddits and project_slug:
+        project = brain_db.get_project(project_slug)
+        if project:
+            subreddits = json.loads(project.get("subreddits", "[]"))
+
+    if not subreddits:
+        subreddits = ["ClaudeAI", "LocalLLaMA", "SideProject"]
+
+    results = await search_subreddits(
+        topic,
+        subreddits,
+        since=body.get("since", "7d"),
+        limit_per_sub=body.get("limit", 25),
+    )
+
+    task_id = None
+    if body.get("deliver_to_telegram", True) and results:
+        desc = f"Reddit scan: '{topic}' found {len(results)} posts across {subreddits}"
+        task = brain_db.create_task(desc, priority=3, source="scan")
+        task_id = task["id"]
+
+    return {
+        "results": [r.model_dump() for r in results],
+        "total": len(results),
+        "query": topic,
+        "subreddits": subreddits,
+        "task_id": task_id,
+    }
+
+
+@app.post("/scan/github")
+async def scan_github(body: dict[str, Any]):
+    from github_search import search_repos, search_issues, get_self_traffic
+
+    kind = body.get("kind", "repos")
+
+    if kind == "self_traffic":
+        project_slug = body.get("project_slug")
+        if not project_slug:
+            raise HTTPException(
+                status_code=400, detail="project_slug required for self_traffic"
+            )
+        project = brain_db.get_project(project_slug)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        traffic = await get_self_traffic(project["owner"], project["repo"])
+        return {"traffic": traffic.model_dump() if traffic else None}
+
+    topic = body.get("topic", "")
+    if not topic:
+        raise HTTPException(status_code=400, detail="topic is required")
+
+    if kind == "repos":
+        results = await search_repos(
+            topic,
+            min_stars=body.get("min_stars", 0),
+            language=body.get("language"),
+            limit=body.get("limit", 25),
+        )
+        return {
+            "results": [r.model_dump() for r in results],
+            "total": len(results),
+            "query": topic,
+            "kind": kind,
+        }
+    elif kind == "issues":
+        results = await search_issues(topic, limit=body.get("limit", 25))
+        return {
+            "results": [r.model_dump() for r in results],
+            "total": len(results),
+            "query": topic,
+            "kind": kind,
+        }
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"Unknown kind: {kind}. Use repos, issues, or self_traffic",
+    )
+
+
+@app.post("/scan/web")
+async def scan_web(body: dict[str, Any]):
+    from llm_proxy import _llm_call
+
+    prompt = body.get("prompt", "")
+    if not prompt:
+        raise HTTPException(status_code=400, detail="prompt is required")
+
+    result = await _llm_call(prompt, max_tokens=1500, web_search=True)
+    return {"result": result or "", "query": prompt}

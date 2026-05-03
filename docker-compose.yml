@@ -103,6 +103,10 @@ services:
       - ./workflows/telegram.py:/app/telegram.py:ro
       - ./workflows/llm_proxy.py:/app/llm_proxy.py:ro
       - ./workflows/models.json:/app/models.json:ro
+      - ./workflows/scheduler.py:/app/scheduler.py:ro
+      - ./workflows/generators.py:/app/generators.py:ro
+      - ./workflows/reddit_search.py:/app/reddit_search.py:ro
+      - ./workflows/github_search.py:/app/github_search.py:ro
       # Soul — gives Max its persona context for self-directed tasks
       - ./openclaw/soul.md:/app/soul.md:ro
       # Brain — persistent knowledge storage
@@ -116,6 +120,13 @@ services:
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
       - PROXY_AUTH_TOKEN=${PROXY_AUTH_TOKEN}
       - OPENROUTER_CREDIT_BALANCE=${OPENROUTER_CREDIT_BALANCE:-0}
+      - REDDIT_CLIENT_ID=${REDDIT_CLIENT_ID:-}
+      - REDDIT_CLIENT_SECRET=${REDDIT_CLIENT_SECRET:-}
+      - REDDIT_USERNAME=${REDDIT_USERNAME:-}
+      - REDDIT_PASSWORD=${REDDIT_PASSWORD:-}
+      - REDDIT_USER_AGENT=${REDDIT_USER_AGENT:-clawrange-marketing-bot/0.1}
+      - GITHUB_PAT=${GITHUB_PAT:-}
+      - SCHEDULER_TZ=${SCHEDULER_TZ:-America/Chicago}
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped
