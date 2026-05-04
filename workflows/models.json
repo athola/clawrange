@@ -41,5 +41,9 @@
       "base_url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
       "env_key": "ZAI_API_KEY"
     }
+  },
+  "search": {
+    "provider": "openrouter",
+    "models": ["anthropic/claude-haiku-4-5:online"]
   }
 }
