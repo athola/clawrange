@@ -2469,3 +2469,309 @@ class TestWebCitationExtraction:
         assert "Here are the results." in result
         assert "https://example.com" in result
         assert "A Post" in result
+
+
+class TestTaskNeedsWeb:
+    """Keyword-driven detection that decides if a task needs live web data."""
+
+    def test_keyword_match_triggers_web_search(self):
+        """
+        GIVEN a task description containing a known web-search keyword
+        WHEN _task_needs_web is called
+        THEN it returns True so the work runner enables GLM web search.
+        """
+        from llm_proxy import _task_needs_web
+
+        for desc in (
+            "Find recent reddit posts about MSP pricing",
+            "Search for latest hacker news on Claude",
+            "Scan Lobsters for new self-hosted tools",
+            "Trending posts on x.com today",
+            "Give me a rundown of the news",
+        ):
+            assert _task_needs_web(desc) is True, f"expected web for: {desc!r}"
+
+    def test_no_keyword_returns_false(self):
+        """
+        GIVEN a task description with no web-search keywords
+        WHEN _task_needs_web is called
+        THEN it returns False so the LLM answers from training data.
+        """
+        from llm_proxy import _task_needs_web
+
+        for desc in (
+            "Summarize today's standup notes",
+            "Draft the invoice for Acme Co",
+            "Compute the next maintenance window",
+            "Review the brain entries for client X",
+        ):
+            assert _task_needs_web(desc) is False, f"unexpected web for: {desc!r}"
+
+    def test_match_is_case_insensitive(self):
+        """Keyword detection lowercases the input — REDDIT and Reddit must both match."""
+        from llm_proxy import _task_needs_web
+
+        assert _task_needs_web("Scan REDDIT for promo opportunities") is True
+        assert _task_needs_web("scan reddit for promo opportunities") is True
+
+    def test_keyword_set_locks_in_known_keywords(self):
+        """
+        Lock the canonical keyword set. If a keyword is removed, this fails so
+        the change becomes a conscious decision rather than silent drift.
+        """
+        from llm_proxy import _WEB_SEARCH_KEYWORDS
+
+        # Anchors that must remain — adding new keywords is fine, deletions need
+        # an explicit human review since downstream tasks rely on them.
+        anchors = {"reddit", "search", "news", "trending", "scan", "web"}
+        missing = anchors - _WEB_SEARCH_KEYWORDS
+        assert not missing, f"web-search anchor keywords removed: {missing}"
+
+
+class TestLlmWorkTaskRouting:
+    """_llm_work_task wires _task_needs_web into _llm_call with the right max_tokens."""
+
+    @patch.dict("os.environ", FAKE_ENV)
+    def test_web_task_uses_1500_max_tokens_and_zai_search(self):
+        """
+        GIVEN a task description that triggers web search
+        WHEN _llm_work_task runs
+        THEN _llm_call is invoked with max_tokens=1500 and web_search=True
+             (1500 was lifted from 500 so detailed link lists fit in Telegram).
+        """
+        import asyncio
+
+        import llm_proxy
+
+        captured = {}
+
+        async def fake_call(prompt, max_tokens, web_search=False):
+            captured["max_tokens"] = max_tokens
+            captured["web_search"] = web_search
+            captured["prompt"] = prompt
+            return "ok"
+
+        async def fake_prompt(desc, web_search=False):
+            return f"PROMPT[{web_search}]: {desc}"
+
+        with (
+            patch.object(llm_proxy, "_llm_call", side_effect=fake_call),
+            patch.object(llm_proxy, "_build_work_prompt", side_effect=fake_prompt),
+        ):
+            result = asyncio.run(
+                llm_proxy._llm_work_task("Scan reddit for MSP pain points")
+            )
+
+        assert result == "ok"
+        assert captured["max_tokens"] == 1500
+        assert captured["web_search"] is True
+
+    @patch.dict("os.environ", FAKE_ENV)
+    def test_non_web_task_uses_500_max_tokens(self):
+        """
+        GIVEN a task description without web keywords
+        WHEN _llm_work_task runs
+        THEN _llm_call is invoked with max_tokens=500 and web_search=False.
+        """
+        import asyncio
+
+        import llm_proxy
+
+        captured = {}
+
+        async def fake_call(prompt, max_tokens, web_search=False):
+            captured["max_tokens"] = max_tokens
+            captured["web_search"] = web_search
+            return "summary"
+
+        async def fake_prompt(desc, web_search=False):
+            return f"PROMPT[{web_search}]: {desc}"
+
+        with (
+            patch.object(llm_proxy, "_llm_call", side_effect=fake_call),
+            patch.object(llm_proxy, "_build_work_prompt", side_effect=fake_prompt),
+        ):
+            result = asyncio.run(llm_proxy._llm_work_task("Summarize standup notes"))
+
+        assert result == "summary"
+        assert captured["max_tokens"] == 500
+        assert captured["web_search"] is False
+
+    @patch.dict("os.environ", FAKE_ENV)
+    def test_empty_llm_response_returns_manual_fallback(self):
+        """
+        GIVEN _llm_call returns an empty string (all tiers down)
+        WHEN _llm_work_task runs
+        THEN it returns a manual-handoff string mentioning the description,
+             so heartbeat/Telegram surfaces the failure to Alex.
+        """
+        import asyncio
+
+        import llm_proxy
+
+        async def fake_call(prompt, max_tokens, web_search=False):
+            return ""
+
+        async def fake_prompt(desc, web_search=False):
+            return "PROMPT"
+
+        with (
+            patch.object(llm_proxy, "_llm_call", side_effect=fake_call),
+            patch.object(llm_proxy, "_build_work_prompt", side_effect=fake_prompt),
+        ):
+            result = asyncio.run(llm_proxy._llm_work_task("Send weekly invoice"))
+
+        assert "Could not reach LLM" in result
+        assert "Alex should handle manually" in result
+        assert "Send weekly invoice" in result
+
+
+class TestBuildWorkPromptFormatting:
+    """_build_work_prompt injects Telegram-format rules only when web_search is enabled."""
+
+    @patch.dict("os.environ", FAKE_ENV)
+    def test_web_search_branch_includes_telegram_format_rules(self):
+        """
+        GIVEN web_search=True
+        WHEN _build_work_prompt runs
+        THEN the prompt contains Telegram-oriented format rules
+             (numbered items, full URLs, suggested comments).
+        """
+        import asyncio
+
+        import llm_proxy
+
+        with (
+            patch.object(llm_proxy, "_load_soul", return_value=""),
+            patch.object(
+                llm_proxy,
+                "_gather_system_state",
+                new=AsyncMock(return_value="STATE"),
+            ),
+        ):
+            prompt = asyncio.run(
+                llm_proxy._build_work_prompt("Find reddit threads", web_search=True)
+            )
+
+        assert "OUTPUT FORMAT (for Telegram delivery):" in prompt
+        assert "Include full URLs" in prompt
+        assert "suggested comment" in prompt
+        assert "numbered items" in prompt.lower()
+
+    @patch.dict("os.environ", FAKE_ENV)
+    def test_non_web_search_branch_omits_telegram_format_rules(self):
+        """
+        GIVEN web_search=False
+        WHEN _build_work_prompt runs
+        THEN no Telegram format rules are appended (saves tokens for tasks
+             that don't return link lists).
+        """
+        import asyncio
+
+        import llm_proxy
+
+        with (
+            patch.object(llm_proxy, "_load_soul", return_value=""),
+            patch.object(
+                llm_proxy,
+                "_gather_system_state",
+                new=AsyncMock(return_value="STATE"),
+            ),
+        ):
+            prompt = asyncio.run(
+                llm_proxy._build_work_prompt("Summarize standup", web_search=False)
+            )
+
+        assert "OUTPUT FORMAT (for Telegram delivery):" not in prompt
+        assert "suggested comment" not in prompt
+
+    @patch.dict("os.environ", FAKE_ENV)
+    def test_url_invention_guard_always_present(self):
+        """
+        Anti-hallucination guard for URLs is in the shared RULES block, so it
+        must appear regardless of web_search flag. Locks in the wording the
+        proxy relies on for grounding.
+        """
+        import asyncio
+
+        import llm_proxy
+
+        with (
+            patch.object(llm_proxy, "_load_soul", return_value=""),
+            patch.object(
+                llm_proxy,
+                "_gather_system_state",
+                new=AsyncMock(return_value="STATE"),
+            ),
+        ):
+            for flag in (True, False):
+                prompt = asyncio.run(
+                    llm_proxy._build_work_prompt("any task", web_search=flag)
+                )
+                assert "Do NOT invent URLs" in prompt, f"missing for web={flag}"
+
+
+@patch.dict("os.environ", FAKE_ENV)
+@patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
+class TestAntiHallucinationTrailer:
+    """Trailing system message must steer the model away from fake tool syntax."""
+
+    def setup_method(self):
+        _reset_state()
+
+    @patch("llm_proxy._background_notify")
+    @patch("llm_proxy._call_provider", side_effect=_all_succeed)
+    def test_trailing_message_blocks_fake_tool_syntax(self, mock_call, _mock_bg):
+        """
+        GIVEN a chat request without tool schemas
+        WHEN the proxy forwards the request
+        THEN a trailing system message is appended that blocks fabricated
+             XML/bracket/tool_call output WITHOUT denying real capabilities
+             (regression guard for commit 2fa753c).
+        """
+        r = client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "hello"}]},
+            headers=AUTH_HEADER,
+        )
+        assert r.status_code == 200
+        sent_messages = mock_call.call_args.args[2]["messages"]
+        trailer = sent_messages[-1]
+        assert trailer["role"] == "system"
+        content = trailer["content"]
+        # Current wording — assert the steering language is present.
+        assert "XML tags" in content
+        assert "bracket syntax" in content
+        assert "tool_call" in content
+        # Regression guard: the old "you have zero tools" wording is gone.
+        assert "zero tools" not in content.lower()
+
+    @patch("llm_proxy._background_notify")
+    @patch("llm_proxy._call_provider", side_effect=_all_succeed)
+    def test_trailing_message_skipped_when_request_has_tools(self, mock_call, _mock_bg):
+        """
+        GIVEN a chat request that includes a tools schema
+        WHEN the proxy forwards the request
+        THEN the anti-hallucination trailer is NOT appended, because the
+             agent legitimately needs tool use (heartbeat, ops tasks).
+        """
+        body = {
+            "messages": [{"role": "user", "content": "do work"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "noop",
+                        "description": "no-op",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        }
+        r = client.post("/v1/chat/completions", json=body, headers=AUTH_HEADER)
+        assert r.status_code == 200
+        sent_messages = mock_call.call_args.args[2]["messages"]
+        # No trailing system message containing the anti-hallucination text.
+        for msg in sent_messages:
+            if msg["role"] == "system":
+                assert "XML tags" not in msg.get("content", "")

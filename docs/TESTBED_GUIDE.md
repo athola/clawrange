@@ -1,6 +1,7 @@
-# AI MSP Testbed Guide
+# ClawRange Testbed Guide
 
-Local validation environment for the AI-powered MSP stack: OpenClaw + n8n + DeerFlow + Ollama.
+Local validation environment for the ClawRange stack:
+OpenClaw + Workflows (FastAPI) + optional DeerFlow + optional Ollama.
 
 ## Quick Start
 
@@ -13,13 +14,11 @@ cd ~/clawrange
 make setup
 nano .env
 
-# 3. Start the core stack (OpenClaw + n8n)
+# 3. Start the core stack (OpenClaw + Workflows)
 make start
 
-# 4. Open n8n and activate the workflows
-#    Go to http://localhost:5678
-#    Import workflows from n8n/workflows/ if not auto-loaded
-#    Toggle each workflow to "Active"
+# 4. Confirm services are healthy
+make health
 
 # 5. Run validation tests
 make test
@@ -35,13 +34,29 @@ Total setup time: under 10 minutes (excluding Docker image pulls).
 
 ## What Each Service Does
 
-**OpenClaw** is the AI gateway. It receives messages from clients (via WhatsApp, Telegram, web chat, etc.), routes them through an LLM (via OpenRouter), and returns responses shaped by the soul.md persona. It's the "brain" of the system — the thing that makes your manufactured home dealer's AI assistant sound like it works at a manufactured home dealer. Accessible at http://localhost:3000.
+**OpenClaw** is the AI assistant gateway. It receives messages over
+Telegram (and HTTP), routes them through the workflows LLM proxy, and
+returns responses shaped by `openclaw/soul.md`. The default persona is
+"John-117", Alex Thola's executive assistant. Accessible at
+http://localhost:3000.
 
-**n8n** is the workflow automation engine. It handles everything the AI can't do alone: scheduled morning briefings, CRM lead lookups, webhook integrations, appointment scheduling triggers, and any future automation you wire up. Think of it as the "nervous system" connecting the AI brain to business tools. Dashboard at http://localhost:5678.
+**Workflows** is the FastAPI service that replaced n8n. It owns the
+brain database (SQLite + optional embeddings), the persistent task
+queue, the OpenAI-compatible LLM proxy with tiered routing, the
+APScheduler-driven cron jobs, and the marketing scanners
+(Reddit + GitHub). Endpoints live at http://localhost:5678 — see
+[specification.md](specification.md) for the full surface.
 
-**DeerFlow** is the deep research layer (optional). When a client question needs real research — market analysis, competitor comparisons, regulatory questions — DeerFlow dispatches sub-agents that search the web, synthesize findings, and produce structured reports. It's overkill for most daily interactions but valuable for pre-sales research and market intelligence. Runs at http://localhost:2026 when started with `--with-deerflow`.
+**DeerFlow** is the deep research layer (optional). When a question
+needs broad research — market analysis, regulatory deep dives — DeerFlow
+dispatches sub-agents that search the web, synthesize findings, and
+produce structured reports. Overkill for most daily ops. Runs at
+http://localhost:2026 when started with `--with-deerflow`.
 
-**Ollama** provides local LLM inference for onsite deployment. When a client site needs AI responses without internet dependency (air-gapped environments, unreliable connections), Ollama runs a small model directly on the ThinkCentre hardware. Test it with `./scripts/test_ollama.sh` to validate your hardware can handle it.
+**Ollama** provides local LLM inference for air-gapped or onsite
+deployment. When the host needs AI responses without internet
+dependency, Ollama runs a small model on the ThinkCentre hardware.
+Test it with `./scripts/test_ollama.sh` to validate the hardware.
 
 ## Testing the Stack
 
@@ -51,33 +66,28 @@ Run the full validation suite:
 ./scripts/test_all.sh
 ```
 
-This runs 6 tests in sequence:
+The suite checks core service health, OpenClaw chat completions, the
+workflows webhook canary, and (optionally) DeerFlow. Individual scripts
+can be run on their own:
 
-| Test | What It Checks | Requirements |
-|------|---------------|-------------|
-| 1. Stack Health | OpenClaw and n8n respond to health checks | Services running |
-| 2. OpenClaw Response | AI returns a relevant answer about financing | OPENROUTER_API_KEY set |
-| 3. n8n Roundtrip | Test webhook echoes a payload back | Test Webhook workflow active |
-| 4. Lead Lookup | Lead status returns John Smith's data | Lead Status workflow active |
-| 5. Morning Briefing | Morning Briefing workflow exists and can trigger | Workflow imported |
-| 6. DeerFlow Research | Research agent returns relevant results | DeerFlow running (optional) |
-
-**Target: 5/6 or 6/6 passed.** DeerFlow (test 6) is optional.
-
-You can also run individual test scripts:
 ```bash
-./scripts/test_openclaw.sh    # OpenClaw only
-./scripts/test_n8n.sh         # n8n workflows only
-./scripts/test_deerflow.sh    # DeerFlow only
+./scripts/test_openclaw.sh    # OpenClaw chat-completion path
+./scripts/test_workflows.sh   # Workflows endpoints
+./scripts/test_deerflow.sh    # DeerFlow research layer
 ./scripts/test_ollama.sh      # Local Ollama inference
 ```
 
-Or use the Python validation suite (offline, no services required):
+Use the Python suites for offline validation (no services required):
+
 ```bash
-make validate                                    # config checks + unit tests
-python3 tests/validate_stack.py                  # config checks only
-python3 -m pytest tests/test_validate_stack.py   # unit tests only
+make validate                                    # config + structure checks
+python3 tests/validate_stack.py                  # structure check only
+python3 -m pytest tests/test_validate_stack.py   # validate_stack unit tests
+make test-unit                                   # workflows/tests/ pytest
 ```
+
+`workflows/tests/` covers the FastAPI app, brain database, LLM proxy
+routing, marketing scanners, and Telegram formatting.
 
 ## Common Issues
 
@@ -85,13 +95,13 @@ python3 -m pytest tests/test_validate_stack.py   # unit tests only
 |---------|---------|-----|
 | Port already in use | `bind: address already in use` | `lsof -ti :3000 \| xargs kill` (replace 3000 with the conflicting port) |
 | Docker not running | `Cannot connect to Docker daemon` | Start Docker Desktop or run `sudo systemctl start docker` |
-| OpenRouter API key invalid | OpenClaw returns errors, test 2 fails | Check key at https://openrouter.ai/settings/keys. Verify balance > $0. |
+| OpenRouter API key invalid | OpenClaw returns errors, completion tests fail | Check key at https://openrouter.ai/settings/keys. Verify balance > $0. |
 | OpenRouter balance zero | LLM calls return 402 errors | Add credits at https://openrouter.ai/credits |
-| OpenClaw can't reach n8n | Webhook calls from OpenClaw fail | Both must be on `msp-network`. Check `docker network ls` and `docker network inspect msp-network`. |
+| OpenClaw can't reach Workflows | Tool/proxy calls from OpenClaw fail | Both must be on `msp-network`. Check `docker network ls` and `docker network inspect msp-network`. |
 | DeerFlow using ByteDance endpoints | Research calls go to Doubao/Volcengine | Check `deer-flow/config.yaml` — all models must have `base_url: https://openrouter.ai/api/v1` |
 | Ollama out of memory | `out of memory` or killed process | Use a smaller model: `ollama run llama3.2:1b`. Or close other apps to free RAM. |
-| n8n workflow import fails | Workflows don't appear in n8n UI | Manually import: n8n UI > Workflows > Import > select JSON from `n8n/workflows/` |
-| Morning briefing not triggering | Test 5 fails, no briefing generated | The cron runs at 8 AM weekdays. For manual testing, trigger via n8n UI "Execute" button. |
+| Schedules not firing | `/sched` shows next_fire_time but no tasks created | Workflows must run with a single uvicorn worker; check container memory and `make logs-workflows`. |
+| Reddit/GitHub scans return empty | `/scan/reddit` or `/scan/github` empty results | Confirm credentials in `.env` (REDDIT_*, GITHUB_PAT). Missing creds degrade gracefully — no exception, just empty list. |
 
 ## Cost Estimation
 
@@ -115,21 +125,22 @@ Monitor in real-time: OpenRouter dashboard shows per-model token usage and cost 
 
 ## Moving to Production
 
-When deploying to a real client site (DigitalOcean Droplet + ThinkCentre M75q):
+When deploying to the live host (DigitalOcean Droplet + ThinkCentre M75q),
+see [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md) for the full Tailscale +
+Caddy walkthrough. Key shifts vs. the local testbed:
 
 | Aspect | Testbed (Local) | Production |
 |--------|----------------|------------|
-| **Docker images** | `:latest` tags | Pin to specific versions (e.g., `ghcr.io/openclaw/openclaw:v1.2.3`) |
+| **Docker images** | `:latest` tags | Pin to specific versions (e.g. `ghcr.io/openclaw/openclaw:2026.3.24`) |
 | **Network** | Docker bridge on localhost | Tailscale VPN mesh between Droplet and ThinkCentre |
-| **Domain/SSL** | http://localhost | Real domain with Let's Encrypt SSL via Caddy or nginx |
-| **activeHours** | Test schedule | Client's actual business hours |
-| **soul.md** | "Longview Home Center" test persona | Client-specific persona from intake interview |
-| **n8n workflows** | Mock data stubs | Connected to real CRM, email, calendar APIs |
-| **Volumes** | Local Docker volumes | Persistent volumes with backup strategy |
-| **Secrets** | .env file | Docker secrets or Vault |
-| **Monitoring** | Manual test scripts | Uptime Kuma + alerting |
-| **DeerFlow** | Optional, local | Runs on Droplet for research-heavy clients |
-| **Ollama** | Test on laptop | Runs on ThinkCentre for air-gapped/Tier 3 clients |
+| **Domain/SSL** | http://localhost | Real domain with Let's Encrypt SSL via Caddy |
+| **soul.md** | Default John-117 persona | Same, optionally swap `soul-ops.md` for ops mode |
+| **Workflows** | Hot-reload bind mounts | Image-baked code, single uvicorn worker |
+| **Brain DB** | `data/brain/brain.db` (bind mount) | Persistent volume with backup strategy |
+| **Secrets** | `.env` file | Docker secrets or sealed env |
+| **Monitoring** | Manual test scripts | Uptime Kuma + Telegram alerts (`/tier/notify`) |
+| **DeerFlow** | Optional, local | Runs on Droplet only when needed |
+| **Ollama** | Test on laptop | Runs on ThinkCentre for air-gapped fallback |
 
 **Tailscale VPN setup** (done separately):
 1. Install Tailscale on both the Droplet and ThinkCentre
@@ -137,24 +148,19 @@ When deploying to a real client site (DigitalOcean Droplet + ThinkCentre M75q):
 3. Replace `localhost` URLs with Tailscale IPs (e.g., `http://100.x.y.z:5678`)
 4. Enable Tailscale MagicDNS for friendly names
 
-## Claude Code Max Tip
+## Repurposing for a New Operator
 
-For every new client, use this prompt template with Claude Code:
+The default persona is wired for Alex Thola. To repoint the stack:
 
-```
-Based on these notes from a [business type] in [city, state], write:
+1. Replace `openclaw/soul.md` with the new operator's persona and
+   `openclaw/soul-ops.md` with their ops-mode instructions. Keep
+   responses tight — Telegram is the main channel.
+2. Reseed the marketing orchestrator: `POST /projects` with the new
+   slugs/repos, then `POST /sched` for any cron jobs that should run.
+3. Update `openclaw/HEARTBEAT.md` if the heartbeat cadence or task
+   priorities differ.
+4. Re-run `make test` to confirm health, completion, and webhook
+   canary still pass.
 
-1. An OpenClaw soul.md persona for their AI assistant
-2. Three n8n workflows for: [specific tasks from intake interview]
-3. A DeerFlow research prompt for: [industry-specific research need]
-
-Use these mock API endpoints for testing:
-- Lead lookup: http://localhost:5678/webhook-test/lead-status
-- Morning briefing: http://localhost:5678/webhook/morning-briefing
-- Test webhook: http://localhost:5678/webhook-test/test
-
-Client notes:
-[paste your interview notes here]
-```
-
-This generates a complete testable configuration for each new client in minutes.
+The brain database is operator-specific — wipe `data/brain/brain.db`
+before reseeding if you want a clean slate.

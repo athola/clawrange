@@ -1,93 +1,137 @@
 # ClawRange
 
-Local validation testbed for the AI-powered MSP (Managed Service Provider)
-stack. Simulates the production architecture (DigitalOcean cloud gateway +
-Lenovo ThinkCentre onsite node) entirely on a single machine using Docker.
+Personal AI ops stack for [@athola](https://github.com/athola). Wraps an
+OpenClaw assistant ("John-117") around a FastAPI workflows service that
+holds the persistent brain, task queue, scheduler, and marketing scanners.
+Designed to run on a single machine (laptop, ThinkCentre, or droplet) and
+optionally exposed to the public internet through a Tailscale + Caddy
+gateway.
 
 ## Stack
 
 | Service | Purpose | Port |
 |---------|---------|------|
-| [OpenClaw](https://github.com/openclaw/openclaw) | AI assistant gateway -- routes client messages through LLMs via OpenRouter | 3000 |
-| [n8n](https://n8n.io/) | Workflow automation -- webhooks, CRM lookups, scheduled briefings | 5678 |
-| [DeerFlow](https://github.com/bytedance/deer-flow) | Deep research agent -- market analysis, competitor research (optional) | 2026 |
-| [Ollama](https://ollama.com/) | Local LLM inference -- for air-gapped/onsite deployment testing | 11434 |
+| [OpenClaw](https://github.com/openclaw/openclaw) | AI assistant gateway — routes Telegram + chat messages through the LLM proxy | 3000 |
+| Workflows (FastAPI) | Brain DB, task queue, LLM proxy, scheduler, Reddit/GitHub scanners — replaces n8n | 5678 |
+| [DeerFlow](https://github.com/bytedance/deer-flow) | Deep research agent (optional, for heavy market analysis) | 2026 |
+| [Ollama](https://ollama.com/) | Local LLM inference (optional, for air-gapped tests) | 11434 |
 
 ## Requirements
 
 - Docker 24+ and Docker Compose v2
-- 8 GB free RAM
-- [OpenRouter API key](https://openrouter.ai/settings/keys) ($10+ balance
-  recommended)
-- Ollama (optional, for local inference testing)
+- 8 GB free RAM (workflows container is capped at 128 MB; OpenClaw at 2 GB)
+- [OpenRouter API key](https://openrouter.ai/settings/keys) with $10+ balance
+- Optional: Z.AI key (GLM Tier 2 fallback), Telegram bot token, Reddit
+  script-app credentials, GitHub PAT — see `.env.example`
 
 ## Quick Start
 
 ```bash
-make setup          # create .env from template, generate encryption key
-# edit .env -- add your OPENROUTER_API_KEY
-make start          # bring up OpenClaw + n8n
-make test           # run 6-test validation suite
+make setup          # generates .env from template + a random gateway token
+# edit .env -- add OPENROUTER_API_KEY at minimum
+make start          # bring up OpenClaw + workflows
+make health         # confirm both services answer /healthz
+make test           # run the validation suite
 ```
 
-See [docs/TESTBED_GUIDE.md](docs/TESTBED_GUIDE.md) for DeerFlow setup,
-Ollama testing, cost estimation, and production deployment notes.
+For Tailscale-secured deployment (cloud gateway + onsite node), see
+[docs/DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md). For specs covering
+the marketing orchestrator and brain database, see
+[docs/specification.md](docs/specification.md) and
+[docs/project-brief.md](docs/project-brief.md).
 
 ## Testing
 
-**Live tests** (requires running services):
+**Live tests** (require running services):
 
 ```bash
-make test                # full 6-test suite against running stack
-make test-openclaw       # OpenClaw only
-make test-n8n            # n8n workflows only
-make test-deerflow       # DeerFlow research layer
-make test-ollama         # local Ollama inference
+make test            # full validation suite via scripts/test_all.sh
+make test-openclaw   # OpenClaw layer only
+make test-workflows  # Workflows endpoints (health + canary webhook)
+make test-deerflow   # DeerFlow research layer
+make test-ollama     # local Ollama inference
 ```
 
 **Offline validation** (no services required):
 
 ```bash
-make validate            # config checks + unit tests
+make validate        # tests/validate_stack.py + pytest unit tests
+make test-unit       # workflows/tests/ — app, brain, llm_proxy, marketing
 ```
 
-This runs `tests/validate_stack.py` (project structure and config validation)
-and `tests/test_validate_stack.py` (34 pytest unit tests covering all 8
-validation checks).
+The Python unit tests under `workflows/tests/` cover the FastAPI app, brain
+database, LLM proxy routing, marketing scanners, and Telegram formatting.
+`tests/test_validate_stack.py` validates project structure and configs.
 
 ## Make Targets
 
 **Lifecycle:**
-`setup` | `start` | `start-full` | `stop` | `stop-clean` | `restart` | `reset`
+`setup` | `start` | `start-full` | `stop` | `stop-clean` | `restart` |
+`reset` | `start-prod` | `stop-prod`
 
 **Testing:**
-`test` | `test-openclaw` | `test-n8n` | `test-deerflow` | `test-ollama` |
-`validate`
+`test` | `test-openclaw` | `test-workflows` | `test-deerflow` |
+`test-ollama` | `test-unit` | `validate`
 
 **Inspection:**
-`health` | `ps` | `logs` | `logs-openclaw` | `logs-n8n`
+`health` | `ps` | `logs` | `logs-openclaw` | `logs-workflows`
 
 **Quality:**
 `lint` | `format` | `env-check`
 
 Run `make help` for descriptions of each target.
 
-## Test Persona
+## Persona
 
-The testbed ships with "Max", an AI assistant for **Longview Home Center**
-(manufactured home dealer in Longview, TX). Max handles questions about
-Jessup and Titanium brand homes, FHA/VA/conventional/in-house financing,
-and appointment scheduling.
+The default persona is **John-117** — Alex's executive assistant. He owns
+the task queue, watches infrastructure tier health, runs the morning
+standup, and drives the marketing scanners for Alex's three tracked
+projects (`claude-night-market`, `skrills`, `simple-resume`). The persona
+lives in `openclaw/soul.md`. To repurpose this stack for a different
+operator, swap that file (and `openclaw/soul-ops.md` for ops mode).
 
 ## Architecture
 
 ```
-Production:
-  Cloud (DigitalOcean) --Tailscale VPN--> Onsite (ThinkCentre M75q)
-  [OpenClaw + n8n + DeerFlow]              [Ollama]
+Production (Tailscale-secured):
+  Internet → DigitalOcean droplet (Caddy + TLS) → Tailscale → Onsite node
+                                                              [OpenClaw + Workflows + Ollama]
 
-Testbed (this repo):
+Local stack (this repo):
   Docker on localhost
-  [OpenClaw:3000] <-> [n8n:5678] <-> [DeerFlow:2026]
-                                      [Ollama:11434]
+  [OpenClaw:3000] ──► [Workflows:5678] ──► brain.db (SQLite)
+                              │                │
+                              ▼                ▼
+                        OpenRouter       APScheduler
+                        (LLM tiers)      (cron jobs)
+                              │                │
+                              ▼                ▼
+                          [Z.AI GLM]     Reddit + GitHub scanners
 ```
+
+The workflows service is a single FastAPI process. It owns:
+
+- `/healthz`, `/tier`, `/tier/notify` — health and tier status
+- `/v1/chat/completions` — OpenAI-compatible LLM proxy with tiered
+  routing, balance circuit breaker, and anti-hallucination guard
+- `/task`, `/task/{id}`, `/task/{id}/claim`, `/task/{id}/result` —
+  task queue
+- `/brain/*` — persistent knowledge store (pages + embeddings)
+- `/projects`, `/sched`, `/scan/{reddit,github,web}` — marketing
+  orchestrator (`/scan/web` routes through GLM server-side web search)
+- `/webhook-test/test` — connectivity canary
+
+### Marketing Orchestrator
+
+Scheduled scans are driven by APScheduler with four built-in generators
+registered in `workflows/generators.py`:
+
+- `morning_scan` — daily Reddit + GitHub scan per tracked project
+- `weekly_traffic` — weekly traffic snapshot tasks
+- `awesome_lists_watch` — alerts when projects are missing from
+  curated awesome-lists
+- `custom_scan` — generic topic scan for user-defined schedules
+
+Schedules are stored in the brain DB and managed via `/sched`. Each
+generator enqueues tasks into the same queue agents read from
+`/task/{id}/claim`, so manual and scheduled work share one pipeline.
