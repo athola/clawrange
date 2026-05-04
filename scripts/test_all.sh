@@ -63,12 +63,12 @@ echo ""
 
 # ─── Test 2: OpenClaw Agent Response ───────────────────────────────
 echo "Test 2 — OpenClaw Agent"
-RESPONSE=$(docker exec msp-openclaw runuser -u node -- openclaw agent --agent main \
-  -m "What financing options does Longview Home Center offer?" --json 2>/dev/null) || RESPONSE=""
+RESPONSE=$(docker exec msp-openclaw runuser -u node -- openclaw agent --agent max \
+  -m "Respond with exactly one word: PONG" --json 2>/dev/null) || RESPONSE=""
 
 AGENT_TEXT=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('result',{}).get('payloads',[{}])[0].get('text',''))" 2>/dev/null) || AGENT_TEXT=""
 echo "  Response: $(echo "$AGENT_TEXT" | head -c 200)"
-if echo "$AGENT_TEXT" | grep -qiE "FHA|VA|conventional|in-house|financ"; then
+if echo "$AGENT_TEXT" | grep -qi "PONG"; then
   pass
 elif echo "$AGENT_TEXT" | grep -qi "billing\|credits\|balance\|insufficient"; then
   echo "  OpenRouter balance empty — agent works but LLM call failed."
@@ -76,7 +76,7 @@ elif echo "$AGENT_TEXT" | grep -qi "billing\|credits\|balance\|insufficient"; th
   skip
 else
   fail
-  echo "  Expected mention of financing or billing error."
+  echo "  Expected PONG or billing error."
   echo "  Check OPENROUTER_API_KEY in .env"
 fi
 echo ""
@@ -96,31 +96,47 @@ else
 fi
 echo ""
 
-# ─── Test 4: Lead Status Lookup ─────────────────────────────────────
-echo "Test 4 — Lead Status Lookup"
-RESPONSE=$(curl -sf --connect-timeout 5 --max-time 15 -X POST "http://localhost:${WORKFLOWS_PORT}/webhook-test/lead-status" \
+# ─── Test 4: Task Queue Lifecycle ──────────────────────────────────
+# Validates the core FastAPI surface that replaced n8n: create a task,
+# read it back, then cancel it. Round-trips the brain DB.
+echo "Test 4 — Task Queue Lifecycle"
+TASK_DESC="stack-validation probe $(date +%s)"
+CREATE_RESPONSE=$(curl -sf --connect-timeout 5 --max-time 15 -X POST "http://localhost:${WORKFLOWS_PORT}/task" \
   -H "Content-Type: application/json" \
-  -d '{"name": "John Smith", "phone": "903-555-0100"}' 2>/dev/null) || RESPONSE=""
+  -d "{\"description\": \"${TASK_DESC}\", \"priority\": 5}" 2>/dev/null) || CREATE_RESPONSE=""
 
-echo "  Response: $(echo "$RESPONSE" | head -c 200)"
-if echo "$RESPONSE" | grep -qi "John Smith"; then
-  pass
-else
+TASK_ID=$(echo "$CREATE_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null) || TASK_ID=""
+echo "  Created task id: ${TASK_ID:-<none>}"
+
+if [ -z "$TASK_ID" ]; then
   fail
-  echo "  Check workflows service: docker compose logs workflows"
+  echo "  POST /task did not return an id. Check: docker compose logs workflows"
+else
+  GET_RESPONSE=$(curl -sf --connect-timeout 5 --max-time 10 "http://localhost:${WORKFLOWS_PORT}/task/${TASK_ID}" 2>/dev/null) || GET_RESPONSE=""
+  echo "  Read response: $(echo "$GET_RESPONSE" | head -c 160)"
+  curl -sf --connect-timeout 5 --max-time 10 -X DELETE "http://localhost:${WORKFLOWS_PORT}/task/${TASK_ID}" >/dev/null 2>&1 || true
+  if echo "$GET_RESPONSE" | grep -qF "$TASK_DESC"; then
+    pass
+  else
+    fail
+    echo "  GET /task/${TASK_ID} did not echo the description back."
+  fi
 fi
 echo ""
 
-# ─── Test 5: Morning Briefing ──────────────────────────────────────
-echo "Test 5 — Morning Briefing"
-RESPONSE=$(curl -sf --connect-timeout 5 --max-time 15 "http://localhost:${WORKFLOWS_PORT}/webhook/morning-briefing" 2>/dev/null) || RESPONSE=""
+# ─── Test 5: Tier and Balance Probe ────────────────────────────────
+# Validates the LLM proxy is configured and can report tier status +
+# OpenRouter balance. This is the closest equivalent of the old
+# "morning briefing" canary on the new FastAPI surface.
+echo "Test 5 — Tier and Balance Probe"
+RESPONSE=$(curl -sf --connect-timeout 5 --max-time 15 "http://localhost:${WORKFLOWS_PORT}/tier" 2>/dev/null) || RESPONSE=""
 
 echo "  Response: $(echo "$RESPONSE" | head -c 200)"
-if echo "$RESPONSE" | grep -qi "MORNING BRIEFING"; then
+if echo "$RESPONSE" | grep -qiE '"tiers"|"balance"|"current_tier"'; then
   pass
 else
   fail
-  echo "  Check workflows service: docker compose logs workflows"
+  echo "  GET /tier did not return tier metadata. Check: docker compose logs workflows"
 fi
 echo ""
 
@@ -150,7 +166,7 @@ fi
 echo ""
 
 # ─── Summary ────────────────────────────────────────────────────────
-LABELS="Stack Health|OpenClaw Response|Webhook Roundtrip|Lead Lookup|Morning Briefing|DeerFlow Research"
+LABELS="Stack Health|OpenClaw Response|Webhook Roundtrip|Task Queue|Tier Probe|DeerFlow Research"
 
 echo "============================================="
 echo " STACK VALIDATION REPORT"

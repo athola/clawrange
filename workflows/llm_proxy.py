@@ -1683,20 +1683,18 @@ async def _llm_call(
     Returns the response text, or None on failure. Used for both
     task suggestions (thinking) and task execution (working).
 
-    When web_search=True, only Z.AI tiers are used (GLM server-side
-    web search). Other providers lack web access and would return
-    hallucinated or "I can't do that" responses.
+    When web_search=True, routes through CONFIG["search"] — a dedicated
+    tier (OpenRouter `:online`) that performs server-side web search.
+    Z.AI's web_search MCP tool is paywalled to a separate resource
+    package the GLM Coding Plan does not unlock, so it's bypassed.
     """
+    if web_search:
+        return await _llm_call_search(prompt, max_tokens)
+
     for tier in CONFIG["tiers"]:
         if _circuit_open(tier["name"]):
             continue
         provider = tier["provider"]
-
-        # Only Z.AI supports server-side web search — skip other providers
-        # to avoid getting a useless "I can't access the web" response
-        # that would short-circuit before reaching a capable tier.
-        if web_search and provider != "zai":
-            continue
 
         provider_config = CONFIG["providers"][provider]
         api_key = os.getenv(provider_config["env_key"], "")
@@ -1709,26 +1707,12 @@ async def _llm_call(
             "temperature": 0.7,
         }
 
-        call_provider = provider
-        if web_search:
-            call_provider = "zai-search"
-            body["tools"] = [{"type": "web_search", "web_search": {"enable": True}}]
-
         try:
-            resp = await _call_provider(call_provider, tier["models"], body, api_key)
+            resp = await _call_provider(provider, tier["models"], body, api_key)
             if resp.status_code == 200:
                 data = resp.json()
                 msg = data.get("choices", [{}])[0].get("message", {})
                 text = (msg.get("content") or "").strip()
-
-                # GLM web search returns citations in tool_calls alongside
-                # content. Extract and append them so the result includes
-                # actual URLs instead of bare prose.
-                if web_search and msg.get("tool_calls"):
-                    citations = _extract_web_citations(msg["tool_calls"])
-                    if citations:
-                        text = f"{text}\n\n{citations}" if text else citations
-
                 if text:
                     return text
         except Exception:
@@ -1736,8 +1720,58 @@ async def _llm_call(
     return None
 
 
+async def _llm_call_search(prompt: str, max_tokens: int) -> str | None:
+    """Route web-search tasks to the dedicated search tier (OpenRouter :online).
+
+    The model name carries the `:online` suffix, which tells OpenRouter to run
+    Exa-powered web search before generation and attach url_citation
+    annotations to the response. We extract those citations and append them
+    to the answer text so Telegram messages include real source links.
+    """
+    search_cfg = CONFIG.get("search")
+    if not search_cfg:
+        return None
+
+    provider = search_cfg["provider"]
+    models = search_cfg["models"]
+    provider_config = CONFIG["providers"][provider]
+    api_key = os.getenv(provider_config["env_key"], "")
+    if not api_key:
+        return None
+
+    body = {
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": 0.7,
+    }
+    try:
+        resp = await _call_provider(provider, models, body, api_key)
+        if resp.status_code == 200:
+            data = resp.json()
+            msg = data.get("choices", [{}])[0].get("message", {})
+            text = (msg.get("content") or "").strip()
+            citations = _extract_openrouter_citations(msg.get("annotations") or [])
+            if citations:
+                text = f"{text}\n\n{citations}" if text else citations
+            if text:
+                return text
+        else:
+            print(
+                f"[PROXY] search tier {provider} returned {resp.status_code}: "
+                f"{resp.text[:200]}",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"[PROXY] search tier exception: {type(exc).__name__}: {exc}", flush=True)
+    return None
+
+
 def _extract_web_citations(tool_calls: list[dict]) -> str:
-    """Pull URLs and titles from GLM web_search tool call results."""
+    """Pull URLs and titles from GLM web_search tool call results.
+
+    Retained for backwards compatibility with any direct GLM web_search
+    integration. The active search path now uses _extract_openrouter_citations.
+    """
     refs: list[str] = []
     for tc in tool_calls:
         if tc.get("type") == "web_search":
@@ -1748,6 +1782,29 @@ def _extract_web_citations(tool_calls: list[dict]) -> str:
                 content = hit.get("content", "")[:120]
                 if link:
                     refs.append(f"{i}. [{title}]({link})\n   {content}")
+    return "\n".join(refs)
+
+
+def _extract_openrouter_citations(annotations: list[dict]) -> str:
+    """Pull URLs and titles from OpenRouter `:online` url_citation annotations.
+
+    OpenRouter's `:online` plugin returns citations on the message via:
+        message.annotations[].type == "url_citation"
+        message.annotations[].url_citation = {url, title, content, start_index, end_index}
+
+    Format mirrors _extract_web_citations so Telegram output stays consistent
+    regardless of which search backend produced the citations.
+    """
+    refs: list[str] = []
+    for i, ann in enumerate(annotations, 1):
+        if ann.get("type") != "url_citation":
+            continue
+        c = ann.get("url_citation", {})
+        url = c.get("url", "")
+        title = c.get("title", "")
+        snippet = (c.get("content") or "")[:120]
+        if url:
+            refs.append(f"{i}. [{title}]({url})\n   {snippet}")
     return "\n".join(refs)
 
 
