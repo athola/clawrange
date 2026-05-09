@@ -735,6 +735,7 @@ async def hot_pulse_generator(
     extra_subreddits: list[str] | None = None,
     max_per_project: int = 25,
     window: str = "15m",
+    min_relevance: float = 1.0,
     **kwargs,
 ) -> None:
     """Reddit pulse for brand-new comment candidates.
@@ -748,9 +749,13 @@ async def hot_pulse_generator(
 
     Per project, searches the union of that project's subreddits +
     the AI-coding extras for posts created in the last `window`
-    (default 15m). Strict-relevance filter only — even at 15min the
-    upvote sample is too small to compute an adaptive popularity
-    threshold, so we trust the keyword/term match alone.
+    (default 15m). High-precision filter: a post must literally match
+    a project topic (rel 1.0) or search_term (rel 1.5) in title or
+    snippet — `min_relevance` (default 1.0) is the floor. The 15min
+    upvote sample is too small to fall back on popularity, so the
+    operator's stated rule applies: surface only the highly relevant,
+    let the 24h morning_digest's popular-bonus tier handle the
+    less-relevant-but-popular case.
 
     `max_per_project` defaults to 25 — effectively uncapped for any
     realistic window. The operator wants every relevant post
@@ -839,13 +844,8 @@ async def hot_pulse_generator(
                 if brain_db.is_seen("reddit_pulse", post.id, slug):
                     continue
                 rel = _score_relevance(post, topics, terms)
-                # Reddit returned this post for THIS project's `query`.
-                # Trust the upstream search relevance: assign a
-                # sub-literal baseline of 0.5 when no literal phrase
-                # matches, so semantic hits still surface but rank
-                # below true literal matches.
-                if rel <= 0:
-                    rel = 0.5
+                if rel < min_relevance:
+                    continue
                 prior = best_for_post.get(post.id)
                 if prior is None or rel > prior[2]:
                     best_for_post[post.id] = (project, post, rel, query)

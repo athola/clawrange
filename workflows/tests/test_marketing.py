@@ -1368,11 +1368,13 @@ class TestHotPulseGenerator:
         assert len(post_tasks) == pre
 
     @pytest.mark.asyncio
-    async def test_hot_pulse_surfaces_semantic_match_with_baseline(self, monkeypatch):
-        """A post returned by Reddit's search but lacking the literal
-        project term in title/snippet must still surface — Reddit's
-        upstream relevance is trusted with a baseline rel=0.5. The
-        post should render with the ◇ semantic-tier marker."""
+    async def test_hot_pulse_drops_semantic_only_matches(self, monkeypatch):
+        """Posts Reddit's search returned for our query but that lack a
+        literal topic/term phrase in title/snippet are NOT surfaced in
+        the 15-min pulse. The operator wants high-precision picks; the
+        24h morning_digest still has the popular-bonus tier for
+        less-relevant-but-popular posts. Operator's contract: skip
+        unless rel >= min_relevance (default 1.0)."""
         from unittest.mock import AsyncMock
 
         from generators import hot_pulse_generator
@@ -1387,7 +1389,6 @@ class TestHotPulseGenerator:
             search_terms=["agent orchestration"],
         )
         # Title intentionally avoids "agent orchestration" verbatim.
-        # Reddit returned it for our query — we trust that.
         semantic_post = RedditPost(
             id="sem1",
             url="https://reddit.com/r/selfhosted/comments/sem1",
@@ -1408,13 +1409,63 @@ class TestHotPulseGenerator:
 
         await hot_pulse_generator(brain_db)
 
+        notify_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_hot_pulse_min_relevance_is_overridable(self, monkeypatch):
+        """min_relevance defaults to 1.0 (one literal topic OR term
+        match required). Operators can tighten via schedule kwargs:
+        min_relevance=1.5 means only multi-word search_terms qualify
+        and single-word topic matches are dropped."""
+        from unittest.mock import AsyncMock
+
+        from generators import hot_pulse_generator
+        from reddit_search import RedditPost
+
+        brain_db.upsert_project(
+            "simple-resume",
+            "athola",
+            "simple-resume",
+            topics=["resume"],  # single-word topic, rel == 1.0
+            subreddits=["resumes"],
+            search_terms=["yaml resume"],  # multi-word term, rel == 1.5
+        )
+
+        topic_only = RedditPost(
+            id="topic1",
+            url="https://reddit.com/r/resumes/comments/topic1",
+            title="Resume tips for 2026",
+            subreddit="resumes",
+            score=4,
+            comments=1,
+            created_utc="2026-05-09T19:15:00+00:00",
+        )
+        term_match = RedditPost(
+            id="term1",
+            url="https://reddit.com/r/resumes/comments/term1",
+            title="My yaml resume tool",
+            subreddit="resumes",
+            score=4,
+            comments=1,
+            created_utc="2026-05-09T19:15:00+00:00",
+        )
+
+        async def fake_search(*a, **kw):
+            return [topic_only, term_match]
+
+        monkeypatch.setattr("reddit_search.search_subreddits", fake_search)
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        # Strict mode: only term match qualifies.
+        await hot_pulse_generator(brain_db, min_relevance=1.5)
+
         notify_mock.assert_awaited_once()
         msg = notify_mock.await_args.args[0]
-        assert "sem1" in msg, (
-            "semantic-only match must surface (was being filtered out)"
+        assert "term1" in msg
+        assert "topic1" not in msg, (
+            "single-word topic match must be dropped at min_relevance=1.5"
         )
-        # Tier marker for semantic match
-        assert "◇" in msg
 
     @pytest.mark.asyncio
     async def test_hot_pulse_renders_category_buckets(self, monkeypatch):
@@ -1447,7 +1498,9 @@ class TestHotPulseGenerator:
         ao_post = RedditPost(
             id="ao1",
             url="https://reddit.com/r/selfhosted/comments/ao1",
-            title="Self-hosted multi-agent runtime",
+            # Title must literally contain "agent orchestration"
+            # under the high-precision policy (rel >= 1.0).
+            title="Agent orchestration on a single host",
             subreddit="selfhosted",
             score=3,
             comments=0,
