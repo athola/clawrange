@@ -287,6 +287,19 @@ class BrainDB:
                 PRIMARY KEY(kind, external_id, project_slug)
             );
 
+            CREATE TABLE IF NOT EXISTS subreddit_stats (
+                subreddit       TEXT NOT NULL,
+                project_slug    TEXT NOT NULL,
+                hits            INTEGER NOT NULL DEFAULT 0,
+                impressions     INTEGER NOT NULL DEFAULT 0,
+                first_hit_at    TEXT,
+                last_hit_at     TEXT,
+                last_searched_at TEXT,
+                is_curated      INTEGER NOT NULL DEFAULT 0,
+                promoted_at     TEXT,
+                PRIMARY KEY (subreddit, project_slug)
+            );
+
             CREATE TABLE IF NOT EXISTS research_sessions (
                 id           TEXT PRIMARY KEY,
                 topic        TEXT NOT NULL,
@@ -988,6 +1001,29 @@ class BrainDB:
         self._conn.commit()
         return cursor.rowcount > 0
 
+    def add_project_subreddit(self, slug: str, subreddit: str) -> bool:
+        """Append a subreddit to the project's `subreddits` list,
+        idempotent (case-insensitive). Returns True if newly added.
+        Used by auto-promotion to fold an emerging sub into the
+        curated list without losing the rest of the project's
+        configuration."""
+        import json
+
+        proj = self.get_project(slug)
+        if not proj:
+            return False
+        subs = json.loads(proj.get("subreddits", "[]"))
+        existing = {s.lower() for s in subs}
+        if subreddit.lower() in existing:
+            return False
+        subs.append(subreddit)
+        self._conn.execute(
+            "UPDATE projects SET subreddits=?, updated_at=? WHERE slug=?",
+            (json.dumps(subs), _now(), slug),
+        )
+        self._conn.commit()
+        return True
+
     # ─── Schedules (marketing orchestrator) ──────────────────────
 
     def list_schedules(self) -> list[dict[str, Any]]:
@@ -1103,6 +1139,114 @@ class BrainDB:
         )
         self._conn.commit()
         return cursor.rowcount
+
+    # ─── Subreddit Stats ─────────────────────────────────────────
+
+    def record_subreddit_search(
+        self, subreddit: str, project_slug: str, is_curated: bool = False
+    ) -> None:
+        """Record one search impression for a (subreddit, project) pair.
+
+        Each digest/pulse cycle increments impressions for every
+        subreddit it searched. Combined with hits, this gives a
+        per-(sub, project) yield rate.
+        """
+        sub = subreddit.lower().strip()
+        now = _now()
+        self._conn.execute(
+            """INSERT INTO subreddit_stats
+                 (subreddit, project_slug, hits, impressions,
+                  last_searched_at, is_curated)
+               VALUES (?, ?, 0, 1, ?, ?)
+               ON CONFLICT(subreddit, project_slug) DO UPDATE SET
+                 impressions = impressions + 1,
+                 last_searched_at = excluded.last_searched_at,
+                 is_curated = MAX(is_curated, excluded.is_curated)""",
+            (sub, project_slug, now, 1 if is_curated else 0),
+        )
+        self._conn.commit()
+
+    def record_subreddit_hit(self, subreddit: str, project_slug: str) -> None:
+        """Record one relevance hit for a (subreddit, project) pair."""
+        sub = subreddit.lower().strip()
+        now = _now()
+        self._conn.execute(
+            """INSERT INTO subreddit_stats
+                 (subreddit, project_slug, hits, impressions,
+                  first_hit_at, last_hit_at)
+               VALUES (?, ?, 1, 0, ?, ?)
+               ON CONFLICT(subreddit, project_slug) DO UPDATE SET
+                 hits = hits + 1,
+                 first_hit_at = COALESCE(first_hit_at, excluded.first_hit_at),
+                 last_hit_at = excluded.last_hit_at""",
+            (sub, project_slug, now, now),
+        )
+        self._conn.commit()
+
+    def list_subreddit_stats(
+        self,
+        project_slug: str | None = None,
+        curated_only: bool | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return (sub, project) stat rows ordered by hits desc."""
+        clauses = []
+        params: list[Any] = []
+        if project_slug is not None:
+            clauses.append("project_slug = ?")
+            params.append(project_slug)
+        if curated_only is True:
+            clauses.append("is_curated = 1")
+        elif curated_only is False:
+            clauses.append("is_curated = 0")
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        rows = self._conn.execute(
+            f"""SELECT * FROM subreddit_stats {where}
+                ORDER BY hits DESC, last_hit_at DESC
+                LIMIT ?""",
+            tuple(params),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def find_promotion_candidates(
+        self,
+        project_slug: str,
+        min_hits: int = 5,
+        window_days: int = 14,
+    ) -> list[dict[str, Any]]:
+        """Non-curated subs with >= min_hits whose first_hit_at falls
+        within window_days of last_hit_at — i.e. sustained recent yield
+        as opposed to a single ancient hit. Returned rows are eligible
+        for auto-promotion into the project's subreddits list."""
+        rows = self._conn.execute(
+            """SELECT * FROM subreddit_stats
+               WHERE project_slug = ?
+                 AND is_curated = 0
+                 AND promoted_at IS NULL
+                 AND hits >= ?
+                 AND first_hit_at IS NOT NULL
+                 AND last_hit_at IS NOT NULL
+                 AND CAST(
+                       (julianday(last_hit_at) - julianday(first_hit_at))
+                     AS INTEGER) <= ?
+               ORDER BY hits DESC""",
+            (project_slug, min_hits, window_days),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_subreddit_promoted(self, subreddit: str, project_slug: str) -> None:
+        """Stamp the (sub, project) row as promoted. Caller is
+        responsible for also adding the sub to the project's
+        `subreddits` JSON array via upsert_project."""
+        sub = subreddit.lower().strip()
+        self._conn.execute(
+            """UPDATE subreddit_stats
+                 SET is_curated = 1, promoted_at = ?
+               WHERE subreddit = ? AND project_slug = ?""",
+            (_now(), sub, project_slug),
+        )
+        self._conn.commit()
 
     # ─── Research Sessions (multi-source orchestrator audit trail) ─
 

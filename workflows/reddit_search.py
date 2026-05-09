@@ -176,6 +176,89 @@ async def search_subreddits(
     return results
 
 
+async def search_all(
+    topic: str,
+    since: str = "24h",
+    sort: str = "new",
+    limit: int = 25,
+) -> list[RedditPost]:
+    """Search across all of Reddit (no subreddit restriction).
+
+    Used for tangential/emerging-sub discovery: find posts matching a
+    topic regardless of which subreddit they appear in. Combined with
+    the project's `subreddits` curated list, this surfaces posts in
+    non-curated subs that the curated scan would have missed.
+
+    Public-API-only for now (the OAuth path uses asyncpraw's
+    Subreddit.search which requires a subreddit; using `all` works
+    but adds complexity). Subject to the same ~30 req/min anonymous
+    rate limit as `_public_search`.
+    """
+    user_agent = os.getenv("REDDIT_USER_AGENT", "clawrange-marketing-bot/0.1")
+    time_filter = _parse_since(since)
+    since_hours = _parse_since_hours(since)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+
+    seen_ids: set[str] = set()
+    results: list[RedditPost] = []
+
+    async with httpx.AsyncClient(
+        headers={"User-Agent": user_agent},
+        timeout=15.0,
+    ) as client:
+        try:
+            resp = await client.get(
+                "https://www.reddit.com/search.json",
+                params={
+                    "q": topic,
+                    "sort": sort,
+                    "t": time_filter,
+                    "limit": str(limit),
+                },
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    "Reddit all-search '%s' -> HTTP %d", topic, resp.status_code
+                )
+                return []
+            payload = resp.json()
+        except Exception as exc:
+            logger.warning("Reddit all-search '%s' failed: %s", topic, exc)
+            return []
+
+    for child in payload.get("data", {}).get("children", []):
+        d = child.get("data", {}) or {}
+        pid = d.get("id")
+        if not pid or pid in seen_ids:
+            continue
+        seen_ids.add(pid)
+
+        created = datetime.fromtimestamp(d.get("created_utc", 0) or 0, tz=timezone.utc)
+        if created < cutoff:
+            continue
+
+        selftext = d.get("selftext") or ""
+        snippet = selftext[:200] + "..." if len(selftext) > 200 else (selftext or None)
+        permalink = d.get("permalink") or ""
+        post_url = f"https://reddit.com{permalink}" if permalink else d.get("url", "")
+
+        results.append(
+            RedditPost(
+                id=pid,
+                url=post_url,
+                title=d.get("title", ""),
+                subreddit=d.get("subreddit", ""),
+                score=int(d.get("score", 0) or 0),
+                comments=int(d.get("num_comments", 0) or 0),
+                created_utc=created.isoformat(),
+                snippet=snippet,
+            )
+        )
+
+    results.sort(key=lambda p: p.score, reverse=True)
+    return results
+
+
 async def _public_search(
     topic: str,
     subreddits: list[str],

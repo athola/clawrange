@@ -32,6 +32,7 @@ def _reset_brain_db():
         "research_sessions",
         "tasks",
         "scan_cache",
+        "subreddit_stats",
         "schedules",
         "projects",
         "page_tags",
