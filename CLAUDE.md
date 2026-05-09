@@ -86,13 +86,24 @@ make logs             # tail docker logs
 - `POST /scan/reddit`, `POST /scan/github`, `POST /scan/web`
 
 **Research orchestrator**
-- `POST /research` — multi-source research (Reddit + GitHub + GLM web)
-  with dedup, ranking, triangulation, and confidence flags. Persists a
+- `POST /research` — multi-source research across 5 channels
+  (`discourse` Reddit, `code` GitHub, `discourse_web` GLM,
+  `academic` arXiv + Semantic Scholar, `triz` cross-domain) with
+  dedup, ranking, triangulation, and confidence flags. Persists a
   session and returns `session_id`.
 - `GET /research/sessions` — list recent sessions, newest first
 - `GET /research/sessions/{id}` — full session with all findings
+- `GET /healthz/research` — per-channel configured/source/reason
+  report so operators can diagnose empty results.
 - See `workflows/research.py` for synthesis logic and
   `docs/research-and-marketing.md` for the operator guide.
+
+**Tome bridge (local-only)**
+- `scripts/tome_bridge.py` polls the workflows task queue for
+  tasks tagged `research:tome:` and runs them through Alex's
+  local `claude /tome:research` session. Stdlib only, no deps.
+- Make targets: `make tome-bridge` (one pass) and
+  `make tome-bridge-watch` (poll forever).
 
 **Canary**
 - `POST /webhook-test/test` — echo payload back

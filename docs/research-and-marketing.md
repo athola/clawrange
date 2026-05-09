@@ -38,6 +38,23 @@ ranked, deduplicated, citation-bearing findings.
 | `discourse` | Reddit subreddits | Default subs: ClaudeAI, LocalLLaMA, SideProject. Override with `subreddits`. |
 | `code` | GitHub repos | Default `min_stars=50`. |
 | `discourse_web` (or `web`) | GLM server-side web search | Returns one synthesized summary finding per call. |
+| `academic` | arXiv + Semantic Scholar | Public, no API key. Fans out both in parallel; per-source failures are logged and swallowed. |
+| `triz` | GLM web search with TRIZ prompt | Cross-domain analogical reasoning — finds solutions in adjacent fields with bridge mappings. |
+
+### Channel readiness check
+
+```bash
+curl -s http://localhost:5678/healthz/research | jq .
+```
+
+Returns `{configured_count, total_channels, status, channels: {...}}`
+where each channel reports `configured`, `source`, and (when not
+configured) a `reason` like `GITHUB_PAT not set`. Use this to
+diagnose empty `/research` responses before chasing logic bugs.
+
+The shell wrapper `scripts/test_research.sh` (also exposed as
+`make test-research`) runs this check, posts a sample `/research`
+query, and dumps the top 3 findings with confidence flags.
 
 ### Request body
 
@@ -115,11 +132,40 @@ without re-running the fanout.
 
 ### Heavy research via tome
 
-For academic literature reviews, TRIZ analogical reasoning, or
-deep multi-hop digs, John-117 enqueues a task tagged
-`research:tome` with the topic. Alex's Claude Code session picks
-these up and runs `/tome:research`, posting the synthesized output
-back via `/task/{id}/result`.
+For research that needs the full tome plugin (multi-hop digging,
+heavy academic synthesis, or TRIZ depth=heavy mode), John-117
+enqueues a task whose description starts with
+`research:tome: <topic>` (or the bracket form
+`[research:tome] <topic>`).
+
+The bridge script in `scripts/tome_bridge.py` runs from Alex's
+local machine where the tome Claude Code plugin lives:
+
+```bash
+make tome-bridge          # one polling pass
+make tome-bridge-watch    # poll forever
+```
+
+The bridge:
+
+1. Polls `/task?status=pending` every 60s (configurable).
+2. Matches descriptions against the three accepted formats
+   (`research:tome:`, `[research:tome]`, `Research via tome:`).
+3. Claims each match, runs `claude --print '/tome:research <topic>'`
+   as a subprocess (timeout default 1800s), and posts the output
+   back via `/task/{id}/result`.
+4. Marks tasks `failed` with diagnostic on timeout (rc=124),
+   missing-binary (rc=127), or non-zero exit.
+
+Setup options:
+- **One-off**: `make tome-bridge` after enqueuing a `research:tome`
+  task from John-117.
+- **Always-on**: run `make tome-bridge-watch` in a tmux/screen pane,
+  or wire it into a systemd user unit / launchd job.
+- **Per-task timeout**: `TOME_BRIDGE_TIMEOUT=600 make tome-bridge`.
+
+The bridge has zero dependencies beyond Python stdlib + the
+`claude` CLI on `$PATH`, so it ships and runs anywhere.
 
 ## Marketing Orchestrator (extended)
 
