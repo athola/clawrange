@@ -85,8 +85,32 @@ make logs             # tail docker logs
 - `GET/POST/PATCH/DELETE /sched` and `/sched/{id}`, `POST /sched/{id}/run`
 - `POST /scan/reddit`, `POST /scan/github`, `POST /scan/web`
 
+**Research orchestrator**
+- `POST /research` — multi-source research (Reddit + GitHub + GLM web)
+  with dedup, ranking, triangulation, and confidence flags. Persists a
+  session and returns `session_id`.
+- `GET /research/sessions` — list recent sessions, newest first
+- `GET /research/sessions/{id}` — full session with all findings
+- See `workflows/research.py` for synthesis logic and
+  `docs/research-and-marketing.md` for the operator guide.
+
 **Canary**
 - `POST /webhook-test/test` — echo payload back
+
+## Research and Marketing Conventions
+
+- **Citation discipline**: every factual claim John-117 makes must
+  cite a URL from a recent `/research` finding. Single-source
+  claims are flagged "needs verification".
+- **Marketing posture**: useful comments first; product mentions
+  only when directly relevant. Drafts queue as `[DRAFT]` tasks for
+  human approval — never auto-post.
+- **Tracked projects**: `claude-night-market`, `skrills`,
+  `simple-resume`, `personal-brand` (Alex's AI-systems voice).
+  Seeded by `seed_default_projects` on workflows startup.
+- **Heavy research**: when a question needs academic literature,
+  TRIZ analogies, or multi-hop digs, queue a `research:tome` task
+  for the local Claude Code session to handle via `/tome:research`.
 
 ## When Modifying
 

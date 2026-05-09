@@ -119,11 +119,27 @@ The workflows service is a single FastAPI process. It owns:
 - `/brain/*` — persistent knowledge store (pages + embeddings)
 - `/projects`, `/sched`, `/scan/{reddit,github,web}` — marketing
   orchestrator (`/scan/web` routes through GLM server-side web search)
+- `/research`, `/research/sessions` — multi-source research
+  orchestrator with citation flagging and persistent sessions
 - `/webhook-test/test` — connectivity canary
+
+### Research Orchestrator
+
+`POST /research` fans out across Reddit, GitHub, and GLM web search
+in parallel, then merges and ranks the results with authority
+bonuses (stars, scores, citations), recency bonus, and a
+cross-channel triangulation bonus capped at +0.15. Each finding is
+tagged with a confidence flag (high/medium/low) so John-117 can
+mark single-source claims as "needs verification".
+
+Every call persists a session in the brain so earlier research is
+recoverable via `GET /research/sessions/{id}` without re-running
+the fanout. See [docs/research-and-marketing.md](docs/research-and-marketing.md)
+for the full operator guide.
 
 ### Marketing Orchestrator
 
-Scheduled scans are driven by APScheduler with four built-in generators
+Scheduled scans are driven by APScheduler with six built-in generators
 registered in `workflows/generators.py`:
 
 - `morning_scan` — daily Reddit + GitHub scan per tracked project
@@ -131,7 +147,15 @@ registered in `workflows/generators.py`:
 - `awesome_lists_watch` — alerts when projects are missing from
   curated awesome-lists
 - `custom_scan` — generic topic scan for user-defined schedules
+- `content_idea` — turns recent research findings into one content
+  idea per project (technical post / Reddit comment / X thread)
+- `comment_draft` — drafts a useful, non-promotional reply for a
+  given URL and queues it as a `[DRAFT]` task for human approval
 
-Schedules are stored in the brain DB and managed via `/sched`. Each
-generator enqueues tasks into the same queue agents read from
-`/task/{id}/claim`, so manual and scheduled work share one pipeline.
+The four tracked projects (`claude-night-market`, `skrills`,
+`simple-resume`, and `personal-brand` for Alex's AI-systems voice)
+are seeded automatically on first boot. Schedules are stored in the
+brain DB and managed via `/sched`. Each generator enqueues tasks
+into the same queue agents read from `/task/{id}/claim`, so manual
+and scheduled work share one pipeline. Drafts are never auto-posted —
+the human-in-the-loop pattern is the entire point.
