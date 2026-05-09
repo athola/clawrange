@@ -16,25 +16,38 @@ async def notify(text: str) -> bool:
     """Send a message to the configured Telegram chat.
 
     Returns True on success, False on failure (never raises).
+    Tries Markdown parse mode first; on a 400 "can't parse entities"
+    error (which happens when post titles contain unbalanced
+    underscores, asterisks, or brackets — common in Reddit titles),
+    retries as plain text. URLs auto-linkify in plain mode anyway.
     """
     if not BOT_TOKEN or not CHAT_ID:
         logger.warning("Telegram not configured — skipping notification")
         return False
 
-    try:
+    async def _send(payload: dict) -> tuple[bool, int, str]:
         async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(
-                f"{API_BASE}/sendMessage",
-                json={
-                    "chat_id": CHAT_ID,
-                    "text": text,
-                    "parse_mode": "Markdown",
-                },
-            )
-            if not r.is_success:
-                logger.error("Telegram API error: %s %s", r.status_code, r.text)
-                return False
+            r = await client.post(f"{API_BASE}/sendMessage", json=payload)
+            return r.is_success, r.status_code, r.text
+
+    try:
+        ok, status, body = await _send(
+            {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
+        )
+        if ok:
             return True
+        # Markdown parse failure -> retry as plain text. Telegram
+        # auto-detects URLs in plain mode, so links stay clickable;
+        # only inline bold formatting is lost.
+        if status == 400 and "parse" in body.lower():
+            logger.warning("Telegram Markdown rejected (parse error), retrying plain")
+            ok2, status2, body2 = await _send({"chat_id": CHAT_ID, "text": text})
+            if ok2:
+                return True
+            logger.error("Telegram plain retry failed: %s %s", status2, body2)
+            return False
+        logger.error("Telegram API error: %s %s", status, body)
+        return False
     except httpx.HTTPError as exc:
         logger.error("Telegram request failed: %s", exc)
         return False
