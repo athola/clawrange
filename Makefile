@@ -70,6 +70,12 @@ test-ollama: ## Test local Ollama inference
 test-research: ## Smoke test the /research endpoint with a live topic
 	@./scripts/test_research.sh "$(TOPIC)"
 
+tome-bridge: ## Run one bridge pass for research:tome tasks
+	@python3 scripts/tome_bridge.py
+
+tome-bridge-watch: ## Watch task queue for research:tome tasks
+	@python3 scripts/tome_bridge.py --watch --interval 60
+
 test-unit: ## Run Python unit tests (no containers needed)
 	@python3 -m pytest workflows/tests/ -v
 
