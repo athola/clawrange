@@ -495,3 +495,40 @@ async def scan_web(body: dict[str, Any]):
 
     result = await _llm_call(prompt, max_tokens=1500, web_search=True)
     return {"result": result or "", "query": prompt}
+
+
+# ─── Research Orchestrator ───────────────────────────────────────
+
+
+class ResearchRequest(BaseModel):
+    topic: str
+    channels: list[str] | None = None
+    subreddits: list[str] | None = None
+    limit: int = 10
+    since: str = "30d"
+    min_stars: int = 50
+
+
+@app.post("/research")
+async def research(body: ResearchRequest):
+    """Run a multi-source research session and return ranked findings.
+
+    Channels default to discourse (Reddit), code (GitHub), and
+    discourse_web (GLM web search). Findings are deduplicated by URL,
+    ranked with authority and recency bonuses, and tagged with a
+    confidence flag based on cross-channel triangulation.
+    """
+    from research import orchestrate_research
+
+    if not body.topic.strip():
+        raise HTTPException(status_code=400, detail="topic is required")
+
+    kwargs: dict[str, Any] = {
+        "limit": body.limit,
+        "since": body.since,
+        "min_stars": body.min_stars,
+    }
+    if body.subreddits:
+        kwargs["subreddits"] = body.subreddits
+
+    return await orchestrate_research(body.topic, channels=body.channels, **kwargs)
