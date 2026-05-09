@@ -10,12 +10,21 @@ import json
 import logging
 import math
 import statistics
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from reddit_search import RedditPost
 
 logger = logging.getLogger("clawrange.generators")
+
+# In-memory throttle state for the hot_pulse generator. The cron fires
+# every 5 minutes (heartbeat), but Telegram delivery is gated to once
+# per `min_delivery_interval_minutes` (default 15min) to keep the
+# operator's chat from getting spammed. Resets on workflows restart —
+# acceptable for a single-uvicorn-worker service where restarts are
+# rare and a one-off extra delivery after restart is harmless.
+_LAST_HOT_PULSE_DELIVERY_AT: datetime | None = None
 
 # Subreddits to include in every morning digest scan, even when no
 # tracked project subscribes to them directly. Sourced from Alex's
@@ -518,8 +527,6 @@ async def morning_digest_generator(
     # Same heartbeat-status update as hot_pulse: ensure the schedule's
     # last_run reflects cron fires, not just manual /sched/.../run.
     try:
-        from datetime import datetime, timezone
-
         brain_db.update_schedule_status(
             "morning_digest",
             datetime.now(timezone.utc).isoformat(),
@@ -736,16 +743,17 @@ async def hot_pulse_generator(
     max_per_project: int = 25,
     window: str = "15m",
     min_relevance: float = 1.0,
+    min_delivery_interval_minutes: int = 15,
     **kwargs,
 ) -> None:
     """Reddit pulse for brand-new comment candidates.
 
-    Scheduled `*/5 * * * *` but each fire searches a 15-minute lookback
-    window by default. Pulse-namespace dedup (`kind=reddit_pulse`)
-    means a post still only reports once across the three fires that
-    catch it (0-5min, 5-10min, 10-15min old). The wider window
-    catches more sparse-niche activity and tolerates a missed cron
-    fire — without re-spamming posts already surfaced.
+    Scheduled `*/5 * * * *` for cron heartbeat, but Telegram delivery
+    is throttled to once per `min_delivery_interval_minutes` (default
+    15min). On throttled fires the function skips Reddit + Telegram
+    entirely, just updates the schedule's last_run/last_status so the
+    operator can verify the cron is alive. Cuts Reddit API load by 3x
+    and reduces chat noise to one message per 15min.
 
     Per project, searches the union of that project's subreddits +
     the AI-coding extras for posts created in the last `window`
@@ -778,8 +786,33 @@ async def hot_pulse_generator(
     Skips Telegram delivery silently when no fresh picks exist
     (logged as a heartbeat WARNING so the cron is still observable).
     """
+    global _LAST_HOT_PULSE_DELIVERY_AT
     from reddit_search import search_subreddits
     from telegram import notify
+
+    # Delivery throttle: the cron fires every 5min for heartbeat, but
+    # Telegram delivery is gated to once per min_delivery_interval_minutes.
+    # On throttled fires we skip Reddit + Telegram and just update
+    # schedule status so the operator sees the cron is still alive.
+    now = datetime.now(timezone.utc)
+    if _LAST_HOT_PULSE_DELIVERY_AT is not None:
+        elapsed_min = (now - _LAST_HOT_PULSE_DELIVERY_AT).total_seconds() / 60.0
+        if elapsed_min < min_delivery_interval_minutes:
+            try:
+                brain_db.update_schedule_status(
+                    "hot_pulse",
+                    now.isoformat(),
+                    f"throttled ({elapsed_min:.1f}m of "
+                    f"{min_delivery_interval_minutes}m)",
+                )
+            except Exception as exc:
+                logger.warning("hot_pulse: schedule status update failed: %s", exc)
+            logger.info(
+                "hot_pulse: throttled — %.1fm since last delivery (min interval %dm)",
+                elapsed_min,
+                min_delivery_interval_minutes,
+            )
+            return
 
     projects = brain_db.list_projects()
     if project_slugs:
@@ -879,8 +912,6 @@ async def hot_pulse_generator(
     # those fields), so without this the schedule looks stale and the
     # operator can't distinguish "scheduler dead" from "no fresh hits".
     try:
-        from datetime import datetime, timezone
-
         brain_db.update_schedule_status(
             "hot_pulse",
             datetime.now(timezone.utc).isoformat(),
@@ -943,10 +974,20 @@ async def hot_pulse_generator(
         logger.warning("hot_pulse: telegram delivery failed; not marking seen")
         return
 
+    # Cross-project mark_seen: a delivered post is marked seen for ALL
+    # tracked projects, not just the one that owned it this fire. Plugs
+    # the cross-fire dedup leak where the same post otherwise pingpongs
+    # between projects on consecutive fires (loser project's
+    # is_seen(post, slug) check returns False because only the owner
+    # was marked).
+    all_slugs = [p["slug"] for p in projects]
     for slug, picks in by_project.items():
         for post, _rel in picks:
-            brain_db.mark_seen("reddit_pulse", post.id, slug)
+            for s in all_slugs:
+                brain_db.mark_seen("reddit_pulse", post.id, s)
             brain_db.record_subreddit_hit(post.subreddit, slug)
+
+    _LAST_HOT_PULSE_DELIVERY_AT = now
     logger.info(
         "hot_pulse: delivered %d fresh posts across %d projects",
         sum(len(v) for v in by_project.values()),
