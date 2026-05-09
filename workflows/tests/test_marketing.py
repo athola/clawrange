@@ -629,6 +629,75 @@ class TestMorningDigestGenerator:
                 f"expected {required} in scan set, got {all_subs_seen}"
             )
 
+    @pytest.mark.asyncio
+    async def test_morning_digest_popular_bonus_tier(self, monkeypatch):
+        """Subreddit-affinity bonus tier: a project subscribing to a
+        sub gets up to popular_bonus_cap picks from that sub even
+        when no literal keyword match, provided the score clears the
+        adaptive threshold (popularity_multiplier × subreddit median).
+
+        Regression for the case where skrills (subs: Construction,
+        ITCareerQuestions, SideProject) was returning zero picks
+        because its terms ('trade skill capture') rarely appear
+        verbatim in those subs."""
+        from unittest.mock import AsyncMock
+
+        from generators import morning_digest_generator
+        from reddit_search import RedditPost
+
+        brain_db.upsert_project(
+            "skrills",
+            "athola",
+            "skrills",
+            topics=["trade skill capture"],
+            subreddits=["Construction"],
+            search_terms=["trade skill capture"],
+            posture="Lead with: capture trade-skill knowledge.",
+        )
+
+        # Five r/Construction posts with no literal 'trade skill' match.
+        # Median score is 5 -> 2x threshold = 10. Posts at 200 and 150
+        # qualify; posts at 1, 5, 10 do not (10 ties median*2 = 10,
+        # so it qualifies; we'll keep 1 and 5 below threshold).
+        sub_posts = [
+            RedditPost(
+                id=f"con{i}",
+                url=f"https://reddit.com/r/Construction/comments/con{i}",
+                title=f"Random construction post {i}",
+                subreddit="Construction",
+                score=score,
+                comments=2,
+                created_utc="2026-05-09T07:00:00+00:00",
+            )
+            for i, score in enumerate([1, 5, 10, 150, 200], start=1)
+        ]
+
+        async def fake_search(*a, **kw):
+            return sub_posts
+
+        monkeypatch.setattr("reddit_search.search_subreddits", fake_search)
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        await morning_digest_generator(
+            brain_db,
+            popularity_multiplier=2.0,
+            popular_bonus_cap=2,
+        )
+
+        notify_mock.assert_awaited_once()
+        digest = notify_mock.await_args.args[0]
+
+        # The two highest-scoring posts must appear (subreddit-affinity
+        # bonus tier kicked in) even with rel == 0.
+        assert "con5" in digest, "score=200 post must be in digest"
+        assert "con4" in digest, "score=150 post must be in digest"
+        # Sub-threshold posts must NOT be picked as bonus.
+        assert "con1" not in digest, "score=1 post must NOT be picked"
+        assert "con2" not in digest, "score=5 post must NOT be picked"
+        # Bonus picks rendered with the ★ marker.
+        assert "★" in digest, "bonus picks must be marked with ★"
+
     def test_morning_digest_schedule_registered_after_seed(self):
         """seed_default_projects must register a 0 8 * * * schedule
         for the morning_digest generator (idempotently)."""
