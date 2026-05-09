@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import statistics
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -286,20 +287,31 @@ async def morning_digest_generator(
     extra_subreddits: list[str] | None = None,
     top_per_project: int = 4,
     queue_drafts: bool = True,
+    popularity_multiplier: float = 2.0,
+    popular_bonus_cap: int = 2,
     **kwargs,
 ) -> None:
     """Deliver the 8am Reddit comment-candidate digest to Telegram.
 
-    Per project, run a live Reddit search (last 24h, sort=new) across the
-    union of that project's subreddits + the AI-coding extras Alex listed.
-    Filter posts already surfaced for that project via scan_cache.
-    Score each post against the project's topics + search_terms, route
-    each post to its highest-relevance project (no double-postings),
-    and compose a single Markdown digest grouped by project.
+    Two-tier picks per project:
+    - Strict tier: posts whose title/snippet literally matches the
+      project's topics or search_terms. Capped at top_per_project,
+      ranked by relevance × log(score+1).
+    - Popular bonus tier: posts in one of the project's own subreddits
+      that lack a literal keyword hit but exceed an adaptive popularity
+      threshold (popularity_multiplier × that subreddit's median score
+      across this scan). Capped at popular_bonus_cap, ranked by raw
+      score. Marked with a ★ prefix in the digest so the operator can
+      tell them apart from strict picks.
 
-    Mark every delivered post as `seen` so tomorrow's digest won't repeat
-    it, and (when queue_drafts) enqueue a `[DRAFT]` comment-draft task per
-    post for human review. Never auto-posts.
+    The adaptive threshold makes the bonus tier fair across busy and
+    quiet subs: r/Construction's "popular" bar is far lower than
+    r/ClaudeCode's, but each gets the same relative treatment.
+
+    Filters posts already surfaced for that project via scan_cache.
+    Marks every delivered post as `seen` so tomorrow's digest won't
+    repeat it. When queue_drafts is True, enqueues a `[DRAFT]`
+    comment-draft task per post for human review. Never auto-posts.
     """
     from reddit_search import search_subreddits
     from telegram import notify
@@ -325,10 +337,21 @@ async def morning_digest_generator(
             sub_set.add(s)
     scan_subreddits = sorted(sub_set)
 
-    # Collect (project, post, relevance) candidates across all projects.
-    # Use a per-post-id best-score map so a single post routes to its
-    # best-fit project rather than appearing under two.
-    best_for_post: dict[str, tuple[dict, "RedditPost", float]] = {}
+    # Per-project subreddit affinity sets (lowercased for case-insensitive
+    # match against post.subreddit).
+    project_sub_sets: dict[str, set[str]] = {
+        p["slug"]: {s.lower() for s in json.loads(p.get("subreddits", "[]"))}
+        for p in projects
+    }
+
+    # Track all post scores per subreddit so we can compute adaptive
+    # popularity thresholds (popularity_multiplier × median).
+    scores_by_sub: dict[str, list[int]] = {}
+
+    # Per-post-id best-fit map: rel + tiny sub-affinity bump for tiebreaks
+    # so a sub-affinity-only post lands in the project that subscribes to
+    # its subreddit, not one that doesn't.
+    best_for_post: dict[str, tuple[dict, "RedditPost", float, bool]] = {}
 
     for project in projects:
         slug = project["slug"]
@@ -354,28 +377,63 @@ async def morning_digest_generator(
                 continue
 
             for post in posts:
+                scores_by_sub.setdefault(post.subreddit.lower(), []).append(post.score)
                 if brain_db.is_seen("reddit_post", post.id, slug):
                     continue
                 rel = _score_relevance(post, topics, terms)
-                if rel <= 0:
+                sub_affinity = post.subreddit.lower() in project_sub_sets[slug]
+                # Skip posts with no signal at all (no keyword match and
+                # not in this project's subreddit list).
+                if rel <= 0 and not sub_affinity:
                     continue
+                # Routing priority: rel dominates, sub-affinity is a small
+                # tiebreak so e.g. an r/Construction post lands at skrills
+                # rather than at clawrange when both have rel == 0.
+                priority = rel + (0.1 if sub_affinity else 0)
                 prior = best_for_post.get(post.id)
-                if prior is None or rel > prior[2]:
-                    best_for_post[post.id] = (project, post, rel)
+                prior_priority = prior[2] + (0.1 if prior[3] else 0) if prior else -1.0
+                if priority > prior_priority:
+                    best_for_post[post.id] = (project, post, rel, sub_affinity)
 
-    # Group winners by project slug, rank by relevance × log(score+1),
-    # cap top_per_project per group.
-    by_project: dict[str, list[tuple["RedditPost", float]]] = {}
-    for project, post, rel in best_for_post.values():
-        by_project.setdefault(project["slug"], []).append((post, rel))
-    for slug in list(by_project.keys()):
-        by_project[slug].sort(
+    # Adaptive popularity thresholds per subreddit. Need at least 3
+    # samples for a stable median; otherwise no bonus picks from that sub.
+    sub_thresholds: dict[str, float] = {
+        sub: popularity_multiplier * statistics.median(scores)
+        for sub, scores in scores_by_sub.items()
+        if len(scores) >= 3
+    }
+
+    # Group by project, separate strict (rel > 0) from popular-bonus
+    # (rel == 0, sub-affinity, score >= adaptive threshold).
+    strict_by_project: dict[str, list[tuple["RedditPost", float]]] = {}
+    bonus_by_project: dict[str, list[tuple["RedditPost", float]]] = {}
+    for project, post, rel, sub_affinity in best_for_post.values():
+        slug = project["slug"]
+        if rel > 0:
+            strict_by_project.setdefault(slug, []).append((post, rel))
+        elif sub_affinity:
+            threshold = sub_thresholds.get(post.subreddit.lower())
+            if threshold is not None and post.score >= threshold:
+                bonus_by_project.setdefault(slug, []).append((post, rel))
+
+    # Final picks per project: top_per_project strict, then up to
+    # popular_bonus_cap bonus picks. is_bonus flag drives the ★ render.
+    picks_by_project: dict[str, list[tuple["RedditPost", bool]]] = {}
+    for project in projects:
+        slug = project["slug"]
+        strict = strict_by_project.get(slug, [])
+        strict.sort(
             key=lambda pr: pr[1] * (1 + math.log(max(pr[0].score, 1))),
             reverse=True,
         )
-        by_project[slug] = by_project[slug][:top_per_project]
+        bonus = bonus_by_project.get(slug, [])
+        bonus.sort(key=lambda pr: pr[0].score, reverse=True)
+        chosen = [(p, False) for p, _ in strict[:top_per_project]]
+        chosen += [(p, True) for p, _ in bonus[:popular_bonus_cap]]
+        if chosen:
+            picks_by_project[slug] = chosen
 
-    if not any(by_project.values()):
+    if not picks_by_project:
         logger.info("morning_digest: no fresh comment-worthy posts, skipping notify")
         return
 
@@ -383,14 +441,15 @@ async def morning_digest_generator(
     lines = ["*Morning digest — Reddit comment candidates (last 24h)*", ""]
     for project in projects:
         slug = project["slug"]
-        picks = by_project.get(slug, [])
+        picks = picks_by_project.get(slug, [])
         if not picks:
             continue
         lines.append(f"*{slug}* ({project['owner']}/{project['repo']})")
-        for post, _rel in picks:
+        for post, is_bonus in picks:
             title = post.title if len(post.title) <= 90 else post.title[:87] + "..."
+            star = "★ " if is_bonus else ""
             lines.append(
-                f"  • r/{post.subreddit} — [{title}]({post.url}) "
+                f"  • {star}r/{post.subreddit} — [{title}]({post.url}) "
                 f"[id:{post.id}] · {post.score} pts · {post.comments} comments"
             )
         lines.append("")
@@ -402,25 +461,32 @@ async def morning_digest_generator(
         return
 
     # Mark seen + enqueue draft tasks only after successful delivery.
-    for slug, picks in by_project.items():
+    for slug, picks in picks_by_project.items():
         proj = brain_db.get_project(slug) or {}
         posture = proj.get("posture", "")
-        for post, _rel in picks:
+        for post, is_bonus in picks:
             brain_db.mark_seen("reddit_post", post.id, slug)
             if queue_drafts:
+                bonus_note = (
+                    " (popular sub-affinity pick — verify topical fit)"
+                    if is_bonus
+                    else ""
+                )
                 desc = (
                     f"[DRAFT] Comment draft for {slug} on {post.url} "
                     f"[id:{post.id}]. OP context: r/{post.subreddit} — "
-                    f'"{post.title}". Write a 3-5 sentence reply that '
-                    f"leads with concrete advice; only mention {slug} if "
+                    f'"{post.title}".{bonus_note} Write a 3-5 sentence reply '
+                    f"that leads with concrete advice; only mention {slug} if "
                     f"directly relevant. Never auto-post — Alex reviews. "
                     f"Posture: {posture}"
                 )
                 brain_db.create_task(desc, priority=2, source="morning_digest")
     logger.info(
-        "morning_digest: delivered %d posts across %d projects",
-        sum(len(v) for v in by_project.values()),
-        sum(1 for v in by_project.values() if v),
+        "morning_digest: delivered %d posts (%d strict + %d bonus) across %d projects",
+        sum(len(v) for v in picks_by_project.values()),
+        sum(1 for v in picks_by_project.values() for _, b in v if not b),
+        sum(1 for v in picks_by_project.values() for _, b in v if b),
+        len(picks_by_project),
     )
 
 
