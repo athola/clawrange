@@ -25,8 +25,10 @@ brain_db.init_db()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from generators import seed_default_projects
     from scheduler import init_scheduler
 
+    seed_default_projects(brain_db)
     scheduler = init_scheduler(brain_db)
     app.state.scheduler = scheduler
     yield

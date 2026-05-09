@@ -121,6 +121,189 @@ async def custom_scan_generator(
     logger.info("custom_scan: enqueued '%s'", desc[:80])
 
 
+async def content_idea_generator(
+    brain_db,
+    project_slugs: list[str] | None = None,
+    sessions_window: int = 5,
+    **kwargs,
+) -> None:
+    """Turn recent research findings into content ideas per project.
+
+    Reads the most recent `sessions_window` research sessions from
+    the brain and, for each tracked project, enqueues a single
+    content-idea task with the strongest finding from that pool.
+
+    The generated task is intended to be picked up by John-117 (or
+    Alex) and elaborated into one of:
+    - a technical blog post (lead),
+    - a Reddit comment (engage),
+    - or an X thread (broadcast).
+
+    The generator never auto-posts. It only proposes; Alex approves.
+    """
+    projects = brain_db.list_projects()
+    if project_slugs:
+        projects = [p for p in projects if p["slug"] in project_slugs]
+    if not projects:
+        return
+
+    sessions = brain_db.list_research_sessions(limit=sessions_window)
+    candidate_findings: list[dict] = []
+    for s in sessions:
+        loaded = brain_db.get_research_session(s["id"])
+        if not loaded:
+            continue
+        for f in loaded.get("findings", []):
+            candidate_findings.append({**f, "topic": s["topic"]})
+
+    if not candidate_findings:
+        logger.info("content_idea: no recent research findings, skipping idea pass")
+        return
+
+    # Highest-relevance first, but still cap one idea per project per run.
+    candidate_findings.sort(key=lambda f: f.get("relevance", 0), reverse=True)
+    top = candidate_findings[0]
+
+    for project in projects:
+        slug = project["slug"]
+        posture = project.get("posture", "")
+        topics = json.loads(project.get("topics", "[]"))
+        topic_hint = ", ".join(topics[:3]) if topics else slug
+
+        desc = (
+            f"Content idea for {slug}: research on '{top['topic']}' "
+            f'surfaced "{top["title"]}" ({top["url"]}). '
+            f"Draft three angles - "
+            f"(1) technical post tying this to {topic_hint}, "
+            f"(2) useful Reddit/HN comment offering specifics, "
+            f"(3) short X thread on the lesson. "
+            f"Posture: {posture}"
+        )
+        brain_db.create_task(desc, priority=3, source="schedule")
+        logger.info(
+            "content_idea: enqueued idea for %s based on session %s",
+            slug,
+            top.get("session_id", "unknown"),
+        )
+
+
+# ─── Default Project Seeds ──────────────────────────────────────────
+
+
+_DEFAULT_PROJECTS = (
+    {
+        "slug": "claude-night-market",
+        "owner": "athola",
+        "repo": "claude-night-market",
+        "topics": ["claude-code", "plugins", "agent-tooling"],
+        "subreddits": ["ClaudeAI", "LocalLLaMA", "SideProject"],
+        "search_terms": [
+            "claude code plugin",
+            "claude code marketplace",
+            "claude skill",
+        ],
+        "posture": (
+            "Lead with: a curated marketplace for Claude Code plugins. "
+            "Useful comments first - link only when the question is about "
+            "discovering or composing plugins."
+        ),
+    },
+    {
+        "slug": "skrills",
+        "owner": "athola",
+        "repo": "skrills",
+        "topics": ["chrome-extension", "trades", "knowledge-capture"],
+        "subreddits": ["Construction", "ITCareerQuestions", "SideProject"],
+        "search_terms": [
+            "trade skill capture",
+            "field knowledge chrome extension",
+        ],
+        "posture": (
+            "Lead with: capture trade-skill knowledge from the field. "
+            "Comment on the workflow first, mention skrills only when the "
+            "thread is explicitly about capture or onboarding."
+        ),
+    },
+    {
+        "slug": "simple-resume",
+        "owner": "athola",
+        "repo": "simple-resume",
+        "topics": ["resume", "yaml-to-pdf", "static-site"],
+        "subreddits": ["resumes", "cscareerquestions", "SideProject"],
+        "search_terms": [
+            "yaml resume",
+            "static resume site",
+            "resume generator",
+        ],
+        "posture": (
+            "Lead with: a YAML-driven resume that builds PDF and HTML. "
+            "Comment with concrete examples; mention only when the post is "
+            "about resume tooling specifically."
+        ),
+    },
+    {
+        "slug": "personal-brand",
+        "owner": "athola",
+        "repo": "athola",  # GitHub profile repo
+        "topics": [
+            "ai-systems",
+            "agent-platforms",
+            "plugin-ecosystems",
+            "msp-tooling",
+            "fastapi",
+            "ai-engineering",
+        ],
+        "subreddits": [
+            "ClaudeAI",
+            "LocalLLaMA",
+            "MachineLearning",
+            "ExperiencedDevs",
+            "ProgrammerHumor",
+        ],
+        "search_terms": [
+            "ai systems engineering",
+            "agent orchestration",
+            "claude code plugins",
+            "personal ai ops stack",
+            "msp automation",
+        ],
+        "posture": (
+            "Voice: AI systems engineer at the company in Austin, building a "
+            "personal AI ops stack. Share first-hand experience, not pitches. "
+            "Always link to source code or running infra. The tone: terse, "
+            "specific, opinionated. Never auto-post; queue drafts for review."
+        ),
+    },
+)
+
+
+def seed_default_projects(brain_db) -> list[dict]:
+    """Idempotently insert the default project tracking set.
+
+    Returns the list of resulting project rows. Safe to call on every
+    boot; `upsert_project` uses ON CONFLICT to preserve hand-edits to
+    topics/subreddits/posture.
+    """
+    out = []
+    for spec in _DEFAULT_PROJECTS:
+        existing = brain_db.get_project(spec["slug"])
+        if existing is None:
+            row = brain_db.upsert_project(
+                spec["slug"],
+                spec["owner"],
+                spec["repo"],
+                topics=spec["topics"],
+                subreddits=spec["subreddits"],
+                search_terms=spec["search_terms"],
+                posture=spec["posture"],
+            )
+            out.append(row)
+            logger.info("seed_default_projects: created %s", spec["slug"])
+        else:
+            out.append(existing)
+    return out
+
+
 # ─── Registry ────────────────────────────────────────────────────────
 
 GENERATORS = {
@@ -128,4 +311,5 @@ GENERATORS = {
     "weekly_traffic": weekly_traffic_generator,
     "awesome_lists_watch": awesome_lists_watch_generator,
     "custom_scan": custom_scan_generator,
+    "content_idea": content_idea_generator,
 }
