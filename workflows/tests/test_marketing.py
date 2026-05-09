@@ -1066,7 +1066,10 @@ class TestHotPulseGenerator:
         assert "hot_pulse" in GENERATORS
 
     @pytest.mark.asyncio
-    async def test_hot_pulse_calls_search_with_5m_window(self, monkeypatch):
+    async def test_hot_pulse_calls_search_with_default_window(self, monkeypatch):
+        """Default window is 15min lookback — the cron still fires
+        every 5min but each fire scans a wider net to catch sparse
+        Reddit activity without missing anything between fires."""
         from unittest.mock import AsyncMock
 
         from generators import hot_pulse_generator
@@ -1087,6 +1090,31 @@ class TestHotPulseGenerator:
         await hot_pulse_generator(brain_db)
 
         assert search_mock.await_count >= 1
+        for call in search_mock.await_args_list:
+            assert call.kwargs.get("since") == "15m"
+
+    @pytest.mark.asyncio
+    async def test_hot_pulse_window_is_overridable(self, monkeypatch):
+        """An explicit `window` kwarg overrides the default."""
+        from unittest.mock import AsyncMock
+
+        from generators import hot_pulse_generator
+
+        brain_db.upsert_project(
+            "claude-night-market",
+            "athola",
+            "claude-night-market",
+            topics=["claude code plugin"],
+            subreddits=["ClaudeAI"],
+            search_terms=["claude code plugin"],
+        )
+
+        search_mock = AsyncMock(return_value=[])
+        monkeypatch.setattr("reddit_search.search_subreddits", search_mock)
+        monkeypatch.setattr("telegram.notify", AsyncMock(return_value=True))
+
+        await hot_pulse_generator(brain_db, window="5m")
+
         for call in search_mock.await_args_list:
             assert call.kwargs.get("since") == "5m"
 
