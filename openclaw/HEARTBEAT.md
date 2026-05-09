@@ -8,6 +8,9 @@ Runs every 5 minutes. Handled in Python by the proxy — no LLM needed.
 2. **Balance** — below $5.00 threshold?
 3. **Pending tasks** — anything in the queue to process?
 4. **Brain health** — is the knowledge DB accessible? (via /healthz brain status)
+5. **Research freshness** (daily, not every cycle) — has a research
+   session run in the last 24 hours? If not, queue a `Daily research
+   pulse: <topic>` task at P3 so John-117 picks one up.
 
 ## Behavior
 
