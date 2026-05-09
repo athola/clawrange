@@ -261,6 +261,65 @@ async def comment_draft_generator(
     logger.info("comment_draft: enqueued draft task for %s", post_url)
 
 
+def _matched_keywords(
+    post: "RedditPost", topics: list[str], terms: list[str]
+) -> list[str]:
+    """Return up to two project keywords/terms that literally appear
+    in the post's title or snippet, search_terms first since they
+    were curated as queries (higher signal than topic tags)."""
+    haystack = (post.title + " " + (post.snippet or "")).lower()
+    matches: list[str] = []
+    for t in list(terms) + list(topics):
+        t_norm = t.lower().strip()
+        if t_norm and t_norm in haystack and t_norm not in (m.lower() for m in matches):
+            matches.append(t)
+            if len(matches) >= 2:
+                break
+    return matches
+
+
+def _comment_angle(post: "RedditPost") -> str:
+    """One-line 'why we should comment' framing based on engagement.
+
+    The pulse and the digest both surface the post's URL — this is
+    just enough framing for Alex to decide whether to click through.
+    No example replies; he writes his own."""
+    if post.comments == 0:
+        return "fresh thread, no replies yet — first useful answer wins visibility"
+    if post.comments < 5:
+        return f"{post.comments} replies — early, your comment lands near the top"
+    if post.comments < 20:
+        return f"{post.comments} replies — active discussion, still on-topic"
+    return f"{post.comments} replies — late-stage but high reach"
+
+
+def _render_pick_lines(
+    post: "RedditPost",
+    topics: list[str],
+    terms: list[str],
+    is_bonus: bool,
+) -> list[str]:
+    """Render one pick as a 3-line block: title-with-link / facts / why.
+
+    The link is the literal post.url so it works as a tap target in
+    Telegram clients regardless of Markdown rendering quirks."""
+    title = post.title if len(post.title) <= 90 else post.title[:87] + "..."
+    matches = _matched_keywords(post, topics, terms)
+    if matches:
+        match_text = "matched " + " + ".join(f'"{m}"' for m in matches)
+    elif is_bonus:
+        match_text = "sub-affinity bonus"
+    else:
+        match_text = "search match"
+    star = "★ " if is_bonus else ""
+    return [
+        f"  • {star}[{title}]({post.url})",
+        f"    r/{post.subreddit} · {post.score} pts · "
+        f"{post.comments} comments · {match_text}",
+        f"    Why: {_comment_angle(post)}",
+    ]
+
+
 def _score_relevance(post: "RedditPost", topics: list[str], terms: list[str]) -> float:
     """Keyword-overlap relevance: title + snippet vs project topics/terms.
 
@@ -286,7 +345,6 @@ async def morning_digest_generator(
     project_slugs: list[str] | None = None,
     extra_subreddits: list[str] | None = None,
     top_per_project: int = 4,
-    queue_drafts: bool = True,
     popularity_multiplier: float = 2.0,
     popular_bonus_cap: int = 2,
     **kwargs,
@@ -310,8 +368,10 @@ async def morning_digest_generator(
 
     Filters posts already surfaced for that project via scan_cache.
     Marks every delivered post as `seen` so tomorrow's digest won't
-    repeat it. When queue_drafts is True, enqueues a `[DRAFT]`
-    comment-draft task per post for human review. Never auto-posts.
+    repeat it. Each pick renders as a 3-line block in Telegram:
+    title-with-link / facts / why-comment. No comment drafts are
+    queued — the operator reads, taps the direct URL, and writes
+    their own replies.
     """
     from reddit_search import search_subreddits
     from telegram import notify
@@ -437,21 +497,20 @@ async def morning_digest_generator(
         logger.info("morning_digest: no fresh comment-worthy posts, skipping notify")
         return
 
-    # Compose Markdown digest.
+    # Compose Markdown digest. Each pick renders as 3 lines:
+    # title-with-link / facts / why-comment. No comment-draft text;
+    # Alex reads, taps, and writes his own replies.
     lines = ["*Morning digest — Reddit comment candidates (last 24h)*", ""]
     for project in projects:
         slug = project["slug"]
         picks = picks_by_project.get(slug, [])
         if not picks:
             continue
+        topics = json.loads(project.get("topics", "[]"))
+        terms = json.loads(project.get("search_terms", "[]"))
         lines.append(f"*{slug}* ({project['owner']}/{project['repo']})")
         for post, is_bonus in picks:
-            title = post.title if len(post.title) <= 90 else post.title[:87] + "..."
-            star = "★ " if is_bonus else ""
-            lines.append(
-                f"  • {star}r/{post.subreddit} — [{title}]({post.url}) "
-                f"[id:{post.id}] · {post.score} pts · {post.comments} comments"
-            )
+            lines.extend(_render_pick_lines(post, topics, terms, is_bonus))
         lines.append("")
 
     digest = "\n".join(lines).strip()
@@ -460,33 +519,151 @@ async def morning_digest_generator(
         logger.warning("morning_digest: telegram delivery failed; not marking seen")
         return
 
-    # Mark seen + enqueue draft tasks only after successful delivery.
+    # Mark seen so tomorrow's run won't re-surface the same posts.
+    # No draft tasks are queued — comment-suggestion was removed at
+    # the operator's request.
     for slug, picks in picks_by_project.items():
-        proj = brain_db.get_project(slug) or {}
-        posture = proj.get("posture", "")
-        for post, is_bonus in picks:
+        for post, _is_bonus in picks:
             brain_db.mark_seen("reddit_post", post.id, slug)
-            if queue_drafts:
-                bonus_note = (
-                    " (popular sub-affinity pick — verify topical fit)"
-                    if is_bonus
-                    else ""
-                )
-                desc = (
-                    f"[DRAFT] Comment draft for {slug} on {post.url} "
-                    f"[id:{post.id}]. OP context: r/{post.subreddit} — "
-                    f'"{post.title}".{bonus_note} Write a 3-5 sentence reply '
-                    f"that leads with concrete advice; only mention {slug} if "
-                    f"directly relevant. Never auto-post — Alex reviews. "
-                    f"Posture: {posture}"
-                )
-                brain_db.create_task(desc, priority=2, source="morning_digest")
     logger.info(
         "morning_digest: delivered %d posts (%d strict + %d bonus) across %d projects",
         sum(len(v) for v in picks_by_project.values()),
         sum(1 for v in picks_by_project.values() for _, b in v if not b),
         sum(1 for v in picks_by_project.values() for _, b in v if b),
         len(picks_by_project),
+    )
+
+
+async def hot_pulse_generator(
+    brain_db,
+    project_slugs: list[str] | None = None,
+    extra_subreddits: list[str] | None = None,
+    max_per_project: int = 25,
+    **kwargs,
+) -> None:
+    """5-minute Reddit pulse for brand-new comment candidates.
+
+    Scheduled `*/5 * * * *`. Per project, searches the union of that
+    project's subreddits + the AI-coding extras for posts created in
+    the last 5 minutes. Strict-relevance filter only — at this window
+    the upvote sample is too small to compute an adaptive popularity
+    threshold, so we trust the keyword/term match alone.
+
+    `max_per_project` defaults to 25 — effectively uncapped for any
+    realistic 5-min window. The operator wants every relevant post
+    in the gap surfaced, not a top-3 truncation; on the rare cycle
+    where many posts match, the cap prevents a runaway message.
+
+    Dedup is via scan_cache `kind="reddit_pulse"` — a separate
+    namespace from the morning_digest's `kind="reddit_post"`. That
+    means a post seen by the pulse will still be eligible for the
+    next morning_digest, which is what Alex wants: the digest can
+    re-surface pulse picks he missed, while consecutive pulses won't
+    repeat themselves.
+
+    The Telegram message uses the same 3-line per-pick rendering as
+    the morning_digest. No comment-draft tasks are queued; the
+    direct Reddit URL is enough for Alex to click through and
+    write his own reply.
+
+    Skips Telegram delivery silently when no fresh picks exist —
+    no point pinging the operator every 5 minutes for empty checks.
+    """
+    from reddit_search import search_subreddits
+    from telegram import notify
+
+    projects = brain_db.list_projects()
+    if project_slugs:
+        projects = [p for p in projects if p["slug"] in project_slugs]
+
+    if not projects:
+        logger.info("hot_pulse: no tracked projects, skipping")
+        return
+
+    extras = (
+        list(extra_subreddits)
+        if extra_subreddits is not None
+        else list(MORNING_DIGEST_EXTRA_SUBREDDITS)
+    )
+    sub_set: set[str] = set(extras)
+    for p in projects:
+        for s in json.loads(p.get("subreddits", "[]")):
+            sub_set.add(s)
+    scan_subreddits = sorted(sub_set)
+
+    best_for_post: dict[str, tuple[dict, "RedditPost", float]] = {}
+
+    for project in projects:
+        slug = project["slug"]
+        topics = json.loads(project.get("topics", "[]"))
+        terms = json.loads(project.get("search_terms", "[]"))
+        queries = terms[:3] if terms else (topics[:3] if topics else [slug])
+
+        for query in queries:
+            try:
+                posts = await search_subreddits(
+                    query,
+                    scan_subreddits,
+                    since="5m",
+                    sort="new",
+                    limit_per_sub=10,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "hot_pulse: search failed for %s/%s: %s", slug, query, exc
+                )
+                continue
+
+            for post in posts:
+                if brain_db.is_seen("reddit_pulse", post.id, slug):
+                    continue
+                rel = _score_relevance(post, topics, terms)
+                if rel <= 0:
+                    continue
+                prior = best_for_post.get(post.id)
+                if prior is None or rel > prior[2]:
+                    best_for_post[post.id] = (project, post, rel)
+
+    by_project: dict[str, list[tuple["RedditPost", float]]] = {}
+    for project, post, rel in best_for_post.values():
+        by_project.setdefault(project["slug"], []).append((post, rel))
+    for slug in list(by_project.keys()):
+        by_project[slug].sort(
+            key=lambda pr: pr[1] * (1 + math.log(max(pr[0].score, 1))),
+            reverse=True,
+        )
+        by_project[slug] = by_project[slug][:max_per_project]
+
+    if not any(by_project.values()):
+        # Quiet pulse — no Telegram noise.
+        return
+
+    lines = ["*Hot pulse — fresh posts (last 5 min)*", ""]
+    for project in projects:
+        slug = project["slug"]
+        picks = by_project.get(slug, [])
+        if not picks:
+            continue
+        topics = json.loads(project.get("topics", "[]"))
+        terms = json.loads(project.get("search_terms", "[]"))
+        lines.append(f"*{slug}* ({project['owner']}/{project['repo']})")
+        for post, _rel in picks:
+            lines.extend(_render_pick_lines(post, topics, terms, is_bonus=False))
+        lines.append("")
+
+    pulse = "\n".join(lines).strip()
+    delivered = await notify(pulse)
+    if not delivered:
+        logger.warning("hot_pulse: telegram delivery failed; not marking seen")
+        return
+
+    for slug, picks in by_project.items():
+        for post, _rel in picks:
+            brain_db.mark_seen("reddit_pulse", post.id, slug)
+    logger.info(
+        "hot_pulse: delivered %d fresh posts across %d projects",
+        sum(len(v) for v in by_project.values()),
+        sum(1 for v in by_project.values() if v),
     )
 
 
@@ -615,7 +792,7 @@ _DEFAULT_PROJECTS = (
             "Voice: AI systems engineer at webAI in Austin, building a "
             "personal AI ops stack. Share first-hand experience, not pitches. "
             "Always link to source code or running infra. The tone: terse, "
-            "specific, opinionated. Never auto-post; queue drafts for review."
+            "specific, opinionated."
         ),
     },
 )
@@ -627,6 +804,13 @@ _DEFAULT_SCHEDULES = (
         "name": "Morning Reddit comment-candidate digest",
         "kind": "morning_digest",
         "cron": "0 8 * * *",
+        "kwargs": {},
+    },
+    {
+        "id": "hot_pulse",
+        "name": "5-min Reddit hot-pulse for fresh comment candidates",
+        "kind": "hot_pulse",
+        "cron": "*/5 * * * *",
         "kwargs": {},
     },
 )
@@ -691,6 +875,7 @@ def seed_default_projects(brain_db) -> list[dict]:
 GENERATORS = {
     "morning_scan": morning_scan_generator,
     "morning_digest": morning_digest_generator,
+    "hot_pulse": hot_pulse_generator,
     "weekly_traffic": weekly_traffic_generator,
     "awesome_lists_watch": awesome_lists_watch_generator,
     "custom_scan": custom_scan_generator,

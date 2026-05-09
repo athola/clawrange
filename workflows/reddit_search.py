@@ -56,8 +56,15 @@ class RedditPost(BaseModel):
 
 
 def _parse_since(since: str) -> str:
-    """Convert duration string to asyncpraw time_filter value."""
+    """Convert duration string to asyncpraw time_filter value.
+
+    Reddit's API has no sub-hour time_filter, so '5m' and '15m'
+    request the 'hour' bucket and the caller post-filters by
+    created_utc against the precise cutoff.
+    """
     mapping = {
+        "5m": "hour",
+        "15m": "hour",
         "1h": "hour",
         "24h": "day",
         "7d": "week",
@@ -70,6 +77,8 @@ def _parse_since(since: str) -> str:
 def _parse_since_hours(since: str) -> float:
     """Convert duration string to hours for client-side filtering."""
     mapping = {
+        "5m": 5 / 60,
+        "15m": 15 / 60,
         "1h": 1,
         "24h": 24,
         "7d": 168,
