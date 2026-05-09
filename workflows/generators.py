@@ -734,35 +734,44 @@ async def hot_pulse_generator(
     project_slugs: list[str] | None = None,
     extra_subreddits: list[str] | None = None,
     max_per_project: int = 25,
+    window: str = "15m",
     **kwargs,
 ) -> None:
-    """5-minute Reddit pulse for brand-new comment candidates.
+    """Reddit pulse for brand-new comment candidates.
 
-    Scheduled `*/5 * * * *`. Per project, searches the union of that
-    project's subreddits + the AI-coding extras for posts created in
-    the last 5 minutes. Strict-relevance filter only — at this window
-    the upvote sample is too small to compute an adaptive popularity
+    Scheduled `*/5 * * * *` but each fire searches a 15-minute lookback
+    window by default. Pulse-namespace dedup (`kind=reddit_pulse`)
+    means a post still only reports once across the three fires that
+    catch it (0-5min, 5-10min, 10-15min old). The wider window
+    catches more sparse-niche activity and tolerates a missed cron
+    fire — without re-spamming posts already surfaced.
+
+    Per project, searches the union of that project's subreddits +
+    the AI-coding extras for posts created in the last `window`
+    (default 15m). Strict-relevance filter only — even at 15min the
+    upvote sample is too small to compute an adaptive popularity
     threshold, so we trust the keyword/term match alone.
 
     `max_per_project` defaults to 25 — effectively uncapped for any
-    realistic 5-min window. The operator wants every relevant post
-    in the gap surfaced, not a top-3 truncation; on the rare cycle
-    where many posts match, the cap prevents a runaway message.
+    realistic window. The operator wants every relevant post
+    surfaced, not a top-3 truncation; on the rare cycle where many
+    posts match, the cap prevents a runaway message.
 
     Dedup is via scan_cache `kind="reddit_pulse"` — a separate
     namespace from the morning_digest's `kind="reddit_post"`. That
     means a post seen by the pulse will still be eligible for the
-    next morning_digest, which is what Alex wants: the digest can
-    re-surface pulse picks he missed, while consecutive pulses won't
-    repeat themselves.
+    next morning_digest. Within the pulse's own stream, dedup also
+    means a post caught at fire N (still 5min old) won't re-report
+    at fires N+1 (10min old) and N+2 (15min old) — each post lands
+    in Telegram exactly once.
 
     The Telegram message uses the same 3-line per-pick rendering as
     the morning_digest. No comment-draft tasks are queued; the
-    direct Reddit URL is enough for Alex to click through and
-    write his own reply.
+    direct Reddit URL is enough for the operator to click through
+    and write their own reply.
 
-    Skips Telegram delivery silently when no fresh picks exist —
-    no point pinging the operator every 5 minutes for empty checks.
+    Skips Telegram delivery silently when no fresh picks exist
+    (logged as a heartbeat WARNING so the cron is still observable).
     """
     from reddit_search import search_subreddits
     from telegram import notify
@@ -811,7 +820,7 @@ async def hot_pulse_generator(
                 posts = await search_subreddits(
                     query,
                     scan_subreddits,
-                    since="5m",
+                    since=window,
                     sort="new",
                     limit_per_sub=10,
                 )
@@ -865,13 +874,14 @@ async def hot_pulse_generator(
         # that produced no picks.
         logger.warning(
             "hot_pulse: heartbeat — no fresh comment-worthy posts in "
-            "last 5min (scanned %d subs across %d projects)",
+            "last %s (scanned %d subs across %d projects)",
+            window,
             len(scan_subreddits),
             len(projects),
         )
         return
 
-    lines = ["*Hot pulse — fresh posts (last 5 min)*", ""]
+    lines = [f"*Hot pulse — fresh posts (last {window})*", ""]
     for project in projects:
         slug = project["slug"]
         picks = by_project.get(slug, [])
