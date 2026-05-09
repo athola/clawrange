@@ -1,6 +1,7 @@
 """ClawRange Workflow Service — replaces n8n with testable Python endpoints."""
 
 import json
+import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -13,6 +14,18 @@ from brain import create_brain_router
 from brain_db import BrainDB
 from llm_proxy import router as llm_router
 from telegram import notify
+
+# Wire INFO-level logging for the clawrange.* loggers so cron
+# heartbeats and digest delivery confirmations show up in
+# `docker logs msp-workflows` without needing a global basicConfig
+# (uvicorn already configures its own root handlers).
+logging.getLogger("clawrange").setLevel(logging.INFO)
+if not logging.getLogger("clawrange").handlers:
+    _clawrange_handler = logging.StreamHandler()
+    _clawrange_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
+    )
+    logging.getLogger("clawrange").addHandler(_clawrange_handler)
 
 # ─── Database Initialization ─────────────────────────────────────
 
@@ -307,9 +320,19 @@ async def list_schedules():
 
 @app.get("/sched/{schedule_id}")
 async def get_schedule(schedule_id: str):
+    from scheduler import list_scheduled_jobs
+
     sched = brain_db.get_schedule(schedule_id)
     if not sched:
         raise HTTPException(status_code=404, detail="Schedule not found")
+    jobs = (
+        list_scheduled_jobs(app.state.scheduler)
+        if hasattr(app.state, "scheduler")
+        else []
+    )
+    job_map = {j["id"].replace("marketing_", ""): j for j in jobs}
+    j = job_map.get(sched["id"])
+    sched["next_fire_time"] = j["next_fire_time"] if j else None
     return sched
 
 
