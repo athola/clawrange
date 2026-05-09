@@ -269,6 +269,58 @@ def flag_confidence(findings: list[Finding]) -> list[dict[str, Any]]:
     return out
 
 
+# ─── Channel health ──────────────────────────────────────────────
+
+
+def channel_health() -> dict[str, dict[str, Any]]:
+    """Report per-channel configuration status.
+
+    The /research endpoint returns empty findings when a channel
+    isn't configured; this report tells operators *why* (e.g.
+    GITHUB_PAT not set) so they can fix the actual gap rather than
+    chase phantom logic bugs.
+    """
+    import os
+
+    report: dict[str, dict[str, Any]] = {}
+
+    # discourse / Reddit
+    reddit_configured = bool(
+        os.getenv("REDDIT_CLIENT_ID")
+        and os.getenv("REDDIT_CLIENT_SECRET")
+        and os.getenv("REDDIT_USERNAME")
+        and os.getenv("REDDIT_PASSWORD")
+    )
+    report["discourse"] = {
+        "source": "reddit",
+        "configured": reddit_configured,
+    }
+    if not reddit_configured:
+        report["discourse"]["reason"] = (
+            "REDDIT_CLIENT_ID/SECRET/USERNAME/PASSWORD not set"
+        )
+
+    # code / GitHub
+    github_configured = bool(os.getenv("GITHUB_PAT"))
+    report["code"] = {
+        "source": "github",
+        "configured": github_configured,
+    }
+    if not github_configured:
+        report["code"]["reason"] = "GITHUB_PAT not set"
+
+    # discourse_web / GLM via proxy
+    web_configured = bool(os.getenv("ZAI_API_KEY") or os.getenv("OPENROUTER_API_KEY"))
+    report["discourse_web"] = {
+        "source": "glm-web",
+        "configured": web_configured,
+    }
+    if not web_configured:
+        report["discourse_web"]["reason"] = "ZAI_API_KEY or OPENROUTER_API_KEY not set"
+
+    return report
+
+
 # ─── Channel fetchers (thin wrappers around existing modules) ─────
 
 

@@ -581,6 +581,21 @@ async def research(body: ResearchRequest):
     return result
 
 
+@app.get("/healthz/research")
+def healthz_research():
+    """Per-channel research orchestrator readiness report."""
+    from research import channel_health
+
+    report = channel_health()
+    healthy = sum(1 for v in report.values() if v["configured"])
+    return {
+        "channels": report,
+        "configured_count": healthy,
+        "total_channels": len(report),
+        "status": "ok" if healthy >= 1 else "degraded",
+    }
+
+
 @app.get("/research/sessions")
 def list_research_sessions(limit: int = 25):
     """List recent research sessions, newest first."""

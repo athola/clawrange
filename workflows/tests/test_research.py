@@ -393,6 +393,40 @@ class TestOrchestrateResearch:
 # ─── Confidence flagging (single-source warning) ─────────────────
 
 
+class TestChannelHealth:
+    """`channel_health()` reports per-channel readiness for the
+    operator so an empty `/research` response can be diagnosed
+    without log spelunking.
+    """
+
+    def test_reports_each_channel_with_source(self):
+        from research import channel_health
+
+        report = channel_health()
+        assert set(report.keys()) >= {"discourse", "code", "discourse_web"}
+        for ch, info in report.items():
+            assert "configured" in info
+            assert "source" in info
+
+    def test_unconfigured_channel_includes_reason(self, monkeypatch):
+        # Force github 'not configured' branch
+        monkeypatch.setenv("GITHUB_PAT", "")
+        # Re-import to pick up env change
+        import importlib
+
+        import github_search
+
+        importlib.reload(github_search)
+
+        from research import channel_health
+
+        report = channel_health()
+        code = report["code"]
+        assert code["configured"] is False
+        assert "reason" in code
+        assert "GITHUB_PAT" in code["reason"]
+
+
 class TestConfidenceFlags:
     def test_single_source_findings_flagged(self):
         from research import flag_confidence

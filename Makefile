@@ -67,6 +67,9 @@ test-deerflow: ## Test DeerFlow research layer
 test-ollama: ## Test local Ollama inference
 	@./scripts/test_ollama.sh
 
+test-research: ## Smoke test the /research endpoint with a live topic
+	@./scripts/test_research.sh "$(TOPIC)"
+
 test-unit: ## Run Python unit tests (no containers needed)
 	@python3 -m pytest workflows/tests/ -v
 
