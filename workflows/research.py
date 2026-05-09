@@ -373,6 +373,155 @@ async def _fetch_github(topic: str, **kwargs: Any) -> list[Finding]:
     ]
 
 
+_ARXIV_API = "http://export.arxiv.org/api/query"
+_S2_API = "https://api.semanticscholar.org/graph/v1/paper/search"
+
+
+async def _fetch_academic(topic: str, **kwargs: Any) -> list[Finding]:
+    """Query arXiv (Atom) and Semantic Scholar (JSON) in parallel.
+
+    Both endpoints are public/no-key. Empty/error results never
+    raise — the orchestrator already handles partial failures, but
+    individual academic-channel failures should not bubble out and
+    cause the whole channel to be marked as a triangulation hole.
+    """
+    import httpx
+    import xml.etree.ElementTree as ET
+
+    limit = int(kwargs.get("limit", 5))
+
+    async def _arxiv() -> list[Finding]:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    _ARXIV_API,
+                    params={
+                        "search_query": f"all:{topic}",
+                        "start": 0,
+                        "max_results": limit,
+                        "sortBy": "submittedDate",
+                        "sortOrder": "descending",
+                    },
+                )
+                resp.raise_for_status()
+                root = ET.fromstring(resp.text)
+        except Exception as exc:
+            logger.info("academic.arxiv: %s", exc)
+            return []
+
+        ns = {"atom": "http://www.w3.org/2005/Atom"}
+        out: list[Finding] = []
+        for entry in root.findall("atom:entry", ns):
+            title_el = entry.find("atom:title", ns)
+            summary_el = entry.find("atom:summary", ns)
+            id_el = entry.find("atom:id", ns)
+            published_el = entry.find("atom:published", ns)
+            if title_el is None or id_el is None:
+                continue
+            title = (title_el.text or "").strip()
+            url = (id_el.text or "").strip()
+            summary = (summary_el.text or "").strip() if summary_el is not None else ""
+            year: int | None = None
+            if published_el is not None and published_el.text:
+                try:
+                    year = int(published_el.text[:4])
+                except ValueError:
+                    year = None
+            out.append(
+                Finding(
+                    source="arxiv",
+                    channel="academic",
+                    title=title,
+                    url=url,
+                    relevance=0.55,
+                    summary=summary[:600],
+                    metadata={"year": year} if year else {},
+                )
+            )
+        return out
+
+    async def _semantic_scholar() -> list[Finding]:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    _S2_API,
+                    params={
+                        "query": topic,
+                        "limit": limit,
+                        "fields": "title,abstract,url,year,citationCount,authors",
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as exc:
+            logger.info("academic.s2: %s", exc)
+            return []
+
+        out: list[Finding] = []
+        for item in data.get("data", []):
+            title = item.get("title") or ""
+            url = item.get("url") or ""
+            if not title or not url:
+                continue
+            year = item.get("year")
+            citations = item.get("citationCount") or 0
+            out.append(
+                Finding(
+                    source="semantic_scholar",
+                    channel="academic",
+                    title=title,
+                    url=url,
+                    relevance=0.55,
+                    summary=(item.get("abstract") or "")[:600],
+                    metadata={"year": year, "citations": citations},
+                )
+            )
+        return out
+
+    results = await asyncio.gather(
+        _arxiv(), _semantic_scholar(), return_exceptions=False
+    )
+    flat: list[Finding] = []
+    for r in results:
+        flat.extend(r)
+    return flat
+
+
+async def _fetch_triz(topic: str, **kwargs: Any) -> list[Finding]:
+    """Cross-domain analogical reasoning channel.
+
+    Asks the GLM proxy to find solutions in adjacent fields
+    (queueing theory, biology, economics, control systems, etc.)
+    that map onto the topic's contradiction. Returns up to one
+    synthesized finding; the prompt steers GLM toward concrete
+    analogies with a domain-bridge mapping.
+    """
+    from llm_proxy import _llm_call
+
+    prompt = (
+        f"TRIZ-style cross-domain analysis for: {topic}\n\n"
+        "Find 3 solutions from adjacent domains (queueing theory, "
+        "biology, control systems, economics, manufacturing, "
+        "distributed systems). For each, name the domain, state the "
+        "analogy in one sentence, and explain the bridge mapping in "
+        "one sentence. Be specific."
+    )
+    text = await _llm_call(prompt, max_tokens=600, web_search=True)
+    if not text:
+        return []
+    return [
+        Finding(
+            source="triz",
+            channel="triz",
+            title=f"TRIZ analogies: {topic}"[:200],
+            url="",
+            relevance=0.45,
+            summary=text[:1500],
+            metadata={"raw_response_chars": len(text)},
+        )
+    ]
+
+
 async def _fetch_web(topic: str, **kwargs: Any) -> list[Finding]:
     """Use the GLM web-search proxy for general discourse coverage.
 
@@ -414,6 +563,8 @@ _CHANNEL_FETCHER_NAMES = {
     "discourse": "_fetch_reddit",
     "code": "_fetch_github",
     "discourse_web": "_fetch_web",
+    "academic": "_fetch_academic",
+    "triz": "_fetch_triz",
 }
 
 
