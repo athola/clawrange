@@ -515,6 +515,23 @@ async def morning_digest_generator(
     # stats row promoted_at, so the next run treats it as curated.
     newly_promoted = _promote_emerging_subreddits(brain_db, projects)
 
+    # Same heartbeat-status update as hot_pulse: ensure the schedule's
+    # last_run reflects cron fires, not just manual /sched/.../run.
+    try:
+        from datetime import datetime, timezone
+
+        brain_db.update_schedule_status(
+            "morning_digest",
+            datetime.now(timezone.utc).isoformat(),
+            (
+                f"ok ({sum(len(v) for v in picks_by_project.values())} picks, "
+                f"{sum(len(v) for v in emerging_picks_by_project.values())} emerging, "
+                f"{len(newly_promoted)} promoted)"
+            ),
+        )
+    except Exception as exc:
+        logger.warning("morning_digest: could not update schedule status: %s", exc)
+
     if not picks_by_project and not emerging_picks_by_project and not newly_promoted:
         logger.info("morning_digest: no fresh comment-worthy posts, skipping notify")
         return
@@ -824,8 +841,34 @@ async def hot_pulse_generator(
         )
         by_project[slug] = by_project[slug][:max_per_project]
 
+    # Update the schedule's last_run/last_status so the operator can
+    # see the cron is firing even on silent cycles. APScheduler-driven
+    # fires bypass run_schedule_now (which is what normally writes
+    # those fields), so without this the schedule looks stale and the
+    # operator can't distinguish "scheduler dead" from "no fresh hits".
+    try:
+        from datetime import datetime, timezone
+
+        brain_db.update_schedule_status(
+            "hot_pulse",
+            datetime.now(timezone.utc).isoformat(),
+            f"ok ({sum(len(v) for v in by_project.values())} picks)",
+        )
+    except Exception as exc:
+        logger.warning("hot_pulse: could not update schedule status: %s", exc)
+
     if not any(by_project.values()):
-        # Quiet pulse — no Telegram noise.
+        # Quiet pulse — no Telegram noise. Logged at WARNING level
+        # (rather than INFO) so it's visible without changing the
+        # default root logger config; this is the operator's only
+        # visible signal that the */5 cron actually fired on cycles
+        # that produced no picks.
+        logger.warning(
+            "hot_pulse: heartbeat — no fresh comment-worthy posts in "
+            "last 5min (scanned %d subs across %d projects)",
+            len(scan_subreddits),
+            len(projects),
+        )
         return
 
     lines = ["*Hot pulse — fresh posts (last 5 min)*", ""]
