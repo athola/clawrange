@@ -390,6 +390,129 @@ class TestOrchestrateResearch:
         assert called == ["github"]
 
 
+# ─── Academic + TRIZ channels ────────────────────────────────────
+
+
+class TestAcademicChannel:
+    """`_fetch_academic` queries arXiv (Atom) and converts entries to
+    Findings with citation/year metadata.
+    """
+
+    @pytest.mark.asyncio
+    async def test_parses_arxiv_atom_feed(self, monkeypatch):
+        from research import _fetch_academic
+
+        atom = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <id>http://arxiv.org/abs/2401.12345v1</id>
+    <title>Multi-Agent Research Systems</title>
+    <summary>An exploration of orchestrator-worker patterns.</summary>
+    <published>2026-01-15T00:00:00Z</published>
+    <link href="http://arxiv.org/abs/2401.12345v1"/>
+  </entry>
+</feed>
+"""
+
+        class FakeResp:
+            status_code = 200
+            text = atom
+
+            def raise_for_status(self):
+                pass
+
+        async def fake_get(self, url, **kw):
+            return FakeResp()
+
+        import httpx
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+        results = await _fetch_academic("multi-agent research")
+        assert len(results) >= 1
+        first = next((f for f in results if f.source == "arxiv"), None)
+        assert first is not None
+        assert "Multi-Agent Research Systems" in first.title
+        assert "arxiv.org/abs/2401.12345" in first.url
+        assert first.metadata.get("year") == 2026
+
+    @pytest.mark.asyncio
+    async def test_handles_arxiv_error_gracefully(self, monkeypatch):
+        from research import _fetch_academic
+        import httpx
+
+        async def fail_get(self, url, **kw):
+            raise httpx.HTTPError("network down")
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", fail_get)
+
+        # Should not raise; both arxiv and semantic-scholar fail -> []
+        results = await _fetch_academic("anything")
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_includes_academic_when_requested(self, monkeypatch):
+        from research import Finding, orchestrate_research
+
+        async def fake_academic(topic, **kw):
+            return [
+                Finding(
+                    "arxiv",
+                    "academic",
+                    "Test paper",
+                    "https://arxiv.org/abs/x",
+                    0.7,
+                    "",
+                    metadata={"citations": 80},
+                )
+            ]
+
+        async def empty(topic, **kw):
+            return []
+
+        monkeypatch.setattr("research._fetch_academic", fake_academic)
+        monkeypatch.setattr("research._fetch_reddit", empty)
+        monkeypatch.setattr("research._fetch_github", empty)
+        monkeypatch.setattr("research._fetch_web", empty)
+
+        result = await orchestrate_research("topic", channels=["academic"])
+        assert result["total"] == 1
+        assert result["findings"][0]["source"] == "arxiv"
+
+
+class TestTrizChannel:
+    """`_fetch_triz` does cross-domain analogical reasoning by
+    asking GLM web-search for solutions in adjacent fields.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_at_least_one_triz_finding(self, monkeypatch):
+        from research import _fetch_triz
+
+        async def fake_llm(prompt, max_tokens=100, web_search=False):
+            return (
+                "1. From queueing theory: bounded buffer pattern.\n"
+                "2. From cell biology: ATP throttle.\n"
+            )
+
+        monkeypatch.setattr("llm_proxy._llm_call", fake_llm)
+        results = await _fetch_triz("rate limiting LLM API calls")
+        assert len(results) >= 1
+        first = results[0]
+        assert first.channel == "triz"
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_llm_returns_none(self, monkeypatch):
+        from research import _fetch_triz
+
+        async def fake_llm(prompt, max_tokens=100, web_search=False):
+            return None
+
+        monkeypatch.setattr("llm_proxy._llm_call", fake_llm)
+        results = await _fetch_triz("anything")
+        assert results == []
+
+
 # ─── Confidence flagging (single-source warning) ─────────────────
 
 
