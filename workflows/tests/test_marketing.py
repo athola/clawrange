@@ -225,6 +225,77 @@ class TestGenerators:
         assert "weekly_traffic" in GENERATORS
         assert "awesome_lists_watch" in GENERATORS
         assert "custom_scan" in GENERATORS
+        assert "content_idea" in GENERATORS
+
+    @pytest.mark.asyncio
+    async def test_content_idea_generator_uses_recent_research(self):
+        """
+        GIVEN a recent research session in the brain
+        WHEN content_idea_generator runs
+        THEN it enqueues at least one task per project that
+             references the session topic and at least one finding URL.
+        """
+        from generators import content_idea_generator
+
+        brain_db.upsert_project(
+            "skrills",
+            "athola",
+            "skrills",
+            topics=["chrome-extension", "trade-skills"],
+            posture="Lead with: trade skill capture",
+        )
+        session = brain_db.create_research_session(
+            "trade skills chrome extensions", ["discourse", "code"]
+        )
+        brain_db.add_research_finding(
+            session_id=session["id"],
+            source="reddit",
+            channel="discourse",
+            title="What chrome extensions do trades use?",
+            url="https://reddit.com/r/Construction/post/123",
+            relevance=0.7,
+            summary="Discussion about chrome extensions for site supervisors",
+            metadata={"score": 80},
+        )
+        brain_db.complete_research_session(session["id"])
+
+        await content_idea_generator(brain_db, project_slugs=["skrills"])
+
+        tasks = brain_db.list_tasks(status="pending")
+        assert len(tasks) >= 1
+        idea_tasks = [t for t in tasks if "content idea" in t["description"].lower()]
+        assert len(idea_tasks) >= 1
+        # At least one task should reference the actual finding URL.
+        assert any("reddit.com/r/Construction" in t["description"] for t in idea_tasks)
+
+    @pytest.mark.asyncio
+    async def test_content_idea_generator_skips_when_no_research(self):
+        """No recent sessions -> no tasks emitted."""
+        from generators import content_idea_generator
+
+        brain_db.upsert_project("empty-proj", "athola", "empty-proj")
+        await content_idea_generator(brain_db, project_slugs=["empty-proj"])
+
+        tasks = brain_db.list_tasks(status="pending")
+        # No findings to base ideas on; generator emits nothing.
+        assert tasks == []
+
+    def test_personal_brand_project_seed_exists(self):
+        """
+        GIVEN seed_default_projects has been called
+        WHEN we look up 'personal-brand'
+        THEN it exists with athola owner and AI-systems posture.
+        """
+        from generators import seed_default_projects
+
+        seed_default_projects(brain_db)
+        pb = brain_db.get_project("personal-brand")
+        assert pb is not None
+        assert pb["owner"] == "athola"
+        topics = json.loads(pb["topics"])
+        # Should at least mention AI-systems / agents / plugins
+        joined = " ".join(topics).lower()
+        assert "agent" in joined or "ai" in joined or "plugin" in joined
 
 
 # ─── Scheduler Module ────────────────────────────────────────────
