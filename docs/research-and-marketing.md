@@ -131,18 +131,43 @@ workflows service:
 | `claude-night-market` | Plugin marketplace for Claude Code | ClaudeAI, LocalLLaMA, SideProject |
 | `skrills` | Trade-skill capture chrome extension | Construction, ITCareerQuestions, SideProject |
 | `simple-resume` | YAML → PDF/HTML resume generator | resumes, cscareerquestions, SideProject |
+| `clawrange` | This stack — personal AI ops gateway | ClaudeAI, claudecode, vibecoding, opensourceai, codex, sideprojects, LocalLLaMA, selfhosted |
 | `personal-brand` | Alex's AI-systems engineer voice | ClaudeAI, LocalLLaMA, MachineLearning, ExperiencedDevs |
 
 ### Generators
 
 | Name | Cron suggestion | What it does |
 |------|-----------------|--------------|
-| `morning_scan` | `0 8 * * *` | Reddit + GitHub scan tasks per project |
+| `morning_scan` | `0 8 * * *` | Reddit + GitHub scan tasks per project (queue-only) |
+| `morning_digest` | `0 8 * * *` (auto-seeded) | Live 24h Reddit scan, Telegram digest of comment-worthy posts grouped by project, plus `[DRAFT]` comment tasks |
 | `weekly_traffic` | `0 8 * * 1` | Stargazer / clone deltas per repo |
 | `awesome_lists_watch` | `0 10 * * 3` | PR-target reminders for awesome-lists |
 | `custom_scan` | (ad-hoc) | Generic single-topic task emitter |
 | `content_idea` | `0 9 * * *` | Turns recent research into 1 idea/project |
 | `comment_draft` | (ad-hoc) | Drafts a reply for a specific URL |
+
+#### `morning_digest` — the 8am rundown
+
+Delivered by `morning_digest_generator` (in `workflows/generators.py`).
+On a fresh boot, `seed_default_projects` registers a `0 8 * * *` schedule
+in the `SCHEDULER_TZ` (default `America/Chicago`), so the morning rundown
+fires without manual `/sched add`.
+
+For each tracked project, the generator searches the union of that
+project's subreddits and the AI-coding extras Alex curated
+(`vibecoding`, `opensourceai`, `claudecode`, `ClaudeAI`, `codex`,
+`sideprojects`) for posts created in the last 24h. Each post is scored
+against the project's topics + search_terms, routed to its best-fit
+project, deduplicated against `scan_cache` (so tomorrow's run won't
+re-surface today's posts), and rendered as a Markdown digest grouped
+by project. Telegram delivery via `telegram.notify`. Top picks become
+`[DRAFT]` comment-draft tasks for human review — never auto-posted.
+
+Override at runtime with `kwargs` on the schedule:
+- `project_slugs`: limit to specific projects
+- `extra_subreddits`: replace the default extras list
+- `top_per_project`: cap the digest size (default 4)
+- `queue_drafts`: set false to skip task creation
 
 ### Posture
 

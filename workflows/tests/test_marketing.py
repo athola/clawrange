@@ -364,6 +364,285 @@ class TestGenerators:
         joined = " ".join(topics).lower()
         assert "agent" in joined or "ai" in joined or "plugin" in joined
 
+    def test_clawrange_project_seed_exists(self):
+        """
+        GIVEN seed_default_projects has been called
+        WHEN we look up 'clawrange'
+        THEN athola/clawrange exists with subreddits covering the
+             AI-coding communities (vibecoding/claudecode/codex).
+        """
+        from generators import seed_default_projects
+
+        seed_default_projects(brain_db)
+        cr = brain_db.get_project("clawrange")
+        assert cr is not None
+        assert cr["owner"] == "athola"
+        assert cr["repo"] == "clawrange"
+        subs = {s.lower() for s in json.loads(cr["subreddits"])}
+        # At least one of the AI-coding communities the user listed
+        assert subs & {
+            "vibecoding",
+            "opensourceai",
+            "claudecode",
+            "claudeai",
+            "codex",
+            "sideprojects",
+        }
+
+
+# ─── Morning Digest Generator ────────────────────────────────────
+
+
+class TestMorningDigestGenerator:
+    """The 8am morning_digest_generator delivers a Telegram rundown
+    of comment-worthy Reddit posts in the last 24h, scoped to
+    tracked projects, deduplicated against scan_cache."""
+
+    @pytest.mark.asyncio
+    async def test_morning_digest_in_registry(self):
+        from generators import GENERATORS
+
+        assert "morning_digest" in GENERATORS
+
+    @pytest.mark.asyncio
+    async def test_morning_digest_skips_when_no_projects(self, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        from generators import morning_digest_generator
+
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        # No projects in DB
+        await morning_digest_generator(brain_db)
+        notify_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_morning_digest_calls_search_with_24h_window(self, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        from generators import morning_digest_generator
+
+        brain_db.upsert_project(
+            "claude-night-market",
+            "athola",
+            "claude-night-market",
+            topics=["claude-code", "plugins"],
+            subreddits=["ClaudeAI"],
+            search_terms=["claude code plugin"],
+        )
+
+        search_mock = AsyncMock(return_value=[])
+        monkeypatch.setattr("reddit_search.search_subreddits", search_mock)
+        monkeypatch.setattr("telegram.notify", AsyncMock(return_value=True))
+
+        await morning_digest_generator(brain_db)
+
+        # Every call must specify a 24h window
+        assert search_mock.await_count >= 1
+        for call in search_mock.await_args_list:
+            kwargs = call.kwargs
+            assert kwargs.get("since") == "24h"
+
+    @pytest.mark.asyncio
+    async def test_morning_digest_groups_posts_by_project(self, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        from generators import morning_digest_generator
+        from reddit_search import RedditPost
+
+        brain_db.upsert_project(
+            "claude-night-market",
+            "athola",
+            "claude-night-market",
+            topics=["claude code plugin", "marketplace"],
+            subreddits=["ClaudeAI"],
+            search_terms=["claude code plugin"],
+        )
+        brain_db.upsert_project(
+            "skrills",
+            "athola",
+            "skrills",
+            topics=["trade skill capture", "chrome extension"],
+            subreddits=["Construction"],
+            search_terms=["trade skill capture"],
+        )
+
+        cnm_post = RedditPost(
+            id="cnm1",
+            url="https://reddit.com/r/ClaudeAI/comments/cnm1",
+            title="Best claude code plugin marketplace?",
+            subreddit="ClaudeAI",
+            score=42,
+            comments=10,
+            created_utc="2026-05-09T07:00:00+00:00",
+        )
+        skr_post = RedditPost(
+            id="skr1",
+            url="https://reddit.com/r/Construction/comments/skr1",
+            title="Chrome extension for trade skill capture",
+            subreddit="Construction",
+            score=15,
+            comments=4,
+            created_utc="2026-05-09T07:30:00+00:00",
+        )
+
+        async def fake_search(topic, subs, **kw):
+            t = topic.lower()
+            if "plugin" in t or "marketplace" in t:
+                return [cnm_post]
+            if "trade" in t or "chrome" in t:
+                return [skr_post]
+            return []
+
+        monkeypatch.setattr("reddit_search.search_subreddits", fake_search)
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        await morning_digest_generator(brain_db)
+
+        notify_mock.assert_awaited_once()
+        msg = notify_mock.await_args.args[0]
+        assert "claude-night-market" in msg
+        assert "skrills" in msg
+        assert "cnm1" in msg
+        assert "skr1" in msg
+
+    @pytest.mark.asyncio
+    async def test_morning_digest_dedupes_seen_posts(self, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        from generators import morning_digest_generator
+        from reddit_search import RedditPost
+
+        brain_db.upsert_project(
+            "claude-night-market",
+            "athola",
+            "claude-night-market",
+            topics=["claude code plugin"],
+            subreddits=["ClaudeAI"],
+            search_terms=["claude code plugin"],
+        )
+        # Already surfaced this post yesterday
+        brain_db.mark_seen("reddit_post", "old1", "claude-night-market")
+
+        old = RedditPost(
+            id="old1",
+            url="https://reddit.com/r/ClaudeAI/comments/old1",
+            title="Old claude code plugin post",
+            subreddit="ClaudeAI",
+            score=99,
+            comments=99,
+            created_utc="2026-05-09T07:00:00+00:00",
+        )
+
+        async def fake_search(*a, **kw):
+            return [old]
+
+        monkeypatch.setattr("reddit_search.search_subreddits", fake_search)
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        await morning_digest_generator(brain_db)
+
+        # Already-seen post must not appear in any notify message.
+        if notify_mock.await_count:
+            for call in notify_mock.await_args_list:
+                assert "old1" not in call.args[0]
+
+    @pytest.mark.asyncio
+    async def test_morning_digest_marks_seen_and_drafts_tasks(self, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        from generators import morning_digest_generator
+        from reddit_search import RedditPost
+
+        brain_db.upsert_project(
+            "claude-night-market",
+            "athola",
+            "claude-night-market",
+            topics=["claude code plugin"],
+            subreddits=["ClaudeAI"],
+            search_terms=["claude code plugin"],
+            posture="Lead with: a curated marketplace.",
+        )
+        post = RedditPost(
+            id="fresh1",
+            url="https://reddit.com/r/ClaudeAI/comments/fresh1",
+            title="What claude code plugin do you recommend?",
+            subreddit="ClaudeAI",
+            score=20,
+            comments=5,
+            created_utc="2026-05-09T07:00:00+00:00",
+        )
+
+        async def fake_search(*a, **kw):
+            return [post]
+
+        monkeypatch.setattr("reddit_search.search_subreddits", fake_search)
+        monkeypatch.setattr("telegram.notify", AsyncMock(return_value=True))
+
+        await morning_digest_generator(brain_db)
+
+        # Marked seen so tomorrow's run won't re-surface it.
+        assert brain_db.is_seen("reddit_post", "fresh1", "claude-night-market")
+        # And produced a [DRAFT] comment-draft task for human review.
+        tasks = brain_db.list_tasks(status="pending")
+        draft_tasks = [t for t in tasks if "[DRAFT]" in t["description"].upper()]
+        assert len(draft_tasks) >= 1
+        assert any("fresh1" in t["description"] for t in draft_tasks)
+
+    @pytest.mark.asyncio
+    async def test_morning_digest_includes_user_extra_subreddits(self, monkeypatch):
+        """The scan set must include the AI-coding subreddits the user
+        explicitly listed (vibecoding, opensourceai, claudecode, etc.)
+        even when no project subscribes to them directly."""
+        from unittest.mock import AsyncMock
+
+        from generators import morning_digest_generator
+
+        brain_db.upsert_project(
+            "clawrange",
+            "athola",
+            "clawrange",
+            topics=["personal ai ops"],
+            subreddits=["selfhosted"],  # deliberately narrow
+            search_terms=["personal ai ops"],
+        )
+
+        search_mock = AsyncMock(return_value=[])
+        monkeypatch.setattr("reddit_search.search_subreddits", search_mock)
+        monkeypatch.setattr("telegram.notify", AsyncMock(return_value=True))
+
+        await morning_digest_generator(brain_db)
+
+        all_subs_seen: set[str] = set()
+        for call in search_mock.await_args_list:
+            subs_arg = (
+                call.args[1]
+                if len(call.args) > 1
+                else call.kwargs.get("subreddits", [])
+            )
+            all_subs_seen.update(s.lower() for s in subs_arg)
+        for required in ("vibecoding", "claudecode", "claudeai"):
+            assert required in all_subs_seen, (
+                f"expected {required} in scan set, got {all_subs_seen}"
+            )
+
+    def test_morning_digest_schedule_registered_after_seed(self):
+        """seed_default_projects must register a 0 8 * * * schedule
+        for the morning_digest generator (idempotently)."""
+        from generators import seed_default_projects
+
+        seed_default_projects(brain_db)
+        # Calling twice must not duplicate
+        seed_default_projects(brain_db)
+
+        sched = brain_db.get_schedule("morning_digest")
+        assert sched is not None
+        assert sched["kind"] == "morning_digest"
+        assert sched["cron"].strip() == "0 8 * * *"
+
 
 # ─── Scheduler Module ────────────────────────────────────────────
 
@@ -410,6 +689,38 @@ class TestSchedulerModule:
 
         result = _parse_cron("every 1m")
         assert result == {"minute": "*/5"}
+
+    @pytest.mark.asyncio
+    async def test_init_scheduler_attaches_jobs_for_db_schedules(self):
+        """Regression: init_scheduler must actually attach APScheduler
+        jobs for every active schedule in the DB. The previous
+        SQLAlchemy jobstore tried to serialise brain_db (which holds a
+        live sqlite3.Connection) and silently degraded to unscheduled
+        mode, meaning the 8am morning_digest cron never fired."""
+        from scheduler import init_scheduler
+
+        brain_db.upsert_schedule(
+            "morning_digest",
+            "Morning Reddit digest",
+            "morning_digest",
+            "0 8 * * *",
+        )
+
+        scheduler = init_scheduler(brain_db)
+        try:
+            assert scheduler is not None, (
+                "scheduler must initialise with a serialisable jobstore"
+            )
+            jobs = scheduler.get_jobs()
+            job_ids = [j.id for j in jobs]
+            assert "marketing_morning_digest" in job_ids, (
+                f"expected marketing_morning_digest in {job_ids}"
+            )
+            morning_job = next(j for j in jobs if j.id == "marketing_morning_digest")
+            assert morning_job.next_run_time is not None
+        finally:
+            if scheduler is not None:
+                scheduler.shutdown(wait=False)
 
 
 # ─── Marketing Command Parsing ───────────────────────────────────

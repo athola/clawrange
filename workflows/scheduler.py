@@ -1,7 +1,10 @@
 """APScheduler 3.x integration for marketing orchestrator.
 
-Embeds AsyncIOScheduler in FastAPI lifespan with SQLAlchemyJobStore
-persisting to the same SQLite database. Jobs survive container restarts.
+Embeds AsyncIOScheduler in FastAPI lifespan. Jobs are reconstructed on
+every boot from the brain_db `schedules` table (the source of truth),
+so the scheduler uses an in-memory jobstore: a serialising jobstore
+would try to persist `brain_db` itself (which holds a live sqlite
+connection) and fail at startup.
 """
 
 import json
@@ -9,22 +12,16 @@ import logging
 import os
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+from apscheduler.jobstores.memory import MemoryJobStore
 
 logger = logging.getLogger("clawrange.scheduler")
-
-
-def _get_db_url() -> str:
-    db_path = os.environ.get("BRAIN_DB_PATH", "/data/brain.db")
-    return f"sqlite:///{db_path}"
 
 
 def init_scheduler(brain_db) -> AsyncIOScheduler | None:
     """Create and configure the scheduler. Returns None on failure."""
     try:
-        jobstore = SQLAlchemyJobStore(url=_get_db_url())
         scheduler = AsyncIOScheduler(
-            jobstores={"default": jobstore},
+            jobstores={"default": MemoryJobStore()},
             timezone=os.getenv("SCHEDULER_TZ", "America/Chicago"),
             job_defaults={"misfire_grace_time": 300, "coalesce": True},
         )

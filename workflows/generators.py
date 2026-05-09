@@ -4,10 +4,30 @@ Each generator reads from the projects table and enqueues tasks
 into the existing task queue via brain_db.create_task().
 """
 
+from __future__ import annotations
+
 import json
 import logging
+import math
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from reddit_search import RedditPost
 
 logger = logging.getLogger("clawrange.generators")
+
+# Subreddits to include in every morning digest scan, even when no
+# tracked project subscribes to them directly. Sourced from Alex's
+# brief: AI-coding communities where comment-worthy posts about
+# Claude Code, plugins, and self-hosted agent tooling appear.
+MORNING_DIGEST_EXTRA_SUBREDDITS = (
+    "vibecoding",
+    "opensourceai",
+    "claudecode",
+    "ClaudeAI",
+    "codex",
+    "sideprojects",
+)
 
 
 async def morning_scan_generator(
@@ -240,6 +260,170 @@ async def comment_draft_generator(
     logger.info("comment_draft: enqueued draft task for %s", post_url)
 
 
+def _score_relevance(post: "RedditPost", topics: list[str], terms: list[str]) -> float:
+    """Keyword-overlap relevance: title + snippet vs project topics/terms.
+
+    Topics weight 1.0, search_terms weight 1.5 (terms are higher-signal,
+    they were curated as queries rather than tags). Multi-word phrases
+    count as a single hit when the whole phrase appears.
+    """
+    haystack = (post.title + " " + (post.snippet or "")).lower()
+    score = 0.0
+    for t in topics:
+        t_norm = t.lower().strip()
+        if t_norm and t_norm in haystack:
+            score += 1.0
+    for t in terms:
+        t_norm = t.lower().strip()
+        if t_norm and t_norm in haystack:
+            score += 1.5
+    return score
+
+
+async def morning_digest_generator(
+    brain_db,
+    project_slugs: list[str] | None = None,
+    extra_subreddits: list[str] | None = None,
+    top_per_project: int = 4,
+    queue_drafts: bool = True,
+    **kwargs,
+) -> None:
+    """Deliver the 8am Reddit comment-candidate digest to Telegram.
+
+    Per project, run a live Reddit search (last 24h, sort=new) across the
+    union of that project's subreddits + the AI-coding extras Alex listed.
+    Filter posts already surfaced for that project via scan_cache.
+    Score each post against the project's topics + search_terms, route
+    each post to its highest-relevance project (no double-postings),
+    and compose a single Markdown digest grouped by project.
+
+    Mark every delivered post as `seen` so tomorrow's digest won't repeat
+    it, and (when queue_drafts) enqueue a `[DRAFT]` comment-draft task per
+    post for human review. Never auto-posts.
+    """
+    from reddit_search import search_subreddits
+    from telegram import notify
+
+    projects = brain_db.list_projects()
+    if project_slugs:
+        projects = [p for p in projects if p["slug"] in project_slugs]
+
+    if not projects:
+        logger.info("morning_digest: no tracked projects, skipping")
+        return
+
+    extras = (
+        list(extra_subreddits)
+        if extra_subreddits is not None
+        else list(MORNING_DIGEST_EXTRA_SUBREDDITS)
+    )
+
+    # Union of every project's subreddit list plus the user's extras.
+    sub_set: set[str] = set(extras)
+    for p in projects:
+        for s in json.loads(p.get("subreddits", "[]")):
+            sub_set.add(s)
+    scan_subreddits = sorted(sub_set)
+
+    # Collect (project, post, relevance) candidates across all projects.
+    # Use a per-post-id best-score map so a single post routes to its
+    # best-fit project rather than appearing under two.
+    best_for_post: dict[str, tuple[dict, "RedditPost", float]] = {}
+
+    for project in projects:
+        slug = project["slug"]
+        topics = json.loads(project.get("topics", "[]"))
+        terms = json.loads(project.get("search_terms", "[]"))
+        # Cap query fan-out: pick top 3 search terms (or fall back to
+        # topics) so we don't hammer the Reddit API on every boot.
+        queries = terms[:3] if terms else (topics[:3] if topics else [slug])
+
+        for query in queries:
+            try:
+                posts = await search_subreddits(
+                    query,
+                    scan_subreddits,
+                    since="24h",
+                    sort="new",
+                    limit_per_sub=15,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "morning_digest: search failed for %s/%s: %s", slug, query, exc
+                )
+                continue
+
+            for post in posts:
+                if brain_db.is_seen("reddit_post", post.id, slug):
+                    continue
+                rel = _score_relevance(post, topics, terms)
+                if rel <= 0:
+                    continue
+                prior = best_for_post.get(post.id)
+                if prior is None or rel > prior[2]:
+                    best_for_post[post.id] = (project, post, rel)
+
+    # Group winners by project slug, rank by relevance × log(score+1),
+    # cap top_per_project per group.
+    by_project: dict[str, list[tuple["RedditPost", float]]] = {}
+    for project, post, rel in best_for_post.values():
+        by_project.setdefault(project["slug"], []).append((post, rel))
+    for slug in list(by_project.keys()):
+        by_project[slug].sort(
+            key=lambda pr: pr[1] * (1 + math.log(max(pr[0].score, 1))),
+            reverse=True,
+        )
+        by_project[slug] = by_project[slug][:top_per_project]
+
+    if not any(by_project.values()):
+        logger.info("morning_digest: no fresh comment-worthy posts, skipping notify")
+        return
+
+    # Compose Markdown digest.
+    lines = ["*Morning digest — Reddit comment candidates (last 24h)*", ""]
+    for project in projects:
+        slug = project["slug"]
+        picks = by_project.get(slug, [])
+        if not picks:
+            continue
+        lines.append(f"*{slug}* ({project['owner']}/{project['repo']})")
+        for post, _rel in picks:
+            title = post.title if len(post.title) <= 90 else post.title[:87] + "..."
+            lines.append(
+                f"  • r/{post.subreddit} — [{title}]({post.url}) "
+                f"[id:{post.id}] · {post.score} pts · {post.comments} comments"
+            )
+        lines.append("")
+
+    digest = "\n".join(lines).strip()
+    delivered = await notify(digest)
+    if not delivered:
+        logger.warning("morning_digest: telegram delivery failed; not marking seen")
+        return
+
+    # Mark seen + enqueue draft tasks only after successful delivery.
+    for slug, picks in by_project.items():
+        proj = brain_db.get_project(slug) or {}
+        posture = proj.get("posture", "")
+        for post, _rel in picks:
+            brain_db.mark_seen("reddit_post", post.id, slug)
+            if queue_drafts:
+                desc = (
+                    f"[DRAFT] Comment draft for {slug} on {post.url} "
+                    f"[id:{post.id}]. OP context: r/{post.subreddit} — "
+                    f'"{post.title}". Write a 3-5 sentence reply that '
+                    f"leads with concrete advice; only mention {slug} if "
+                    f"directly relevant. Never auto-post — Alex reviews. "
+                    f"Posture: {posture}"
+                )
+                brain_db.create_task(desc, priority=2, source="morning_digest")
+    logger.info(
+        "morning_digest: delivered %d posts across %d projects",
+        sum(len(v) for v in by_project.values()),
+        sum(1 for v in by_project.values() if v),
+    )
+
+
 # ─── Default Project Seeds ──────────────────────────────────────────
 
 
@@ -295,6 +479,47 @@ _DEFAULT_PROJECTS = (
         ),
     },
     {
+        "slug": "clawrange",
+        "owner": "athola",
+        "repo": "clawrange",
+        "topics": [
+            "personal ai ops",
+            "fastapi workflow service",
+            "claude code",
+            "telegram bot",
+            "llm proxy",
+            "openrouter",
+            "apscheduler",
+            "self-hosted ai",
+        ],
+        "subreddits": [
+            "ClaudeAI",
+            "claudecode",
+            "vibecoding",
+            "opensourceai",
+            "codex",
+            "sideprojects",
+            "LocalLLaMA",
+            "selfhosted",
+        ],
+        "search_terms": [
+            "personal ai ops stack",
+            "claude code workflow",
+            "fastapi llm proxy",
+            "openrouter telegram",
+            "agent orchestration self-hosted",
+        ],
+        "posture": (
+            "Lead with: a single-host AI ops stack (FastAPI workflows + "
+            "Claude Code via OpenClaw) for tier-routed LLM access, "
+            "scheduled marketing scans, and Telegram delivery. Comment "
+            "with first-hand operational details (single uvicorn worker, "
+            "APScheduler job persistence, balance-aware tier routing). "
+            "Mention clawrange only when the post is explicitly about "
+            "self-hosted Claude tooling or LLM-proxy gateways."
+        ),
+    },
+    {
         "slug": "personal-brand",
         "owner": "athola",
         "repo": "athola",  # GitHub profile repo
@@ -330,12 +555,49 @@ _DEFAULT_PROJECTS = (
 )
 
 
+_DEFAULT_SCHEDULES = (
+    {
+        "id": "morning_digest",
+        "name": "Morning Reddit comment-candidate digest",
+        "kind": "morning_digest",
+        "cron": "0 8 * * *",
+        "kwargs": {},
+    },
+)
+
+
+def _seed_default_schedules(brain_db) -> list[dict]:
+    """Idempotently register baseline marketing schedules.
+
+    Only inserts when the schedule_id is missing so that hand-edits to
+    cron, kwargs, or paused state via the /sched API survive reboots.
+    """
+    out: list[dict] = []
+    for spec in _DEFAULT_SCHEDULES:
+        existing = brain_db.get_schedule(spec["id"])
+        if existing is None:
+            row = brain_db.upsert_schedule(
+                spec["id"],
+                spec["name"],
+                spec["kind"],
+                spec["cron"],
+                spec.get("kwargs"),
+            )
+            out.append(row)
+            logger.info("seed_default_schedules: created %s", spec["id"])
+        else:
+            out.append(existing)
+    return out
+
+
 def seed_default_projects(brain_db) -> list[dict]:
     """Idempotently insert the default project tracking set.
 
     Returns the list of resulting project rows. Safe to call on every
     boot; `upsert_project` uses ON CONFLICT to preserve hand-edits to
-    topics/subreddits/posture.
+    topics/subreddits/posture. Also registers the baseline marketing
+    schedules (e.g. the 8am morning_digest) so a fresh deploy gets the
+    morning rundown without manual /sched setup.
     """
     out = []
     for spec in _DEFAULT_PROJECTS:
@@ -354,6 +616,7 @@ def seed_default_projects(brain_db) -> list[dict]:
             logger.info("seed_default_projects: created %s", spec["slug"])
         else:
             out.append(existing)
+    _seed_default_schedules(brain_db)
     return out
 
 
@@ -361,6 +624,7 @@ def seed_default_projects(brain_db) -> list[dict]:
 
 GENERATORS = {
     "morning_scan": morning_scan_generator,
+    "morning_digest": morning_digest_generator,
     "weekly_traffic": weekly_traffic_generator,
     "awesome_lists_watch": awesome_lists_watch_generator,
     "custom_scan": custom_scan_generator,
