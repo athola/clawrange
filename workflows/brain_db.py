@@ -286,6 +286,31 @@ class BrainDB:
                 seen_at      TEXT NOT NULL,
                 PRIMARY KEY(kind, external_id, project_slug)
             );
+
+            CREATE TABLE IF NOT EXISTS research_sessions (
+                id           TEXT PRIMARY KEY,
+                topic        TEXT NOT NULL,
+                channels     TEXT NOT NULL DEFAULT '[]',
+                status       TEXT NOT NULL DEFAULT 'pending',
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS research_findings (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id   TEXT NOT NULL REFERENCES research_sessions(id) ON DELETE CASCADE,
+                source       TEXT NOT NULL,
+                channel      TEXT NOT NULL,
+                title        TEXT NOT NULL DEFAULT '',
+                url          TEXT NOT NULL DEFAULT '',
+                relevance    REAL NOT NULL DEFAULT 0,
+                summary      TEXT NOT NULL DEFAULT '',
+                metadata     TEXT NOT NULL DEFAULT '{}',
+                created_at   TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_research_findings_session
+                ON research_findings(session_id);
         """)
 
         # Migrate: add source column to tasks if missing (existing DBs)
@@ -1078,3 +1103,111 @@ class BrainDB:
         )
         self._conn.commit()
         return cursor.rowcount
+
+    # ─── Research Sessions (multi-source orchestrator audit trail) ─
+
+    def create_research_session(
+        self, topic: str, channels: list[str]
+    ) -> dict[str, Any]:
+        import json
+
+        now = _now()
+        session_id = str(uuid.uuid4())[:12]
+        self._conn.execute(
+            "INSERT INTO research_sessions "
+            "(id, topic, channels, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'pending', ?, ?)",
+            (session_id, topic, json.dumps(channels), now, now),
+        )
+        self._conn.commit()
+        return self.get_research_session(session_id) or {}
+
+    def add_research_finding(
+        self,
+        session_id: str,
+        source: str,
+        channel: str,
+        title: str,
+        url: str,
+        relevance: float,
+        summary: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> int:
+        import json
+
+        now = _now()
+        cursor = self._conn.execute(
+            "INSERT INTO research_findings "
+            "(session_id, source, channel, title, url, relevance, summary, "
+            " metadata, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                session_id,
+                source,
+                channel,
+                title,
+                url,
+                float(relevance),
+                summary,
+                json.dumps(metadata or {}),
+                now,
+            ),
+        )
+        self._conn.execute(
+            "UPDATE research_sessions SET updated_at=? WHERE id=?",
+            (now, session_id),
+        )
+        self._conn.commit()
+        return cursor.lastrowid or 0
+
+    def complete_research_session(self, session_id: str) -> dict[str, Any]:
+        now = _now()
+        self._conn.execute(
+            "UPDATE research_sessions SET status='complete', updated_at=? WHERE id=?",
+            (now, session_id),
+        )
+        self._conn.commit()
+        return self.get_research_session(session_id) or {}
+
+    def get_research_session(self, session_id: str) -> dict[str, Any] | None:
+        import json
+
+        row = self._conn.execute(
+            "SELECT * FROM research_sessions WHERE id=?", (session_id,)
+        ).fetchone()
+        if not row:
+            return None
+        session = self._row_to_dict(row)
+        session["channels"] = json.loads(session.get("channels") or "[]")
+        finding_rows = self._conn.execute(
+            "SELECT * FROM research_findings WHERE session_id=? ORDER BY id ASC",
+            (session_id,),
+        ).fetchall()
+        findings = []
+        for fr in finding_rows:
+            f = self._row_to_dict(fr)
+            f["metadata"] = json.loads(f.get("metadata") or "{}")
+            findings.append(f)
+        session["findings"] = findings
+        session["finding_count"] = len(findings)
+        return session
+
+    def list_research_sessions(self, limit: int = 25) -> list[dict[str, Any]]:
+        import json
+
+        rows = self._conn.execute(
+            "SELECT s.id, s.topic, s.channels, s.status, s.created_at, "
+            "       s.updated_at, "
+            "       (SELECT COUNT(*) FROM research_findings rf "
+            "          WHERE rf.session_id = s.id) AS finding_count "
+            "FROM research_sessions s "
+            "ORDER BY s.created_at DESC "
+            "LIMIT ?",
+            (max(1, limit),),
+        ).fetchall()
+        out = []
+        for r in rows:
+            d = self._row_to_dict(r)
+            d["channels"] = json.loads(d.get("channels") or "[]")
+            out.append(d)
+        return out

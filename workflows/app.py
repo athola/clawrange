@@ -517,6 +517,11 @@ async def research(body: ResearchRequest):
     discourse_web (GLM web search). Findings are deduplicated by URL,
     ranked with authority and recency bonuses, and tagged with a
     confidence flag based on cross-channel triangulation.
+
+    The full session (topic, channels, findings) is persisted in the
+    brain so John-117 can recall earlier research without re-running
+    the fanout. The response includes `session_id` for follow-up
+    queries against `/research/sessions/{id}`.
     """
     from research import orchestrate_research
 
@@ -531,4 +536,37 @@ async def research(body: ResearchRequest):
     if body.subreddits:
         kwargs["subreddits"] = body.subreddits
 
-    return await orchestrate_research(body.topic, channels=body.channels, **kwargs)
+    result = await orchestrate_research(body.topic, channels=body.channels, **kwargs)
+
+    session = brain_db.create_research_session(body.topic, result["channels"])
+    for f in result["findings"]:
+        brain_db.add_research_finding(
+            session_id=session["id"],
+            source=f["source"],
+            channel=f["channel"],
+            title=f["title"],
+            url=f["url"],
+            relevance=f["relevance"],
+            summary=f["summary"],
+            metadata=f.get("metadata", {}),
+        )
+    brain_db.complete_research_session(session["id"])
+
+    result["session_id"] = session["id"]
+    return result
+
+
+@app.get("/research/sessions")
+def list_research_sessions(limit: int = 25):
+    """List recent research sessions, newest first."""
+    sessions = brain_db.list_research_sessions(limit=limit)
+    return {"sessions": sessions, "total": len(sessions)}
+
+
+@app.get("/research/sessions/{session_id}")
+def get_research_session(session_id: str):
+    """Return a research session with all findings."""
+    session = brain_db.get_research_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Research session not found")
+    return session
