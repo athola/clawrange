@@ -275,3 +275,65 @@ class TestTaskCommandDetection:
 
         assert _extract_task_command("hello world") is None
         assert _extract_task_command("what tasks do I have") is None
+
+
+# ─── Research Endpoints ──────────────────────────────────────────
+
+
+class TestResearchEndpoint:
+    """End-to-end tests for /research and /research/sessions."""
+
+    def test_post_research_persists_session(self, monkeypatch):
+        from research import Finding
+
+        async def fake_orch(topic, channels=None, **kwargs):
+            return {
+                "topic": topic,
+                "channels": ["discourse", "code"],
+                "findings": [
+                    {
+                        **Finding(
+                            "reddit",
+                            "discourse",
+                            "Hit 1",
+                            "https://r/1",
+                            0.6,
+                            "summary",
+                            metadata={"score": 80},
+                        ).to_dict(),
+                        "confidence": "low",
+                    }
+                ],
+                "errors": {},
+                "total": 1,
+            }
+
+        monkeypatch.setattr("research.orchestrate_research", fake_orch)
+
+        r = client.post("/research", json={"topic": "agent platforms"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["topic"] == "agent platforms"
+        assert body["total"] == 1
+        assert "session_id" in body
+
+        session_id = body["session_id"]
+        listed = client.get("/research/sessions").json()
+        assert listed["total"] >= 1
+        ids = [s["id"] for s in listed["sessions"]]
+        assert session_id in ids
+
+        detail = client.get(f"/research/sessions/{session_id}").json()
+        assert detail["topic"] == "agent platforms"
+        assert detail["status"] == "complete"
+        assert detail["finding_count"] == 1
+        assert detail["findings"][0]["title"] == "Hit 1"
+        assert detail["findings"][0]["metadata"]["score"] == 80
+
+    def test_empty_topic_returns_400(self):
+        r = client.post("/research", json={"topic": "   "})
+        assert r.status_code == 400
+
+    def test_unknown_session_returns_404(self):
+        r = client.get("/research/sessions/no-such-session")
+        assert r.status_code == 404
