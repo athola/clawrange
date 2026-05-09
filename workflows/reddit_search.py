@@ -1,14 +1,16 @@
-"""Reddit search adapter — asyncpraw wrapper for marketing research.
+"""Reddit search adapter — asyncpraw with a public-JSON fallback.
 
-Calls Reddit's official API via asyncpraw (script-app OAuth flow).
-Returns structured RedditPost results with real URLs, scores, and snippets.
-Gracefully degrades when credentials are missing.
+Preferred path: Reddit's official API via asyncpraw (script-app OAuth
+flow). When credentials are missing, falls back to Reddit's
+unauthenticated read-only JSON endpoint so the morning_digest still
+fires before the operator wires script-app credentials.
 """
 
 import logging
 import os
 from datetime import datetime, timedelta, timezone
 
+import httpx
 from pydantic import BaseModel
 
 logger = logging.getLogger("clawrange.reddit")
@@ -89,12 +91,14 @@ async def search_subreddits(
 ) -> list[RedditPost]:
     """Search multiple subreddits for posts matching a topic.
 
-    Returns deduplicated results sorted by score descending.
-    On missing credentials or API errors, returns empty list with warning.
+    Returns deduplicated results sorted by score descending. Uses the
+    OAuth script-app flow when REDDIT_CLIENT_ID/SECRET/USERNAME/PASSWORD
+    are all set; otherwise falls back to Reddit's public JSON endpoint.
+    Network/API errors degrade to an empty list with a warning.
     """
     if not await is_configured():
-        logger.warning("Reddit credentials not configured — returning empty results")
-        return []
+        logger.info("Reddit OAuth not configured — using public JSON fallback")
+        return await _public_search(topic, subreddits, since, sort, limit_per_sub)
 
     try:
         import asyncpraw
@@ -158,6 +162,97 @@ async def search_subreddits(
         await reddit.close()
     except Exception as exc:
         logger.warning("Reddit API error: %s", exc)
+
+    results.sort(key=lambda p: p.score, reverse=True)
+    return results
+
+
+async def _public_search(
+    topic: str,
+    subreddits: list[str],
+    since: str,
+    sort: str,
+    limit_per_sub: int,
+) -> list[RedditPost]:
+    """Unauthenticated read-only fallback via Reddit's public JSON API.
+
+    No OAuth required — only a non-default User-Agent (Reddit blocks
+    requests using the httpx default UA). Subject to Reddit's stricter
+    anonymous rate limit (~30 req/min), so the OAuth path is preferred
+    when the operator wires REDDIT_CLIENT_ID/SECRET/USERNAME/PASSWORD.
+    """
+    user_agent = os.getenv("REDDIT_USER_AGENT", "clawrange-marketing-bot/0.1")
+    time_filter = _parse_since(since)
+    since_hours = _parse_since_hours(since)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+
+    seen_ids: set[str] = set()
+    results: list[RedditPost] = []
+
+    async with httpx.AsyncClient(
+        headers={"User-Agent": user_agent},
+        timeout=15.0,
+    ) as client:
+        for sub_name in subreddits:
+            url = f"https://www.reddit.com/r/{sub_name}/search.json"
+            params = {
+                "q": topic,
+                "restrict_sr": "1",
+                "sort": sort,
+                "t": time_filter,
+                "limit": str(limit_per_sub),
+            }
+            try:
+                resp = await client.get(url, params=params)
+                if resp.status_code != 200:
+                    logger.warning(
+                        "Reddit public search r/%s '%s' -> HTTP %d",
+                        sub_name,
+                        topic,
+                        resp.status_code,
+                    )
+                    continue
+                payload = resp.json()
+            except Exception as exc:
+                logger.warning("Reddit public search r/%s failed: %s", sub_name, exc)
+                continue
+
+            for child in payload.get("data", {}).get("children", []):
+                d = child.get("data", {}) or {}
+                pid = d.get("id")
+                if not pid or pid in seen_ids:
+                    continue
+                seen_ids.add(pid)
+
+                created = datetime.fromtimestamp(
+                    d.get("created_utc", 0) or 0, tz=timezone.utc
+                )
+                if created < cutoff:
+                    continue
+
+                selftext = d.get("selftext") or ""
+                snippet = (
+                    selftext[:200] + "..."
+                    if len(selftext) > 200
+                    else (selftext or None)
+                )
+                permalink = d.get("permalink") or ""
+                post_url = (
+                    f"https://reddit.com{permalink}" if permalink else d.get("url", "")
+                )
+
+                results.append(
+                    RedditPost(
+                        id=pid,
+                        url=post_url,
+                        title=d.get("title", ""),
+                        subreddit=d.get("subreddit", sub_name),
+                        score=int(d.get("score", 0) or 0),
+                        comments=int(d.get("num_comments", 0) or 0),
+                        created_utc=created.isoformat(),
+                        snippet=snippet,
+                    )
+                )
 
     results.sort(key=lambda p: p.score, reverse=True)
     return results
