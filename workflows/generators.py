@@ -807,7 +807,12 @@ async def hot_pulse_generator(
             is_curated = sub.lower() in project_sub_sets[slug]
             brain_db.record_subreddit_search(sub, slug, is_curated=is_curated)
 
-    best_for_post: dict[str, tuple[dict, "RedditPost", float]] = {}
+    # Per-post-id best-fit map. Each entry tracks the project that
+    # claimed the post, the post object, the literal-match relevance
+    # (>= 1.0 for keyword hits, 0.5 for Reddit-search-only baseline),
+    # and the search query that brought the post back. The query
+    # becomes the "category bucket" we group by in the render.
+    best_for_post: dict[str, tuple[dict, "RedditPost", float, str]] = {}
 
     for project in projects:
         slug = project["slug"]
@@ -834,15 +839,33 @@ async def hot_pulse_generator(
                 if brain_db.is_seen("reddit_pulse", post.id, slug):
                     continue
                 rel = _score_relevance(post, topics, terms)
+                # Reddit returned this post for THIS project's `query`.
+                # Trust the upstream search relevance: assign a
+                # sub-literal baseline of 0.5 when no literal phrase
+                # matches, so semantic hits still surface but rank
+                # below true literal matches.
                 if rel <= 0:
-                    continue
+                    rel = 0.5
                 prior = best_for_post.get(post.id)
                 if prior is None or rel > prior[2]:
-                    best_for_post[post.id] = (project, post, rel)
+                    best_for_post[post.id] = (project, post, rel, query)
+
+    # Group by project, then by category (the search query that
+    # brought the post). Each project block in the digest renders one
+    # subsection per category so the operator sees which area is
+    # currently active.
+    by_project_by_category: dict[str, dict[str, list[tuple["RedditPost", float]]]] = {}
+    for project, post, rel, query in best_for_post.values():
+        slug = project["slug"]
+        by_project_by_category.setdefault(slug, {}).setdefault(query, []).append(
+            (post, rel)
+        )
 
     by_project: dict[str, list[tuple["RedditPost", float]]] = {}
-    for project, post, rel in best_for_post.values():
-        by_project.setdefault(project["slug"], []).append((post, rel))
+    for slug, cat_map in by_project_by_category.items():
+        for cat_picks in cat_map.values():
+            by_project.setdefault(slug, []).extend(cat_picks)
+
     for slug in list(by_project.keys()):
         by_project[slug].sort(
             key=lambda pr: pr[1] * (1 + math.log(max(pr[0].score, 1))),
@@ -881,17 +904,37 @@ async def hot_pulse_generator(
         )
         return
 
+    # Render with category buckets per project. Within each project
+    # block, picks subdivide by the search query that brought them
+    # back. Each pick is also tagged 📌 (literal phrase match,
+    # rel >= 1.0) or ◇ (semantic-only match via Reddit's search
+    # ranking, rel == 0.5) so the operator can tell precision tiers
+    # at a glance.
     lines = [f"*Hot pulse — fresh posts (last {window})*", ""]
     for project in projects:
         slug = project["slug"]
-        picks = by_project.get(slug, [])
-        if not picks:
+        cat_map = by_project_by_category.get(slug, {})
+        if not cat_map:
             continue
         topics = json.loads(project.get("topics", "[]"))
         terms = json.loads(project.get("search_terms", "[]"))
         lines.append(f"*{slug}* ({project['owner']}/{project['repo']})")
-        for post, _rel in picks:
-            lines.extend(_render_pick_lines(post, topics, terms, is_bonus=False))
+        # Sort categories by total pick count desc (most active first).
+        sorted_cats = sorted(cat_map.items(), key=lambda kv: len(kv[1]), reverse=True)
+        for category, cat_picks in sorted_cats:
+            cat_picks_sorted = sorted(
+                cat_picks,
+                key=lambda pr: pr[1] * (1 + math.log(max(pr[0].score, 1))),
+                reverse=True,
+            )
+            lines.append(f'  Category: "{category}"')
+            for post, rel in cat_picks_sorted:
+                tier = "📌" if rel >= 1.0 else "◇"
+                pick_lines = _render_pick_lines(post, topics, terms, is_bonus=False)
+                # Replace the bullet with our tier marker on line 0,
+                # leave the facts/why lines alone.
+                pick_lines[0] = pick_lines[0].replace("  • ", f"  • {tier} ", 1)
+                lines.extend(pick_lines)
         lines.append("")
 
     pulse = "\n".join(lines).strip()

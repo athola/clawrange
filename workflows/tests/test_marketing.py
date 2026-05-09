@@ -1367,6 +1367,114 @@ class TestHotPulseGenerator:
         post_tasks = brain_db.list_tasks(status="pending")
         assert len(post_tasks) == pre
 
+    @pytest.mark.asyncio
+    async def test_hot_pulse_surfaces_semantic_match_with_baseline(self, monkeypatch):
+        """A post returned by Reddit's search but lacking the literal
+        project term in title/snippet must still surface — Reddit's
+        upstream relevance is trusted with a baseline rel=0.5. The
+        post should render with the ◇ semantic-tier marker."""
+        from unittest.mock import AsyncMock
+
+        from generators import hot_pulse_generator
+        from reddit_search import RedditPost
+
+        brain_db.upsert_project(
+            "clawrange",
+            "athola",
+            "clawrange",
+            topics=["agent orchestration"],
+            subreddits=["ClaudeAI"],
+            search_terms=["agent orchestration"],
+        )
+        # Title intentionally avoids "agent orchestration" verbatim.
+        # Reddit returned it for our query — we trust that.
+        semantic_post = RedditPost(
+            id="sem1",
+            url="https://reddit.com/r/selfhosted/comments/sem1",
+            title="Crate Beta — runtime for distributed AI workers",
+            subreddit="selfhosted",
+            score=2,
+            comments=0,
+            created_utc="2026-05-09T19:15:00+00:00",
+            snippet="A new runtime for orchestrating ...",
+        )
+
+        async def fake_search(*a, **kw):
+            return [semantic_post]
+
+        monkeypatch.setattr("reddit_search.search_subreddits", fake_search)
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        await hot_pulse_generator(brain_db)
+
+        notify_mock.assert_awaited_once()
+        msg = notify_mock.await_args.args[0]
+        assert "sem1" in msg, (
+            "semantic-only match must surface (was being filtered out)"
+        )
+        # Tier marker for semantic match
+        assert "◇" in msg
+
+    @pytest.mark.asyncio
+    async def test_hot_pulse_renders_category_buckets(self, monkeypatch):
+        """Picks group by which search query brought them, so the
+        operator can see which category is currently active for a
+        project. Category line appears above the picks for that bucket."""
+        from unittest.mock import AsyncMock
+
+        from generators import hot_pulse_generator
+        from reddit_search import RedditPost
+
+        brain_db.upsert_project(
+            "clawrange",
+            "athola",
+            "clawrange",
+            topics=["claude code workflow"],
+            subreddits=["ClaudeCode"],
+            search_terms=["claude code workflow", "agent orchestration"],
+        )
+
+        cw_post = RedditPost(
+            id="cw1",
+            url="https://reddit.com/r/ClaudeCode/comments/cw1",
+            title="My claude code workflow tips",
+            subreddit="ClaudeCode",
+            score=5,
+            comments=2,
+            created_utc="2026-05-09T19:15:00+00:00",
+        )
+        ao_post = RedditPost(
+            id="ao1",
+            url="https://reddit.com/r/selfhosted/comments/ao1",
+            title="Self-hosted multi-agent runtime",
+            subreddit="selfhosted",
+            score=3,
+            comments=0,
+            created_utc="2026-05-09T19:15:00+00:00",
+        )
+
+        async def fake_search(query, *a, **kw):
+            if "workflow" in query:
+                return [cw_post]
+            if "orchestration" in query:
+                return [ao_post]
+            return []
+
+        monkeypatch.setattr("reddit_search.search_subreddits", fake_search)
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        await hot_pulse_generator(brain_db)
+
+        msg = notify_mock.await_args.args[0]
+        # Both category headers appear
+        assert 'Category: "claude code workflow"' in msg
+        assert 'Category: "agent orchestration"' in msg
+        # Both posts present
+        assert "cw1" in msg
+        assert "ao1" in msg
+
     def test_hot_pulse_schedule_registered_after_seed(self):
         """seed_default_projects must register a */5 * * * * schedule
         for the hot_pulse generator (idempotently)."""
