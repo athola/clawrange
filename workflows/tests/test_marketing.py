@@ -1094,6 +1094,17 @@ class TestHotPulseGenerator:
     relevant to tracked projects, deduplicating only against its own
     pulse history (independent of the 24h digest's dedup namespace)."""
 
+    @pytest.fixture(autouse=True)
+    def _reset_throttle(self):
+        """Reset the module-level delivery-throttle timestamp before
+        each test so cross-test pollution doesn't make the second
+        test's first fire throttle on the previous test's delivery."""
+        import generators
+
+        generators._LAST_HOT_PULSE_DELIVERY_AT = None
+        yield
+        generators._LAST_HOT_PULSE_DELIVERY_AT = None
+
     @pytest.mark.asyncio
     async def test_hot_pulse_in_registry(self):
         from generators import GENERATORS
@@ -1232,12 +1243,13 @@ class TestHotPulseGenerator:
         notify_mock = AsyncMock(return_value=True)
         monkeypatch.setattr("telegram.notify", notify_mock)
 
-        # First fire delivers
-        await hot_pulse_generator(brain_db)
+        # Bypass delivery throttle so this test only exercises the
+        # scan_cache dedup path, not the in-memory delivery interval.
+        await hot_pulse_generator(brain_db, min_delivery_interval_minutes=0)
         assert notify_mock.await_count == 1
 
-        # Second fire same post -> no new delivery
-        await hot_pulse_generator(brain_db)
+        # Second fire same post -> no new delivery (dedup works).
+        await hot_pulse_generator(brain_db, min_delivery_interval_minutes=0)
         assert notify_mock.await_count == 1, "duplicate pulse must be suppressed"
 
     @pytest.mark.asyncio
@@ -1540,6 +1552,205 @@ class TestHotPulseGenerator:
         assert sched is not None
         assert sched["kind"] == "hot_pulse"
         assert sched["cron"].strip() == "*/5 * * * *"
+
+    @pytest.mark.asyncio
+    async def test_hot_pulse_throttles_within_delivery_interval(self, monkeypatch):
+        """Cron fires every 5min for heartbeat, but Telegram delivery
+        is throttled to once per `min_delivery_interval_minutes`
+        (default 15). On throttled fires the function does NOT call
+        Reddit or Telegram — just updates schedule status so the
+        operator can see the cron is alive."""
+        from datetime import datetime, timedelta, timezone
+        from unittest.mock import AsyncMock
+
+        import generators
+        from generators import hot_pulse_generator
+
+        brain_db.upsert_project(
+            "clawrange",
+            "athola",
+            "clawrange",
+            topics=["agent orchestration"],
+            subreddits=["ClaudeAI"],
+            search_terms=["agent orchestration"],
+        )
+        # Schedule row must exist for update_schedule_status to land —
+        # in production seed_default_projects creates this on startup.
+        brain_db.upsert_schedule(
+            "hot_pulse",
+            "5-min Reddit hot-pulse",
+            "hot_pulse",
+            "*/5 * * * *",
+            {},
+        )
+
+        # Pretend we delivered 5 minutes ago — within the 15min throttle.
+        recent = datetime.now(timezone.utc) - timedelta(minutes=5)
+        monkeypatch.setattr(generators, "_LAST_HOT_PULSE_DELIVERY_AT", recent)
+
+        search_mock = AsyncMock(return_value=[])
+        monkeypatch.setattr("reddit_search.search_subreddits", search_mock)
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        await hot_pulse_generator(brain_db)
+
+        search_mock.assert_not_awaited()
+        notify_mock.assert_not_awaited()
+        sched = brain_db.get_schedule("hot_pulse")
+        assert sched is not None
+        assert "throttled" in (sched.get("last_status") or "")
+
+    @pytest.mark.asyncio
+    async def test_hot_pulse_delivers_after_interval_elapses(self, monkeypatch):
+        """After `min_delivery_interval_minutes` has passed since the
+        last delivery, the next fire delivers normally."""
+        from datetime import datetime, timedelta, timezone
+        from unittest.mock import AsyncMock
+
+        import generators
+        from generators import hot_pulse_generator
+        from reddit_search import RedditPost
+
+        brain_db.upsert_project(
+            "clawrange",
+            "athola",
+            "clawrange",
+            topics=["agent orchestration"],
+            subreddits=["ClaudeAI"],
+            search_terms=["agent orchestration"],
+        )
+
+        # Last delivery 16 minutes ago — past the 15min throttle.
+        stale = datetime.now(timezone.utc) - timedelta(minutes=16)
+        monkeypatch.setattr(generators, "_LAST_HOT_PULSE_DELIVERY_AT", stale)
+
+        post = RedditPost(
+            id="ao_fresh",
+            url="https://reddit.com/r/ClaudeAI/comments/ao_fresh",
+            title="Agent orchestration thoughts",
+            subreddit="ClaudeAI",
+            score=3,
+            comments=0,
+            created_utc="2026-05-09T19:15:00+00:00",
+        )
+
+        async def fake_search(*a, **kw):
+            return [post]
+
+        monkeypatch.setattr("reddit_search.search_subreddits", fake_search)
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        await hot_pulse_generator(brain_db)
+
+        notify_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_hot_pulse_min_delivery_interval_is_overridable(self, monkeypatch):
+        """An operator can tune the delivery interval at runtime via
+        the schedule's kwargs (e.g. min_delivery_interval_minutes=5
+        to revert to the old behavior)."""
+        from datetime import datetime, timedelta, timezone
+        from unittest.mock import AsyncMock
+
+        import generators
+        from generators import hot_pulse_generator
+        from reddit_search import RedditPost
+
+        brain_db.upsert_project(
+            "clawrange",
+            "athola",
+            "clawrange",
+            topics=["agent orchestration"],
+            subreddits=["ClaudeAI"],
+            search_terms=["agent orchestration"],
+        )
+
+        # 6 minutes ago — past a 5min override but within the 15min default.
+        recent = datetime.now(timezone.utc) - timedelta(minutes=6)
+        monkeypatch.setattr(generators, "_LAST_HOT_PULSE_DELIVERY_AT", recent)
+
+        post = RedditPost(
+            id="ao_o",
+            url="https://reddit.com/r/ClaudeAI/comments/ao_o",
+            title="Agent orchestration override test",
+            subreddit="ClaudeAI",
+            score=3,
+            comments=0,
+            created_utc="2026-05-09T19:15:00+00:00",
+        )
+
+        async def fake_search(*a, **kw):
+            return [post]
+
+        monkeypatch.setattr("reddit_search.search_subreddits", fake_search)
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        await hot_pulse_generator(brain_db, min_delivery_interval_minutes=5)
+
+        notify_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_hot_pulse_marks_seen_for_all_candidate_projects(self, monkeypatch):
+        """When two projects both could claim the same post (rel ties
+        or one wins by a small margin), the delivered post must be
+        marked seen for ALL projects that scanned it — not just the
+        owner. Otherwise the loser project picks it up on the next
+        fire that's still within the lookback window (cross-project
+        dedup leak)."""
+        from datetime import datetime, timezone
+        from unittest.mock import AsyncMock
+
+        import generators
+        from generators import hot_pulse_generator
+        from reddit_search import RedditPost
+
+        # Both projects literally match the post — relevance tie.
+        brain_db.upsert_project(
+            "clawrange",
+            "athola",
+            "clawrange",
+            topics=["claude code"],
+            subreddits=["ClaudeAI"],
+            search_terms=["claude code"],
+        )
+        brain_db.upsert_project(
+            "claude-night-market",
+            "athola",
+            "claude-night-market",
+            topics=["claude code"],
+            subreddits=["ClaudeAI"],
+            search_terms=["claude code"],
+        )
+
+        # Force fresh delivery (no throttle interference).
+        monkeypatch.setattr(generators, "_LAST_HOT_PULSE_DELIVERY_AT", None)
+
+        shared_post = RedditPost(
+            id="shared1",
+            url="https://reddit.com/r/ClaudeAI/comments/shared1",
+            title="Claude code question",
+            subreddit="ClaudeAI",
+            score=2,
+            comments=0,
+            created_utc=datetime.now(timezone.utc).isoformat(),
+        )
+
+        async def fake_search(*a, **kw):
+            return [shared_post]
+
+        monkeypatch.setattr("reddit_search.search_subreddits", fake_search)
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        await hot_pulse_generator(brain_db)
+
+        notify_mock.assert_awaited_once()
+        # Both projects must be marked seen for the post — leak fix.
+        assert brain_db.is_seen("reddit_pulse", "shared1", "clawrange")
+        assert brain_db.is_seen("reddit_pulse", "shared1", "claude-night-market")
 
 
 # ─── Scheduler Module ────────────────────────────────────────────
