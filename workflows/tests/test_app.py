@@ -337,3 +337,17 @@ class TestResearchEndpoint:
     def test_unknown_session_returns_404(self):
         r = client.get("/research/sessions/no-such-session")
         assert r.status_code == 404
+
+    def test_healthz_research_lists_channels(self):
+        r = client.get("/healthz/research")
+        assert r.status_code == 200
+        body = r.json()
+        assert "channels" in body
+        assert "configured_count" in body
+        assert "total_channels" in body
+        assert body["status"] in ("ok", "degraded")
+        assert set(body["channels"].keys()) >= {
+            "discourse",
+            "code",
+            "discourse_web",
+        }
