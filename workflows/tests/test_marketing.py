@@ -280,6 +280,73 @@ class TestGenerators:
         # No findings to base ideas on; generator emits nothing.
         assert tasks == []
 
+    @pytest.mark.asyncio
+    async def test_comment_draft_generator_emits_review_task(self):
+        """
+        GIVEN a Reddit URL and a project slug
+        WHEN comment_draft_generator runs
+        THEN it enqueues a single comment-draft task tagged for
+             human review and never enqueues a 'post' task.
+        """
+        from generators import comment_draft_generator
+
+        brain_db.upsert_project(
+            "claude-night-market",
+            "athola",
+            "claude-night-market",
+            topics=["claude-code", "plugins"],
+            posture="Lead with: a curated marketplace for Claude Code plugins.",
+        )
+
+        await comment_draft_generator(
+            brain_db,
+            post_url="https://www.reddit.com/r/ClaudeAI/comments/abc123/",
+            post_summary="OP wants to know how to share custom skills.",
+            project_slug="claude-night-market",
+        )
+
+        tasks = brain_db.list_tasks(status="pending")
+        assert len(tasks) == 1
+        t = tasks[0]
+        # Always pending, never auto-sent
+        assert t["status"] == "pending"
+        # Marked as a draft for review
+        assert (
+            "comment draft" in t["description"].lower()
+            or "[draft]" in t["description"].lower()
+        )
+        # Carries the source URL and project context
+        assert "reddit.com/r/ClaudeAI" in t["description"]
+        assert "claude-night-market" in t["description"]
+
+    @pytest.mark.asyncio
+    async def test_comment_draft_generator_requires_url(self):
+        from generators import comment_draft_generator
+
+        # Missing url -> no task created, no exception
+        brain_db.upsert_project("p", "athola", "p")
+        await comment_draft_generator(brain_db, post_url="", project_slug="p")
+        assert brain_db.list_tasks(status="pending") == []
+
+    @pytest.mark.asyncio
+    async def test_comment_draft_generator_handles_unknown_project(self):
+        """Unknown project slug -> still emit a task; posture defaults."""
+        from generators import comment_draft_generator
+
+        await comment_draft_generator(
+            brain_db,
+            post_url="https://news.ycombinator.com/item?id=12345",
+            project_slug="not-a-real-project",
+        )
+        tasks = brain_db.list_tasks(status="pending")
+        assert len(tasks) == 1
+        assert "12345" in tasks[0]["description"]
+
+    def test_comment_draft_in_registry(self):
+        from generators import GENERATORS
+
+        assert "comment_draft" in GENERATORS
+
     def test_personal_brand_project_seed_exists(self):
         """
         GIVEN seed_default_projects has been called

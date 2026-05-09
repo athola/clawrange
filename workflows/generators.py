@@ -187,6 +187,59 @@ async def content_idea_generator(
         )
 
 
+async def comment_draft_generator(
+    brain_db,
+    post_url: str = "",
+    post_summary: str = "",
+    project_slug: str | None = None,
+    **kwargs,
+) -> None:
+    """Draft a useful, non-promotional comment for a target post.
+
+    The output is a *draft*, never an auto-post. We follow the
+    community-first marketing playbook: lead with specific,
+    helpful content; mention a product only when it directly
+    answers the question the post asks.
+
+    Inputs:
+    - post_url: Reddit/HN/blog URL the draft is responding to.
+    - post_summary: optional one-line summary of what OP asked.
+    - project_slug: optional project whose posture should color
+      the draft (e.g. mention claude-night-market when the post
+      is about plugin discovery).
+
+    Emits a single task tagged 'comment_draft' for human review.
+    """
+    if not post_url or not post_url.strip():
+        logger.info("comment_draft: missing post_url, skipping")
+        return
+
+    posture = ""
+    project_name = project_slug or "(no project context)"
+    if project_slug:
+        proj = brain_db.get_project(project_slug)
+        if proj:
+            posture = proj.get("posture", "")
+        else:
+            logger.info(
+                "comment_draft: unknown project slug %s, using defaults",
+                project_slug,
+            )
+
+    summary_clause = f" OP context: {post_summary}." if post_summary else ""
+    posture_clause = f" Posture: {posture}" if posture else ""
+
+    desc = (
+        f"[DRAFT] Comment draft for {project_name} on {post_url}.{summary_clause} "
+        f"Write a useful 3-5 sentence reply that leads with concrete advice and "
+        f"only mentions the product if directly relevant. Honest, specific, no "
+        f"hype. Never auto-post - this draft is for Alex to review and send "
+        f"manually.{posture_clause}"
+    )
+    brain_db.create_task(desc, priority=2, source="schedule")
+    logger.info("comment_draft: enqueued draft task for %s", post_url)
+
+
 # ─── Default Project Seeds ──────────────────────────────────────────
 
 
@@ -312,4 +365,5 @@ GENERATORS = {
     "awesome_lists_watch": awesome_lists_watch_generator,
     "custom_scan": custom_scan_generator,
     "content_idea": content_idea_generator,
+    "comment_draft": comment_draft_generator,
 }
