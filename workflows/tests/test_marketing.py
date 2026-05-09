@@ -551,7 +551,11 @@ class TestMorningDigestGenerator:
                 assert "old1" not in call.args[0]
 
     @pytest.mark.asyncio
-    async def test_morning_digest_marks_seen_and_drafts_tasks(self, monkeypatch):
+    async def test_morning_digest_marks_seen_no_draft_tasks(self, monkeypatch):
+        """The digest marks delivered posts as seen (so tomorrow won't
+        repeat them) but no longer queues [DRAFT] comment tasks. Alex
+        reads the digest, clicks the direct links, and writes his own
+        replies."""
         from unittest.mock import AsyncMock
 
         from generators import morning_digest_generator
@@ -582,15 +586,62 @@ class TestMorningDigestGenerator:
         monkeypatch.setattr("reddit_search.search_subreddits", fake_search)
         monkeypatch.setattr("telegram.notify", AsyncMock(return_value=True))
 
+        pre = len(brain_db.list_tasks(status="pending"))
         await morning_digest_generator(brain_db)
 
-        # Marked seen so tomorrow's run won't re-surface it.
         assert brain_db.is_seen("reddit_post", "fresh1", "claude-night-market")
-        # And produced a [DRAFT] comment-draft task for human review.
-        tasks = brain_db.list_tasks(status="pending")
-        draft_tasks = [t for t in tasks if "[DRAFT]" in t["description"].upper()]
-        assert len(draft_tasks) >= 1
-        assert any("fresh1" in t["description"] for t in draft_tasks)
+        post_tasks = brain_db.list_tasks(status="pending")
+        draft_tasks = [t for t in post_tasks if "[DRAFT]" in t["description"].upper()]
+        assert draft_tasks == [], (
+            f"comment-draft suggestion is removed; got {draft_tasks}"
+        )
+        assert len(post_tasks) == pre, "no new tasks should be queued"
+
+    @pytest.mark.asyncio
+    async def test_morning_digest_renders_relevance_snippet(self, monkeypatch):
+        """Each pick must carry a short 'why relevant + comment angle'
+        snippet directly in the Telegram message — no separate task,
+        no example reply, just enough context to decide whether to
+        click through and comment."""
+        from unittest.mock import AsyncMock
+
+        from generators import morning_digest_generator
+        from reddit_search import RedditPost
+
+        brain_db.upsert_project(
+            "claude-night-market",
+            "athola",
+            "claude-night-market",
+            topics=["claude code plugin"],
+            subreddits=["ClaudeAI"],
+            search_terms=["claude code plugin"],
+        )
+        post = RedditPost(
+            id="snippet1",
+            url="https://reddit.com/r/ClaudeAI/comments/snippet1/best_plugin",
+            title="Best claude code plugin marketplace?",
+            subreddit="ClaudeAI",
+            score=20,
+            comments=5,
+            created_utc="2026-05-09T07:00:00+00:00",
+        )
+
+        async def fake_search(*a, **kw):
+            return [post]
+
+        monkeypatch.setattr("reddit_search.search_subreddits", fake_search)
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        await morning_digest_generator(brain_db)
+
+        notify_mock.assert_awaited_once()
+        msg = notify_mock.await_args.args[0]
+        # Direct URL appears verbatim so Alex can tap to open.
+        assert post.url in msg
+        # 'why' line shows the matched keyword and engagement.
+        assert "claude code plugin" in msg.lower()
+        assert "5 comments" in msg or "5 comment" in msg or "5 pts" in msg
 
     @pytest.mark.asyncio
     async def test_morning_digest_includes_user_extra_subreddits(self, monkeypatch):
@@ -711,6 +762,273 @@ class TestMorningDigestGenerator:
         assert sched is not None
         assert sched["kind"] == "morning_digest"
         assert sched["cron"].strip() == "0 8 * * *"
+
+
+# ─── Hot Pulse Generator (5-min) ─────────────────────────────────
+
+
+class TestHotPulseGenerator:
+    """The 5-min hot_pulse_generator surfaces brand-new Reddit posts
+    relevant to tracked projects, deduplicating only against its own
+    pulse history (independent of the 24h digest's dedup namespace)."""
+
+    @pytest.mark.asyncio
+    async def test_hot_pulse_in_registry(self):
+        from generators import GENERATORS
+
+        assert "hot_pulse" in GENERATORS
+
+    @pytest.mark.asyncio
+    async def test_hot_pulse_calls_search_with_5m_window(self, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        from generators import hot_pulse_generator
+
+        brain_db.upsert_project(
+            "claude-night-market",
+            "athola",
+            "claude-night-market",
+            topics=["claude code plugin"],
+            subreddits=["ClaudeAI"],
+            search_terms=["claude code plugin"],
+        )
+
+        search_mock = AsyncMock(return_value=[])
+        monkeypatch.setattr("reddit_search.search_subreddits", search_mock)
+        monkeypatch.setattr("telegram.notify", AsyncMock(return_value=True))
+
+        await hot_pulse_generator(brain_db)
+
+        assert search_mock.await_count >= 1
+        for call in search_mock.await_args_list:
+            assert call.kwargs.get("since") == "5m"
+
+    @pytest.mark.asyncio
+    async def test_hot_pulse_renders_link_and_relevance(self, monkeypatch):
+        """The pulse message must include the post's direct URL and a
+        short 'why relevant' snippet — no example comment text."""
+        from unittest.mock import AsyncMock
+
+        from generators import hot_pulse_generator
+        from reddit_search import RedditPost
+
+        brain_db.upsert_project(
+            "claude-night-market",
+            "athola",
+            "claude-night-market",
+            topics=["claude code plugin"],
+            subreddits=["ClaudeAI"],
+            search_terms=["claude code plugin"],
+        )
+        post = RedditPost(
+            id="hot1",
+            url="https://reddit.com/r/ClaudeAI/comments/hot1/just_posted",
+            title="Anyone using a claude code plugin?",
+            subreddit="ClaudeAI",
+            score=2,
+            comments=0,
+            created_utc="2026-05-09T17:55:00+00:00",
+        )
+
+        async def fake_search(*a, **kw):
+            return [post]
+
+        monkeypatch.setattr("reddit_search.search_subreddits", fake_search)
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        await hot_pulse_generator(brain_db)
+
+        notify_mock.assert_awaited_once()
+        msg = notify_mock.await_args.args[0]
+        assert post.url in msg, "direct Reddit link required"
+        assert "claude code plugin" in msg.lower(), "relevance snippet required"
+        # Comment-draft text MUST NOT appear.
+        assert "draft" not in msg.lower()
+        assert "3-5 sentence" not in msg.lower()
+        assert "write a" not in msg.lower()
+
+    @pytest.mark.asyncio
+    async def test_hot_pulse_dedups_within_pulse_namespace(self, monkeypatch):
+        """Re-running the pulse with the same post must NOT re-deliver
+        it — dedup is via scan_cache kind='reddit_pulse'."""
+        from unittest.mock import AsyncMock
+
+        from generators import hot_pulse_generator
+        from reddit_search import RedditPost
+
+        brain_db.upsert_project(
+            "claude-night-market",
+            "athola",
+            "claude-night-market",
+            topics=["claude code plugin"],
+            subreddits=["ClaudeAI"],
+            search_terms=["claude code plugin"],
+        )
+        post = RedditPost(
+            id="dedup1",
+            url="https://reddit.com/r/ClaudeAI/comments/dedup1",
+            title="claude code plugin question",
+            subreddit="ClaudeAI",
+            score=1,
+            comments=0,
+            created_utc="2026-05-09T17:55:00+00:00",
+        )
+
+        async def fake_search(*a, **kw):
+            return [post]
+
+        monkeypatch.setattr("reddit_search.search_subreddits", fake_search)
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        # First fire delivers
+        await hot_pulse_generator(brain_db)
+        assert notify_mock.await_count == 1
+
+        # Second fire same post -> no new delivery
+        await hot_pulse_generator(brain_db)
+        assert notify_mock.await_count == 1, "duplicate pulse must be suppressed"
+
+    @pytest.mark.asyncio
+    async def test_hot_pulse_dedup_independent_of_morning_digest(self, monkeypatch):
+        """A post the morning_digest already marked as seen
+        (kind='reddit_post') must STILL surface in hot_pulse — Alex
+        explicitly wants the digest to potentially repeat pulse picks
+        in case he missed them."""
+        from unittest.mock import AsyncMock
+
+        from generators import hot_pulse_generator
+        from reddit_search import RedditPost
+
+        brain_db.upsert_project(
+            "claude-night-market",
+            "athola",
+            "claude-night-market",
+            topics=["claude code plugin"],
+            subreddits=["ClaudeAI"],
+            search_terms=["claude code plugin"],
+        )
+        # Pre-mark as seen by morning_digest namespace.
+        brain_db.mark_seen("reddit_post", "indep1", "claude-night-market")
+
+        post = RedditPost(
+            id="indep1",
+            url="https://reddit.com/r/ClaudeAI/comments/indep1",
+            title="claude code plugin question",
+            subreddit="ClaudeAI",
+            score=1,
+            comments=0,
+            created_utc="2026-05-09T17:55:00+00:00",
+        )
+
+        async def fake_search(*a, **kw):
+            return [post]
+
+        monkeypatch.setattr("reddit_search.search_subreddits", fake_search)
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        await hot_pulse_generator(brain_db)
+
+        notify_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_hot_pulse_does_not_truncate_relevant_posts(self, monkeypatch):
+        """All relevant posts in the 5-min window must appear — no
+        truncation to a small fixed cap. Operator complained that
+        a single match was the only thing surfaced when more were
+        expected; 5-min windows are tight, but when matches exist
+        every one should land in the message."""
+        from unittest.mock import AsyncMock
+
+        from generators import hot_pulse_generator
+        from reddit_search import RedditPost
+
+        brain_db.upsert_project(
+            "claude-night-market",
+            "athola",
+            "claude-night-market",
+            topics=["claude code plugin"],
+            subreddits=["ClaudeAI"],
+            search_terms=["claude code plugin"],
+        )
+
+        # Five distinct relevant posts in the 5-min window
+        posts = [
+            RedditPost(
+                id=f"many{i}",
+                url=f"https://reddit.com/r/ClaudeAI/comments/many{i}",
+                title=f"Question about claude code plugin #{i}",
+                subreddit="ClaudeAI",
+                score=i,
+                comments=0,
+                created_utc="2026-05-09T17:55:00+00:00",
+            )
+            for i in range(1, 6)
+        ]
+
+        async def fake_search(*a, **kw):
+            return posts
+
+        monkeypatch.setattr("reddit_search.search_subreddits", fake_search)
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        await hot_pulse_generator(brain_db)
+
+        msg = notify_mock.await_args.args[0]
+        for i in range(1, 6):
+            assert f"many{i}" in msg, f"post many{i} should appear, got:\n{msg}"
+
+    @pytest.mark.asyncio
+    async def test_hot_pulse_does_not_queue_draft_tasks(self, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        from generators import hot_pulse_generator
+        from reddit_search import RedditPost
+
+        brain_db.upsert_project(
+            "claude-night-market",
+            "athola",
+            "claude-night-market",
+            topics=["claude code plugin"],
+            subreddits=["ClaudeAI"],
+            search_terms=["claude code plugin"],
+        )
+        post = RedditPost(
+            id="nodraft1",
+            url="https://reddit.com/r/ClaudeAI/comments/nodraft1",
+            title="claude code plugin question",
+            subreddit="ClaudeAI",
+            score=1,
+            comments=0,
+            created_utc="2026-05-09T17:55:00+00:00",
+        )
+
+        async def fake_search(*a, **kw):
+            return [post]
+
+        monkeypatch.setattr("reddit_search.search_subreddits", fake_search)
+        monkeypatch.setattr("telegram.notify", AsyncMock(return_value=True))
+
+        pre = len(brain_db.list_tasks(status="pending"))
+        await hot_pulse_generator(brain_db)
+        post_tasks = brain_db.list_tasks(status="pending")
+        assert len(post_tasks) == pre
+
+    def test_hot_pulse_schedule_registered_after_seed(self):
+        """seed_default_projects must register a */5 * * * * schedule
+        for the hot_pulse generator (idempotently)."""
+        from generators import seed_default_projects
+
+        seed_default_projects(brain_db)
+        seed_default_projects(brain_db)
+
+        sched = brain_db.get_schedule("hot_pulse")
+        assert sched is not None
+        assert sched["kind"] == "hot_pulse"
+        assert sched["cron"].strip() == "*/5 * * * *"
 
 
 # ─── Scheduler Module ────────────────────────────────────────────
