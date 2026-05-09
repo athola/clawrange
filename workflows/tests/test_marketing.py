@@ -439,6 +439,41 @@ class TestGenerators:
 
         assert "comment_draft" in GENERATORS
 
+    def test_seed_default_schedules_creates_daily_content_idea(self):
+        """
+        GIVEN seed_default_schedules has been called
+        WHEN we list schedules
+        THEN at minimum the daily-content-idea schedule exists with a
+             cron string that fires at a morning hour.
+        """
+        from generators import seed_default_schedules
+
+        seed_default_schedules(brain_db)
+        scheds = {s["id"]: s for s in brain_db.list_schedules()}
+        assert "daily-content-idea" in scheds
+        sched = scheds["daily-content-idea"]
+        assert sched["kind"] == "content_idea"
+        assert sched["cron"].split()[1] in {"7", "8", "9", "10"}
+
+    def test_seed_default_schedules_idempotent(self):
+        """Calling twice does not duplicate, and preserves user edits."""
+        from generators import seed_default_schedules
+
+        seed_default_schedules(brain_db)
+        first = brain_db.list_schedules()
+        sched = brain_db.get_schedule("daily-content-idea")
+        brain_db.upsert_schedule(
+            sched["id"],
+            sched["name"],
+            sched["kind"],
+            "*/30 * * * *",
+        )
+        seed_default_schedules(brain_db)
+        second = brain_db.list_schedules()
+        assert len(first) == len(second)
+        edited = brain_db.get_schedule("daily-content-idea")
+        assert edited["cron"] == "*/30 * * * *"
+
     def test_personal_brand_project_seed_exists(self):
         """
         GIVEN seed_default_projects has been called
