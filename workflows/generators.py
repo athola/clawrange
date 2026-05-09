@@ -1057,10 +1057,17 @@ _DEFAULT_SCHEDULES = (
         "cron": "*/5 * * * *",
         "kwargs": {},
     },
+    {
+        "id": "daily-content-idea",
+        "name": "Daily content idea per tracked project",
+        "kind": "content_idea",
+        "cron": "0 9 * * *",
+        "kwargs": {},
+    },
 )
 
 
-def _seed_default_schedules(brain_db) -> list[dict]:
+def seed_default_schedules(brain_db) -> list[dict]:
     """Idempotently register baseline marketing schedules.
 
     Only inserts when the schedule_id is missing so that hand-edits to
@@ -1110,7 +1117,7 @@ def seed_default_projects(brain_db) -> list[dict]:
             logger.info("seed_default_projects: created %s", spec["slug"])
         else:
             out.append(existing)
-    _seed_default_schedules(brain_db)
+    seed_default_schedules(brain_db)
     return out
 
 
