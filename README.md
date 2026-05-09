@@ -125,16 +125,26 @@ The workflows service is a single FastAPI process. It owns:
 
 ### Research Orchestrator
 
-`POST /research` fans out across Reddit, GitHub, and GLM web search
-in parallel, then merges and ranks the results with authority
-bonuses (stars, scores, citations), recency bonus, and a
-cross-channel triangulation bonus capped at +0.15. Each finding is
-tagged with a confidence flag (high/medium/low) so John-117 can
-mark single-source claims as "needs verification".
+`POST /research` fans out across five channels in parallel —
+Reddit (`discourse`), GitHub (`code`), GLM web search
+(`discourse_web`), arXiv + Semantic Scholar (`academic`), and
+TRIZ analogical reasoning (`triz`) — then merges and ranks the
+results with authority bonuses (stars, scores, citations),
+recency bonus, and a cross-channel triangulation bonus capped at
++0.15. Each finding is tagged with a confidence flag (high /
+medium / low) so John-117 can mark single-source claims as
+"needs verification".
+
+Operators can probe per-channel readiness with `GET /healthz/research`
+or run the full smoke test with `make test-research TOPIC="..."`.
 
 Every call persists a session in the brain so earlier research is
 recoverable via `GET /research/sessions/{id}` without re-running
-the fanout. See [docs/research-and-marketing.md](docs/research-and-marketing.md)
+the fanout. Heavier work (full tome `/tome:research` synthesis,
+academic deep-dives) is handled by `scripts/tome_bridge.py` which
+polls for `research:tome:` tasks and runs them through Alex's
+local Claude Code session. See
+[docs/research-and-marketing.md](docs/research-and-marketing.md)
 for the full operator guide.
 
 ### Marketing Orchestrator
