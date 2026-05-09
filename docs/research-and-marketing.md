@@ -169,6 +169,93 @@ Override at runtime with `kwargs` on the schedule:
 - `top_per_project`: cap the digest size (default 4)
 - `queue_drafts`: set false to skip task creation
 
+#### Reddit API access — script-app setup
+
+The digest works on a fresh deploy without credentials by falling
+back to Reddit's unauthenticated public JSON endpoint. That fallback
+is rate-limited (~30 req/min anonymous) and omits some fields, so
+wire a script-app for production-quality lookups.
+
+**Step 1 — Create the script app**
+
+1. Sign in to Reddit as the account whose voice the bot will speak
+   in (typically `u/athola`).
+2. Visit https://www.reddit.com/prefs/apps and click
+   **"are you a developer? create an app..."** at the bottom.
+3. Fill in the form:
+   - **name**: `clawrange-marketing-bot` (or any identifier you like)
+   - **type**: select **`script`** — this is the only OAuth flow
+     that supports username + password and works for read-only
+     personal use. Do **not** pick `web app` or `installed app`.
+   - **description**: optional. e.g. *"Personal marketing-research
+     bot. Read-only search across AI-coding subreddits."*
+   - **about url**: leave blank or point at your repo.
+   - **redirect uri**: required even for script apps — set it to
+     `http://localhost:8080` (it isn't used by the script flow but
+     Reddit rejects the form if it's empty).
+4. Click **"create app"**. You should land on the app's detail card.
+
+**Step 2 — Pull the credentials**
+
+On the app card you just created:
+- **client_id**: the short string directly under the app name —
+  it's labelled `personal use script` (~14 characters, base62).
+- **client_secret**: the longer `secret` field on the same card.
+  Click **"edit"** if it's hidden behind a placeholder.
+
+You also need the Reddit account's own credentials:
+- **username**: the account you logged in as (e.g. `athola`).
+- **password**: that account's password. If 2FA is enabled, append
+  the current TOTP code with a colon, e.g. `mypassword:123456`,
+  per asyncpraw's documented script-app flow. Long-running daemons
+  generally disable 2FA on the bot account or use an app-password.
+
+**Step 3 — Wire the credentials**
+
+Add to `.env` at the repo root (the file is gitignored):
+
+```dotenv
+REDDIT_CLIENT_ID=abc123XYZ
+REDDIT_CLIENT_SECRET=longersecretvalue
+REDDIT_USERNAME=athola
+REDDIT_PASSWORD=yourpassword
+REDDIT_USER_AGENT=clawrange-marketing-bot/0.1 (by u/athola)
+```
+
+The `REDDIT_USER_AGENT` is required by Reddit's API rules — include
+your username so they can contact you about misbehaving bots. The
+default value is acceptable but the personalised form is preferred.
+
+**Step 4 — Reload the workflows container**
+
+```bash
+docker compose restart workflows
+```
+
+The container reads `.env` at start; a restart picks up the new
+values. No image rebuild needed.
+
+**Step 5 — Verify the OAuth path is live**
+
+```bash
+curl -X POST http://localhost:5678/sched/morning_digest/run
+docker logs msp-workflows --since 30s | grep -i reddit
+```
+
+Look for the absence of `Reddit OAuth not configured — using public
+JSON fallback` in the logs. Confirm `[DRAFT]` tasks appear in the
+queue with `curl http://localhost:5678/task?status=pending` and
+that the Markdown digest landed in Telegram.
+
+**Troubleshooting**
+
+| Symptom | Cause |
+|---------|-------|
+| `401 Unauthorized` from asyncpraw | Wrong client_id/secret, or app type is not `script` |
+| `invalid_grant` | Wrong username or password |
+| Empty results despite valid creds | Account has no Reddit history; new accounts hit shadow filters. Use an account with at least one comment / 1+ karma. |
+| Rate limit warnings (`429`) on public fallback | Expected when creds are missing under heavy fan-out — set creds to upgrade to authenticated rate limits (~60 req/min). |
+
 ### Posture
 
 The marketing posture is encoded in each project's `posture` field

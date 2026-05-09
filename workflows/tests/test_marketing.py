@@ -976,11 +976,71 @@ class TestMarketingAPIEndpoints:
 
 class TestRedditAdapter:
     @pytest.mark.asyncio
-    async def test_not_configured(self):
+    async def test_no_creds_uses_public_fallback(self):
+        """When OAuth credentials aren't configured, search_subreddits
+        must fall back to Reddit's public JSON endpoint instead of
+        returning an empty list. This keeps the morning_digest useful
+        on a fresh deploy before the operator wires script-app creds."""
+        import json as _json
+        from datetime import datetime, timezone
+        from unittest.mock import AsyncMock, patch
+
+        import httpx
+
         from reddit_search import is_configured, search_subreddits
 
         assert not await is_configured()
-        results = await search_subreddits("test", ["ClaudeAI"])
+
+        now_ts = datetime.now(timezone.utc).timestamp()
+        payload = {
+            "data": {
+                "children": [
+                    {
+                        "data": {
+                            "id": "abc123",
+                            "title": "Best claude code plugin for new users?",
+                            "subreddit": "ClaudeAI",
+                            "permalink": "/r/ClaudeAI/comments/abc123/best_plugin/",
+                            "score": 42,
+                            "num_comments": 7,
+                            "created_utc": now_ts,
+                            "selftext": "Looking for recommendations.",
+                        }
+                    }
+                ]
+            }
+        }
+        mock_resp = httpx.Response(200, content=_json.dumps(payload).encode())
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("reddit_search.httpx.AsyncClient", return_value=mock_client):
+            results = await search_subreddits(
+                "claude code plugin", ["ClaudeAI"], since="24h"
+            )
+
+        assert len(results) == 1
+        assert results[0].id == "abc123"
+        assert results[0].subreddit == "ClaudeAI"
+        assert "reddit.com" in results[0].url
+        assert results[0].score == 42
+
+    @pytest.mark.asyncio
+    async def test_public_fallback_swallows_network_errors(self):
+        from unittest.mock import AsyncMock, patch
+
+        from reddit_search import search_subreddits
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(side_effect=Exception("network down"))
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("reddit_search.httpx.AsyncClient", return_value=mock_client):
+            results = await search_subreddits("test", ["ClaudeAI"])
+
         assert results == []
 
     def test_parse_since(self):
