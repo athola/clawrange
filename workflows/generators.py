@@ -413,6 +413,14 @@ async def morning_digest_generator(
     # its subreddit, not one that doesn't.
     best_for_post: dict[str, tuple[dict, "RedditPost", float, bool]] = {}
 
+    # Record one search impression per (sub, project) pair this cycle —
+    # gives the stats table a denominator for hit-rate analysis.
+    for project in projects:
+        slug = project["slug"]
+        for sub in scan_subreddits:
+            is_curated = sub.lower() in project_sub_sets[slug]
+            brain_db.record_subreddit_search(sub, slug, is_curated=is_curated)
+
     for project in projects:
         slug = project["slug"]
         topics = json.loads(project.get("topics", "[]"))
@@ -493,7 +501,21 @@ async def morning_digest_generator(
         if chosen:
             picks_by_project[slug] = chosen
 
-    if not picks_by_project:
+    # Discovery pass: search across all of Reddit (no sub restriction)
+    # for each project's first search term. Posts in non-curated subs
+    # that match relevance get tagged emerging — surfaced in their own
+    # 🆕 section AND recorded as hits in subreddit_stats so they
+    # accumulate toward the auto-promote threshold (≥5 hits in 14d).
+    emerging_picks_by_project = await _discover_emerging(
+        brain_db, projects, project_sub_sets
+    )
+
+    # Auto-promote any non-curated subs that have crossed the threshold
+    # since the last digest. Mutates project.subreddits + stamps the
+    # stats row promoted_at, so the next run treats it as curated.
+    newly_promoted = _promote_emerging_subreddits(brain_db, projects)
+
+    if not picks_by_project and not emerging_picks_by_project and not newly_promoted:
         logger.info("morning_digest: no fresh comment-worthy posts, skipping notify")
         return
 
@@ -504,14 +526,25 @@ async def morning_digest_generator(
     for project in projects:
         slug = project["slug"]
         picks = picks_by_project.get(slug, [])
-        if not picks:
+        emerging = emerging_picks_by_project.get(slug, [])
+        if not picks and not emerging:
             continue
         topics = json.loads(project.get("topics", "[]"))
         terms = json.loads(project.get("search_terms", "[]"))
         lines.append(f"*{slug}* ({project['owner']}/{project['repo']})")
         for post, is_bonus in picks:
             lines.extend(_render_pick_lines(post, topics, terms, is_bonus))
+        if emerging:
+            lines.append("  🆕 Emerging subs:")
+            for post in emerging:
+                lines.extend(_render_pick_lines(post, topics, terms, is_bonus=False))
         lines.append("")
+
+    # Stored-subs report paragraph: which subs we search, which yield
+    # hits, and any newly auto-promoted into curated lists.
+    report = _render_subreddit_report(brain_db, projects, newly_promoted)
+    if report:
+        lines.append(report)
 
     digest = "\n".join(lines).strip()
     delivered = await notify(digest)
@@ -519,19 +552,164 @@ async def morning_digest_generator(
         logger.warning("morning_digest: telegram delivery failed; not marking seen")
         return
 
-    # Mark seen so tomorrow's run won't re-surface the same posts.
+    # Mark seen + record hits for surfaced posts.
     # No draft tasks are queued — comment-suggestion was removed at
     # the operator's request.
     for slug, picks in picks_by_project.items():
         for post, _is_bonus in picks:
             brain_db.mark_seen("reddit_post", post.id, slug)
+            brain_db.record_subreddit_hit(post.subreddit, slug)
     logger.info(
-        "morning_digest: delivered %d posts (%d strict + %d bonus) across %d projects",
-        sum(len(v) for v in picks_by_project.values()),
+        "morning_digest: delivered %d posts (%d strict + %d bonus + %d emerging) "
+        "across %d projects, %d newly promoted",
+        sum(len(v) for v in picks_by_project.values())
+        + sum(len(v) for v in emerging_picks_by_project.values()),
         sum(1 for v in picks_by_project.values() for _, b in v if not b),
         sum(1 for v in picks_by_project.values() for _, b in v if b),
-        len(picks_by_project),
+        sum(len(v) for v in emerging_picks_by_project.values()),
+        len(picks_by_project) + len(emerging_picks_by_project),
+        len(newly_promoted),
     )
+
+
+async def _discover_emerging(
+    brain_db,
+    projects: list[dict],
+    project_sub_sets: dict[str, set[str]],
+    cap_per_project: int = 2,
+) -> dict[str, list["RedditPost"]]:
+    """Search /r/all for each project's first term; return posts in
+    non-curated subreddits that pass the project's strict relevance
+    filter, capped per project. Records each match as a stat hit so
+    sustained emerging subs accumulate toward auto-promotion.
+    """
+    from reddit_search import search_all
+
+    out: dict[str, list["RedditPost"]] = {}
+    for project in projects:
+        slug = project["slug"]
+        terms = json.loads(project.get("search_terms", "[]"))
+        topics = json.loads(project.get("topics", "[]"))
+        if not terms and not topics:
+            continue
+        query = (terms or topics)[0]
+        try:
+            all_posts = await search_all(query, since="24h", limit=15)
+        except Exception as exc:
+            logger.warning(
+                "morning_digest: discovery search failed for %s/%s: %s",
+                slug,
+                query,
+                exc,
+            )
+            continue
+
+        curated = project_sub_sets.get(slug, set())
+        emerging: list[tuple["RedditPost", float]] = []
+        for post in all_posts:
+            sub_lower = post.subreddit.lower()
+            if not sub_lower or sub_lower in curated:
+                continue
+            rel = _score_relevance(post, topics, terms)
+            if rel <= 0:
+                continue
+            # Skip posts already surfaced in earlier digests.
+            if brain_db.is_seen("reddit_post", post.id, slug):
+                continue
+            emerging.append((post, rel))
+            brain_db.record_subreddit_search(post.subreddit, slug, is_curated=False)
+            brain_db.record_subreddit_hit(post.subreddit, slug)
+
+        if emerging:
+            emerging.sort(
+                key=lambda pr: pr[1] * (1 + math.log(max(pr[0].score, 1))),
+                reverse=True,
+            )
+            out[slug] = [p for p, _ in emerging[:cap_per_project]]
+    return out
+
+
+def _promote_emerging_subreddits(
+    brain_db,
+    projects: list[dict],
+    min_hits: int = 5,
+    window_days: int = 14,
+) -> list[tuple[str, str]]:
+    """Auto-promote non-curated subs that crossed the (≥min_hits in
+    window_days) threshold. Mutates project.subreddits via
+    add_project_subreddit and stamps the stats row promoted_at.
+    Returns list of (project_slug, subreddit) pairs newly promoted."""
+    promoted: list[tuple[str, str]] = []
+    for project in projects:
+        slug = project["slug"]
+        candidates = brain_db.find_promotion_candidates(
+            slug, min_hits=min_hits, window_days=window_days
+        )
+        for c in candidates:
+            sub = c["subreddit"]
+            if brain_db.add_project_subreddit(slug, sub):
+                brain_db.mark_subreddit_promoted(sub, slug)
+                promoted.append((slug, sub))
+                logger.info(
+                    "morning_digest: auto-promoted r/%s to %s subreddits "
+                    "(%d hits since %s)",
+                    sub,
+                    slug,
+                    c["hits"],
+                    c.get("first_hit_at", "?"),
+                )
+    return promoted
+
+
+def _render_subreddit_report(
+    brain_db,
+    projects: list[dict],
+    newly_promoted: list[tuple[str, str]],
+) -> str:
+    """One-paragraph report on subreddit coverage: how many subs the
+    digest searches across all projects, how many produced hits this
+    cycle, top yields, and any newly auto-promoted (project, sub)
+    pairs. Renders at the bottom of the morning_digest message."""
+    all_subs: set[str] = set()
+    for p in projects:
+        for s in json.loads(p.get("subreddits", "[]")):
+            all_subs.add(s.lower())
+    for s in MORNING_DIGEST_EXTRA_SUBREDDITS:
+        all_subs.add(s.lower())
+
+    # Top yields across all projects (limit 5)
+    top_rows: list[dict] = []
+    for p in projects:
+        rows = brain_db.list_subreddit_stats(project_slug=p["slug"], limit=20)
+        for r in rows:
+            if r["hits"] > 0:
+                top_rows.append({**r, "project_slug": p["slug"]})
+    top_rows.sort(key=lambda r: r["hits"], reverse=True)
+    top_yields = top_rows[:5]
+
+    parts = [
+        "*Subreddit coverage report*",
+        f"Tracking {len(all_subs)} subreddits across {len(projects)} projects.",
+    ]
+    if top_yields:
+        yields_str = ", ".join(
+            f"r/{r['subreddit']} → {r['project_slug']} ({r['hits']} hits)"
+            for r in top_yields
+        )
+        parts.append(f"Top yield: {yields_str}.")
+    if newly_promoted:
+        promoted_str = ", ".join(f"r/{sub} → {slug}" for slug, sub in newly_promoted)
+        parts.append(
+            f"🆕 Newly promoted to curated: {promoted_str}. "
+            f"These subs hit ≥5 relevant posts in the last 14 days "
+            f"and are now part of the project's standing scan list."
+        )
+    else:
+        parts.append(
+            "No new subs promoted this cycle (auto-promote bar: "
+            "≥5 relevant hits in 14d)."
+        )
+    return " ".join(parts)
 
 
 async def hot_pulse_generator(
@@ -590,6 +768,18 @@ async def hot_pulse_generator(
         for s in json.loads(p.get("subreddits", "[]")):
             sub_set.add(s)
     scan_subreddits = sorted(sub_set)
+
+    project_sub_sets: dict[str, set[str]] = {
+        p["slug"]: {s.lower() for s in json.loads(p.get("subreddits", "[]"))}
+        for p in projects
+    }
+
+    # Record one search impression per (sub, project) pair this cycle.
+    for project in projects:
+        slug = project["slug"]
+        for sub in scan_subreddits:
+            is_curated = sub.lower() in project_sub_sets[slug]
+            brain_db.record_subreddit_search(sub, slug, is_curated=is_curated)
 
     best_for_post: dict[str, tuple[dict, "RedditPost", float]] = {}
 
@@ -660,6 +850,7 @@ async def hot_pulse_generator(
     for slug, picks in by_project.items():
         for post, _rel in picks:
             brain_db.mark_seen("reddit_pulse", post.id, slug)
+            brain_db.record_subreddit_hit(post.subreddit, slug)
     logger.info(
         "hot_pulse: delivered %d fresh posts across %d projects",
         sum(len(v) for v in by_project.values()),

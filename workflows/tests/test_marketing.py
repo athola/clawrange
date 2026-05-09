@@ -161,6 +161,98 @@ class TestScanCache:
         assert brain_db.is_seen("github_repo", "repo1", None)
 
 
+# ─── Subreddit Stats ─────────────────────────────────────────────
+
+
+class TestSubredditStats:
+    """Track per-(sub, project) impressions and hits so the operator
+    can see which subreddits actually pay off and so the system can
+    auto-promote emerging subs that pass a sustained-yield bar."""
+
+    def test_record_search_increments_impressions(self):
+        brain_db.record_subreddit_search("ClaudeAI", "claude-night-market", True)
+        brain_db.record_subreddit_search("ClaudeAI", "claude-night-market", True)
+        rows = brain_db.list_subreddit_stats(project_slug="claude-night-market")
+        assert len(rows) == 1
+        assert rows[0]["subreddit"] == "claudeai"
+        assert rows[0]["impressions"] == 2
+        assert rows[0]["hits"] == 0
+        assert rows[0]["is_curated"] == 1
+
+    def test_record_hit_increments_hits_and_sets_first_hit(self):
+        brain_db.record_subreddit_hit("Construction", "skrills")
+        brain_db.record_subreddit_hit("Construction", "skrills")
+        rows = brain_db.list_subreddit_stats(project_slug="skrills")
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["hits"] == 2
+        assert row["first_hit_at"] is not None
+        assert row["last_hit_at"] is not None
+
+    def test_record_search_then_hit_aggregates(self):
+        brain_db.record_subreddit_search("ClaudeAI", "clawrange", True)
+        brain_db.record_subreddit_hit("ClaudeAI", "clawrange")
+        rows = brain_db.list_subreddit_stats(project_slug="clawrange")
+        assert rows[0]["impressions"] == 1
+        assert rows[0]["hits"] == 1
+
+    def test_curated_filter(self):
+        brain_db.record_subreddit_search("ClaudeAI", "p", True)
+        brain_db.record_subreddit_search("emerging-sub", "p", False)
+        all_ = brain_db.list_subreddit_stats(project_slug="p")
+        curated = brain_db.list_subreddit_stats(project_slug="p", curated_only=True)
+        emerging = brain_db.list_subreddit_stats(project_slug="p", curated_only=False)
+        assert len(all_) == 2
+        assert len(curated) == 1 and curated[0]["subreddit"] == "claudeai"
+        assert len(emerging) == 1 and emerging[0]["subreddit"] == "emerging-sub"
+
+    def test_find_promotion_candidates_threshold(self):
+        """A non-curated sub with >= 5 hits and a first->last hit
+        gap <= 14 days is promotable."""
+        for _ in range(5):
+            brain_db.record_subreddit_hit("AI_Agents", "clawrange")
+        candidates = brain_db.find_promotion_candidates(
+            "clawrange", min_hits=5, window_days=14
+        )
+        assert len(candidates) == 1
+        assert candidates[0]["subreddit"] == "ai_agents"
+
+    def test_find_promotion_skips_under_threshold(self):
+        for _ in range(4):
+            brain_db.record_subreddit_hit("LangChain", "clawrange")
+        candidates = brain_db.find_promotion_candidates(
+            "clawrange", min_hits=5, window_days=14
+        )
+        assert candidates == []
+
+    def test_find_promotion_skips_curated(self):
+        for _ in range(5):
+            brain_db.record_subreddit_search("ClaudeAI", "clawrange", True)
+            brain_db.record_subreddit_hit("ClaudeAI", "clawrange")
+        candidates = brain_db.find_promotion_candidates("clawrange")
+        assert candidates == []
+
+    def test_mark_promoted_excludes_from_future_candidates(self):
+        for _ in range(5):
+            brain_db.record_subreddit_hit("AI_Agents", "clawrange")
+        brain_db.mark_subreddit_promoted("AI_Agents", "clawrange")
+        candidates = brain_db.find_promotion_candidates("clawrange")
+        assert candidates == []
+
+    def test_add_project_subreddit_idempotent(self):
+        brain_db.upsert_project(
+            "skrills", "athola", "skrills", subreddits=["Construction"]
+        )
+        assert brain_db.add_project_subreddit("skrills", "AI_Agents") is True
+        # Already present, case-insensitive
+        assert brain_db.add_project_subreddit("skrills", "ai_agents") is False
+        proj = brain_db.get_project("skrills")
+        assert proj is not None
+        subs = json.loads(proj["subreddits"])
+        assert "Construction" in subs
+        assert "AI_Agents" in subs
+
+
 # ─── Generators ──────────────────────────────────────────────────
 
 
@@ -748,6 +840,201 @@ class TestMorningDigestGenerator:
         assert "con2" not in digest, "score=5 post must NOT be picked"
         # Bonus picks rendered with the ★ marker.
         assert "★" in digest, "bonus picks must be marked with ★"
+
+    @pytest.mark.asyncio
+    async def test_morning_digest_records_search_impressions(self, monkeypatch):
+        """Each (sub, project) pair gets at least one impression
+        recorded per cycle, so the stats table has a denominator."""
+        from unittest.mock import AsyncMock
+
+        from generators import morning_digest_generator
+
+        brain_db.upsert_project(
+            "claude-night-market",
+            "athola",
+            "claude-night-market",
+            topics=["claude code plugin"],
+            subreddits=["ClaudeAI"],
+            search_terms=["claude code plugin"],
+        )
+
+        monkeypatch.setattr(
+            "reddit_search.search_subreddits", AsyncMock(return_value=[])
+        )
+        monkeypatch.setattr("reddit_search.search_all", AsyncMock(return_value=[]))
+        monkeypatch.setattr("telegram.notify", AsyncMock(return_value=True))
+
+        await morning_digest_generator(brain_db)
+
+        rows = brain_db.list_subreddit_stats(project_slug="claude-night-market")
+        subs = {r["subreddit"] for r in rows}
+        assert "claudeai" in subs, "ClaudeAI must have an impression recorded"
+        # User-extras subs should also be searched even though not curated
+        assert "vibecoding" in subs
+
+    @pytest.mark.asyncio
+    async def test_morning_digest_records_hit_for_surfaced_post(self, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        from generators import morning_digest_generator
+        from reddit_search import RedditPost
+
+        brain_db.upsert_project(
+            "claude-night-market",
+            "athola",
+            "claude-night-market",
+            topics=["claude code plugin"],
+            subreddits=["ClaudeAI"],
+            search_terms=["claude code plugin"],
+        )
+        post = RedditPost(
+            id="hit1",
+            url="https://reddit.com/r/ClaudeAI/comments/hit1",
+            title="claude code plugin question",
+            subreddit="ClaudeAI",
+            score=10,
+            comments=2,
+            created_utc="2026-05-09T07:00:00+00:00",
+        )
+
+        async def fake_search(*a, **kw):
+            return [post]
+
+        monkeypatch.setattr("reddit_search.search_subreddits", fake_search)
+        monkeypatch.setattr("reddit_search.search_all", AsyncMock(return_value=[]))
+        monkeypatch.setattr("telegram.notify", AsyncMock(return_value=True))
+
+        await morning_digest_generator(brain_db)
+
+        rows = brain_db.list_subreddit_stats(project_slug="claude-night-market")
+        cn = next(r for r in rows if r["subreddit"] == "claudeai")
+        assert cn["hits"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_morning_digest_discovers_emerging_sub(self, monkeypatch):
+        """search_all returns a post in a non-curated sub matching
+        project terms — the digest must surface it under '🆕 Emerging
+        subs' AND record a stats hit so the auto-promote path can
+        eventually fire."""
+        from unittest.mock import AsyncMock
+
+        from generators import morning_digest_generator
+        from reddit_search import RedditPost
+
+        brain_db.upsert_project(
+            "clawrange",
+            "athola",
+            "clawrange",
+            topics=["agent orchestration"],
+            subreddits=["ClaudeAI"],
+            search_terms=["agent orchestration"],
+        )
+        emerging_post = RedditPost(
+            id="em1",
+            url="https://reddit.com/r/AI_Agents/comments/em1",
+            title="multi-agent orchestration patterns?",
+            subreddit="AI_Agents",
+            score=12,
+            comments=3,
+            created_utc="2026-05-09T07:00:00+00:00",
+        )
+
+        monkeypatch.setattr(
+            "reddit_search.search_subreddits", AsyncMock(return_value=[])
+        )
+        monkeypatch.setattr(
+            "reddit_search.search_all",
+            AsyncMock(return_value=[emerging_post]),
+        )
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        await morning_digest_generator(brain_db)
+
+        notify_mock.assert_awaited_once()
+        msg = notify_mock.await_args.args[0]
+        assert "🆕 Emerging subs" in msg
+        assert "AI_Agents" in msg or "ai_agents" in msg.lower()
+        # Hit recorded for the emerging sub
+        rows = brain_db.list_subreddit_stats(project_slug="clawrange")
+        ai = next((r for r in rows if r["subreddit"] == "ai_agents"), None)
+        assert ai is not None and ai["hits"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_morning_digest_auto_promotes_emerging_sub(self, monkeypatch):
+        """A non-curated sub with ≥5 hits in 14 days gets folded into
+        the project's subreddits list and the digest report mentions
+        it as newly promoted."""
+        from unittest.mock import AsyncMock
+
+        from generators import morning_digest_generator
+
+        brain_db.upsert_project(
+            "clawrange",
+            "athola",
+            "clawrange",
+            topics=["agent orchestration"],
+            subreddits=["ClaudeAI"],
+            search_terms=["agent orchestration"],
+        )
+        # Pre-seed stats: AI_Agents has crossed the threshold
+        for _ in range(5):
+            brain_db.record_subreddit_hit("AI_Agents", "clawrange")
+
+        monkeypatch.setattr(
+            "reddit_search.search_subreddits", AsyncMock(return_value=[])
+        )
+        monkeypatch.setattr("reddit_search.search_all", AsyncMock(return_value=[]))
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        await morning_digest_generator(brain_db)
+
+        notify_mock.assert_awaited_once()
+        msg = notify_mock.await_args.args[0]
+        assert "Newly promoted" in msg
+        assert "AI_Agents" in msg or "ai_agents" in msg
+        # Project's subreddits list now includes AI_Agents
+        proj = brain_db.get_project("clawrange")
+        assert proj is not None
+        subs = json.loads(proj["subreddits"])
+        assert any(s.lower() == "ai_agents" for s in subs)
+
+    @pytest.mark.asyncio
+    async def test_morning_digest_includes_subreddit_report(self, monkeypatch):
+        """Even when no picks land, the digest renders a one-paragraph
+        coverage report listing tracked subs and confirming no new
+        promotions this cycle. Operator wants visibility into the
+        scan footprint."""
+        from unittest.mock import AsyncMock
+
+        from generators import morning_digest_generator
+
+        brain_db.upsert_project(
+            "clawrange",
+            "athola",
+            "clawrange",
+            topics=["x"],
+            subreddits=["ClaudeAI", "selfhosted"],
+            search_terms=["x"],
+        )
+        # Force at least one promoted sub by pre-seeding stats
+        for _ in range(5):
+            brain_db.record_subreddit_hit("AI_Agents", "clawrange")
+
+        monkeypatch.setattr(
+            "reddit_search.search_subreddits", AsyncMock(return_value=[])
+        )
+        monkeypatch.setattr("reddit_search.search_all", AsyncMock(return_value=[]))
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        await morning_digest_generator(brain_db)
+
+        notify_mock.assert_awaited_once()
+        msg = notify_mock.await_args.args[0]
+        assert "Subreddit coverage report" in msg
+        assert "Tracking" in msg
 
     def test_morning_digest_schedule_registered_after_seed(self):
         """seed_default_projects must register a 0 8 * * * schedule
