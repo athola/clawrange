@@ -255,6 +255,126 @@ class TestProxyTierFallback:
         assert "Analyzing" in content
 
     @patch("llm_proxy._background_notify")
+    def test_colon_suffixed_tool_call_xml_is_stripped(self, _mock_bg):
+        """Free-tier models hallucinate <tool_call:NAME>...</tool_call:NAME>
+        when they get OpenAI tool schemas but the upstream doesn't support
+        function calling. The closing tag is colon-suffixed too, which the
+        original regex missed — so the entire block leaked to the user."""
+        from llm_proxy import _sanitize_response
+
+        raw = (
+            "Let me gather real data before documenting anything.\n\n"
+            "<tool_call:paste>\n"
+            "<tool_name>web_fetch</tool_name>\n"
+            "http://msp-workflows:5678/healthz\n"
+            "</tool_call:paste>\n\n"
+            "<tool_call:paste>\n"
+            "<tool_name>web_fetch</tool_name>\n"
+            "http://msp-workflows:5678/tier\n"
+            "</tool_call:paste>"
+        )
+        cleaned = _sanitize_response(raw)
+        assert "tool_call" not in cleaned
+        assert "msp-workflows" not in cleaned
+        assert "Let me gather real data" in cleaned
+
+    @patch("llm_proxy._background_notify")
+    def test_colon_suffixed_tool_call_preserves_text_between_blocks(self, _mock_bg):
+        """The proper fix matches both <tool_call:NAME>...</tool_call:NAME>
+        so prose between hallucinated blocks survives. The catch-all
+        unclosed-tag fallback alone would nuke everything after the first
+        opener — including a second sentence the user actually wants."""
+        from llm_proxy import _sanitize_response
+
+        raw = (
+            "Checking health.\n"
+            "<tool_call:paste><tool_name>web_fetch</tool_name>"
+            "http://msp-workflows:5678/healthz</tool_call:paste>\n"
+            "Now checking balance.\n"
+            "<tool_call:paste><tool_name>web_fetch</tool_name>"
+            "http://msp-workflows:5678/tier</tool_call:paste>\n"
+            "Done."
+        )
+        cleaned = _sanitize_response(raw)
+        assert "Checking health" in cleaned
+        assert "Now checking balance" in cleaned
+        assert "Done" in cleaned
+        assert "tool_call" not in cleaned
+
+    @patch("llm_proxy._background_notify")
+    def test_hallucinated_tool_call_response_falls_to_next_tier(self, _mock_bg):
+        """When a tier returns *only* hallucinated <tool_call:NAME> XML
+        (the John-117 ops-task failure mode), sanitization empties the
+        response and the race must skip to the next tier — not return the
+        empty string to the user."""
+        hallucinated_body = {
+            "id": "test",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": (
+                            "<tool_call:paste>\n"
+                            "<tool_name>web_fetch</tool_name>\n"
+                            "http://msp-workflows:5678/healthz\n"
+                            "</tool_call:paste>"
+                        ),
+                    }
+                }
+            ],
+        }
+        clean_body = {
+            "id": "test",
+            "object": "chat.completion",
+            "choices": [
+                {"message": {"role": "assistant", "content": "Stack is healthy."}}
+            ],
+        }
+
+        async def mock_call(provider, models, body, api_key):
+            if provider == "openrouter":
+                return _mock_response(200, hallucinated_body)
+            return _mock_response(200, clean_body)
+
+        with patch("llm_proxy._call_provider", side_effect=mock_call):
+            r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
+            assert r.status_code == 200
+            data = r.json()
+            assert data["_clawrange_tier"] == "zai-direct"
+            assert "Stack is healthy" in data["choices"][0]["message"]["content"]
+
+    @patch("llm_proxy._background_notify")
+    def test_anti_hallucination_injected_even_when_tools_present(self, _mock_bg):
+        """The original gate skipped anti-hallucination when body.tools
+        existed, trusting the model to use real function calls. Free-tier
+        upstreams fake tool calls instead — the rule must always run, with
+        wording adapted to require the OpenAI tool-call format when tools
+        are available."""
+        mock_caller = AsyncMock(return_value=_mock_response(200))
+        body_with_tools = {
+            "messages": [{"role": "user", "content": "check tier"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "web_fetch",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        }
+        with patch("llm_proxy._call_provider", mock_caller):
+            r = client.post(
+                "/v1/chat/completions", json=body_with_tools, headers=AUTH_HEADER
+            )
+            assert r.status_code == 200
+            sent_messages = mock_caller.call_args.args[2]["messages"]
+            assert sent_messages[-1]["role"] == "system"
+            last = sent_messages[-1]["content"].lower()
+            assert "tool_call" in last or "xml" in last or "bracket" in last
+
+    @patch("llm_proxy._background_notify")
     def test_garbled_response_falls_to_next_tier(self, _mock_bg):
         """If a tier returns garbled (no-space) text, skip it and try next."""
         garbled_body = {
@@ -1085,6 +1205,208 @@ class TestResponseSanitization:
         result = _sanitize_response(text)
         assert "<thinking>" not in result
         assert "Let me look that up." in result
+
+
+# ─── Persona Backstory Stripping (search-tier prompt hygiene) ─────
+
+
+class TestPersonaBackstoryStripping:
+    """When tasks route to the OpenRouter `:online` search tier, Exa runs
+    web search on the full prompt. The Halo character backstory in soul.md
+    pollutes that search with Halopedia / Master Chief citations. Tasks
+    routed to the search tier must get a soul.md with the backstory
+    sections stripped — operational sections (Marketing Mode, Research
+    Mode, What You Can Do) stay so the model still understands its job."""
+
+    def test_strips_who_you_are_section(self):
+        from llm_proxy import _strip_persona_backstory
+
+        soul = (
+            "You are John-117, Alex's executive assistant.\n\n"
+            "## Who You Are\n"
+            "- Master Chief Petty Officer John-117 — Spartan-II super-soldier\n"
+            "- Born John in 2511 on Eridanus II\n\n"
+            "## What You Can Do\n"
+            "- Manage the task queue\n"
+        )
+        stripped = _strip_persona_backstory(soul)
+        assert "Spartan-II" not in stripped
+        assert "Master Chief Petty Officer" not in stripped
+        assert "Eridanus II" not in stripped
+        # Operational section preserved
+        assert "Manage the task queue" in stripped
+
+    def test_strips_your_character_section(self):
+        from llm_proxy import _strip_persona_backstory
+
+        soul = (
+            "## Your Character\n"
+            "- Leader of Blue Team, feared by the Covenant as 'The Demon'\n"
+            "- Wears MJOLNIR Powered Assault Armor, partnered with Cortana\n\n"
+            "## Marketing Mode\n"
+            "- Lurk and comment first\n"
+        )
+        stripped = _strip_persona_backstory(soul)
+        assert "MJOLNIR" not in stripped
+        assert "Cortana" not in stripped
+        assert "Covenant" not in stripped
+        # Operational section preserved
+        assert "Lurk and comment first" in stripped
+
+    def test_preserves_inline_johh_117_reference_in_operational_text(self):
+        """The backstory blocks are the search-pollution source. Stray
+        mentions of John-117 in operational instructions (e.g.
+        'You [John-117] manage the task queue') are unavoidable but rare
+        enough that Exa won't pivot to Halopedia for them."""
+        from llm_proxy import _strip_persona_backstory
+
+        soul = "## Marketing Mode\nJohn-117 drafts comments for Alex's products.\n"
+        stripped = _strip_persona_backstory(soul)
+        assert "Marketing Mode" in stripped
+
+    def test_empty_soul_returns_empty(self):
+        from llm_proxy import _strip_persona_backstory
+
+        assert _strip_persona_backstory("") == ""
+        assert _strip_persona_backstory("   ") == ""
+
+
+# ─── Work Prompt Persona Routing ──────────────────────────────────
+
+
+class TestWorkPromptPersonaRouting:
+    """Search-tier work prompts must be clean of Halo character noise.
+    Non-search work prompts keep the full persona so John-117 stays in
+    character for direct responses."""
+
+    _FAKE_SOUL = (
+        "You are John-117.\n\n"
+        "## Who You Are\n"
+        "- Master Chief Petty Officer John-117 — Spartan-II super-soldier\n"
+        "- Eridanus II, Cortana, MJOLNIR\n\n"
+        "## Your Character\n"
+        "- Feared by the Covenant\n\n"
+        "## What You Can Do\n"
+        "- Manage tasks for Alex\n"
+    )
+
+    @patch.dict("os.environ", FAKE_ENV)
+    @patch("llm_proxy._load_soul")
+    def test_search_prompt_omits_halo_character_tokens(self, mock_soul):
+        import asyncio
+
+        from llm_proxy import _build_work_prompt
+
+        mock_soul.return_value = self._FAKE_SOUL
+        prompt = asyncio.run(
+            _build_work_prompt(
+                "Research AI agent frameworks shipping this week",
+                web_search=True,
+            )
+        )
+        lower = prompt.lower()
+        for token in (
+            "spartan",
+            "master chief",
+            "mjolnir",
+            "cortana",
+            "covenant",
+            "eridanus",
+        ):
+            assert token not in lower, (
+                f"search-tier prompt leaked Halo token {token!r} — Exa "
+                f"will return Halopedia citations again"
+            )
+
+    @patch.dict("os.environ", FAKE_ENV)
+    @patch("llm_proxy._load_soul")
+    def test_non_search_prompt_keeps_full_persona(self, mock_soul):
+        """Regression guard: direct chat (no web search) still needs the
+        full John-117 character for in-character replies. The strip only
+        applies to search-tier routes."""
+        import asyncio
+
+        from llm_proxy import _build_work_prompt
+
+        mock_soul.return_value = self._FAKE_SOUL
+        prompt = asyncio.run(
+            _build_work_prompt(
+                "Summarize the current task queue",
+                web_search=False,
+            )
+        )
+        # Persona character tokens should appear (soul.md is loaded in full)
+        assert "Master Chief" in prompt
+        assert "Spartan-II" in prompt
+
+
+# ─── Irrelevant Citation Filtering ────────────────────────────────
+
+
+class TestIrrelevantCitationFiltering:
+    """Belt-and-suspenders: even if the prompt-stripping fix lets a stray
+    Halo token through, the citation-extraction layer drops Halopedia and
+    other character-backstory URLs so the user's Telegram message stays
+    clean."""
+
+    def test_drops_halopedia_citations(self):
+        from llm_proxy import _extract_openrouter_citations
+
+        annotations = [
+            {
+                "type": "url_citation",
+                "url_citation": {
+                    "url": "https://www.halopedia.org/John-117",
+                    "title": "John-117 - Character - Halopedia, the Halo wiki",
+                    "content": "Master Chief Petty Officer John-117",
+                },
+            },
+            {
+                "type": "url_citation",
+                "url_citation": {
+                    "url": "https://github.com/anthropics/claude-code",
+                    "title": "Claude Code plugin marketplace",
+                    "content": "Plugin marketplace for Claude Code",
+                },
+            },
+        ]
+        out = _extract_openrouter_citations(annotations)
+        assert "halopedia" not in out.lower()
+        assert "John-117" not in out
+        # The legitimate citation survives
+        assert "claude-code" in out
+
+    def test_drops_wikipedia_character_pages(self):
+        from llm_proxy import _extract_openrouter_citations
+
+        annotations = [
+            {
+                "type": "url_citation",
+                "url_citation": {
+                    "url": "https://en.wikipedia.org/wiki/Master_Chief_(Halo)",
+                    "title": "Master Chief (Halo)",
+                    "content": "Master Chief Petty Officer John-117",
+                },
+            },
+        ]
+        out = _extract_openrouter_citations(annotations)
+        assert out == ""
+
+    def test_keeps_legitimate_results(self):
+        from llm_proxy import _extract_openrouter_citations
+
+        annotations = [
+            {
+                "type": "url_citation",
+                "url_citation": {
+                    "url": "https://news.ycombinator.com/item?id=12345",
+                    "title": "Show HN: AI agent framework",
+                    "content": "Open source agent framework",
+                },
+            },
+        ]
+        out = _extract_openrouter_citations(annotations)
+        assert "ycombinator" in out
 
 
 # ─── SSE Wrapping (streaming fallback) ──────────────────────────
@@ -2814,12 +3136,17 @@ class TestAntiHallucinationTrailer:
 
     @patch("llm_proxy._background_notify")
     @patch("llm_proxy._call_provider", side_effect=_all_succeed)
-    def test_trailing_message_skipped_when_request_has_tools(self, mock_call, _mock_bg):
+    def test_trailing_message_present_with_tools_demands_openai_format(
+        self, mock_call, _mock_bg
+    ):
         """
         GIVEN a chat request that includes a tools schema
         WHEN the proxy forwards the request
-        THEN the anti-hallucination trailer is NOT appended, because the
-             agent legitimately needs tool use (heartbeat, ops tasks).
+        THEN the trailer IS appended with wording that requires the OpenAI
+             tool_call format and forbids XML/bracket alternatives. Free-tier
+             upstream models often get tool schemas they don't actually
+             support and improvise <tool_call:NAME> XML — the rule must
+             always run, with wording adapted to the tools-present case.
         """
         body = {
             "messages": [{"role": "user", "content": "do work"}],
@@ -2837,7 +3164,10 @@ class TestAntiHallucinationTrailer:
         r = client.post("/v1/chat/completions", json=body, headers=AUTH_HEADER)
         assert r.status_code == 200
         sent_messages = mock_call.call_args.args[2]["messages"]
-        # No trailing system message containing the anti-hallucination text.
-        for msg in sent_messages:
-            if msg["role"] == "system":
-                assert "XML tags" not in msg.get("content", "")
+        trailer = sent_messages[-1]
+        assert trailer["role"] == "system"
+        content = trailer["content"]
+        # Demands real OpenAI tool_call format
+        assert "tool_call" in content.lower()
+        # Explicitly forbids XML/bracket alternatives
+        assert "xml" in content.lower() or "bracket" in content.lower()
