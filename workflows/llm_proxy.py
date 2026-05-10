@@ -434,16 +434,28 @@ _INNER_TAG = re.compile(
 )
 
 
-# XML-style hallucinated tool tags: <exec command="..."></exec>, <tool_call>...</tool_call>, etc.
+# XML-style hallucinated tool tags: <exec command="..."></exec>, <tool_call>...</tool_call>,
+# and colon-suffixed variants like <tool_call:paste>...</tool_call:paste> that free-tier
+# models invent when they get OpenAI tool schemas but the upstream doesn't support
+# function calling. Alternation keeps the two cases distinct so backref groups stay
+# populated — Python's (?P=name) backrefs require the group to have participated.
+_XML_TOOL_TAG_NAMES = (
+    r"exec|tool_call|function_call|search|browse|cron|write|read|subagents?"
+)
 _XML_TOOL_TAG = re.compile(
-    r"<(?:exec|tool_call|function_call|search|browse|cron|write|read|subagents?)\b[^>]*>"
+    rf"<(?P<n1>{_XML_TOOL_TAG_NAMES}):(?P<sx>\w+)\b[^>]*>"
     r"[\s\S]*?"
-    r"</(?:exec|tool_call|function_call|search|browse|cron|write|read|subagents?)>",
+    r"</(?P=n1):(?P=sx)>"
+    r"|"
+    rf"<(?P<n2>{_XML_TOOL_TAG_NAMES})\b[^>]*>"
+    r"[\s\S]*?"
+    r"</(?P=n2)>",
     re.IGNORECASE,
 )
-# Self-closing XML tags: <exec command="..."/>
+# Self-closing XML tags: <exec command="..."/> and <tool_call:paste .../> variants
 _XML_SELF_CLOSING = re.compile(
-    r"<(?:exec|tool_call|function_call|search|browse|cron|write|read|subagents?)\b[^/]*/\s*>",
+    r"<(?:exec|tool_call|function_call|search|browse|cron|write|read|subagents?)"
+    r"(?::\w+)?\b[^/]*/\s*>",
     re.IGNORECASE,
 )
 # Unclosed XML tool tags: <exec ...> or <exec ... (runs to end of string)
@@ -1481,6 +1493,42 @@ def _load_soul() -> str:
         return ""
 
 
+# Section headers that hold pure character-backstory narrative. When a
+# prompt routes to the OpenRouter `:online` search tier, Exa runs web
+# search on the prompt — these sections contain "John-117 / Master Chief
+# / Spartan-II / Cortana / MJOLNIR / Halo" tokens that pull Halopedia and
+# Master-Chief-Wikipedia citations to the top, polluting research output.
+# Operational sections (Marketing Mode, Research Mode, What You Can Do,
+# etc.) are kept so the model still understands its job.
+_BACKSTORY_HEADINGS = ("## Who You Are", "## Your Character")
+
+
+def _strip_persona_backstory(soul: str) -> str:
+    """Remove Halo character-backstory sections from soul.md text.
+
+    A section runs from its `## Heading` line to (but not including) the
+    next `## ` heading or end-of-file. Only the sections named in
+    `_BACKSTORY_HEADINGS` get stripped; the rest is returned intact.
+
+    Empty or whitespace-only input returns "" so callers can use the
+    result directly in prompt templates without an extra falsy check.
+    """
+    if not soul or not soul.strip():
+        return ""
+    lines = soul.splitlines()
+    out: list[str] = []
+    skipping = False
+    for line in lines:
+        if line.startswith("## "):
+            skipping = line.strip() in _BACKSTORY_HEADINGS
+            if skipping:
+                continue
+        if skipping:
+            continue
+        out.append(line)
+    return "\n".join(out).strip()
+
+
 _TASK_CATEGORIES = [
     "client outreach or relationship building",
     "financial review (spending, billing, ROI)",
@@ -1785,6 +1833,32 @@ def _extract_web_citations(tool_calls: list[dict]) -> str:
     return "\n".join(refs)
 
 
+# Citation URL/title patterns that indicate Halo character-backstory
+# pages — Exa returns these when the persona name leaks into search
+# (and as a defense even after _strip_persona_backstory runs). Matched
+# against url + title joined with a space, case-insensitive.
+_PERSONA_CITATION_PATTERN = re.compile(
+    r"halopedia|"
+    r"wiki(?:pedia|/john-117|/master_chief|/spartan-?ii?|/cortana|/mjolnir)|"
+    r"shapes\.ai.*master.chief|"
+    r"halo[\s\-_]?(?:5|infinite|wars|reach)|"
+    r"\bunsc\b|\bspartan-?ii?\b",
+    re.IGNORECASE,
+)
+
+
+def _is_persona_citation(url: str, title: str) -> bool:
+    """Return True when a citation URL/title points at Halo character lore.
+
+    Belt-and-suspenders for _strip_persona_backstory: even if a future
+    soul.md edit leaks "John-117 / Master Chief" tokens past the
+    stripper, Exa-returned Halopedia results never reach the user's
+    Telegram message.
+    """
+    haystack = f"{url} {title}"
+    return bool(_PERSONA_CITATION_PATTERN.search(haystack))
+
+
 def _extract_openrouter_citations(annotations: list[dict]) -> str:
     """Pull URLs and titles from OpenRouter `:online` url_citation annotations.
 
@@ -1792,19 +1866,26 @@ def _extract_openrouter_citations(annotations: list[dict]) -> str:
         message.annotations[].type == "url_citation"
         message.annotations[].url_citation = {url, title, content, start_index, end_index}
 
-    Format mirrors _extract_web_citations so Telegram output stays consistent
-    regardless of which search backend produced the citations.
+    Halo character-backstory citations (Halopedia, Master Chief Wikipedia,
+    etc.) are filtered out — see _is_persona_citation. Format mirrors
+    _extract_web_citations so Telegram output stays consistent regardless
+    of which search backend produced the citations.
     """
     refs: list[str] = []
-    for i, ann in enumerate(annotations, 1):
+    idx = 0
+    for ann in annotations:
         if ann.get("type") != "url_citation":
             continue
         c = ann.get("url_citation", {})
         url = c.get("url", "")
         title = c.get("title", "")
+        if not url:
+            continue
+        if _is_persona_citation(url, title):
+            continue
+        idx += 1
         snippet = (c.get("content") or "")[:120]
-        if url:
-            refs.append(f"{i}. [{title}]({url})\n   {snippet}")
+        refs.append(f"{idx}. [{title}]({url})\n   {snippet}")
     return "\n".join(refs)
 
 
@@ -1854,8 +1935,19 @@ async def _gather_system_state() -> str:
 
 
 async def _build_work_prompt(task_description: str, web_search: bool = False) -> str:
-    """Build a prompt for the LLM to work on a specific task, with live system data."""
+    """Build a prompt for the LLM to work on a specific task, with live system data.
+
+    When `web_search=True`, the prompt routes through OpenRouter `:online`
+    which runs Exa server-side search over the full prompt body. The Halo
+    character backstory in soul.md ("Master Chief", "Spartan-II",
+    "Cortana", "MJOLNIR") pulls Halopedia/Wikipedia character pages to
+    the top of Exa results, polluting the research output. Strip those
+    sections for search-tier routes; non-search routes keep the full
+    persona so John-117 stays in character for direct chat replies.
+    """
     soul = _load_soul()
+    if web_search:
+        soul = _strip_persona_backstory(soul)
     state = await _gather_system_state()
     context = f"{soul}\n\n---\n" if soul else ""
 
@@ -2467,10 +2559,23 @@ async def chat_completions(
     # LLMs weight instructions near the end of context most heavily.
     # Placing it at the start (where soul.md lives) gets lost — placing it
     # after the last user message means the model sees it right before generating.
-    # Skip anti-hallucination when the request includes tool schemas —
-    # the agent legitimately needs to use tools (heartbeat, ops tasks).
+    #
+    # Always inject, even when tools are present. Free-tier upstream models
+    # (the racing default) often get OpenAI tool schemas but don't actually
+    # support function calling — they invent fake <tool_call:paste>...XML
+    # that the proxy then strips, leaving the user with empty replies. The
+    # adapted wording below tells the model to either use the OpenAI
+    # tool-call format properly or answer in plain text — never improvise XML.
     has_tools = bool(body.get("tools"))
-    if not has_tools:
+    if has_tools:
+        _ANTI_HALLUCINATION = (
+            "[SYSTEM] If you need a tool, emit a real OpenAI tool_call object — "
+            "never XML tags, bracket syntax, or <tool_call:NAME> blocks. "
+            "Hallucinated tool syntax is stripped and the response is retried "
+            "on another tier. If no tool fits, answer in plain text from your "
+            "knowledge and conversation context."
+        )
+    else:
         _ANTI_HALLUCINATION = (
             "[SYSTEM] Respond now in plain text. "
             "No startup sequences. No initialization steps. "
@@ -2478,7 +2583,7 @@ async def chat_completions(
             "those are not real tools and will be stripped. "
             "Answer directly using your knowledge and conversation context."
         )
-        messages.append({"role": "system", "content": _ANTI_HALLUCINATION})
+    messages.append({"role": "system", "content": _ANTI_HALLUCINATION})
 
     # Tier routing — explicit !keyword overrides, otherwise race all free tiers
     forced_tier = _detect_tier_hint(messages)
