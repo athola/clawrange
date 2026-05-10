@@ -12,6 +12,7 @@ import math
 import statistics
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 if TYPE_CHECKING:
     from reddit_search import RedditPost
@@ -25,6 +26,40 @@ logger = logging.getLogger("clawrange.generators")
 # acceptable for a single-uvicorn-worker service where restarts are
 # rare and a one-off extra delivery after restart is harmless.
 _LAST_HOT_PULSE_DELIVERY_AT: datetime | None = None
+
+# Tracks whether the most recent hot_pulse fire was suppressed by the
+# quiet-hours gate. Used so we write the schedule status row exactly
+# once per night (on the boundary fire entering quiet hours) instead
+# of 60 times — keeps the schedule history readable when the operator
+# wakes up. Flag flips back to False on the first non-quiet fire,
+# which then naturally writes "ok (N picks)" / "throttled" status as
+# part of the normal flow.
+_HOT_PULSE_IN_QUIET_HOURS: bool = False
+
+
+def _is_quiet_hours(
+    now_utc: datetime, start_hour: int, end_hour: int, tz_name: str
+) -> bool:
+    """Return True when `now_utc` falls inside the half-open
+    [start_hour, end_hour) window in the named tz.
+
+    DST-aware via zoneinfo: passing ``America/Chicago`` produces the
+    correct CST/CDT offset for any date so the operator's 12am-5am
+    sleep window stays anchored to local clock time across the
+    daylight-saving boundary.
+
+    End hour is exclusive: a window of (0, 5) covers 00:00:00 through
+    04:59:59 local, so the */5 cron fire at exactly 05:00 wakes the
+    pulse back up. Wrap-around windows (e.g. 22 → 6) are supported.
+    """
+    local = now_utc.astimezone(ZoneInfo(tz_name))
+    hour = local.hour
+    if start_hour == end_hour:
+        return False
+    if start_hour < end_hour:
+        return start_hour <= hour < end_hour
+    return hour >= start_hour or hour < end_hour
+
 
 # Subreddits to include in every morning digest scan, even when no
 # tracked project subscribes to them directly. Sourced from Alex's
@@ -744,6 +779,9 @@ async def hot_pulse_generator(
     window: str = "15m",
     min_relevance: float = 1.0,
     min_delivery_interval_minutes: int = 15,
+    quiet_hours_start: int = 0,
+    quiet_hours_end: int = 5,
+    quiet_hours_tz: str = "America/Chicago",
     **kwargs,
 ) -> None:
     """Reddit pulse for brand-new comment candidates.
@@ -786,15 +824,50 @@ async def hot_pulse_generator(
     Skips Telegram delivery silently when no fresh picks exist
     (logged as a heartbeat WARNING so the cron is still observable).
     """
-    global _LAST_HOT_PULSE_DELIVERY_AT
+    global _LAST_HOT_PULSE_DELIVERY_AT, _HOT_PULSE_IN_QUIET_HOURS
     from reddit_search import search_subreddits
     from telegram import notify
+
+    now = datetime.now(timezone.utc)
+
+    # Quiet-hours gate: skip Reddit + Telegram entirely when the
+    # operator is asleep. Default 00:00-05:00 America/Chicago covers
+    # the operator's CST/CDT sleep window. Status row is written
+    # exactly once on the boundary fire entering quiet hours; later
+    # fires inside the window are silent to avoid 60 status writes
+    # per night. On the first non-quiet fire after the window the
+    # flag clears and the normal flow resumes (and naturally rewrites
+    # last_status with "ok"/"throttled" as part of delivery).
+    in_quiet = _is_quiet_hours(now, quiet_hours_start, quiet_hours_end, quiet_hours_tz)
+    if in_quiet:
+        if not _HOT_PULSE_IN_QUIET_HOURS:
+            local_now = now.astimezone(ZoneInfo(quiet_hours_tz)).strftime("%H:%M")
+            try:
+                brain_db.update_schedule_status(
+                    "hot_pulse",
+                    now.isoformat(),
+                    f"quiet hours (entered at {local_now} {quiet_hours_tz}, "
+                    f"resume {quiet_hours_end:02d}:00)",
+                )
+            except Exception as exc:
+                logger.warning("hot_pulse: quiet-hours status update failed: %s", exc)
+            _HOT_PULSE_IN_QUIET_HOURS = True
+            logger.info(
+                "hot_pulse: entering quiet hours (%02d:00-%02d:00 %s), "
+                "suppressing delivery until window ends",
+                quiet_hours_start,
+                quiet_hours_end,
+                quiet_hours_tz,
+            )
+        return
+    if _HOT_PULSE_IN_QUIET_HOURS:
+        logger.info("hot_pulse: exiting quiet hours, resuming normal delivery")
+        _HOT_PULSE_IN_QUIET_HOURS = False
 
     # Delivery throttle: the cron fires every 5min for heartbeat, but
     # Telegram delivery is gated to once per min_delivery_interval_minutes.
     # On throttled fires we skip Reddit + Telegram and just update
     # schedule status so the operator sees the cron is still alive.
-    now = datetime.now(timezone.utc)
     if _LAST_HOT_PULSE_DELIVERY_AT is not None:
         elapsed_min = (now - _LAST_HOT_PULSE_DELIVERY_AT).total_seconds() / 60.0
         if elapsed_min < min_delivery_interval_minutes:

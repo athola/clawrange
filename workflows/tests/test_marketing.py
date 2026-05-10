@@ -1752,6 +1752,163 @@ class TestHotPulseGenerator:
         assert brain_db.is_seen("reddit_pulse", "shared1", "clawrange")
         assert brain_db.is_seen("reddit_pulse", "shared1", "claude-night-market")
 
+    def test_is_quiet_hours_inside_window_chicago(self):
+        """The pure helper returns True when the given UTC instant
+        falls inside the configured local-time window in
+        America/Chicago. 07:30 UTC = 01:30 CST (winter, UTC-6) or
+        02:30 CDT (summer, UTC-5); both are inside [0, 5)."""
+        from datetime import datetime, timezone
+
+        from generators import _is_quiet_hours
+
+        winter_utc = datetime(2026, 1, 15, 7, 30, tzinfo=timezone.utc)
+        summer_utc = datetime(2026, 7, 15, 7, 30, tzinfo=timezone.utc)
+        assert _is_quiet_hours(winter_utc, 0, 5, "America/Chicago") is True
+        assert _is_quiet_hours(summer_utc, 0, 5, "America/Chicago") is True
+
+    def test_is_quiet_hours_outside_window_chicago(self):
+        """Returns False at noon UTC, which lands at 06:00 CST /
+        07:00 CDT — outside the [0, 5) sleep window."""
+        from datetime import datetime, timezone
+
+        from generators import _is_quiet_hours
+
+        winter_noon_utc = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
+        summer_noon_utc = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
+        assert _is_quiet_hours(winter_noon_utc, 0, 5, "America/Chicago") is False
+        assert _is_quiet_hours(summer_noon_utc, 0, 5, "America/Chicago") is False
+
+    def test_is_quiet_hours_boundary_exclusive_end(self):
+        """End hour is exclusive: 05:00 CST = 11:00 UTC (winter) is
+        already OUT of quiet hours so the */5 fire at 5:00am wakes
+        the operator's pulse up immediately."""
+        from datetime import datetime, timezone
+
+        from generators import _is_quiet_hours
+
+        five_am_cst_utc = datetime(2026, 1, 15, 11, 0, tzinfo=timezone.utc)
+        assert _is_quiet_hours(five_am_cst_utc, 0, 5, "America/Chicago") is False
+
+    @pytest.mark.asyncio
+    async def test_hot_pulse_skips_during_quiet_hours(self, monkeypatch):
+        """During CST quiet hours (default 00:00-05:00 America/Chicago),
+        hot_pulse must skip Reddit + Telegram entirely. On the first
+        fire entering the window it writes a 'quiet hours' status to
+        the schedule row; on subsequent fires inside the window it
+        skips silently (no DB write) to avoid 60 status-row writes per
+        night."""
+        from unittest.mock import AsyncMock
+
+        import generators
+        from generators import hot_pulse_generator
+
+        brain_db.upsert_project(
+            "clawrange",
+            "athola",
+            "clawrange",
+            topics=["agent orchestration"],
+            subreddits=["ClaudeAI"],
+            search_terms=["agent orchestration"],
+        )
+        brain_db.upsert_schedule(
+            "hot_pulse",
+            "5-min Reddit hot-pulse",
+            "hot_pulse",
+            "*/5 * * * *",
+            {},
+        )
+        brain_db.update_schedule_status(
+            "hot_pulse", "2026-01-15T10:55:00+00:00", "ok (3 picks)"
+        )
+
+        # Force the gate to report we're in quiet hours.
+        monkeypatch.setattr(generators, "_is_quiet_hours", lambda *a, **kw: True)
+        monkeypatch.setattr(
+            generators, "_HOT_PULSE_IN_QUIET_HOURS", False, raising=False
+        )
+
+        search_mock = AsyncMock(return_value=[])
+        monkeypatch.setattr("reddit_search.search_subreddits", search_mock)
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        # First fire entering quiet hours — should write status.
+        await hot_pulse_generator(brain_db)
+
+        search_mock.assert_not_awaited()
+        notify_mock.assert_not_awaited()
+        sched = brain_db.get_schedule("hot_pulse")
+        assert sched is not None
+        assert "quiet hours" in (sched.get("last_status") or "").lower()
+        assert generators._HOT_PULSE_IN_QUIET_HOURS is True
+
+        # Second fire still inside quiet hours — must NOT touch the
+        # schedule row again. Track the prior status to detect writes.
+        prior_status = sched.get("last_status")
+        prior_run = sched.get("last_run")
+
+        await hot_pulse_generator(brain_db)
+
+        search_mock.assert_not_awaited()
+        notify_mock.assert_not_awaited()
+        sched_after = brain_db.get_schedule("hot_pulse")
+        assert sched_after.get("last_status") == prior_status
+        assert sched_after.get("last_run") == prior_run
+
+    @pytest.mark.asyncio
+    async def test_hot_pulse_resumes_after_quiet_hours(self, monkeypatch):
+        """When the gate transitions from in-window back to out-of-window
+        (5am CST boundary), the next fire must run the normal flow:
+        reset the in-quiet-hours flag, call Reddit, and (if posts found)
+        deliver to Telegram."""
+        from datetime import datetime, timezone
+        from unittest.mock import AsyncMock
+
+        import generators
+        from generators import hot_pulse_generator
+        from reddit_search import RedditPost
+
+        brain_db.upsert_project(
+            "clawrange",
+            "athola",
+            "clawrange",
+            topics=["agent orchestration"],
+            subreddits=["ClaudeAI"],
+            search_terms=["agent orchestration"],
+        )
+
+        # Simulate: we were in quiet hours, now we're out.
+        monkeypatch.setattr(generators, "_is_quiet_hours", lambda *a, **kw: False)
+        monkeypatch.setattr(
+            generators, "_HOT_PULSE_IN_QUIET_HOURS", True, raising=False
+        )
+        # Bypass delivery throttle so the normal flow runs.
+        monkeypatch.setattr(generators, "_LAST_HOT_PULSE_DELIVERY_AT", None)
+
+        post = RedditPost(
+            id="post_after_sleep",
+            subreddit="ClaudeAI",
+            title="agent orchestration tips",
+            url="https://reddit.com/r/ClaudeAI/post_after_sleep",
+            score=42,
+            comments=5,
+            created_utc=datetime.now(timezone.utc).isoformat(),
+        )
+
+        async def fake_search(*a, **kw):
+            return [post]
+
+        monkeypatch.setattr("reddit_search.search_subreddits", fake_search)
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        await hot_pulse_generator(brain_db)
+
+        # Flag cleared on transition out.
+        assert generators._HOT_PULSE_IN_QUIET_HOURS is False
+        # Normal flow ran.
+        notify_mock.assert_awaited_once()
+
 
 # ─── Scheduler Module ────────────────────────────────────────────
 
