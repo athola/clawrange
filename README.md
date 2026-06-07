@@ -169,3 +169,32 @@ brain DB and managed via `/sched`. Each generator enqueues tasks
 into the same queue agents read from `/task/{id}/claim`, so manual
 and scheduled work share one pipeline. Drafts are never auto-posted —
 the human-in-the-loop pattern is the entire point.
+
+## Multi-Tenant Template
+
+ClawRange is a pull-down-and-configure template. A declarative **tenant
+profile** (`config/profiles/<name>/profile.yaml`) owns everything
+tenant-specific — persona, seeded projects/schedules, connector wiring, and
+CRM config — while the connector registry and CRM adapters live in code and
+are shared. The active profile is chosen by `CLAWRANGE_PROFILE` (default
+`marketing`, reproducing the original John-117 setup exactly).
+
+A second profile, `lead-crm`, is a worked business example: an assistant that
+hourly syncs leads from a web portal into a pluggable CRM (SQLite by default)
+and answers relational and time-series questions about them on a schedule or
+via Telegram. Stand up your own by copying the profile and editing YAML:
+
+```bash
+cp -r config/profiles/lead-crm config/profiles/acme
+$EDITOR config/profiles/acme/profile.yaml   # set profile: acme, fields, connectors
+make profile PROFILE=acme                     # render openclaw/soul.md + set .env
+make seed-demo                                # optional: load demo leads offline
+```
+
+New code modules: `workflows/connectors/` (source/transform/sink registry),
+`workflows/crm/` (pluggable `CRMAdapter` + SQLite/REST backends + query
+templates), `workflows/tenant_profile.py` (loader/validator),
+`workflows/persona.py` (persona renderer), and `workflows/crm_api.py` (the
+`/crm/*` router, mounted only when the profile defines a CRM). See
+[docs/multi-tenant-guide.md](docs/multi-tenant-guide.md) for the full
+operator guide.

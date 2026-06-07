@@ -27,6 +27,8 @@ if not logging.getLogger("clawrange").handlers:
     )
     logging.getLogger("clawrange").addHandler(_clawrange_handler)
 
+logger = logging.getLogger("clawrange.app")
+
 # ─── Database Initialization ─────────────────────────────────────
 
 _db_path = os.environ.get("BRAIN_DB_PATH", "/data/brain.db")
@@ -36,12 +38,74 @@ brain_db.init_db()
 # ─── Scheduler Setup ─────────────────────────────────────────────
 
 
+def init_profile(
+    app: FastAPI,
+    brain_db,
+    *,
+    profile=None,
+    soul_path: str | None = None,
+    http_client=None,
+) -> Any:
+    """Wire a tenant profile into the app (FR-8.1).
+
+    Renders the persona to ``soul.md`` when missing, seeds projects and
+    schedules from the profile, and — when the profile defines a CRM — inits
+    the adapter on ``app.state.crm`` and mounts the ``/crm`` router. Returns
+    the resolved profile. Degrades gracefully: a profile-load failure logs and
+    leaves the marketing-style baseline (no CRM) untouched. ``http_client`` is
+    injectable so the connector-sync route can be tested offline.
+    """
+    from generators import seed_from_profile
+    from persona import write_soul
+    from tenant_profile import load_profile
+
+    if profile is None:
+        try:
+            profile = load_profile()
+        except Exception as exc:  # graceful: never crash boot on a bad profile
+            logger.warning("init_profile: could not load profile: %s", exc)
+            return None
+
+    app.state.profile = profile
+
+    # Render the persona only when no soul.md is present, so hand-edits and
+    # the marketing verbatim soul are never clobbered on restart.
+    soul = (
+        soul_path
+        or os.environ.get("SOUL_PATH")
+        or str(
+            os.path.join(
+                os.path.dirname(os.path.dirname(__file__)), "openclaw", "soul.md"
+            )
+        )
+    )
+    try:
+        if not os.path.exists(soul):
+            write_soul(profile, soul)
+            logger.info("init_profile: rendered persona -> %s", soul)
+    except Exception as exc:
+        logger.warning("init_profile: persona render skipped: %s", exc)
+
+    seed_from_profile(brain_db, profile)
+
+    if profile.crm:
+        from crm import get_adapter
+        from crm_api import create_crm_router
+
+        crm = get_adapter(profile.crm)
+        crm.init()
+        app.state.crm = crm
+        app.include_router(create_crm_router(profile, crm, http_client=http_client))
+        logger.info("init_profile: CRM mounted (%s)", crm.health().get("adapter"))
+
+    return profile
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from generators import seed_default_projects
     from scheduler import init_scheduler
 
-    seed_default_projects(brain_db)
+    init_profile(app, brain_db)
     scheduler = init_scheduler(brain_db)
     app.state.scheduler = scheduler
     yield

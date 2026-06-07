@@ -1,0 +1,36 @@
+{
+  "mission_type": "full",
+  "mission_name": "marketing-orchestrator",
+  "phases": ["brainstorm", "specify", "plan", "execute"],
+  "completed_phases": ["brainstorm", "specify", "plan", "execute"],
+  "current_phase": "complete",
+  "artifacts": {
+    "brief": "docs/project-brief.md",
+    "specification": "docs/specification.md"
+  },
+  "predecessor_mission": ".attune/mission-state-brain.json",
+  "started_at": "2026-05-03T00:00:00Z",
+  "updated_at": "2026-05-03T16:00:00Z",
+  "directive_overrides": ["ignore_scope_guard", "stay_on_branch"],
+  "evidence": {
+    "tests_total": 369,
+    "tests_new": 59,
+    "all_pass": true,
+    "modules_created": [
+      "workflows/reddit_search.py",
+      "workflows/github_search.py",
+      "workflows/scheduler.py",
+      "workflows/generators.py",
+      "workflows/tests/test_marketing.py"
+    ],
+    "modules_modified": [
+      "workflows/brain_db.py",
+      "workflows/app.py",
+      "workflows/llm_proxy.py",
+      "workflows/tests/conftest.py",
+      "workflows/requirements.txt",
+      "docker-compose.yml",
+      ".env.example"
+    ]
+  }
+}
