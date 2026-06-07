@@ -1068,170 +1068,25 @@ async def hot_pulse_generator(
     )
 
 
-# ─── Default Project Seeds ──────────────────────────────────────────
+# ─── Profile-Driven Seeds ──────────────────────────────────────────
+#
+# Seeds (tracked projects + baseline schedules) now live in the active
+# tenant profile (config/profiles/<name>/profile.yaml), not in code. The
+# marketing profile reproduces the original hardcoded set exactly
+# (regression-locked by tests/test_profile.py). seed_default_projects /
+# seed_default_schedules keep their names as the public entry points so
+# existing callers (app lifespan, tests) are unchanged; they load the
+# active profile (CLAWRANGE_PROFILE, default "marketing") and seed from it.
 
 
-_DEFAULT_PROJECTS = (
-    {
-        "slug": "claude-night-market",
-        "owner": "athola",
-        "repo": "claude-night-market",
-        "topics": ["claude-code", "plugins", "agent-tooling"],
-        "subreddits": ["ClaudeAI", "LocalLLaMA", "SideProject"],
-        "search_terms": [
-            "claude code plugin",
-            "claude code marketplace",
-            "claude skill",
-        ],
-        "posture": (
-            "Lead with: a curated marketplace for Claude Code plugins. "
-            "Useful comments first - link only when the question is about "
-            "discovering or composing plugins."
-        ),
-    },
-    {
-        "slug": "skrills",
-        "owner": "athola",
-        "repo": "skrills",
-        "topics": ["chrome-extension", "trades", "knowledge-capture"],
-        "subreddits": ["Construction", "ITCareerQuestions", "SideProject"],
-        "search_terms": [
-            "trade skill capture",
-            "field knowledge chrome extension",
-        ],
-        "posture": (
-            "Lead with: capture trade-skill knowledge from the field. "
-            "Comment on the workflow first, mention skrills only when the "
-            "thread is explicitly about capture or onboarding."
-        ),
-    },
-    {
-        "slug": "simple-resume",
-        "owner": "athola",
-        "repo": "simple-resume",
-        "topics": ["resume", "yaml-to-pdf", "static-site"],
-        "subreddits": ["resumes", "cscareerquestions", "SideProject"],
-        "search_terms": [
-            "yaml resume",
-            "static resume site",
-            "resume generator",
-        ],
-        "posture": (
-            "Lead with: a YAML-driven resume that builds PDF and HTML. "
-            "Comment with concrete examples; mention only when the post is "
-            "about resume tooling specifically."
-        ),
-    },
-    {
-        "slug": "clawrange",
-        "owner": "athola",
-        "repo": "clawrange",
-        "topics": [
-            "personal ai ops",
-            "fastapi workflow service",
-            "claude code",
-            "telegram bot",
-            "llm proxy",
-            "openrouter",
-            "apscheduler",
-            "self-hosted ai",
-        ],
-        "subreddits": [
-            "ClaudeAI",
-            "claudecode",
-            "vibecoding",
-            "opensourceai",
-            "codex",
-            "sideprojects",
-            "LocalLLaMA",
-            "selfhosted",
-        ],
-        "search_terms": [
-            "personal ai ops stack",
-            "claude code workflow",
-            "fastapi llm proxy",
-            "openrouter telegram",
-            "agent orchestration self-hosted",
-        ],
-        "posture": (
-            "Lead with: a single-host AI ops stack (FastAPI workflows + "
-            "Claude Code via OpenClaw) for tier-routed LLM access, "
-            "scheduled marketing scans, and Telegram delivery. Comment "
-            "with first-hand operational details (single uvicorn worker, "
-            "APScheduler job persistence, balance-aware tier routing). "
-            "Mention clawrange only when the post is explicitly about "
-            "self-hosted Claude tooling or LLM-proxy gateways."
-        ),
-    },
-    {
-        "slug": "personal-brand",
-        "owner": "athola",
-        "repo": "athola",  # GitHub profile repo
-        "topics": [
-            "ai-systems",
-            "agent-platforms",
-            "plugin-ecosystems",
-            "msp-tooling",
-            "fastapi",
-            "ai-engineering",
-        ],
-        "subreddits": [
-            "ClaudeAI",
-            "LocalLLaMA",
-            "MachineLearning",
-            "ExperiencedDevs",
-            "ProgrammerHumor",
-        ],
-        "search_terms": [
-            "ai systems engineering",
-            "agent orchestration",
-            "claude code plugins",
-            "personal ai ops stack",
-            "msp automation",
-        ],
-        "posture": (
-            "Voice: AI systems engineer at the company in Austin, building a "
-            "personal AI ops stack. Share first-hand experience, not pitches. "
-            "Always link to source code or running infra. The tone: terse, "
-            "specific, opinionated."
-        ),
-    },
-)
+def _seed_schedules_from_profile(brain_db, profile) -> list[dict]:
+    """Idempotently register the profile's baseline schedules.
 
-
-_DEFAULT_SCHEDULES = (
-    {
-        "id": "morning_digest",
-        "name": "Morning Reddit comment-candidate digest",
-        "kind": "morning_digest",
-        "cron": "0 8 * * *",
-        "kwargs": {},
-    },
-    {
-        "id": "hot_pulse",
-        "name": "5-min Reddit hot-pulse for fresh comment candidates",
-        "kind": "hot_pulse",
-        "cron": "*/5 * * * *",
-        "kwargs": {},
-    },
-    {
-        "id": "daily-content-idea",
-        "name": "Daily content idea per tracked project",
-        "kind": "content_idea",
-        "cron": "0 9 * * *",
-        "kwargs": {},
-    },
-)
-
-
-def seed_default_schedules(brain_db) -> list[dict]:
-    """Idempotently register baseline marketing schedules.
-
-    Only inserts when the schedule_id is missing so that hand-edits to
-    cron, kwargs, or paused state via the /sched API survive reboots.
+    Only inserts when the schedule_id is missing so hand-edits to cron,
+    kwargs, or paused state via the /sched API survive reboots.
     """
     out: list[dict] = []
-    for spec in _DEFAULT_SCHEDULES:
+    for spec in profile.schedules:
         existing = brain_db.get_schedule(spec["id"])
         if existing is None:
             row = brain_db.upsert_schedule(
@@ -1242,40 +1097,195 @@ def seed_default_schedules(brain_db) -> list[dict]:
                 spec.get("kwargs"),
             )
             out.append(row)
-            logger.info("seed_default_schedules: created %s", spec["id"])
+            logger.info("seed_schedules: created %s", spec["id"])
         else:
             out.append(existing)
     return out
 
 
-def seed_default_projects(brain_db) -> list[dict]:
-    """Idempotently insert the default project tracking set.
+def seed_from_profile(brain_db, profile) -> list[dict]:
+    """Idempotently seed projects + schedules from a tenant profile.
 
-    Returns the list of resulting project rows. Safe to call on every
-    boot; `upsert_project` uses ON CONFLICT to preserve hand-edits to
-    topics/subreddits/posture. Also registers the baseline marketing
-    schedules (e.g. the 8am morning_digest) so a fresh deploy gets the
-    morning rundown without manual /sched setup.
+    Safe to call on every boot; upsert_project uses ON CONFLICT to preserve
+    hand-edits to topics/subreddits/posture. Also registers the profile's
+    baseline schedules so a fresh deploy gets its standing jobs without
+    manual /sched setup.
     """
-    out = []
-    for spec in _DEFAULT_PROJECTS:
+    out: list[dict] = []
+    for spec in profile.projects:
         existing = brain_db.get_project(spec["slug"])
         if existing is None:
             row = brain_db.upsert_project(
                 spec["slug"],
                 spec["owner"],
                 spec["repo"],
-                topics=spec["topics"],
-                subreddits=spec["subreddits"],
-                search_terms=spec["search_terms"],
-                posture=spec["posture"],
+                topics=spec.get("topics", []),
+                subreddits=spec.get("subreddits", []),
+                search_terms=spec.get("search_terms", []),
+                posture=spec.get("posture", ""),
             )
             out.append(row)
-            logger.info("seed_default_projects: created %s", spec["slug"])
+            logger.info("seed_from_profile: created project %s", spec["slug"])
         else:
             out.append(existing)
-    seed_default_schedules(brain_db)
+    _seed_schedules_from_profile(brain_db, profile)
     return out
+
+
+def seed_default_schedules(brain_db) -> list[dict]:
+    """Seed the active profile's schedules (back-compat entry point)."""
+    from tenant_profile import load_profile
+
+    return _seed_schedules_from_profile(brain_db, load_profile())
+
+
+def seed_default_projects(brain_db) -> list[dict]:
+    """Seed the active profile's projects + schedules (back-compat entry point).
+
+    Loads the profile named by CLAWRANGE_PROFILE (default "marketing").
+    """
+    from tenant_profile import load_profile
+
+    return seed_from_profile(brain_db, load_profile())
+
+
+# ─── CRM generators (lead-crm profile) ───────────────────────────────
+
+
+def _crm_for(profile, crm):
+    """Resolve a CRM adapter: prefer the injected one, else build from profile.
+
+    Returns ``None`` (graceful) when the profile defines no CRM, mirroring
+    the marketing scanners — a missing backend disables the feature rather
+    than crashing the heartbeat.
+    """
+    if crm is not None:
+        return crm
+    if not (profile and profile.crm):
+        logger.warning("crm generator: profile has no crm configured; skipping")
+        return None
+    from crm import get_adapter
+
+    adapter = get_adapter(profile.crm)
+    adapter.init()
+    return adapter
+
+
+async def pipeline_generator(
+    brain_db,
+    connector: str,
+    profile=None,
+    crm=None,
+    schedule_id: str | None = None,
+    http_client=None,
+    **kwargs,
+):
+    """Run a profile connector (source->transform->sink) into the CRM (FR-6.1).
+
+    Loads the named connector from the active profile, runs it against the
+    CRM adapter, records the schedule status with counts, and (when rows
+    were written) posts a one-line Telegram summary. Never auto-crashes the
+    heartbeat: unknown connectors / fetch errors degrade to a logged status.
+    """
+    from connectors import run_connector
+    from tenant_profile import load_profile
+
+    profile = profile or load_profile()
+    spec = profile.connector(connector)
+    now = datetime.now(timezone.utc).isoformat()
+
+    if spec is None:
+        logger.warning("pipeline: connector %r not defined in profile", connector)
+        if schedule_id:
+            brain_db.update_schedule_status(
+                schedule_id, now, f"error (unknown connector {connector})"
+            )
+        return None
+
+    adapter = _crm_for(profile, crm)
+    if adapter is None:
+        if schedule_id:
+            brain_db.update_schedule_status(schedule_id, now, "error (no crm)")
+        return None
+
+    try:
+        counts = run_connector(spec, adapter, http_client=http_client)
+    except Exception as exc:
+        logger.warning("pipeline: connector %s failed: %s", connector, exc)
+        if schedule_id:
+            brain_db.update_schedule_status(schedule_id, now, f"error ({exc})")
+        return None
+
+    if schedule_id:
+        brain_db.update_schedule_status(
+            schedule_id, now, f"ok ({counts['written']} written)"
+        )
+
+    if counts["written"]:
+        from telegram import notify
+
+        await notify(
+            f"Lead sync ({connector}): {counts['written']} written "
+            f"({counts['fetched']} fetched, {counts['kept']} kept)."
+        )
+    else:
+        logger.info("pipeline: %s wrote 0 rows; no telegram summary", connector)
+    return counts
+
+
+async def crm_digest_generator(
+    brain_db,
+    queries: list[str] | None = None,
+    profile=None,
+    crm=None,
+    schedule_id: str | None = None,
+    **kwargs,
+):
+    """Run named query templates and deliver a Telegram digest (FR-6.2).
+
+    Each entry in ``queries`` names a ``crm.query_templates`` template; the
+    digest renders each result with the same deterministic formatter the
+    NL ``answer`` path uses. Unknown templates and per-query errors are
+    reported inline rather than raising.
+    """
+    from crm.query import _format_rows, find_template, run_query
+    from tenant_profile import load_profile
+
+    profile = profile or load_profile()
+    queries = queries or []
+    now = datetime.now(timezone.utc).isoformat()
+
+    adapter = _crm_for(profile, crm)
+    if adapter is None:
+        if schedule_id:
+            brain_db.update_schedule_status(schedule_id, now, "error (no crm)")
+        return None
+
+    templates = profile.query_templates()
+    lines = ["*CRM digest*", ""]
+    for qname in queries:
+        template = find_template(templates, qname)
+        if template is None:
+            lines.append(f"{qname}: (unknown template)")
+            continue
+        try:
+            rows = run_query(adapter, template, {})
+            lines.append(_format_rows(template, rows))
+        except Exception as exc:
+            logger.warning("crm_digest: query %s failed: %s", qname, exc)
+            lines.append(f"{qname}: error ({exc})")
+
+    digest = "\n".join(lines).strip()
+
+    if schedule_id:
+        brain_db.update_schedule_status(
+            schedule_id, now, f"ok ({len(queries)} queries)"
+        )
+
+    from telegram import notify
+
+    await notify(digest)
+    return digest
 
 
 # ─── Registry ────────────────────────────────────────────────────────
@@ -1289,4 +1299,6 @@ GENERATORS = {
     "custom_scan": custom_scan_generator,
     "content_idea": content_idea_generator,
     "comment_draft": comment_draft_generator,
+    "pipeline": pipeline_generator,
+    "crm_digest": crm_digest_generator,
 }

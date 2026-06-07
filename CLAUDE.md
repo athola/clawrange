@@ -23,7 +23,15 @@ Tailscale + Caddy gateway.
   - `scheduler.py`, `generators.py` — APScheduler jobs and generators
   - `reddit_search.py`, `github_search.py` — marketing scanners
   - `telegram.py` — Telegram delivery
-  - `tests/` — pytest suite (app, brain, llm_proxy, marketing, telegram)
+  - `tenant_profile.py` — declarative profile loader/validator/env-resolver
+  - `persona.py` — render `openclaw/soul.md` from a profile
+  - `connectors/` — source→transform→sink registry (`http_csv`,
+    `login_scrape`, `leads_clean`, `crm` sink, `run_connector`)
+  - `crm/` — pluggable `CRMAdapter` (SQLite default + REST seam) and
+    read-only query templates / NL router (`crm/query.py`)
+  - `crm_api.py` — `/crm/*` router (mounted only when profile defines `crm`)
+  - `tests/` — pytest suite (app, brain, llm_proxy, marketing, telegram,
+    profile, persona, connectors, crm, crm_api, lifespan)
 - `deerflow/` — DeerFlow research agent config (optional, OpenRouter)
 - `scripts/` — POSIX shell scripts for lifecycle and testing
 - `tests/` — Python validation suite (`validate_stack.py`)
@@ -105,6 +113,15 @@ make logs             # tail docker logs
 - Make targets: `make tome-bridge` (one pass) and
   `make tome-bridge-watch` (poll forever).
 
+**CRM (lead-crm profile; mounted only when the profile defines `crm`)**
+- `POST /crm/query` `{prompt}` — NL question → `{answer, template, params, rows}`
+- `POST /crm/query/run` `{template, params}` — run a query template directly
+- `GET  /crm/templates` — list available query templates
+- `GET  /crm/leads?status=&limit=` — list leads
+- `POST /crm/sync/{connector_id}` — run a connector now → counts
+- `GET  /healthz/crm` — CRM adapter health + configured connectors
+- See `docs/multi-tenant-guide.md` for profile authoring.
+
 **Canary**
 - `POST /webhook-test/test` — echo payload back
 
@@ -129,6 +146,13 @@ make logs             # tail docker logs
   registered with `app.include_router`).
 - New scheduled generators go in `workflows/generators.py` and must be
   added to the `GENERATORS` registry.
+- New connector kinds go in `workflows/connectors/` and must be registered
+  in `connectors/__init__.py` AND mirrored in `tenant_profile.KNOWN_*_KINDS`
+  so a profile fails validation at load time, not at first cron fire.
+- New CRM backends implement `crm.adapter.CRMAdapter` and register in
+  `get_adapter`. Tenant-specific config belongs in a profile YAML, never in
+  Python; the generic core/template must stay free of any one operator's
+  identity.
 - New test scripts go in `scripts/test_*.sh` and get a Makefile target.
 - Pytest unit tests go in `workflows/tests/test_*.py`.
 - Persona edits to `openclaw/soul.md` should keep responses tight

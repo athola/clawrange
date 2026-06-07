@@ -1,0 +1,123 @@
+# lead-crm — the reference business profile.
+#
+# A worked example for a business owner: an assistant that hourly syncs
+# leads from a web portal into a local CRM, and answers relational and
+# time-series questions about those leads on a morning digest or on demand
+# via Telegram. Everything tenant-specific lives here — copy this directory,
+# rename it, edit the fields, and set CLAWRANGE_PROFILE to the new name.
+#
+# ${VAR} tokens resolve from the environment at load time. Unset vars
+# resolve to "" and the affected connector/CRM is treated as unconfigured
+# (a missing credential disables a feature; it never crashes boot). For an
+# offline demo, leave the portal vars unset and use `make seed-demo` to load
+# config/profiles/lead-crm/demo_leads.csv directly into the CRM.
+
+profile: lead-crm
+
+assistant:
+  name: "Sales Assistant"
+  role: "sales operations assistant"
+  channel: telegram
+  # No persona_markdown: the generic soul.template.md is filled from the
+  # structured fields below, so a new owner writes data, not prose.
+  owner:
+    name: "Dana Owner"
+    org: "Acme Co"
+    context: >-
+      Acme sells HVAC services. Leads arrive through a web portal and are
+      worked through a new -> contacted -> qualified -> won/lost pipeline.
+  capabilities:
+    - "Sync new leads from the portal into the CRM every hour"
+    - "Report new-lead counts, status breakdowns, and weekly trends"
+    - "Answer ad-hoc questions about leads from a Telegram prompt"
+    - "Never auto-contact a lead — surface and recommend, owner decides"
+
+seeds:
+  projects: []
+  schedules:
+    - id: lead-sync
+      name: "Hourly lead sync"
+      kind: pipeline
+      cron: "0 * * * *"
+      kwargs:
+        connector: portal-leads
+        schedule_id: lead-sync
+    - id: crm-digest
+      name: "Morning CRM digest"
+      kind: crm_digest
+      cron: "0 8 * * *"
+      kwargs:
+        queries: [new_leads_count, leads_by_status, leads_over_time]
+        schedule_id: crm-digest
+
+connectors:
+  - id: portal-leads
+    source:
+      kind: http_csv               # http_csv | login_scrape
+      url: ${PORTAL_EXPORT_URL}
+      auth:
+        kind: bearer               # none | api_key | bearer | basic | login_form
+        token: ${PORTAL_TOKEN}
+        # api_key: {header: X-API-Key, value: ${PORTAL_API_KEY}}
+        # basic: {username: ${PORTAL_USERNAME}, password: ${PORTAL_PASSWORD}}
+        # login_form:
+        #   login_url: ${PORTAL_LOGIN_URL}
+        #   username_field: username
+        #   password_field: password
+        #   username: ${PORTAL_USERNAME}
+        #   password: ${PORTAL_PASSWORD}
+        #   export_path: ${PORTAL_EXPORT_URL}
+    transform:
+      kind: leads_clean
+      mapping:                     # source CSV column -> CRM field
+        "Full Name": name
+        "Email Address": email
+        "Phone": phone
+        "Lead Source": source
+        "Created": created_at
+      required: [email]            # drop rows missing these
+      dedup_key: email
+    sink:
+      kind: crm
+      object: leads
+      upsert_key: email
+
+crm:
+  adapter: sqlite                  # sqlite | rest
+  sqlite:
+    path: ${CRM_DB_PATH}          # defaults to /data/crm.db when unset
+  rest:
+    base_url: ${CRM_BASE_URL}
+    auth:
+      kind: bearer
+      token: "${CRM_TOKEN}"
+    objects:
+      leads: {create: "POST /leads", list: "GET /leads"}
+  query_templates:
+    - name: new_leads_count
+      description: "Count of leads created within a recent time window."
+      params:
+        window: {type: duration, default: "7d"}
+      sql: "SELECT COUNT(*) AS n FROM leads WHERE created_at >= :since"
+    - name: leads_by_status
+      description: "Lead counts grouped by pipeline status."
+      params: {}
+      sql: "SELECT status, COUNT(*) AS n FROM leads GROUP BY status ORDER BY n DESC"
+    - name: leads_over_time
+      description: "New-lead counts bucketed by day or week over a window."
+      params:
+        bucket:
+          type: enum
+          values: [day, week]
+          default: week
+          bind: fmt
+          map: {day: "%Y-%m-%d", week: "%Y-%W"}
+        window: {type: duration, default: "60d"}
+      sql: >-
+        SELECT strftime(:fmt, created_at) AS bucket, COUNT(*) AS n
+        FROM leads WHERE created_at >= :since GROUP BY bucket ORDER BY bucket
+    - name: lead_lookup
+      description: "Find leads matching a name or email fragment."
+      params:
+        q: {type: string}
+      sql: "SELECT * FROM leads WHERE email LIKE :like OR name LIKE :like LIMIT 10"
