@@ -1,0 +1,150 @@
+{
+  "projects": [
+    {
+      "slug": "claude-night-market",
+      "owner": "athola",
+      "repo": "claude-night-market",
+      "topics": [
+        "claude-code",
+        "plugins",
+        "agent-tooling"
+      ],
+      "subreddits": [
+        "ClaudeAI",
+        "LocalLLaMA",
+        "SideProject"
+      ],
+      "search_terms": [
+        "claude code plugin",
+        "claude code marketplace",
+        "claude skill"
+      ],
+      "posture": "Lead with: a curated marketplace for Claude Code plugins. Useful comments first - link only when the question is about discovering or composing plugins."
+    },
+    {
+      "slug": "skrills",
+      "owner": "athola",
+      "repo": "skrills",
+      "topics": [
+        "chrome-extension",
+        "trades",
+        "knowledge-capture"
+      ],
+      "subreddits": [
+        "Construction",
+        "ITCareerQuestions",
+        "SideProject"
+      ],
+      "search_terms": [
+        "trade skill capture",
+        "field knowledge chrome extension"
+      ],
+      "posture": "Lead with: capture trade-skill knowledge from the field. Comment on the workflow first, mention skrills only when the thread is explicitly about capture or onboarding."
+    },
+    {
+      "slug": "simple-resume",
+      "owner": "athola",
+      "repo": "simple-resume",
+      "topics": [
+        "resume",
+        "yaml-to-pdf",
+        "static-site"
+      ],
+      "subreddits": [
+        "resumes",
+        "cscareerquestions",
+        "SideProject"
+      ],
+      "search_terms": [
+        "yaml resume",
+        "static resume site",
+        "resume generator"
+      ],
+      "posture": "Lead with: a YAML-driven resume that builds PDF and HTML. Comment with concrete examples; mention only when the post is about resume tooling specifically."
+    },
+    {
+      "slug": "clawrange",
+      "owner": "athola",
+      "repo": "clawrange",
+      "topics": [
+        "personal ai ops",
+        "fastapi workflow service",
+        "claude code",
+        "telegram bot",
+        "llm proxy",
+        "openrouter",
+        "apscheduler",
+        "self-hosted ai"
+      ],
+      "subreddits": [
+        "ClaudeAI",
+        "claudecode",
+        "vibecoding",
+        "opensourceai",
+        "codex",
+        "sideprojects",
+        "LocalLLaMA",
+        "selfhosted"
+      ],
+      "search_terms": [
+        "personal ai ops stack",
+        "claude code workflow",
+        "fastapi llm proxy",
+        "openrouter telegram",
+        "agent orchestration self-hosted"
+      ],
+      "posture": "Lead with: a single-host AI ops stack (FastAPI workflows + Claude Code via OpenClaw) for tier-routed LLM access, scheduled marketing scans, and Telegram delivery. Comment with first-hand operational details (single uvicorn worker, APScheduler job persistence, balance-aware tier routing). Mention clawrange only when the post is explicitly about self-hosted Claude tooling or LLM-proxy gateways."
+    },
+    {
+      "slug": "personal-brand",
+      "owner": "athola",
+      "repo": "athola",
+      "topics": [
+        "ai-systems",
+        "agent-platforms",
+        "plugin-ecosystems",
+        "msp-tooling",
+        "fastapi",
+        "ai-engineering"
+      ],
+      "subreddits": [
+        "ClaudeAI",
+        "LocalLLaMA",
+        "MachineLearning",
+        "ExperiencedDevs",
+        "ProgrammerHumor"
+      ],
+      "search_terms": [
+        "ai systems engineering",
+        "agent orchestration",
+        "claude code plugins",
+        "personal ai ops stack",
+        "msp automation"
+      ],
+      "posture": "Voice: AI systems engineer at the company in Austin, building a personal AI ops stack. Share first-hand experience, not pitches. Always link to source code or running infra. The tone: terse, specific, opinionated."
+    }
+  ],
+  "schedules": [
+    {
+      "id": "morning_digest",
+      "name": "Morning Reddit comment-candidate digest",
+      "kind": "morning_digest",
+      "cron": "0 8 * * *",
+      "kwargs": {}
+    },
+    {
+      "id": "hot_pulse",
+      "name": "5-min Reddit hot-pulse for fresh comment candidates",
+      "kind": "hot_pulse",
+      "cron": "*/5 * * * *",
+      "kwargs": {}
+    },
+    {
+      "id": "daily-content-idea",
+      "name": "Daily content idea per tracked project",
+      "kind": "content_idea",
+      "cron": "0 9 * * *",
+      "kwargs": {}
+    }
+  ]
+}

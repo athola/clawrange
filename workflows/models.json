@@ -1,0 +1,49 @@
+{
+  "tiers": [
+    {
+      "name": "openrouter-free",
+      "description": "OpenRouter free models — $0, 1000 req/day with $10 balance",
+      "provider": "openrouter",
+      "models": [
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "google/gemma-3-27b-it:free",
+        "z-ai/glm-4.5-air:free"
+      ]
+    },
+    {
+      "name": "zai-direct",
+      "description": "Z.AI GLM 5.1 — direct API, separate rate limits",
+      "provider": "zai",
+      "models": [
+        "glm-5.1"
+      ]
+    },
+    {
+      "name": "openrouter-paid",
+      "description": "OpenRouter paid models — last resort, pennies per call",
+      "provider": "openrouter",
+      "models": [
+        "anthropic/claude-haiku-4-5",
+        "anthropic/claude-sonnet-4-5"
+      ]
+    }
+  ],
+  "providers": {
+    "openrouter": {
+      "base_url": "https://openrouter.ai/api/v1/chat/completions",
+      "env_key": "OPENROUTER_API_KEY"
+    },
+    "zai": {
+      "base_url": "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
+      "env_key": "ZAI_API_KEY"
+    },
+    "zai-search": {
+      "base_url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+      "env_key": "ZAI_API_KEY"
+    }
+  },
+  "search": {
+    "provider": "openrouter",
+    "models": ["anthropic/claude-haiku-4-5:online"]
+  }
+}

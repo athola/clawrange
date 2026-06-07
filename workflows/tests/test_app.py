@@ -1,6 +1,7 @@
 """Tests for the ClawRange workflow service."""
 
-import pytest
+from unittest.mock import AsyncMock, patch
+
 from fastapi.testclient import TestClient
 
 from app import app
@@ -12,7 +13,12 @@ class TestHealthz:
     def test_returns_ok(self):
         r = client.get("/healthz")
         assert r.status_code == 200
-        assert r.json()["status"] == "ok"
+        data = r.json()
+        assert data["status"] == "ok"
+        assert "brain" in data
+        assert data["brain"]["db"] == "ok"
+        assert data["brain"]["pages"] == 0
+        assert "embeddings" in data["brain"]
 
 
 class TestWebhook:
@@ -36,59 +42,312 @@ class TestWebhook:
         assert "received" in r.json()["message"]
 
 
-class TestLeadLookup:
-    def test_find_by_name(self):
-        r = client.post("/webhook/lead-status", json={"name": "John Smith"})
+# ─── Tier Status ─────────────────────────────────────────────────
+
+
+class TestTierStatus:
+    """GIVEN the /tier endpoint
+    WHEN queried
+    THEN it returns tier list with status markers and balance info."""
+
+    @patch(
+        "llm_proxy._check_openrouter_balance",
+        new_callable=AsyncMock,
+        return_value=12.50,
+    )
+    @patch("llm_proxy._last_tier_used", "zai-direct")
+    def test_returns_tier_list(self, _mock_balance):
+        r = client.get("/tier")
+        assert r.status_code == 200
         data = r.json()
-        assert data["status"] == "found"
-        assert data["lead"]["name"] == "John Smith"
-        assert "John Smith" in data["message"]
+        assert isinstance(data["tiers"], list)
+        assert len(data["tiers"]) >= 2
+        assert data["last_used"] == "zai-direct"
+        assert data["balance_remaining"] == "$12.50"
+        assert data["paid_auto_fallback"] == "off"
+        # Each tier has name, status, description
+        for tier in data["tiers"]:
+            assert "name" in tier
+            assert "status" in tier
+            assert "description" in tier
 
-    def test_find_by_phone(self):
-        r = client.post("/webhook/lead-status", json={"phone": "903-555-0200"})
+    @patch(
+        "llm_proxy._check_openrouter_balance", new_callable=AsyncMock, return_value=None
+    )
+    @patch("llm_proxy._last_tier_used", None)
+    def test_handles_unconfigured_balance(self, _mock_balance):
+        r = client.get("/tier")
         data = r.json()
-        assert data["status"] == "found"
-        assert data["lead"]["name"] == "Maria Garcia"
+        assert data["balance_remaining"] == "not configured"
+        assert data["last_used"] == "none"
 
-    def test_partial_name_match(self):
-        r = client.post("/webhook/lead-status", json={"name": "robert"})
-        assert r.json()["lead"]["name"] == "Robert Johnson"
+    @patch(
+        "llm_proxy._check_openrouter_balance", new_callable=AsyncMock, return_value=5.0
+    )
+    @patch("llm_proxy._last_tier_used", None)
+    def test_tripped_tier_shows_tripped(self, _mock_balance):
+        import llm_proxy
 
-    def test_not_found(self):
-        r = client.post("/webhook/lead-status", json={"name": "Nobody"})
+        # Trip the circuit breaker for a tier
+        llm_proxy._circuit_state["openrouter-free"] = {
+            "failures": llm_proxy.CIRCUIT_FAILURE_THRESHOLD,
+            "last_failure": __import__("time").monotonic(),
+        }
+        try:
+            r = client.get("/tier")
+            tiers = {t["name"]: t["status"] for t in r.json()["tiers"]}
+            assert tiers.get("openrouter-free") == "TRIPPED"
+        finally:
+            llm_proxy._circuit_state.clear()
+
+
+# ─── Tier Notify ─────────────────────────────────────────────────
+
+
+class TestTierNotify:
+    """GIVEN the /tier/notify endpoint
+    WHEN called
+    THEN it formats a status message and sends it via Telegram."""
+
+    @patch("app.notify", new_callable=AsyncMock, return_value=True)
+    @patch(
+        "llm_proxy._check_openrouter_balance", new_callable=AsyncMock, return_value=8.00
+    )
+    @patch("llm_proxy._last_tier_used", "zai-direct")
+    def test_sends_notification(self, _mock_balance, mock_notify):
+        r = client.post("/tier/notify")
+        assert r.status_code == 200
         data = r.json()
-        assert data["status"] == "not_found"
-        assert "No lead found" in data["message"]
+        assert data["sent"] is True
+        assert "Tier Status" in data["message"]
+        assert "zai-direct" in data["message"]
+        mock_notify.assert_called_once()
 
-    def test_webhook_test_path(self):
+    @patch("app.notify", new_callable=AsyncMock, return_value=False)
+    @patch(
+        "llm_proxy._check_openrouter_balance", new_callable=AsyncMock, return_value=None
+    )
+    @patch("llm_proxy._last_tier_used", None)
+    def test_reports_failure_when_telegram_down(self, _mock_balance, mock_notify):
+        r = client.post("/tier/notify")
+        data = r.json()
+        assert data["sent"] is False
+        assert "not configured" in data["message"]
+
+
+# ─── Task Queue (Persistent Backend) ──────────────────────────────
+
+
+class TestTaskQueue:
+    """GIVEN the /task endpoints backed by SQLite
+    WHEN tasks are created, listed, claimed, completed, and cancelled
+    THEN the queue manages state transitions correctly with persistence."""
+
+    def test_create_task(self):
+        r = client.post("/task", json={"description": "check z.ai models"})
+        assert r.status_code == 200
+        task = r.json()
+        assert task["status"] == "pending"
+        assert task["description"] == "check z.ai models"
+        assert task["priority"] == 3
+        assert task["id"]
+
+    def test_list_empty_queue(self):
+        r = client.get("/task")
+        assert r.json() == {"tasks": [], "total": 0}
+
+    def test_list_with_filter(self):
+        client.post("/task", json={"description": "task a"})
+        client.post("/task", json={"description": "task b"})
+        r = client.get("/task?status=pending")
+        assert r.json()["total"] == 2
+        r = client.get("/task?status=completed")
+        assert r.json()["total"] == 0
+
+    def test_get_task_by_id(self):
+        task = client.post("/task", json={"description": "lookup"}).json()
+        r = client.get(f"/task/{task['id']}")
+        assert r.status_code == 200
+        assert r.json()["description"] == "lookup"
+
+    def test_get_nonexistent_task(self):
+        r = client.get("/task/nope")
+        assert r.status_code == 404
+
+    def test_claim_task(self):
+        task = client.post("/task", json={"description": "work"}).json()
+        r = client.post(f"/task/{task['id']}/claim")
+        assert r.status_code == 200
+        assert r.json()["status"] == "active"
+
+    def test_claim_non_pending_task_fails(self):
+        task = client.post("/task", json={"description": "work"}).json()
+        client.post(f"/task/{task['id']}/claim")
+        r = client.post(f"/task/{task['id']}/claim")
+        assert r.status_code == 409
+
+    def test_complete_task_with_result(self):
+        task = client.post("/task", json={"description": "research"}).json()
+        client.post(f"/task/{task['id']}/claim")
         r = client.post(
-            "/webhook-test/lead-status",
-            json={"name": "John Smith", "phone": "903-555-0100"},
+            f"/task/{task['id']}/result",
+            json={"result": "found 3 new models", "status": "completed"},
         )
         assert r.status_code == 200
-        assert "John Smith" in r.json()["message"]
+        assert r.json()["status"] == "completed"
+        assert r.json()["result"] == "found 3 new models"
+        assert r.json()["completed_at"] is not None
 
+    def test_fail_task(self):
+        task = client.post("/task", json={"description": "impossible"}).json()
+        client.post(f"/task/{task['id']}/claim")
+        r = client.post(
+            f"/task/{task['id']}/result",
+            json={"result": "tools insufficient", "status": "failed"},
+        )
+        assert r.json()["status"] == "failed"
 
-class TestMorningBriefing:
-    def test_returns_briefing(self):
-        r = client.get("/webhook/morning-briefing")
-        data = r.json()
-        assert "briefing" in data
-        assert data["leadCount"] == 4
-
-    def test_briefing_contains_all_leads(self):
-        briefing = client.get("/webhook/morning-briefing").json()["briefing"]
-        assert "John Smith" in briefing
-        assert "Maria Garcia" in briefing
-        assert "Robert Johnson" in briefing
-        assert "Ashley Williams" in briefing
-
-    def test_briefing_header(self):
-        briefing = client.get("/webhook/morning-briefing").json()["briefing"]
-        assert "MORNING BRIEFING" in briefing
-        assert "Longview Home Center" in briefing
-
-    def test_post_also_works(self):
-        r = client.post("/webhook/morning-briefing")
+    def test_cancel_task(self):
+        task = client.post("/task", json={"description": "nevermind"}).json()
+        r = client.delete(f"/task/{task['id']}")
         assert r.status_code == 200
-        assert r.json()["leadCount"] == 4
+        assert r.json()["status"] == "cancelled"
+
+    def test_cancel_completed_task_fails(self):
+        task = client.post("/task", json={"description": "done"}).json()
+        client.post(f"/task/{task['id']}/claim")
+        client.post(
+            f"/task/{task['id']}/result",
+            json={"result": "done", "status": "completed"},
+        )
+        r = client.delete(f"/task/{task['id']}")
+        assert r.status_code == 409
+
+    def test_priority_ordering(self):
+        client.post("/task", json={"description": "low", "priority": 5})
+        client.post("/task", json={"description": "urgent", "priority": 1})
+        client.post("/task", json={"description": "normal", "priority": 3})
+        tasks = client.get("/task").json()["tasks"]
+        descriptions = [t["description"] for t in tasks]
+        assert descriptions == ["urgent", "normal", "low"]
+
+    def test_priority_clamped(self):
+        task = client.post("/task", json={"description": "x", "priority": 99}).json()
+        assert task["priority"] == 5
+
+
+# ─── Task Command Interception ───────────────────────────────────
+
+
+class TestTaskCommandDetection:
+    """GIVEN the _extract_task_command parser
+    WHEN various !task commands are sent
+    THEN it correctly classifies them."""
+
+    def test_create_task(self):
+        from llm_proxy import _extract_task_command
+
+        result = _extract_task_command("!task check z.ai for new models")
+        assert result == {"type": "create", "description": "check z.ai for new models"}
+
+    def test_list_tasks(self):
+        from llm_proxy import _extract_task_command
+
+        assert _extract_task_command("!tasks")["type"] == "list"
+        assert _extract_task_command("/tasks")["type"] == "list"
+        assert _extract_task_command("!task")["type"] == "list"
+        assert _extract_task_command("!task list")["type"] == "list"
+
+    def test_cancel_task(self):
+        from llm_proxy import _extract_task_command
+
+        result = _extract_task_command("!task cancel abc123")
+        assert result == {"type": "action", "action": "cancel", "args": "abc123"}
+
+    def test_priority_task(self):
+        from llm_proxy import _extract_task_command
+
+        result = _extract_task_command("!task priority abc123 1")
+        assert result == {"type": "action", "action": "priority", "args": "abc123 1"}
+
+    def test_non_task_message(self):
+        from llm_proxy import _extract_task_command
+
+        assert _extract_task_command("hello world") is None
+        assert _extract_task_command("what tasks do I have") is None
+
+
+# ─── Research Endpoints ──────────────────────────────────────────
+
+
+class TestResearchEndpoint:
+    """End-to-end tests for /research and /research/sessions."""
+
+    def test_post_research_persists_session(self, monkeypatch):
+        from research import Finding
+
+        async def fake_orch(topic, channels=None, **kwargs):
+            return {
+                "topic": topic,
+                "channels": ["discourse", "code"],
+                "findings": [
+                    {
+                        **Finding(
+                            "reddit",
+                            "discourse",
+                            "Hit 1",
+                            "https://r/1",
+                            0.6,
+                            "summary",
+                            metadata={"score": 80},
+                        ).to_dict(),
+                        "confidence": "low",
+                    }
+                ],
+                "errors": {},
+                "total": 1,
+            }
+
+        monkeypatch.setattr("research.orchestrate_research", fake_orch)
+
+        r = client.post("/research", json={"topic": "agent platforms"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["topic"] == "agent platforms"
+        assert body["total"] == 1
+        assert "session_id" in body
+
+        session_id = body["session_id"]
+        listed = client.get("/research/sessions").json()
+        assert listed["total"] >= 1
+        ids = [s["id"] for s in listed["sessions"]]
+        assert session_id in ids
+
+        detail = client.get(f"/research/sessions/{session_id}").json()
+        assert detail["topic"] == "agent platforms"
+        assert detail["status"] == "complete"
+        assert detail["finding_count"] == 1
+        assert detail["findings"][0]["title"] == "Hit 1"
+        assert detail["findings"][0]["metadata"]["score"] == 80
+
+    def test_empty_topic_returns_400(self):
+        r = client.post("/research", json={"topic": "   "})
+        assert r.status_code == 400
+
+    def test_unknown_session_returns_404(self):
+        r = client.get("/research/sessions/no-such-session")
+        assert r.status_code == 404
+
+    def test_healthz_research_lists_channels(self):
+        r = client.get("/healthz/research")
+        assert r.status_code == 200
+        body = r.json()
+        assert "channels" in body
+        assert "configured_count" in body
+        assert "total_channels" in body
+        assert body["status"] in ("ok", "degraded")
+        assert set(body["channels"].keys()) >= {
+            "discourse",
+            "code",
+            "discourse_web",
+        }

@@ -10,27 +10,69 @@ services:
   # ─── OpenClaw: AI Assistant Gateway ───────────────────────────────
   # Routes client messages through LLM providers via OpenRouter.
   # Web UI + API at http://localhost:3000
+  #
+  # SANDBOX: Container filesystem is read-only. Writes only to:
+  #   - ./data/openclaw-state/ (persistent state, sessions, config)
+  #   - ./data/openclaw-tmp/   (ephemeral logs, locks)
+  # Host reads allowed via :ro mounts. No writes outside ~/clawrange.
   openclaw:
     image: ghcr.io/openclaw/openclaw:2026.3.24
     container_name: msp-openclaw
+    read_only: true
     ports:
       - "${BIND_ADDR:-0.0.0.0}:${OPENCLAW_PORT:-3000}:18789"
+    # WSL2 networking: pin Telegram API to IPv4 and use reliable DNS.
+    # WSL2's NAT drops idle TCP connections before Linux's default 2-hour
+    # keepalive detects it, causing Telegram long-polling to hang silently.
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    extra_hosts:
+      - "api.telegram.org:149.154.166.110"
+    sysctls:
+      - net.ipv4.tcp_keepalive_time=30
+      - net.ipv4.tcp_keepalive_intvl=10
+      - net.ipv4.tcp_keepalive_probes=3
     volumes:
-      - openclaw_state:/home/node/.openclaw
+      # Persistent state — bind mount to ~/clawrange/data/ (not a Docker volume)
+      - ./data/openclaw-state:/home/node/.openclaw
+      # Ephemeral scratch space — stays in ~/clawrange/data/
+      - ./data/openclaw-tmp:/tmp
+      # Config templates — read-only
       - ./openclaw/soul.md:/home/node/.openclaw/soul.md:ro
-      - ./openclaw/config/openclaw.json:/home/node/.openclaw/openclaw.json
+      - ./openclaw/soul-ops.md:/home/node/.openclaw/soul-ops.md:ro
+      - ./openclaw/HEARTBEAT.md:/home/node/.openclaw/HEARTBEAT.md:ro
+      - ./openclaw/config/openclaw.json:/opt/openclaw.json.template:ro
+      # Host home — read-only access for agent file reads
+      - ${HOME}:/mnt/host-home:ro
+      # Healthcheck script — detects stuck Telegram polling
+      - ./scripts/healthcheck-openclaw.sh:/opt/healthcheck.sh:ro
     environment:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - OPENCLAW_TZ=${TIMEZONE:-America/Chicago}
       - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
-    command: ["node", "--max-old-space-size=1536", "dist/index.js", "gateway", "--bind", "lan", "--port", "18789"]
+      - PROXY_AUTH_TOKEN=${PROXY_AUTH_TOKEN}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+    user: "0:0"
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - "sh"
+      - "-c"
+      - |
+        chown 1000:1000 /home/node/.openclaw /tmp
+        if [ ! -f /home/node/.openclaw/openclaw.json ] || grep -q 'PROXY_AUTH_TOKEN' /home/node/.openclaw/openclaw.json; then
+          sed "s|\$${PROXY_AUTH_TOKEN}|${PROXY_AUTH_TOKEN}|g" /opt/openclaw.json.template > /home/node/.openclaw/openclaw.json
+          chown 1000:1000 /home/node/.openclaw/openclaw.json
+        fi
+        exec runuser -u node -- node --max-old-space-size=1536 dist/index.js gateway --bind lan --port 18789
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:18789/healthz').then(r=>{if(!r.ok)throw 1})"]
-      interval: 30s
+      test: ["CMD", "sh", "/opt/healthcheck.sh"]
+      interval: 45s
       timeout: 10s
-      retries: 3
-      start_period: 15s
+      retries: 1
+      start_period: 120s
     depends_on:
       workflows:
         condition: service_healthy
@@ -45,11 +87,48 @@ services:
   # Handles webhooks, lead lookups, morning briefings.
   # Replaces n8n with testable Python endpoints.
   # API at http://localhost:5678
+  #
+  # SANDBOX: Read-only container. No host mounts. Network-only service.
   workflows:
     build: ./workflows
     container_name: msp-workflows
+    read_only: true
     ports:
       - "${BIND_ADDR:-0.0.0.0}:${WORKFLOWS_PORT:-5678}:5678"
+    volumes:
+      # Dev hot-reload — mount source so uvicorn --reload picks up changes
+      - ./workflows/app.py:/app/app.py:ro
+      - ./workflows/brain.py:/app/brain.py:ro
+      - ./workflows/brain_db.py:/app/brain_db.py:ro
+      - ./workflows/telegram.py:/app/telegram.py:ro
+      - ./workflows/llm_proxy.py:/app/llm_proxy.py:ro
+      - ./workflows/models.json:/app/models.json:ro
+      - ./workflows/scheduler.py:/app/scheduler.py:ro
+      - ./workflows/generators.py:/app/generators.py:ro
+      - ./workflows/reddit_search.py:/app/reddit_search.py:ro
+      - ./workflows/github_search.py:/app/github_search.py:ro
+      # Soul — gives Max its persona context for self-directed tasks
+      - ./openclaw/soul.md:/app/soul.md:ro
+      # Brain — persistent knowledge storage
+      - ./data/brain:/data
+    tmpfs:
+      - /tmp:size=32M
+    environment:
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - ZAI_API_KEY=${ZAI_API_KEY}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - PROXY_AUTH_TOKEN=${PROXY_AUTH_TOKEN}
+      - OPENROUTER_CREDIT_BALANCE=${OPENROUTER_CREDIT_BALANCE:-0}
+      - REDDIT_CLIENT_ID=${REDDIT_CLIENT_ID:-}
+      - REDDIT_CLIENT_SECRET=${REDDIT_CLIENT_SECRET:-}
+      - REDDIT_USERNAME=${REDDIT_USERNAME:-}
+      - REDDIT_PASSWORD=${REDDIT_PASSWORD:-}
+      - REDDIT_USER_AGENT=${REDDIT_USER_AGENT:-clawrange-marketing-bot/0.1}
+      - GITHUB_PAT=${GITHUB_PAT:-}
+      - SCHEDULER_TZ=${SCHEDULER_TZ:-America/Chicago}
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5678/healthz')"]
@@ -63,10 +142,6 @@ services:
           memory: 128M
     networks:
       - msp-network
-
-volumes:
-  openclaw_state:
-    name: msp-openclaw-state
 
 networks:
   msp-network:

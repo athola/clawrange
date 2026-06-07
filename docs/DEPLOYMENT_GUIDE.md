@@ -10,7 +10,7 @@ Internet → Droplet (Caddy + TLS) → Tailscale tunnel → Node (Docker service
 
 | Component | Role | Location |
 |-----------|------|----------|
-| Node machine | Runs OpenClaw, n8n, DeerFlow | Behind NAT, no public IP needed |
+| Node machine | Runs OpenClaw + Workflows (FastAPI) + optional DeerFlow | Behind NAT, no public IP needed |
 | DigitalOcean droplet | Gateway — reverse proxy + TLS termination | Public IP, domain pointed here |
 | Tailscale | Encrypted WireGuard tunnel between them | Mesh VPN, NAT-traversal built in |
 | Caddy | HTTPS reverse proxy on gateway | Auto Let's Encrypt certificates |
@@ -50,7 +50,9 @@ cp .env.example .env
 #   OPENROUTER_API_KEY=<your key>
 #   TAILSCALE_IP=<your tailscale ip from step 1.1>
 #   OPENCLAW_GATEWAY_TOKEN=<generate with: openssl rand -base64 32 | tr -d '/+=' | head -c 40>
-#   N8N_ENCRYPTION_KEY=<generate with: openssl rand -hex 32>
+#   PROXY_AUTH_TOKEN=<generate with: python3 -c "import secrets; print(secrets.token_urlsafe(32))">
+#   ZAI_API_KEY=<your Z.AI key, optional Tier 2 fallback>
+#   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID=<for tier alerts and task delivery>
 ```
 
 ### 1.3 Start services in production mode
@@ -97,7 +99,7 @@ Create a DNS A record:
 |------|------|-------|-----|
 | A | `ai` (or `@`) | `<droplet-public-ip>` | 300 |
 
-If you need n8n webhooks from external services:
+If you need to expose workflow webhooks (e.g. Telegram callbacks) on a separate hostname:
 
 | Type | Name | Value | TTL |
 |------|------|-------|-----|
@@ -212,11 +214,13 @@ Your personal devices can still reach everything as the tailnet owner.
 ### Node
 
 - [ ] Docker ports bound to 127.0.0.1 + Tailscale IP only (`make start-prod`)
-- [ ] OPENCLAW_GATEWAY_TOKEN set to random value
-- [ ] N8N_ENCRYPTION_KEY generated
-- [ ] OPENROUTER_API_KEY set in .env
+- [ ] `OPENCLAW_GATEWAY_TOKEN` set to random value
+- [ ] `PROXY_AUTH_TOKEN` set to random value (gates the workflows LLM proxy)
+- [ ] `OPENROUTER_API_KEY` set in `.env`; `OPENROUTER_CREDIT_BALANCE` reflects actual deposit
 - [ ] Pin Docker images to specific versions before production
-- [ ] Enable n8n authentication (set N8N_BASIC_AUTH_USER / N8N_BASIC_AUTH_PASSWORD)
+  (e.g. `ghcr.io/openclaw/openclaw:2026.3.24`)
+- [ ] Workflows runs single uvicorn worker (default — do not raise)
+- [ ] Brain DB at `data/brain/brain.db` is included in your backup plan
 
 ### Gateway (droplet)
 
@@ -265,8 +269,8 @@ ufw status                        # Firewall status
 | TLS cert not issued | DNS A record points to droplet? `dig ai.yourdomain.com` |
 | 502 Bad Gateway | Node services running? `make health` on node |
 | Slow responses | Tailscale using relay? `tailscale status` — look for "relay" vs "direct" |
-| n8n webhooks failing | Webhook URL in OpenClaw config uses Docker service name, not Tailscale IP |
-| DeerFlow not reachable | Started with `--with-deerflow`? Connected to msp-network? |
+| Workflows endpoints failing | Tool URL in `openclaw/config/openclaw.json` should use Docker service name (`workflows`), not Tailscale IP |
+| DeerFlow not reachable | Started with `--with-deerflow`? Connected to `msp-network`? |
 
 ## Cost Estimate
 

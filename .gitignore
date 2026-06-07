@@ -1,6 +1,9 @@
 # Secrets — NEVER commit
 .env
 
+# OpenClaw sandboxed state (bind-mounted, not Docker volumes)
+data/
+
 # DeerFlow cloned repo
 deer-flow/
 

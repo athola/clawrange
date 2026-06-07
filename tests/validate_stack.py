@@ -87,7 +87,12 @@ def check_env_example() -> TestResult:
     except FileNotFoundError:
         result.fail_(".env.example not found")
         return result
-    required_keys = ["OPENROUTER_API_KEY", "OPENCLAW_GATEWAY_TOKEN", "WORKFLOWS_PORT", "TIMEZONE"]
+    required_keys = [
+        "OPENROUTER_API_KEY",
+        "OPENCLAW_GATEWAY_TOKEN",
+        "WORKFLOWS_PORT",
+        "TIMEZONE",
+    ]
     missing = [k for k in required_keys if k not in content]
     if missing:
         result.fail_(f"Missing keys in .env.example: {', '.join(missing)}")
@@ -124,7 +129,13 @@ def check_n8n_workflows() -> TestResult:
     else:
         with open(app_path) as f:
             source = f.read()
-        for endpoint in ["/webhook/test", "/webhook/lead-status", "/webhook/morning-briefing", "/healthz"]:
+        for endpoint in [
+            "/webhook/test",
+            "/healthz",
+            "/brain",
+            "/task",
+            "/tier",
+        ]:
             if endpoint not in source:
                 errors.append(f"missing endpoint: {endpoint}")
     dockerfile = os.path.join(PROJECT_ROOT, "workflows", "Dockerfile")
@@ -164,7 +175,12 @@ def check_openclaw_config() -> TestResult:
     if "agents" not in data:
         errors.append("missing 'agents' section")
     else:
-        primary = data.get("agents", {}).get("defaults", {}).get("model", {}).get("primary", "")
+        primary = (
+            data.get("agents", {})
+            .get("defaults", {})
+            .get("model", {})
+            .get("primary", "")
+        )
         if not primary:
             errors.append("missing 'agents.defaults.model.primary'")
     if errors:
@@ -190,7 +206,9 @@ def check_deerflow_data_sovereignty() -> TestResult:
     blocklist = ["doubao", "volcengine", "bytedance", "deepseek.com"]
     violations = [endpoint for endpoint in blocklist if endpoint in config_text]
     if violations:
-        result.fail_(f"Direct endpoints found: {', '.join(violations)} — must route through OpenRouter")
+        result.fail_(
+            f"Direct endpoints found: {', '.join(violations)} — must route through OpenRouter"
+        )
         return result
     # Check that base_url values specifically contain openrouter.ai
     base_urls = [line.strip() for line in config_lines if "base_url:" in line]
@@ -214,12 +232,12 @@ def check_soul_md() -> TestResult:
     except FileNotFoundError:
         result.fail_("openclaw/soul.md not found")
         return result
-    required = ["longview home center", "jessup", "titanium", "fha", "va"]
+    required = ["john-117", "executive assistant", "clawrange"]
     missing = [r for r in required if r not in content]
     if missing:
         result.fail_(f"Missing references: {', '.join(missing)}")
     else:
-        result.pass_("Persona includes dealership, brands, and financing")
+        result.pass_("Persona includes identity, role, and infrastructure")
     return result
 
 

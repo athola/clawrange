@@ -67,6 +67,15 @@ test-deerflow: ## Test DeerFlow research layer
 test-ollama: ## Test local Ollama inference
 	@./scripts/test_ollama.sh
 
+test-research: ## Smoke test the /research endpoint with a live topic
+	@./scripts/test_research.sh "$(TOPIC)"
+
+tome-bridge: ## Run one bridge pass for research:tome tasks
+	@python3 scripts/tome_bridge.py
+
+tome-bridge-watch: ## Watch task queue for research:tome tasks
+	@python3 scripts/tome_bridge.py --watch --interval 60
+
 test-unit: ## Run Python unit tests (no containers needed)
 	@python3 -m pytest workflows/tests/ -v
 
@@ -75,6 +84,26 @@ validate: ## Validate config files and project structure
 	@if command -v pytest >/dev/null 2>&1; then \
 		python3 -m pytest tests/test_validate_stack.py -q; \
 	fi
+
+# ─── Tenant Profiles (multi-tenant template) ──────────────────────
+
+.PHONY: profile seed-demo
+
+profile: ## Render openclaw/soul.md from a profile + set it in .env (PROFILE=<name>)
+	@test -n "$(PROFILE)" || { echo "usage: make profile PROFILE=<name>"; exit 1; }
+	@python3 -c "import sys; sys.path.insert(0,'workflows'); \
+from persona import write_soul; from tenant_profile import load_profile; \
+p=write_soul(load_profile('$(PROFILE)'), 'openclaw/soul.md'); \
+print('rendered persona ->', p)"
+	@if [ -f .env ]; then \
+		if grep -q '^CLAWRANGE_PROFILE=' .env; then \
+			sed -i.bak 's/^CLAWRANGE_PROFILE=.*/CLAWRANGE_PROFILE=$(PROFILE)/' .env && rm -f .env.bak; \
+		else echo "CLAWRANGE_PROFILE=$(PROFILE)" >> .env; fi; \
+		echo "set CLAWRANGE_PROFILE=$(PROFILE) in .env"; \
+	else echo "no .env yet — run 'make setup' first (CLAWRANGE_PROFILE not set)"; fi
+
+seed-demo: ## Load the lead-crm demo leads into the CRM for an offline demo
+	@CRM_DB_PATH=$${CRM_DB_PATH:-data/crm/crm.db} python3 scripts/seed_demo.py
 
 # ─── Docker Inspection ────────────────────────────────────────────
 

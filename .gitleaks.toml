@@ -1,0 +1,16 @@
+[extend]
+# Use default gitleaks rules
+
+[allowlist]
+paths = [
+  '''.env\.example''',
+]
+# Allow known placeholder values that aren't real secrets
+regexTarget = "match"
+regexes = [
+  '''your-.*-here''',
+  '''testbed-token-change-me''',
+  '''generate-a-token-here''',
+  '''replace-with-.*''',
+  '''sk-or-v1-your-key-here''',
+]

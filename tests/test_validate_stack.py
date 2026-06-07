@@ -173,9 +173,7 @@ class TestCheckDataSovereignty:
         config_dir = project_tree / "deerflow"
         config_dir.mkdir(exist_ok=True)
         (config_dir / "config.yaml").write_text(
-            "models:\n"
-            "  - name: researcher\n"
-            "    model: deepseek/deepseek-chat\n"
+            "models:\n  - name: researcher\n    model: deepseek/deepseek-chat\n"
         )
         result = validate_stack.check_deerflow_data_sovereignty()
         assert result.passed is False
@@ -248,10 +246,25 @@ class TestCheckOpenclawConfig:
         THEN the check should pass."""
         config_dir = project_tree / "openclaw" / "config"
         config_dir.mkdir(parents=True, exist_ok=True)
-        (config_dir / "openclaw.json").write_text(json.dumps({
-            "gateway": {"port": 18789, "mode": "local", "bind": "lan", "auth": {"mode": "token"}},
-            "agents": {"defaults": {"model": {"primary": "openrouter/anthropic/claude-haiku-4-5"}}},
-        }))
+        (config_dir / "openclaw.json").write_text(
+            json.dumps(
+                {
+                    "gateway": {
+                        "port": 18789,
+                        "mode": "local",
+                        "bind": "lan",
+                        "auth": {"mode": "token"},
+                    },
+                    "agents": {
+                        "defaults": {
+                            "model": {
+                                "primary": "openrouter/anthropic/claude-haiku-4-5"
+                            }
+                        }
+                    },
+                }
+            )
+        )
         result = validate_stack.check_openclaw_config()
         assert result.passed is True
 
@@ -260,10 +273,14 @@ class TestCheckOpenclawConfig:
         THEN the check should fail."""
         config_dir = project_tree / "openclaw" / "config"
         config_dir.mkdir(parents=True, exist_ok=True)
-        (config_dir / "openclaw.json").write_text(json.dumps({
-            "gateway": {"port": 18789, "mode": "local", "bind": "lan"},
-            "agents": {"defaults": {"model": {"primary": "test"}}},
-        }))
+        (config_dir / "openclaw.json").write_text(
+            json.dumps(
+                {
+                    "gateway": {"port": 18789, "mode": "local", "bind": "lan"},
+                    "agents": {"defaults": {"model": {"primary": "test"}}},
+                }
+            )
+        )
         result = validate_stack.check_openclaw_config()
         assert result.passed is False
         assert "token" in result.message
@@ -388,8 +405,7 @@ class TestCheckN8nWorkflows:
         wf_dir = project_tree / "workflows"
         wf_dir.mkdir(parents=True, exist_ok=True)
         (wf_dir / "app.py").write_text(
-            '"/webhook/test"\n"/webhook/lead-status"\n'
-            '"/webhook/morning-briefing"\n"/healthz"\n'
+            '"/webhook/test"\n"/healthz"\n"/brain"\n"/task"\n"/tier"\n'
         )
         (wf_dir / "Dockerfile").write_text("FROM python:3.12-slim\n")
         result = validate_stack.check_n8n_workflows()
@@ -404,7 +420,7 @@ class TestCheckN8nWorkflows:
         (wf_dir / "Dockerfile").write_text("FROM python:3.12-slim\n")
         result = validate_stack.check_n8n_workflows()
         assert result.passed is False
-        assert "lead-status" in result.message
+        assert "brain" in result.message
 
     def test_fail_with_missing_app(self, project_tree):
         """GIVEN workflows/app.py does not exist
@@ -422,8 +438,7 @@ class TestCheckN8nWorkflows:
         wf_dir = project_tree / "workflows"
         wf_dir.mkdir(parents=True, exist_ok=True)
         (wf_dir / "app.py").write_text(
-            '"/webhook/test"\n"/webhook/lead-status"\n'
-            '"/webhook/morning-briefing"\n"/healthz"\n'
+            '"/webhook/test"\n"/healthz"\n"/brain"\n"/task"\n"/tier"\n'
         )
         result = validate_stack.check_n8n_workflows()
         assert result.passed is False
@@ -442,26 +457,23 @@ class TestCheckSoulMd:
         soul_dir = project_tree / "openclaw"
         soul_dir.mkdir(parents=True, exist_ok=True)
         (soul_dir / "soul.md").write_text(
-            "You are the AI assistant for Longview Home Center.\n"
-            "Located in Jessup, PA. We sell Titanium brand homes.\n"
-            "We offer FHA and VA financing options.\n"
+            "# John-117 — Executive Assistant\nYou run on ClawRange infrastructure.\n"
         )
         result = validate_stack.check_soul_md()
         assert result.passed is True
-        assert "Persona" in result.message or "dealership" in result.message
+        assert "Persona" in result.message or "identity" in result.message
 
-    def test_fail_when_missing_brand(self, project_tree):
-        """GIVEN soul.md is missing the 'titanium' reference
+    def test_fail_when_missing_identity(self, project_tree):
+        """GIVEN soul.md is missing the 'john-117' reference
         THEN the check should fail."""
         soul_dir = project_tree / "openclaw"
         soul_dir.mkdir(parents=True, exist_ok=True)
         (soul_dir / "soul.md").write_text(
-            "You are the AI for Longview Home Center in Jessup.\n"
-            "We offer FHA and VA loans.\n"
+            "# Executive Assistant\nYou run on ClawRange infrastructure.\n"
         )
         result = validate_stack.check_soul_md()
         assert result.passed is False
-        assert "titanium" in result.message
+        assert "john-117" in result.message
 
     def test_fail_when_file_missing(self, project_tree):
         """GIVEN soul.md does not exist
@@ -471,13 +483,12 @@ class TestCheckSoulMd:
         assert "not found" in result.message
 
     def test_case_insensitive_matching(self, project_tree):
-        """GIVEN soul.md uses uppercase for brand names
+        """GIVEN soul.md uses uppercase for persona references
         THEN the check should still pass (case-insensitive)."""
         soul_dir = project_tree / "openclaw"
         soul_dir.mkdir(parents=True, exist_ok=True)
         (soul_dir / "soul.md").write_text(
-            "LONGVIEW HOME CENTER in JESSUP sells TITANIUM homes.\n"
-            "Financing: FHA and VA approved.\n"
+            "# JOHN-117 — EXECUTIVE ASSISTANT\nYou run on CLAWRANGE infrastructure.\n"
         )
         result = validate_stack.check_soul_md()
         assert result.passed is True
