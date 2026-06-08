@@ -53,6 +53,7 @@ services:
       - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
       - PROXY_AUTH_TOKEN=${PROXY_AUTH_TOKEN}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
     user: "0:0"
     security_opt:
       - no-new-privileges:true
@@ -116,6 +117,8 @@ services:
       - ./workflows/crm_api.py:/app/crm_api.py:ro
       - ./workflows/connectors:/app/connectors:ro
       - ./workflows/crm:/app/crm:ro
+      # Tenant profiles — load_profile() resolves CLAWRANGE_PROFILE here.
+      - ./config/profiles:/config/profiles:ro
       # Soul — gives Max its persona context for self-directed tasks
       - ./openclaw/soul.md:/app/soul.md:ro
       # Brain — persistent knowledge storage
@@ -136,6 +139,8 @@ services:
       - REDDIT_USER_AGENT=${REDDIT_USER_AGENT:-clawrange-marketing-bot/0.1}
       - GITHUB_PAT=${GITHUB_PAT:-}
       - SCHEDULER_TZ=${SCHEDULER_TZ:-America/Chicago}
+      # Which tenant profile to load (defaults to the identity-free starter).
+      - CLAWRANGE_PROFILE=${CLAWRANGE_PROFILE:-starter}
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped
