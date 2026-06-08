@@ -38,3 +38,19 @@ repos:
     hooks:
       - id: docker-compose-check
         files: ^docker-compose\.yml$
+
+  # Local guards — block operator identity/secrets the scanners miss.
+  # gitleaks catches the Telegram *bot token* (it has a distinctive shape) but
+  # not a bare-numeric *chat ID*, which would false-positive everywhere.
+  - repo: local
+    hooks:
+      - id: forbid-hardcoded-telegram-id
+        name: forbid hardcoded Telegram chat ID (use ${TELEGRAM_CHAT_ID})
+        language: pygrep
+        entry: '"(to|allowFrom)"\s*:\s*\[?\s*"[0-9]{6,}"'
+        files: ^openclaw/config/.*\.json$
+      - id: forbid-operator-private
+        name: operator-private files must stay local (not committed)
+        language: fail
+        entry: "Operator-private file staged — keep it local-only, do not commit."
+        files: ^(openclaw/soul\.md$|config/profiles/local-)
