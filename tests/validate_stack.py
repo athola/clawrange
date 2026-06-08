@@ -37,7 +37,7 @@ def check_required_files() -> TestResult:
         ".env.example",
         ".gitignore",
         "Makefile",
-        "openclaw/soul.md",
+        "openclaw/soul.template.md",
         "openclaw/config/openclaw.json",
         "deerflow/config.yaml",
         "workflows/app.py",
@@ -222,22 +222,27 @@ def check_deerflow_data_sovereignty() -> TestResult:
     return result
 
 
-def check_soul_md() -> TestResult:
-    """Verify soul.md has required persona sections."""
-    result = TestResult("Soul.md Persona")
-    path = os.path.join(PROJECT_ROOT, "openclaw", "soul.md")
+def check_soul_template() -> TestResult:
+    """Verify the shipped persona template is present and generic.
+
+    soul.md is rendered per operator (and gitignored); the committed source is
+    the identity-free soul.template.md, filled from a profile's structured
+    fields. Validate the template form, not a rendered persona.
+    """
+    result = TestResult("Soul Template")
+    path = os.path.join(PROJECT_ROOT, "openclaw", "soul.template.md")
     try:
         with open(path) as f:
-            content = f.read().lower()
+            content = f.read()
     except FileNotFoundError:
-        result.fail_("openclaw/soul.md not found")
+        result.fail_("openclaw/soul.template.md not found")
         return result
-    required = ["john-117", "executive assistant", "clawrange"]
-    missing = [r for r in required if r not in content]
-    if missing:
-        result.fail_(f"Missing references: {', '.join(missing)}")
+    if "{{name}}" not in content:
+        result.fail_("soul.template.md missing {{name}} placeholder")
+    elif "clawrange" not in content.lower():
+        result.fail_("soul.template.md missing ClawRange infrastructure reference")
     else:
-        result.pass_("Persona includes identity, role, and infrastructure")
+        result.pass_("Generic persona template present with placeholders")
     return result
 
 
@@ -255,7 +260,7 @@ def main():
         check_n8n_workflows,
         check_openclaw_config,
         check_deerflow_data_sovereignty,
-        check_soul_md,
+        check_soul_template,
     ]
 
     results: list[TestResult] = []
