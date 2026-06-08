@@ -33,6 +33,9 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Claude Code local tooling state (machine-specific settings + session state)
+.claude/
+
 # Python
 __pycache__/
 *.pyc
