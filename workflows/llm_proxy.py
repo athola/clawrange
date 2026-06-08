@@ -179,6 +179,13 @@ async def _safe_notify(message: str) -> None:
 MAX_AUTO_RETRY_WAIT = 30  # seconds — max hold time before returning synthetic response
 PROVIDER_TIMEOUT = 45  # per-provider HTTP timeout (seconds) — was 90
 REQUEST_DEADLINE = 60  # hard ceiling for the entire chat request (seconds)
+# Total ceiling for _llm_call across ALL tiers (seconds). The interactive chat
+# path races tiers concurrently under REQUEST_DEADLINE, but the heartbeat path
+# (_handle_heartbeat -> _llm_work_task/_llm_suggest_task -> _llm_call) still
+# tries tiers sequentially. Without an aggregate cap a hung provider compounds
+# to PROVIDER_TIMEOUT * len(tiers), blocking the heartbeat past the upstream
+# OpenClaw client timeout and surfacing "LLM request timed out" to Telegram.
+LLM_CALL_DEADLINE = 45  # one full provider attempt; fast failover still fits
 
 
 # ─── Rate Limit Detection ─────────────────────────────────────────
@@ -1739,33 +1746,43 @@ async def _llm_call(
     if web_search:
         return await _llm_call_search(prompt, max_tokens)
 
-    for tier in CONFIG["tiers"]:
-        if _circuit_open(tier["name"]):
-            continue
-        provider = tier["provider"]
+    async def _try_tiers() -> str | None:
+        for tier in CONFIG["tiers"]:
+            if _circuit_open(tier["name"]):
+                continue
+            provider = tier["provider"]
 
-        provider_config = CONFIG["providers"][provider]
-        api_key = os.getenv(provider_config["env_key"], "")
-        if not api_key:
-            continue
+            provider_config = CONFIG["providers"][provider]
+            api_key = os.getenv(provider_config["env_key"], "")
+            if not api_key:
+                continue
 
-        body: dict = {
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens,
-            "temperature": 0.7,
-        }
+            body: dict = {
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": 0.7,
+            }
 
-        try:
-            resp = await _call_provider(provider, tier["models"], body, api_key)
-            if resp.status_code == 200:
-                data = resp.json()
-                msg = data.get("choices", [{}])[0].get("message", {})
-                text = (msg.get("content") or "").strip()
-                if text:
-                    return text
-        except Exception:
-            pass
-    return None
+            try:
+                resp = await _call_provider(provider, tier["models"], body, api_key)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    msg = data.get("choices", [{}])[0].get("message", {})
+                    text = (msg.get("content") or "").strip()
+                    if text:
+                        return text
+            except Exception:
+                pass
+        return None
+
+    # Cap total time so a hung provider can't compound across tiers and block
+    # the heartbeat past the upstream client timeout. On timeout, return None —
+    # callers (_llm_work_task / _llm_suggest_task) degrade gracefully.
+    try:
+        return await asyncio.wait_for(_try_tiers(), timeout=LLM_CALL_DEADLINE)
+    except asyncio.TimeoutError:
+        logger.warning("LLM call exceeded %ss deadline across tiers", LLM_CALL_DEADLINE)
+        return None
 
 
 async def _llm_call_search(prompt: str, max_tokens: int) -> str | None:
