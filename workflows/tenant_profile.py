@@ -204,11 +204,12 @@ def load_profile(
 ) -> Profile:
     """Load, env-resolve, and validate a tenant profile.
 
-    ``name`` defaults to ``CLAWRANGE_PROFILE`` then ``"marketing"``.
+    ``name`` defaults to ``CLAWRANGE_PROFILE`` then ``"starter"`` — the
+    identity-free profile shipped for fresh clones.
     """
     if env is None:
         env = dict(os.environ)
-    name = name or env.get("CLAWRANGE_PROFILE") or "marketing"
+    name = name or env.get("CLAWRANGE_PROFILE") or "starter"
 
     base = Path(profiles_dir) if profiles_dir is not None else default_profiles_dir()
     path = base / name / "profile.yaml"

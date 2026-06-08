@@ -8,6 +8,17 @@ import pytest
 from app import brain_db
 
 
+@pytest.fixture(autouse=True)
+def _marketing_profile_default(monkeypatch):
+    """Pin the default profile to ``marketing`` for this module.
+
+    The shipped default is now the identity-free ``starter`` profile (empty
+    seeds), but these tests assert the marketing orchestrator's project and
+    schedule seeds, so they target the marketing profile explicitly.
+    """
+    monkeypatch.setenv("CLAWRANGE_PROFILE", "marketing")
+
+
 # ─── Projects Table ──────────────────────────────────────────────
 
 
