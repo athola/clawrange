@@ -107,6 +107,15 @@ services:
       - ./workflows/generators.py:/app/generators.py:ro
       - ./workflows/reddit_search.py:/app/reddit_search.py:ro
       - ./workflows/github_search.py:/app/github_search.py:ro
+      # Multi-tenant + research modules (added in the n8n->FastAPI merge).
+      # Must be mounted: the image only bakes app/telegram/llm_proxy/models,
+      # so an absent module here crashes uvicorn --reload on the next reload.
+      - ./workflows/research.py:/app/research.py:ro
+      - ./workflows/tenant_profile.py:/app/tenant_profile.py:ro
+      - ./workflows/persona.py:/app/persona.py:ro
+      - ./workflows/crm_api.py:/app/crm_api.py:ro
+      - ./workflows/connectors:/app/connectors:ro
+      - ./workflows/crm:/app/crm:ro
       # Soul — gives Max its persona context for self-directed tasks
       - ./openclaw/soul.md:/app/soul.md:ro
       # Brain — persistent knowledge storage
