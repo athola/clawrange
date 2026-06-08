@@ -1,5 +1,14 @@
 [extend]
-# Use default gitleaks rules
+useDefault = true
+
+# Custom rule: a bare-numeric Telegram chat ID hardcoded in OpenClaw config.
+# Default rules catch the bot *token* but not a plain chat ID; this is the
+# scan-layer counterpart to the forbid-hardcoded-telegram-id pre-commit hook.
+[[rules]]
+id = "telegram-chat-id"
+description = "Hardcoded Telegram chat ID in OpenClaw config"
+regex = '''"(to|allowFrom)"\s*:\s*\[?\s*"[0-9]{6,}"'''
+path = '''openclaw/config/.*\.json'''
 
 [allowlist]
 paths = [
@@ -13,4 +22,5 @@ regexes = [
   '''generate-a-token-here''',
   '''replace-with-.*''',
   '''sk-or-v1-your-key-here''',
+  '''\$\{TELEGRAM_CHAT_ID\}''',
 ]

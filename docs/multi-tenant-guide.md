@@ -7,16 +7,22 @@ it pulls data from, and what CRM it writes to — lives in a single declarative
 machinery (connectors, CRM adapters, query execution) lives in code and is
 shared by every profile.
 
-Two profiles ship in the box:
+Three profiles ship in the box, all identity-free:
 
-- **`marketing`** — the original John-117 / Reddit-GitHub setup. This is the
-  default (`CLAWRANGE_PROFILE` unset → `marketing`), and it behaves exactly
-  as it did before the template existed.
+- **`starter`** — the default (`CLAWRANGE_PROFILE` unset → `starter`). A
+  generic, identity-free baseline so a fresh clone runs without carrying
+  anyone's personal data. Empty seeds; the persona renders from
+  `openclaw/soul.template.md`.
+- **`marketing`** — a worked content-marketing example with a verbatim
+  John-117 persona and example open-source projects/schedules. Edit it to
+  point at your own products.
 - **`lead-crm`** — a worked business example: an assistant that hourly syncs
   leads from a web portal into a local CRM and answers relational and
   time-series questions about them on a schedule or via a Telegram prompt.
 
-To stand up your own assistant, copy `lead-crm`, rename it, and edit YAML.
+To stand up your own assistant, copy one of these, rename it, and edit YAML.
+Operator-private profiles named `local-*` are gitignored, so your real
+identity never gets committed.
 
 ```bash
 cp -r config/profiles/lead-crm config/profiles/acme

@@ -1,6 +1,15 @@
 # Secrets — NEVER commit
 .env
 
+# Operator persona — rendered/edited per operator from a profile + soul.template.md.
+# The committed source is the profiles' persona and openclaw/soul.template.md;
+# the live soul.md is local so it can hold an operator's personal context.
+openclaw/soul.md
+
+# Operator-private profiles. The shipped examples (starter, lead-crm, marketing)
+# are committed; copy one to a new name for your own identity and it stays local.
+config/profiles/local-*/
+
 # OpenClaw sandboxed state (bind-mounted, not Docker volumes)
 data/
 
@@ -23,6 +32,9 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Claude Code local tooling state (machine-specific settings + session state)
+.claude/
 
 # Python
 __pycache__/

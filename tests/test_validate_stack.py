@@ -38,7 +38,7 @@ def _create_minimal_project(root):
         ".env.example",
         ".gitignore",
         "Makefile",
-        "openclaw/soul.md",
+        "openclaw/soul.template.md",
         "openclaw/config/openclaw.json",
         "deerflow/config.yaml",
         "workflows/app.py",
@@ -445,50 +445,54 @@ class TestCheckN8nWorkflows:
         assert "Dockerfile" in result.message
 
 
-# ─── check_soul_md ────────────────────────────────────────────────
+# ─── check_soul_template ──────────────────────────────────────────
 
 
-class TestCheckSoulMd:
-    """Tests for soul.md persona validation."""
+class TestCheckSoulTemplate:
+    """Tests for the generic persona template validation.
 
-    def test_pass_with_all_required_references(self, project_tree):
-        """GIVEN soul.md mentions all required persona references
-        THEN the check should pass."""
+    soul.md is rendered per operator (gitignored); the committed source is the
+    identity-free soul.template.md, so the check validates the template form.
+    """
+
+    def _write_template(self, project_tree, text):
         soul_dir = project_tree / "openclaw"
         soul_dir.mkdir(parents=True, exist_ok=True)
-        (soul_dir / "soul.md").write_text(
-            "# John-117 — Executive Assistant\nYou run on ClawRange infrastructure.\n"
+        (soul_dir / "soul.template.md").write_text(text)
+
+    def test_pass_with_placeholders_and_infra(self, project_tree):
+        """GIVEN soul.template.md has the {{name}} placeholder and a ClawRange
+        reference THEN the check should pass."""
+        self._write_template(
+            project_tree,
+            "# {{name}}\nYou are {{name}}, a {{role}}.\n"
+            "You run on ClawRange infrastructure.\n",
         )
-        result = validate_stack.check_soul_md()
+        result = validate_stack.check_soul_template()
         assert result.passed is True
-        assert "Persona" in result.message or "identity" in result.message
 
-    def test_fail_when_missing_identity(self, project_tree):
-        """GIVEN soul.md is missing the 'john-117' reference
+    def test_fail_when_not_a_template(self, project_tree):
+        """GIVEN soul.template.md is a rendered persona without placeholders
         THEN the check should fail."""
-        soul_dir = project_tree / "openclaw"
-        soul_dir.mkdir(parents=True, exist_ok=True)
-        (soul_dir / "soul.md").write_text(
-            "# Executive Assistant\nYou run on ClawRange infrastructure.\n"
+        self._write_template(
+            project_tree,
+            "# John-117 — Executive Assistant\nYou run on ClawRange infrastructure.\n",
         )
-        result = validate_stack.check_soul_md()
+        result = validate_stack.check_soul_template()
         assert result.passed is False
-        assert "john-117" in result.message
+        assert "{{name}}" in result.message
+
+    def test_fail_when_missing_infra(self, project_tree):
+        """GIVEN soul.template.md omits the ClawRange reference
+        THEN the check should fail."""
+        self._write_template(project_tree, "# {{name}}\nYou are {{name}}.\n")
+        result = validate_stack.check_soul_template()
+        assert result.passed is False
+        assert "ClawRange" in result.message
 
     def test_fail_when_file_missing(self, project_tree):
-        """GIVEN soul.md does not exist
+        """GIVEN soul.template.md does not exist
         THEN the check should fail gracefully."""
-        result = validate_stack.check_soul_md()
+        result = validate_stack.check_soul_template()
         assert result.passed is False
         assert "not found" in result.message
-
-    def test_case_insensitive_matching(self, project_tree):
-        """GIVEN soul.md uses uppercase for persona references
-        THEN the check should still pass (case-insensitive)."""
-        soul_dir = project_tree / "openclaw"
-        soul_dir.mkdir(parents=True, exist_ok=True)
-        (soul_dir / "soul.md").write_text(
-            "# JOHN-117 — EXECUTIVE ASSISTANT\nYou run on CLAWRANGE infrastructure.\n"
-        )
-        result = validate_stack.check_soul_md()
-        assert result.passed is True

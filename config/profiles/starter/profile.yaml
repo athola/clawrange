@@ -1,0 +1,40 @@
+# starter — the identity-free default profile shipped with ClawRange.
+#
+# A fresh clone runs on this profile (CLAWRANGE_PROFILE unset -> starter), so
+# the repo never carries anyone's personal data. To build your own assistant,
+# copy a profile directory, rename it, edit the fields, and point
+# CLAWRANGE_PROFILE at the new name:
+#
+#   cp -r config/profiles/starter config/profiles/myassistant
+#   # edit config/profiles/myassistant/profile.yaml
+#   echo "CLAWRANGE_PROFILE=myassistant" >> .env
+#
+# For a richer worked example see `lead-crm` (a business/CRM assistant) or
+# `marketing` (a content-marketing assistant). ${VAR} tokens resolve from the
+# environment at load time; an unset var resolves to "" and never crashes boot.
+#
+# No persona_markdown: the generic openclaw/soul.template.md is filled from the
+# structured fields below, so you write data, not prose.
+
+profile: starter
+
+assistant:
+  name: "Assistant"
+  role: "personal operations assistant"
+  channel: telegram
+  owner:
+    name: "Operator"
+    org: ""
+    context: >-
+      Replace this with a short description of who you are and what you want
+      the assistant to help with day to day.
+  capabilities:
+    - "Manage a task queue: create, prioritize, track, and report on tasks"
+    - "Monitor infrastructure health (LLM tiers, balance, service status)"
+    - "Remember and recall notes via the persistent brain"
+    - "Run multi-source research via the workflows /research endpoint"
+    - "Never take an outward-facing or irreversible action without explicit approval"
+
+seeds:
+  projects: []
+  schedules: []

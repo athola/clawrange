@@ -2565,6 +2565,45 @@ class TestHeartbeatInterceptor:
             content = r.json()["choices"][0]["message"]["content"]
             assert content == ""
 
+    def test_llm_call_total_deadline_caps_tier_hangs(self):
+        """_llm_call must enforce a total deadline across tiers.
+
+        Regression: the heartbeat path (``_handle_heartbeat`` ->
+        ``_llm_work_task``/``_llm_suggest_task`` -> ``_llm_call``) iterated
+        tiers sequentially with a 45s per-call httpx timeout and no aggregate
+        cap. A slow/hung provider compounded to ~135s (3 tiers x 45s), blocking
+        the heartbeat request past the upstream OpenClaw client timeout — which
+        surfaced "LLM request timed out" alerts from the Telegram heartbeat.
+        Unlike ``test_heartbeat_llm_thinking_graceful_failure`` (instant
+        exception), this exercises a *slow* provider so the compounding shows.
+        """
+        import asyncio
+        import time as _time
+
+        import llm_proxy
+
+        async def _hang(provider, models, body, api_key):
+            # Slower than the (shrunk) deadline — simulates a hung provider.
+            await asyncio.sleep(2)
+            return _mock_response(200)
+
+        original = llm_proxy.LLM_CALL_DEADLINE
+        llm_proxy.LLM_CALL_DEADLINE = 0.3
+        try:
+            with patch("llm_proxy._call_provider", _hang):
+                start = _time.monotonic()
+                result = asyncio.run(llm_proxy._llm_call("ping", max_tokens=10))
+                elapsed = _time.monotonic() - start
+        finally:
+            llm_proxy.LLM_CALL_DEADLINE = original
+
+        # Deadline hit -> no usable text, treated as a graceful miss upstream.
+        assert result is None
+        # Bounded by the deadline, NOT 3 tiers x 2s sequential.
+        assert elapsed < 1.0, (
+            f"_llm_call blocked {elapsed:.2f}s — deadline not enforced"
+        )
+
 
 class TestSemanticDedup:
     """Tests for keyword-overlap task deduplication."""
