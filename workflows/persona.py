@@ -19,6 +19,7 @@ the generic core never leaks one operator's identity into another's deploy.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from tenant_profile import Profile
@@ -118,3 +119,52 @@ def write_soul(profile: Profile, path: str | Path) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(render_persona(profile))
     return dest
+
+
+def _learned_region(learnings: list, kind: str) -> str:
+    rows = [x for x in learnings if x.get("kind") == kind]
+    if not rows:
+        return ""
+    lines = ["", "## Learned", ""]
+    for x in rows:
+        target = x.get("target") or "General"
+        lines.append(f"- **{target}:** {x['content']}")
+    return "\n".join(lines) + "\n"
+
+
+def compose_persona(profile: Profile, learnings: list) -> str:
+    base = render_persona(profile).rstrip("\n") + "\n"
+    return (base + _learned_region(learnings, "persona")).rstrip("\n") + "\n"
+
+
+def compose_identity(profile: Profile, learnings: list) -> str:
+    base = render_identity(profile).rstrip("\n") + "\n"
+    return (base + _learned_region(learnings, "identity")).rstrip("\n") + "\n"
+
+
+def _atomic_write(path: Path, text: str) -> bool:
+    """Write text atomically; return False (no raise) if dir is unwritable."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(text)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
+
+
+def render_all(profile: Profile, targets: dict, learnings: list) -> dict:
+    """Render persona+identity to all configured targets. Returns per-target ok."""
+    soul = compose_persona(profile, learnings)
+    ident = compose_identity(profile, learnings)
+    results = {}
+    if targets.get("soul"):
+        results["soul"] = _atomic_write(Path(targets["soul"]), soul)
+    if targets.get("identity"):
+        results["identity"] = _atomic_write(Path(targets["identity"]), ident)
+    for wp in targets.get("workspace_soul", []):
+        results[f"ws_soul:{wp}"] = _atomic_write(Path(wp), soul)
+    for wp in targets.get("workspace_identity", []):
+        results[f"ws_identity:{wp}"] = _atomic_write(Path(wp), ident)
+    return results

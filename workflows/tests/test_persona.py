@@ -123,3 +123,36 @@ def test_write_soul_round_trips(tmp_path):
     dest = tmp_path / "soul.md"
     write_soul(p, dest)
     assert dest.read_text() == render_persona(p)
+
+
+def test_compose_appends_learned_region_and_is_non_destructive():
+    from tenant_profile import Profile
+    from persona import compose_persona
+
+    p = Profile(name="t", raw={"profile": "t", "assistant": {"name": "Max"}})
+    learnings = [
+        {
+            "kind": "persona",
+            "target": "Communication",
+            "content": "Lead with the recommendation.",
+        }
+    ]
+    out = compose_persona(p, learnings)
+    assert "## Learned" in out
+    assert "Communication" in out and "Lead with the recommendation." in out
+    # base persona still present
+    assert "Max" in out
+    # no learnings -> no Learned region
+    assert "## Learned" not in compose_persona(p, [])
+
+
+def test_render_all_writes_targets(tmp_path):
+    from tenant_profile import Profile
+    from persona import render_all
+
+    p = Profile(name="t", raw={"profile": "t", "assistant": {"name": "Max"}})
+    soul = tmp_path / "soul.md"
+    ident = tmp_path / "IDENTITY.md"
+    res = render_all(p, {"soul": str(soul), "identity": str(ident)}, [])
+    assert res == {"soul": True, "identity": True}
+    assert "Max" in soul.read_text() and "Name:** Max" in ident.read_text()
