@@ -12,10 +12,10 @@
     },
     {
       "name": "zai-direct",
-      "description": "Z.AI GLM 5.1 — direct API, separate rate limits",
+      "description": "Z.AI GLM 5.2 — direct API, separate rate limits",
       "provider": "zai",
       "models": [
-        "glm-5.1"
+        "glm-5.2"
       ]
     },
     {
