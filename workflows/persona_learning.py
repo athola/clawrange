@@ -7,6 +7,7 @@ git-trackable learned.yaml overlay (export/seed are inverse operations).
 from __future__ import annotations
 
 import logging
+import os
 
 VALID_KINDS = {"identity", "persona"}
 VALID_SOURCES = {"feedback", "reflect", "scheduled", "signal", "seed"}
@@ -74,6 +75,32 @@ def export_overlay(brain_db, profile_name):
         }
         for r in rows
     ]
+
+
+def scan_signals(brain_db, profile_name):
+    """Weak outcome-signal source (flagged). Off unless PERSONA_SIGNAL_LEARNING set."""
+    if not os.environ.get("PERSONA_SIGNAL_LEARNING"):
+        return []
+    pending = brain_db.list_learnings(profile=profile_name, status="pending")
+    # Repetition heuristic: 3+ pending with same target -> surface a meta-note.
+    by_target = {}
+    for r in pending:
+        by_target.setdefault(r["target"], 0)
+        by_target[r["target"]] += 1
+    out = []
+    for target, count in by_target.items():
+        if count >= 3:
+            out.append(
+                propose(
+                    brain_db,
+                    profile_name,
+                    "persona",
+                    target,
+                    f"Recurring feedback about '{target}' ({count}x) — consolidate.",
+                    "signal",
+                )
+            )
+    return out
 
 
 def seed_overlay(brain_db, profile_name, overlay):

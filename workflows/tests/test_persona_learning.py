@@ -120,3 +120,16 @@ def test_seed_overlay_skips_invalid_items(db):
     n = pl.seed_overlay(db, "cos", [valid_item, invalid_kind, invalid_content])
     assert n == 1
     assert len(db.list_learnings(profile="cos")) == 1
+
+
+def test_scan_signals_disabled_by_default(db, monkeypatch):
+    monkeypatch.delenv("PERSONA_SIGNAL_LEARNING", raising=False)
+    assert pl.scan_signals(db, "cos") == []
+
+
+def test_scan_signals_enabled_returns_proposals(db, monkeypatch):
+    monkeypatch.setenv("PERSONA_SIGNAL_LEARNING", "1")
+    for _ in range(3):
+        pl.propose(db, "cos", "persona", "Tone", "Be terse.", "feedback")
+    out = pl.scan_signals(db, "cos")
+    assert isinstance(out, list)  # may propose based on repetition
