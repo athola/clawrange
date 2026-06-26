@@ -3316,3 +3316,16 @@ class TestPersonaCommand:
         assert m.called
         content = r.json()["choices"][0]["message"]["content"].lower()
         assert "draft" in content or "queued" in content
+
+    def test_persona_command_case_insensitive(self):
+        body = {
+            "messages": [
+                {"role": "user", "content": "!Persona lead with the recommendation"}
+            ]
+        }
+        with patch("llm_proxy._post_persona_propose", return_value={"id": "cd34"}) as m:
+            r = client.post("/v1/chat/completions", json=body, headers=AUTH_HEADER)
+        assert r.status_code == 200
+        assert m.called
+        # the proposed content must preserve original casing of the args
+        assert "lead with the recommendation" in m.call_args.args[0].lower()

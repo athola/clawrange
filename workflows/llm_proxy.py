@@ -655,7 +655,8 @@ async def _handle_persona_command(args: str) -> JSONResponse:
     args = args.strip()
     if args.startswith("reflect"):
         async with httpx.AsyncClient(timeout=30) as client:
-            await client.post("http://localhost:5678/persona/reflect")
+            r = await client.post("http://localhost:5678/persona/reflect")
+            r.raise_for_status()
         return _synthetic_response(
             "Persona reflection queued — review drafts with !tasks."
         )
@@ -2660,7 +2661,8 @@ async def chat_completions(
 
     # Intercept !persona — explicit feedback and on-demand reflection
     if msg_lower.startswith("!persona"):
-        resp = await _handle_persona_command(last_user_msg.split("!persona", 1)[1])
+        args = last_user_msg.strip()[len("!persona") :]
+        resp = await _handle_persona_command(args)
         return _wrap_json_as_sse(resp) if is_stream else resp
 
     # Strip poisoned assistant messages from conversation history.
