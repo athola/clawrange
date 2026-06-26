@@ -118,6 +118,45 @@ app.include_router(llm_router)
 app.include_router(create_brain_router(brain_db), prefix="/brain")
 
 
+def _persona_render_targets(profile):
+    import os as _os
+
+    repo = _os.path.dirname(_os.path.dirname(__file__))
+    state = _os.environ.get(
+        "OPENCLAW_STATE_DIR", _os.path.join(repo, "data", "openclaw-state")
+    )
+    return {
+        "soul": _os.path.join(repo, "openclaw", "soul.md"),
+        "identity": _os.path.join(repo, "openclaw", "identity.md"),
+        "workspace_soul": [
+            _os.path.join(state, "workspace", "SOUL.md"),
+            _os.path.join(state, "workspace-max-ops", "SOUL.md"),
+        ],
+        "workspace_identity": [
+            _os.path.join(state, "workspace", "IDENTITY.md"),
+            _os.path.join(state, "workspace-max-ops", "IDENTITY.md"),
+        ],
+    }
+
+
+def _current_profile():
+    from tenant_profile import load_profile
+
+    try:
+        return load_profile()
+    except Exception:
+        from tenant_profile import Profile
+
+        return Profile(name="starter", raw={"profile": "starter", "assistant": {}})
+
+
+from persona_api import create_persona_router  # noqa: E402
+
+app.include_router(
+    create_persona_router(brain_db, _current_profile, _persona_render_targets)
+)
+
+
 # ─── Task Queue (Persistent via BrainDB) ──────────────────────────
 
 
