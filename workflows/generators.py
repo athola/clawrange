@@ -1288,6 +1288,39 @@ async def crm_digest_generator(
     return digest
 
 
+async def persona_reflect_generator(brain_db, profile_name=None, **kwargs) -> None:
+    """Review recent activity and queue persona-enhancement proposals.
+
+    Routes the reflection prompt through the LLM proxy and posts any
+    suggestion as a [DRAFT] persona proposal. Degrades to a no-op if the
+    proxy is unavailable.
+    """
+    import persona_learning as pl
+    from llm_proxy import _llm_call
+
+    profile_name = profile_name or "starter"
+    prompt = (
+        "From recent operator interactions, suggest at most ONE concrete "
+        "persona adjustment (tone/format/priority). Reply with a single "
+        "imperative sentence, or 'none'."
+    )
+    suggestion = await _llm_call(prompt, max_tokens=80)
+    if not suggestion or suggestion.strip().lower().startswith("none"):
+        return
+    if brain_db is None:
+        from app import brain_db as _bd
+
+        brain_db = _bd
+    pl.propose(
+        brain_db,
+        profile_name,
+        "persona",
+        "Reflection",
+        suggestion.strip(),
+        "reflect",
+    )
+
+
 # ─── Registry ────────────────────────────────────────────────────────
 
 GENERATORS = {
@@ -1301,4 +1334,5 @@ GENERATORS = {
     "comment_draft": comment_draft_generator,
     "pipeline": pipeline_generator,
     "crm_digest": crm_digest_generator,
+    "persona_reflect": persona_reflect_generator,
 }

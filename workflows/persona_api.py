@@ -16,6 +16,14 @@ class Proposal(BaseModel):
     source: str = "feedback"
 
 
+def _run_reflection(profile_name):
+    """Override point; default runs the generator. Patched in tests."""
+    from generators import persona_reflect_generator
+    import asyncio
+
+    return asyncio.run(persona_reflect_generator(None, profile_name=profile_name))
+
+
 def create_persona_router(brain_db, profile_provider, render_targets_fn) -> APIRouter:
     router = APIRouter()
 
@@ -74,6 +82,13 @@ def create_persona_router(brain_db, profile_provider, render_targets_fn) -> APIR
     @router.get("/persona/soul")
     def soul():
         return {"soul": compose_persona(_profile(), _approved())}
+
+    @router.post("/persona/reflect")
+    def reflect():
+        p = _profile()
+        _run_reflection(p.name)
+        pending = brain_db.list_learnings(profile=p.name, status="pending")
+        return {"queued": len(pending)}
 
     @router.get("/healthz/persona")
     def health():

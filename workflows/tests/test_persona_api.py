@@ -119,3 +119,20 @@ def test_health_endpoint(tmp_path):
     assert data["profile"] == "cos"
     assert "pending" in data
     assert "targets" in data
+
+
+def test_reflect_endpoint_creates_proposals(tmp_path, monkeypatch):
+    client, db = _client(tmp_path)
+    # stub the generator so the test stays offline
+    import persona_api
+
+    monkeypatch.setattr(
+        persona_api,
+        "_run_reflection",
+        lambda profile_name: db.create_learning(
+            profile_name, "persona", "Reflection", "Observed: be terser.", "reflect"
+        ),
+    )
+    r = client.post("/persona/reflect")
+    assert r.status_code == 200
+    assert db.list_learnings(status="pending")
