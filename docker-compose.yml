@@ -114,6 +114,8 @@ services:
       - ./workflows/research.py:/app/research.py:ro
       - ./workflows/tenant_profile.py:/app/tenant_profile.py:ro
       - ./workflows/persona.py:/app/persona.py:ro
+      - ./workflows/persona_api.py:/app/persona_api.py:ro
+      - ./workflows/persona_learning.py:/app/persona_learning.py:ro
       - ./workflows/crm_api.py:/app/crm_api.py:ro
       - ./workflows/connectors:/app/connectors:ro
       - ./workflows/crm:/app/crm:ro
@@ -123,6 +125,9 @@ services:
       - ./openclaw/soul.md:/app/soul.md:ro
       # Brain — persistent knowledge storage
       - ./data/brain:/data
+      # OpenClaw workspace state — writable so runtime persona re-render
+      # (on learning approval) can update the agent's SOUL.md / IDENTITY.md.
+      - ./data/openclaw-state:/openclaw-state
     tmpfs:
       - /tmp:size=32M
     environment:
@@ -141,6 +146,8 @@ services:
       - SCHEDULER_TZ=${SCHEDULER_TZ:-America/Chicago}
       # Which tenant profile to load (defaults to the identity-free starter).
       - CLAWRANGE_PROFILE=${CLAWRANGE_PROFILE:-starter}
+      # Where the OpenClaw workspace state is mounted (runtime persona render).
+      - OPENCLAW_STATE_DIR=/openclaw-state
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped

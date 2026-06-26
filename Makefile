@@ -76,6 +76,9 @@ tome-bridge: ## Run one bridge pass for research:tome tasks
 tome-bridge-watch: ## Watch task queue for research:tome tasks
 	@python3 scripts/tome_bridge.py --watch --interval 60
 
+persona-export: ## Export approved persona learnings to learned.yaml (PROFILE=<name>)
+	@python3 workflows/scripts/persona_export.py $(PROFILE)
+
 test-unit: ## Run Python unit tests (no containers needed)
 	@python3 -m pytest workflows/tests/ -v
 
@@ -87,7 +90,7 @@ validate: ## Validate config files and project structure
 
 # ─── Tenant Profiles (multi-tenant template) ──────────────────────
 
-.PHONY: profile seed-demo
+.PHONY: profile seed-demo persona-export
 
 profile: ## Render openclaw/soul.md from a profile + set it in .env (PROFILE=<name>)
 	@test -n "$(PROFILE)" || { echo "usage: make profile PROFILE=<name>"; exit 1; }

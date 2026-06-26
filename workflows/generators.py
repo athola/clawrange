@@ -1129,6 +1129,22 @@ def seed_from_profile(brain_db, profile) -> list[dict]:
         else:
             out.append(existing)
     _seed_schedules_from_profile(brain_db, profile)
+
+    # Seed approved persona learnings from the profile's learned.yaml overlay
+    # (the git-portable projection of the brain's approved meta-learnings).
+    try:
+        import yaml
+
+        import persona_learning as pl
+        from tenant_profile import default_profiles_dir
+
+        overlay_path = default_profiles_dir() / profile.name / "learned.yaml"
+        if overlay_path.exists():
+            data = yaml.safe_load(overlay_path.read_text()) or {}
+            pl.seed_overlay(brain_db, profile.name, data.get("learned", []))
+    except Exception as exc:  # never crash boot on a bad overlay
+        logger.warning("seed_from_profile: learned overlay skipped: %s", exc)
+
     return out
 
 

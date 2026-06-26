@@ -236,3 +236,65 @@ path to keep the demo database outside the container.
   registry; reference it by `kind` in a schedule.
 - **Browser scraping** (JS-rendered portals): out of scope for the bundled
   sources; add a `headless` source kind backed by the chrome tooling.
+
+## 9. Persona & meta-learning
+
+A profile shapes not just *what* the assistant does but *who* it is. The
+`assistant.identity` block renders the agent's `IDENTITY.md`, and an
+approval-gated learning loop lets the persona improve over time without ever
+leaving the operator out of the decision. The `chief-of-staff` profile (Max)
+is the worked example.
+
+### Identity block
+
+```yaml
+assistant:
+  name: "Max"
+  identity:
+    name: "Max"            # defaults to assistant.name when omitted
+    creature: "Chief of Staff — strategic AI operator"
+    vibe: "Sharp, direct, calm under pressure."
+    emoji: "🎯"
+    avatar: ""             # workspace-relative path, URL, or data URI
+```
+
+`identity` is optional — profiles without it (e.g. `starter`) render no
+`IDENTITY.md`, exactly as before. Unknown identity keys fail validation at
+load, so a typo never reaches runtime.
+
+### The meta-learning loop
+
+The assistant proposes persona enhancements; you approve them; approved
+enhancements are appended to the rendered persona under a `## Learned`
+region and persisted. Nothing is applied without approval — the same posture
+as outward-facing actions.
+
+- **Give feedback:** `!persona lead with the recommendation` queues the
+  feedback as a `[DRAFT]` proposal.
+- **Reflect on demand:** `!persona reflect` reviews recent activity (through
+  the LLM proxy) and queues any suggestions. A `persona_reflect` schedule can
+  run the same pass on a cadence (see the `chief-of-staff` profile's
+  `seeds.schedules`).
+- **Approve / reject:** `POST /persona/proposals/<id>/approve` (or
+  `/reject`). Approval re-renders the persona; rejection drops the proposal.
+  Proposals and approvals are scoped to the active profile — one tenant
+  cannot approve another's drafts.
+- **Inspect:** `GET /persona/proposals?status=pending`,
+  `GET /persona/identity`, `GET /persona/soul`, and `GET /healthz/persona`.
+
+### Persisting an evolved persona for git
+
+Approved learnings live in the brain (the live store). To capture them as a
+git-trackable overlay that anyone who pulls the repo inherits:
+
+```bash
+make persona-export PROFILE=chief-of-staff
+```
+
+This writes `config/profiles/chief-of-staff/learned.yaml`. On boot,
+`seed_from_profile` reads that overlay back into the brain (a bad or partial
+overlay is skipped with a warning, never crashing boot), so the file and the
+live store stay in sync — edit either side and re-export/re-seed.
+
+> Outcome-signal proposals (the assistant noticing recurring corrections on
+> its own) are off by default; set `PERSONA_SIGNAL_LEARNING=1` to enable them.

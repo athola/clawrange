@@ -268,3 +268,11 @@ def test_marketing_projects_match_golden():
 def test_marketing_schedules_match_golden():
     p = load_profile("marketing", profiles_dir=_real_profiles_dir())
     assert p.schedules == _GOLDEN["schedules"]
+
+
+def test_chief_of_staff_profile_loads_with_identity():
+    from tenant_profile import load_profile
+
+    p = load_profile("chief-of-staff", profiles_dir=_real_profiles_dir())
+    assert p.assistant["identity"]["name"] == "Max"
+    assert p.assistant["identity"]["emoji"] == "🎯"
