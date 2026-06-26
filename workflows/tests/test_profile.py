@@ -206,6 +206,41 @@ def test_module_exposes_known_kind_sets():
     assert "sqlite" in profile_mod.KNOWN_ADAPTERS
 
 
+def test_identity_block_validates_and_rejects_unknown_keys():
+    from tenant_profile import Profile, validate, ProfileError
+
+    ok = Profile(
+        name="t",
+        raw={
+            "profile": "t",
+            "assistant": {
+                "name": "Max",
+                "identity": {
+                    "name": "Max",
+                    "creature": "CoS",
+                    "vibe": "sharp",
+                    "emoji": "🎯",
+                },
+            },
+        },
+    )
+    validate(ok)  # should not raise
+    bad = Profile(
+        name="t",
+        raw={
+            "profile": "t",
+            "assistant": {
+                "identity": {"name": "Max", "bogus": "x"},
+            },
+        },
+    )
+    try:
+        validate(bad)
+        assert False, "expected ProfileError"
+    except ProfileError as e:
+        assert "identity" in str(e)
+
+
 # ─── marketing seed equivalence (regression lock, TR-003) ─────────
 #
 # The marketing profile must reproduce the original hardcoded

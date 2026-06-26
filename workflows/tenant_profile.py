@@ -33,6 +33,8 @@ KNOWN_SINK_KINDS = {"crm"}
 KNOWN_TRANSFORM_KINDS = {"leads_clean", "passthrough"}
 KNOWN_ADAPTERS = {"sqlite", "rest"}
 KNOWN_AUTH_KINDS = {"none", "api_key", "bearer", "basic", "login_form"}
+IDENTITY_FIELDS = {"name", "creature", "vibe", "emoji", "avatar"}
+EMOJI_MAX_LEN = 16
 
 
 class ProfileError(ValueError):
@@ -170,6 +172,21 @@ def validate(
             raise ProfileError(
                 f"connector '{c.get('id')}' has unknown sink kind '{sink.get('kind')}'"
             )
+
+    assistant = profile.raw.get("assistant") or {}
+    identity = assistant.get("identity")
+    if identity is not None:
+        if not isinstance(identity, dict):
+            raise ProfileError("assistant.identity must be a mapping")
+        unknown = set(identity) - IDENTITY_FIELDS
+        if unknown:
+            raise ProfileError(
+                f"assistant.identity has unknown keys {sorted(unknown)} "
+                f"(known: {sorted(IDENTITY_FIELDS)})"
+            )
+        emoji = identity.get("emoji", "")
+        if emoji and len(str(emoji)) > EMOJI_MAX_LEN:
+            raise ProfileError("assistant.identity.emoji is too long")
 
     crm = profile.crm
     if crm is not None:

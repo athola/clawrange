@@ -88,6 +88,30 @@ def test_marketing_render_contains_john117():
     assert "John-117" in out
 
 
+def test_render_identity_fills_fields_and_defaults_name():
+    from tenant_profile import Profile
+    from persona import render_identity
+
+    p = Profile(
+        name="t",
+        raw={
+            "profile": "t",
+            "assistant": {
+                "name": "Max",
+                "identity": {
+                    "creature": "Chief of Staff",
+                    "vibe": "sharp",
+                    "emoji": "🎯",
+                },
+            },
+        },
+    )
+    out = render_identity(p)
+    assert "**Name:** Max" in out  # defaults to assistant.name
+    assert "**Creature:** Chief of Staff" in out
+    assert "🎯" in out
+
+
 def test_write_soul_round_trips(tmp_path):
     p = Profile(
         "acme",

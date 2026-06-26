@@ -27,6 +27,10 @@ _TEMPLATE_PATH = (
     Path(__file__).resolve().parent.parent / "openclaw" / "soul.template.md"
 )
 
+_IDENTITY_TEMPLATE_PATH = (
+    Path(__file__).resolve().parent.parent / "openclaw" / "identity.template.md"
+)
+
 
 def _template() -> str:
     return _TEMPLATE_PATH.read_text()
@@ -82,6 +86,30 @@ def render_persona(profile: Profile) -> str:
     for token, value in substitutions.items():
         rendered = rendered.replace(token, value)
     return rendered.rstrip("\n") + "\n"
+
+
+def render_identity(profile: Profile) -> str:
+    """Render IDENTITY.md from the profile's assistant.identity block."""
+    a = profile.assistant
+    ident = a.get("identity") or {}
+    template = _IDENTITY_TEMPLATE_PATH.read_text()
+    subs = {
+        "{{name}}": ident.get("name") or a.get("name", "Assistant"),
+        "{{creature}}": ident.get("creature", "AI operator"),
+        "{{vibe}}": ident.get("vibe", "calm, direct, helpful"),
+        "{{emoji}}": ident.get("emoji", "🤖"),
+        "{{avatar}}": ident.get("avatar", ""),
+    }
+    for token, value in subs.items():
+        template = template.replace(token, value)
+    return template.rstrip("\n") + "\n"
+
+
+def write_identity(profile: Profile, path: str | Path) -> Path:
+    dest = Path(path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(render_identity(profile))
+    return dest
 
 
 def write_soul(profile: Profile, path: str | Path) -> Path:
