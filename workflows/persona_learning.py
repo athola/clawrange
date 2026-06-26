@@ -6,11 +6,17 @@ git-trackable learned.yaml overlay (export/seed are inverse operations).
 
 from __future__ import annotations
 
+import logging
+
 VALID_KINDS = {"identity", "persona"}
+VALID_SOURCES = {"feedback", "reflect", "scheduled", "signal", "seed"}
 CONTENT_MAX = 500
 
+_log = logging.getLogger("clawrange.persona")
 
-def propose(brain_db, profile_name, kind, target, content, source):
+
+def _validate_learning(kind, content, source):
+    """Validate a learning's fields. Returns the stripped content. Raises ValueError."""
     if kind not in VALID_KINDS:
         raise ValueError(f"kind must be one of {sorted(VALID_KINDS)}")
     content = (content or "").strip()
@@ -18,6 +24,13 @@ def propose(brain_db, profile_name, kind, target, content, source):
         raise ValueError("content is required")
     if len(content) > CONTENT_MAX:
         raise ValueError(f"content exceeds {CONTENT_MAX} chars")
+    if source not in VALID_SOURCES:
+        raise ValueError(f"source must be one of {sorted(VALID_SOURCES)}")
+    return content
+
+
+def propose(brain_db, profile_name, kind, target, content, source):
+    content = _validate_learning(kind, content, source)
     task = brain_db.create_task(
         f"[DRAFT] persona {kind} enhancement ({target}): {content}",
         priority=3,
@@ -32,6 +45,8 @@ def approve(brain_db, profile_name, learning_id, render_fn):
     row = brain_db.get_learning(learning_id)
     if not row:
         raise ValueError("learning not found")
+    if row["profile"] != profile_name:
+        raise ValueError("learning not found")
     if row["status"] == "approved":
         return row  # idempotent
     brain_db.set_learning_status(learning_id, "approved")
@@ -40,8 +55,9 @@ def approve(brain_db, profile_name, learning_id, render_fn):
     return brain_db.get_learning(learning_id)
 
 
-def reject(brain_db, learning_id):
-    if not brain_db.get_learning(learning_id):
+def reject(brain_db, profile_name, learning_id):
+    row = brain_db.get_learning(learning_id)
+    if not row or row["profile"] != profile_name:
         raise ValueError("learning not found")
     return brain_db.set_learning_status(learning_id, "rejected")
 
@@ -69,6 +85,15 @@ def seed_overlay(brain_db, profile_name, overlay):
     for item in overlay or []:
         key = (item.get("target"), item.get("content"))
         if key in existing:
+            continue
+        try:
+            _validate_learning(
+                item.get("kind", "persona"),
+                item.get("content"),
+                item.get("source", "seed"),
+            )
+        except ValueError as exc:
+            _log.warning("seed_overlay skipping invalid item %r: %s", item, exc)
             continue
         row = brain_db.create_learning(
             profile_name,
