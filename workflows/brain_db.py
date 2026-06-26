@@ -326,6 +326,22 @@ class BrainDB:
                 ON research_findings(session_id);
         """)
 
+        # Persona learnings
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS persona_learnings (
+                id          TEXT PRIMARY KEY,
+                profile     TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                target      TEXT,
+                content     TEXT NOT NULL,
+                status      TEXT NOT NULL DEFAULT 'pending',
+                source      TEXT NOT NULL DEFAULT 'feedback',
+                task_id     TEXT,
+                created_at  TEXT NOT NULL,
+                decided_at  TEXT
+            )
+        """)
+
         # Migrate: add source column to tasks if missing (existing DBs)
         try:
             conn.execute("SELECT source FROM tasks LIMIT 1")
@@ -1355,3 +1371,56 @@ class BrainDB:
             d["channels"] = json.loads(d.get("channels") or "[]")
             out.append(d)
         return out
+
+    # ─── Persona Learnings ───────────────────────────────────────
+
+    def create_learning(
+        self,
+        profile: str,
+        kind: str,
+        target: str | None,
+        content: str,
+        source: str = "feedback",
+        task_id: str | None = None,
+    ) -> dict[str, Any]:
+        lid = str(uuid.uuid4())[:8]
+        now = _now()
+        self._conn.execute(
+            "INSERT INTO persona_learnings "
+            "(id, profile, kind, target, content, status, source, task_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+            (lid, profile, kind, target, content, source, task_id, now),
+        )
+        self._conn.commit()
+        return self.get_learning(lid)
+
+    def get_learning(self, learning_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM persona_learnings WHERE id = ?", (learning_id,)
+        ).fetchone()
+        return self._row_to_dict(row) if row else None
+
+    def list_learnings(
+        self, profile: str | None = None, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        q = "SELECT * FROM persona_learnings"
+        clauses, params = [], []
+        if profile:
+            clauses.append("profile = ?")
+            params.append(profile)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if clauses:
+            q += " WHERE " + " AND ".join(clauses)
+        q += " ORDER BY created_at DESC"
+        rows = self._conn.execute(q, params).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
+    def set_learning_status(self, learning_id: str, status: str) -> dict[str, Any]:
+        self._conn.execute(
+            "UPDATE persona_learnings SET status = ?, decided_at = ? WHERE id = ?",
+            (status, _now(), learning_id),
+        )
+        self._conn.commit()
+        return self.get_learning(learning_id)

@@ -647,3 +647,25 @@ class TestPersistentTaskQueue:
         fetched = db2.get_task(task_id)
         assert fetched is not None
         assert fetched["description"] == "persistent work"
+
+
+# ─── Persona Learnings ───────────────────────────────────────────
+
+
+def test_persona_learning_lifecycle(tmp_path):
+    from brain_db import BrainDB
+
+    db = BrainDB(str(tmp_path / "b.db"))
+    db.init_db()
+    row = db.create_learning(
+        "chief-of-staff",
+        "persona",
+        "Communication",
+        "Lead with the recommendation.",
+        "feedback",
+    )
+    assert row["status"] == "pending" and row["id"]
+    assert db.get_learning(row["id"])["content"].startswith("Lead with")
+    db.set_learning_status(row["id"], "approved")
+    approved = db.list_learnings(profile="chief-of-staff", status="approved")
+    assert len(approved) == 1 and approved[0]["decided_at"]
