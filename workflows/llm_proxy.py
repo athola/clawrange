@@ -632,6 +632,42 @@ async def _call_embeddings(
         )
 
 
+# ─── Persona Helpers ────────────────────────────────────────────────
+
+
+async def _post_persona_propose(
+    content: str,
+    kind: str = "persona",
+    target: str = "feedback",
+    source: str = "feedback",
+):
+    """Post a persona proposal to the local /persona API. Returns the created row."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(
+            "http://localhost:5678/persona/propose",
+            json={"kind": kind, "target": target, "content": content, "source": source},
+        )
+        r.raise_for_status()
+        return r.json()
+
+
+async def _handle_persona_command(args: str) -> JSONResponse:
+    args = args.strip()
+    if args.startswith("reflect"):
+        async with httpx.AsyncClient(timeout=30) as client:
+            await client.post("http://localhost:5678/persona/reflect")
+        return _synthetic_response(
+            "Persona reflection queued — review drafts with !tasks."
+        )
+    if not args:
+        return _synthetic_response("Usage: !persona <feedback> | !persona reflect")
+    row = await _post_persona_propose(args)
+    return _synthetic_response(
+        f"Queued persona enhancement as [DRAFT] (id {row.get('id')}). "
+        "Approve via /persona/proposals/<id>/approve."
+    )
+
+
 # ─── Tier Routing Hints ────────────────────────────────────────────
 
 TIER_HINTS = {
@@ -2621,6 +2657,11 @@ async def chat_completions(
     marketing_cmd = _extract_marketing_command(last_user_msg)
     if marketing_cmd is not None:
         return await _dispatch_marketing_command(marketing_cmd, is_stream)
+
+    # Intercept !persona — explicit feedback and on-demand reflection
+    if msg_lower.startswith("!persona"):
+        resp = await _handle_persona_command(last_user_msg.split("!persona", 1)[1])
+        return _wrap_json_as_sse(resp) if is_stream else resp
 
     # Strip poisoned assistant messages from conversation history.
     # Uses both static markers (synthetic responses, tool hallucinations)

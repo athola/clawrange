@@ -3299,3 +3299,20 @@ class TestEmbeddings:
         ):
             r = client.post("/v1/embeddings", json=EMBED_BODY, headers=AUTH_HEADER)
         assert r.status_code == 503
+
+
+@patch.dict("os.environ", FAKE_ENV)
+@patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
+class TestPersonaCommand:
+    def test_persona_feedback_intercepted(self):
+        body = {
+            "messages": [
+                {"role": "user", "content": "!persona lead with the recommendation"}
+            ]
+        }
+        with patch("llm_proxy._post_persona_propose", return_value={"id": "ab12"}) as m:
+            r = client.post("/v1/chat/completions", json=body, headers=AUTH_HEADER)
+        assert r.status_code == 200
+        assert m.called
+        content = r.json()["choices"][0]["message"]["content"].lower()
+        assert "draft" in content or "queued" in content
