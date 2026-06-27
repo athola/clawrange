@@ -9,8 +9,11 @@ Runs every 5 minutes. Handled in Python by the proxy — no LLM needed.
 3. **Pending tasks** — anything in the queue to process?
 4. **Brain health** — is the knowledge DB accessible? (via /healthz brain status)
 5. **Research freshness** (daily, not every cycle) — has a research
-   session run in the last 24 hours? If not, queue a `Daily research
-   pulse: <topic>` task at P3 so John-117 picks one up.
+   session run in the last 24 hours? Handled server-side by the
+   `research_pulse` generator: if research is stale it enqueues a
+   `research:tome: <topic>` task (P3) that `scripts/tome_bridge.py`
+   runs through the local `/tome:research` session. The personas have
+   no POST tool, so they never trigger research directly.
 
 ## Behavior
 

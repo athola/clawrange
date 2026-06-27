@@ -145,6 +145,19 @@
       "kind": "content_idea",
       "cron": "0 9 * * *",
       "kwargs": {}
+    },
+    {
+      "id": "daily-research-pulse",
+      "name": "Daily research freshness pulse via tome bridge",
+      "kind": "research_pulse",
+      "cron": "0 6 * * *",
+      "kwargs": {
+        "topics": [
+          "trade-skill knowledge capture tooling and platforms shipping in 2025: market gaps and positioning for a field-capture Chrome extension (skrills)",
+          "Claude Code plugin and skill discovery in 2025: marketplaces, awesome-lists, and developer-workflow gaps (claude-night-market)",
+          "AI-assisted resume and job-application tooling in 2025: differentiation and unmet needs (simple-resume)"
+        ]
+      }
     }
   ]
 }

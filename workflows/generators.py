@@ -1133,15 +1133,9 @@ def seed_from_profile(brain_db, profile) -> list[dict]:
     # Seed approved persona learnings from the profile's learned.yaml overlay
     # (the git-portable projection of the brain's approved meta-learnings).
     try:
-        import yaml
-
         import persona_learning as pl
-        from tenant_profile import default_profiles_dir
 
-        overlay_path = default_profiles_dir() / profile.name / "learned.yaml"
-        if overlay_path.exists():
-            data = yaml.safe_load(overlay_path.read_text()) or {}
-            pl.seed_overlay(brain_db, profile.name, data.get("learned", []))
+        pl.seed_overlay(brain_db, profile.name, pl.load_overlay(profile.name))
     except Exception as exc:  # never crash boot on a bad overlay
         logger.warning("seed_from_profile: learned overlay skipped: %s", exc)
 
@@ -1337,6 +1331,68 @@ async def persona_reflect_generator(brain_db, profile_name=None, **kwargs) -> No
     )
 
 
+def _hours_since(iso_ts: str | None) -> float:
+    """Hours elapsed since an ISO-8601 timestamp (``inf`` if missing/bad)."""
+    if not iso_ts:
+        return float("inf")
+    try:
+        ts = datetime.fromisoformat(iso_ts)
+    except ValueError:
+        return float("inf")
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - ts).total_seconds() / 3600.0
+
+
+async def research_pulse_generator(
+    brain_db,
+    topics: list[str] | None = None,
+    stale_hours: int = 24,
+    **kwargs,
+) -> None:
+    """Queue a heavy-research task when research has gone stale.
+
+    Research only runs via ``POST /research`` or the tome bridge; the
+    restricted LLM personas have no tool that can issue a POST, so a
+    research task queued for the agent hits a dead end. This generator
+    closes that gap from the scheduler's Python process (no LLM needed):
+    when no research session has run within ``stale_hours`` it enqueues a
+    ``research:tome: <topic>`` task. ``scripts/tome_bridge.py`` already
+    matches that prefix, runs it through the local ``/tome:research``
+    session, and posts results back -- no agent POST capability required.
+
+    Topic selection: an explicit ``topics`` list (from the schedule's
+    kwargs) wins; otherwise the tracked projects' topic hints are used.
+    The first candidate not already queued is chosen, giving basic
+    rotation across a list while never double-queuing the same task.
+    Never auto-posts -- it only enqueues a research task for review.
+    """
+    recent = brain_db.list_research_sessions(limit=1)
+    if recent and _hours_since(recent[0].get("created_at")) < stale_hours:
+        logger.info("research_pulse: research is fresh, skipping")
+        return
+
+    candidates: list[str] = [t.strip() for t in (topics or []) if t and t.strip()]
+    if not candidates:
+        for project in brain_db.list_projects():
+            for topic in json.loads(project.get("topics", "[]")):
+                if topic and topic.strip():
+                    candidates.append(topic.strip())
+    if not candidates:
+        logger.info("research_pulse: no topic configured, skipping")
+        return
+
+    pending = {t["description"] for t in brain_db.list_tasks(status="pending")}
+    for topic in candidates:
+        desc = f"research:tome: {topic}"
+        if desc not in pending:
+            brain_db.create_task(desc, priority=3, source="schedule")
+            logger.info("research_pulse: enqueued '%s'", desc)
+            return
+
+    logger.info("research_pulse: all candidate topics already queued, skipping")
+
+
 # ─── Registry ────────────────────────────────────────────────────────
 
 GENERATORS = {
@@ -1351,4 +1407,5 @@ GENERATORS = {
     "pipeline": pipeline_generator,
     "crm_digest": crm_digest_generator,
     "persona_reflect": persona_reflect_generator,
+    "research_pulse": research_pulse_generator,
 }
