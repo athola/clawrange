@@ -122,6 +122,37 @@ def test_seed_overlay_skips_invalid_items(db):
     assert len(db.list_learnings(profile="cos")) == 1
 
 
+def test_load_overlay_reads_learned_yaml(tmp_path, monkeypatch):
+    import tenant_profile
+
+    prof_dir = tmp_path / "myassistant"
+    prof_dir.mkdir(parents=True)
+    (prof_dir / "learned.yaml").write_text(
+        "learned:\n"
+        "  - kind: persona\n"
+        "    target: Communication\n"
+        "    content: Lead with the recommendation.\n"
+        "    source: feedback\n"
+    )
+    monkeypatch.setattr(tenant_profile, "default_profiles_dir", lambda: tmp_path)
+    overlay = pl.load_overlay("myassistant")
+    assert overlay == [
+        {
+            "kind": "persona",
+            "target": "Communication",
+            "content": "Lead with the recommendation.",
+            "source": "feedback",
+        }
+    ]
+
+
+def test_load_overlay_missing_file_returns_empty(tmp_path, monkeypatch):
+    import tenant_profile
+
+    monkeypatch.setattr(tenant_profile, "default_profiles_dir", lambda: tmp_path)
+    assert pl.load_overlay("nope") == []
+
+
 def test_scan_signals_disabled_by_default(db, monkeypatch):
     monkeypatch.delenv("PERSONA_SIGNAL_LEARNING", raising=False)
     assert pl.scan_signals(db, "cos") == []

@@ -81,14 +81,53 @@ database, LLM proxy routing, marketing scanners, and Telegram formatting.
 
 Run `make help` for descriptions of each target.
 
-## Persona
+## Persona & identity (configurable + self-learning)
 
-The default persona is **John-117** — Alex's executive assistant. He owns
-the task queue, watches infrastructure tier health, runs the morning
-standup, and drives the marketing scanners for Alex's three tracked
-projects (`claude-night-market`, `skrills`, `simple-resume`). The persona
-lives in `openclaw/soul.md`. To repurpose this stack for a different
-operator, swap that file (and `openclaw/soul-ops.md` for ops mode).
+The assistant's persona **and** identity are profile-driven, so anyone who
+pulls this repo can shape their own assistant declaratively — and the
+assistant can meta-learn enhancements to itself over time, gated by your
+approval.
+
+**Configure it (per use case).** A profile under
+`config/profiles/<name>/profile.yaml` carries an `assistant` block (role,
+capabilities, owner context) and an optional `identity` block (name,
+creature, vibe, emoji, avatar). Pick a profile with `CLAWRANGE_PROFILE` and
+render it:
+
+```bash
+cp -r config/profiles/chief-of-staff config/profiles/myassistant   # start from an example
+$EDITOR config/profiles/myassistant/profile.yaml                   # set name, role, identity
+make persona PROFILE=myassistant                                   # → openclaw/soul.md + identity.md
+```
+
+Shipped examples: `starter` (identity-free baseline), `lead-crm`,
+`marketing` (a John-117 content-marketing persona), and **`chief-of-staff`
+(Max)** — the worked, end-to-end example of the whole system.
+
+**It learns (with your approval).** Three layers keep "others configure"
+and "the assistant evolves" reconciled: git-tracked config, a brain-backed
+`persona_learnings` store, and a non-destructive `## Learned` render overlay.
+The loop:
+
+1. **Propose** — say `!persona <feedback>` (e.g. *"lead with the
+   recommendation"*), call `POST /persona/propose`, or let the scheduled
+   `persona_reflect` job suggest one. Each proposal queues as a `[DRAFT]`
+   task — nothing changes yet.
+2. **Approve** — `POST /persona/proposals/{id}/approve` appends it to the
+   brain and atomically re-renders the assistant's read surfaces. (Approval
+   is API-gated by design — persona changes don't happen from a chat
+   command.)
+3. **Export** — `make persona-export PROFILE=<name>` writes approved
+   learnings to `config/profiles/<name>/learned.yaml`, so the evolved
+   persona is reproducible for anyone who pulls the repo.
+
+See the loop run end-to-end offline (no keys, no containers):
+
+```bash
+make persona-demo PROFILE=chief-of-staff
+```
+
+Full authoring guide: [`docs/multi-tenant-guide.md`](docs/multi-tenant-guide.md).
 
 ## Architecture
 

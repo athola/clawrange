@@ -24,14 +24,22 @@ Tailscale + Caddy gateway.
   - `reddit_search.py`, `github_search.py` — marketing scanners
   - `telegram.py` — Telegram delivery
   - `tenant_profile.py` — declarative profile loader/validator/env-resolver
-  - `persona.py` — render `openclaw/soul.md` from a profile
+  - `persona.py` — render `soul.md` + `identity.md` from a profile's
+    persona/identity blocks; compose the non-destructive `## Learned`
+    overlay and atomically `render_all` to the configured targets
+  - `persona_learning.py` — meta-learning pipeline: `propose`/`approve`/
+    `reject`, brain↔`learned.yaml` overlay (`seed_overlay`/`export_overlay`/
+    `load_overlay`), flagged outcome-signal scan
+  - `persona_api.py` — `/persona/*` router (propose/approve/reflect/render/
+    health), mounted in `app.py`
   - `connectors/` — source→transform→sink registry (`http_csv`,
     `login_scrape`, `leads_clean`, `crm` sink, `run_connector`)
   - `crm/` — pluggable `CRMAdapter` (SQLite default + REST seam) and
     read-only query templates / NL router (`crm/query.py`)
   - `crm_api.py` — `/crm/*` router (mounted only when profile defines `crm`)
   - `tests/` — pytest suite (app, brain, llm_proxy, marketing, telegram,
-    profile, persona, connectors, crm, crm_api, lifespan)
+    profile, persona, persona_api, persona_learning, connectors, crm,
+    crm_api, lifespan)
 - `deerflow/` — DeerFlow research agent config (optional, OpenRouter)
 - `scripts/` — POSIX shell scripts for lifecycle and testing
 - `tests/` — Python validation suite (`validate_stack.py`)
@@ -121,6 +129,21 @@ make logs             # tail docker logs
 - `POST /crm/sync/{connector_id}` — run a connector now → counts
 - `GET  /healthz/crm` — CRM adapter health + configured connectors
 - See `docs/multi-tenant-guide.md` for profile authoring.
+
+**Persona & meta-learning (profile-driven; identity block optional)**
+- `POST /persona/propose` `{kind, target, content, source}` — queue a
+  persona/identity enhancement as a pending learning + `[DRAFT]` task
+- `GET  /persona/proposals?status=&profile=` — list proposals
+- `POST /persona/proposals/{id}/approve` — approve → append + atomic re-render
+- `POST /persona/proposals/{id}/reject` — reject (idempotent)
+- `POST /persona/render` — re-render current profile to its targets
+- `POST /persona/reflect` — on-demand reflection (source=`reflect`)
+- `GET  /persona/identity`, `GET /persona/soul` — current rendered text
+- `GET  /healthz/persona` — profile, render-target writability, pending count
+- Render via `make persona PROFILE=<name>`; export approved learnings with
+  `make persona-export`; offline loop demo via `make persona-demo`.
+  `PERSONA_SIGNAL_LEARNING=1` enables the flagged outcome-signal source.
+  See `docs/multi-tenant-guide.md` for profile authoring.
 
 **Canary**
 - `POST /webhook-test/test` — echo payload back

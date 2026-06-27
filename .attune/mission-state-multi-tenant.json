@@ -1,0 +1,23 @@
+{
+  "mission_type": "full",
+  "mission_name": "multi-tenant-template",
+  "phases": ["brainstorm", "specify", "plan", "execute"],
+  "completed_phases": ["brainstorm", "specify", "plan", "execute"],
+  "current_phase": "complete",
+  "artifacts": {
+    "brief": "docs/multi-tenant-brief.md",
+    "specification": "docs/multi-tenant-spec.md",
+    "plan": "docs/multi-tenant-plan.md",
+    "tradeoffs": "docs/tradeoffs.md"
+  },
+  "predecessor_mission": ".attune/mission-state-marketing.json",
+  "started_at": "2026-06-07T00:00:00Z",
+  "updated_at": "2026-06-07T23:00:00Z",
+  "directive_overrides": ["ignore_scope_guard", "stay_on_branch", "autonomous"],
+  "decisions": {
+    "strategy": "full_template_extraction",
+    "crm_backend": "local_sqlite_default_plus_pluggable_adapter",
+    "lead_source": "authenticated_scrape_with_auth_params",
+    "query_mode": "templated_queries_plus_llm_router"
+  }
+}

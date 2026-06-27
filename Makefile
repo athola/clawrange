@@ -79,6 +79,18 @@ tome-bridge-watch: ## Watch task queue for research:tome tasks
 persona-export: ## Export approved persona learnings to learned.yaml (PROFILE=<name>)
 	@python3 workflows/scripts/persona_export.py $(PROFILE)
 
+persona: ## Render soul.md + identity.md from a profile's identity + learned overlay (PROFILE=<name>)
+	@test -n "$(PROFILE)" || { echo "usage: make persona PROFILE=<name>"; exit 1; }
+	@python3 -c "import sys; sys.path.insert(0,'workflows'); \
+from persona import render_all; from tenant_profile import load_profile; \
+import persona_learning as pl; \
+p=load_profile('$(PROFILE)'); \
+r=render_all(p, {'soul':'openclaw/soul.md','identity':'openclaw/identity.md'}, pl.load_overlay('$(PROFILE)')); \
+print('rendered ->', {k:('ok' if v else 'failed') for k,v in r.items()})"
+
+persona-demo: ## Offline walkthrough of the persona meta-learning loop (PROFILE=<name>)
+	@python3 workflows/scripts/persona_demo.py $${PROFILE:-chief-of-staff}
+
 test-unit: ## Run Python unit tests (no containers needed)
 	@python3 -m pytest workflows/tests/ -v
 
@@ -90,7 +102,7 @@ validate: ## Validate config files and project structure
 
 # ─── Tenant Profiles (multi-tenant template) ──────────────────────
 
-.PHONY: profile seed-demo persona-export
+.PHONY: profile persona persona-demo seed-demo persona-export
 
 profile: ## Render openclaw/soul.md from a profile + set it in .env (PROFILE=<name>)
 	@test -n "$(PROFILE)" || { echo "usage: make profile PROFILE=<name>"; exit 1; }

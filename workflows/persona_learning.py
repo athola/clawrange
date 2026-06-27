@@ -103,6 +103,24 @@ def scan_signals(brain_db, profile_name):
     return out
 
 
+def load_overlay(profile_name):
+    """Read a profile's git-tracked learned.yaml overlay into a list.
+
+    The inverse-on-disk of export_overlay: returns the ``learned`` list from
+    ``config/profiles/<name>/learned.yaml``. Missing file or empty overlay
+    returns ``[]`` (never raises) so setup and boot stay resilient.
+    """
+    import yaml
+
+    from tenant_profile import default_profiles_dir
+
+    path = default_profiles_dir() / profile_name / "learned.yaml"
+    if not path.exists():
+        return []
+    data = yaml.safe_load(path.read_text()) or {}
+    return data.get("learned", []) or []
+
+
 def seed_overlay(brain_db, profile_name, overlay):
     existing = {
         (r["target"], r["content"])

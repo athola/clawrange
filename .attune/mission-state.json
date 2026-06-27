@@ -1,23 +1,37 @@
 {
-  "mission_type": "full",
-  "mission_name": "multi-tenant-template",
-  "phases": ["brainstorm", "specify", "plan", "execute"],
-  "completed_phases": ["brainstorm", "specify", "plan", "execute"],
+  "mission_type": "tactical",
+  "mission_name": "persona-config-meta-learning",
+  "phases": ["plan", "execute", "closeout"],
+  "completed_phases": ["plan", "execute", "closeout"],
   "current_phase": "complete",
   "artifacts": {
-    "brief": "docs/multi-tenant-brief.md",
-    "specification": "docs/multi-tenant-spec.md",
-    "plan": "docs/multi-tenant-plan.md",
-    "tradeoffs": "docs/tradeoffs.md"
+    "design": "docs/superpowers/specs/2026-06-26-persona-config-meta-learning-design.md",
+    "plan": "docs/superpowers/plans/2026-06-26-persona-config-meta-learning.md",
+    "guide": "docs/multi-tenant-guide.md",
+    "example_profile": "config/profiles/chief-of-staff/profile.yaml"
   },
-  "predecessor_mission": ".attune/mission-state-marketing.json",
-  "started_at": "2026-06-07T00:00:00Z",
-  "updated_at": "2026-06-07T23:00:00Z",
-  "directive_overrides": ["ignore_scope_guard", "stay_on_branch", "autonomous"],
+  "predecessor_mission": ".attune/mission-state-multi-tenant.json",
+  "branch": "variable-config",
+  "started_at": "2026-06-26T00:00:00Z",
+  "updated_at": "2026-06-26T00:00:00Z",
+  "directive_overrides": ["ignore_scope_guard", "autonomous", "continue_from_crash"],
   "decisions": {
-    "strategy": "full_template_extraction",
-    "crm_backend": "local_sqlite_default_plus_pluggable_adapter",
-    "lead_source": "authenticated_scrape_with_auth_params",
-    "query_mode": "templated_queries_plus_llm_router"
+    "architecture": "three_layer_config_brain_learned_overlay",
+    "approval_posture": "api_gated_approval_no_chat_command",
+    "setup_render": "make_persona_renders_soul_and_identity_config_level",
+    "identity_md": "gitignored_rendered_artifact_like_soul_md",
+    "proven_example": "chief-of-staff_max_with_offline_make_persona-demo"
+  },
+  "closeout": {
+    "verification": "629 unit tests pass; 8/8 validate_stack checks; ruff clean",
+    "gaps_closed": [
+      "README persona section rewritten for configurable + self-learning",
+      "make persona renders identity.md at setup (was soul-only)",
+      "make persona-demo offline dogfood of the learning loop",
+      "load_overlay extracted (DRY) with TDD coverage",
+      "CLAUDE.md modules + /persona endpoints documented",
+      ".env.example PERSONA_SIGNAL_LEARNING + OPENCLAW_STATE_DIR documented",
+      "openclaw/identity.md gitignored as a rendered artifact"
+    ]
   }
 }
