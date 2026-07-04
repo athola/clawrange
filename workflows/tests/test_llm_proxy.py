@@ -3300,6 +3300,21 @@ class TestEmbeddings:
             r = client.post("/v1/embeddings", json=EMBED_BODY, headers=AUTH_HEADER)
         assert r.status_code == 503
 
+    @patch("llm_proxy._call_embeddings", new_callable=AsyncMock)
+    def test_upstream_non_200_maps_to_same_status(self, mock_call):
+        """Upstream errors must surface as errors, never as HTTP 200 bodies
+        that OpenClaw memory would ingest as embeddings."""
+        mock_call.return_value = _mock_response(429, {"error": "rate limited"})
+        r = client.post("/v1/embeddings", json=EMBED_BODY, headers=AUTH_HEADER)
+        assert r.status_code == 429
+        assert "429" in r.json()["detail"]
+
+    @patch("llm_proxy._call_embeddings", new_callable=AsyncMock)
+    def test_upstream_transport_error_is_502(self, mock_call):
+        mock_call.side_effect = httpx.ConnectError("boom")
+        r = client.post("/v1/embeddings", json=EMBED_BODY, headers=AUTH_HEADER)
+        assert r.status_code == 502
+
 
 @patch.dict("os.environ", FAKE_ENV)
 @patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
@@ -3320,7 +3335,7 @@ class TestPersonaCommand:
     def test_persona_command_case_insensitive(self):
         body = {
             "messages": [
-                {"role": "user", "content": "!Persona lead with the recommendation"}
+                {"role": "user", "content": "!Persona Lead with THE recommendation"}
             ]
         }
         with patch("llm_proxy._post_persona_propose", return_value={"id": "cd34"}) as m:
@@ -3328,4 +3343,49 @@ class TestPersonaCommand:
         assert r.status_code == 200
         assert m.called
         # the proposed content must preserve original casing of the args
-        assert "lead with the recommendation" in m.call_args.args[0].lower()
+        assert "Lead with THE recommendation" in m.call_args.args[0]
+
+    def test_learn_alias_intercepted(self):
+        """Spec §6: !learn <feedback> is an alias for !persona <feedback>."""
+        body = {"messages": [{"role": "user", "content": "!learn keep answers short"}]}
+        with patch("llm_proxy._post_persona_propose", return_value={"id": "ef56"}) as m:
+            r = client.post("/v1/chat/completions", json=body, headers=AUTH_HEADER)
+        assert r.status_code == 200
+        assert m.called
+        assert "keep answers short" in m.call_args.args[0]
+
+    def test_propose_default_target_matches_api_default(self):
+        """N1: llm_proxy's propose helper and the /persona API must agree on
+        the default target so bare feedback renders under the same heading."""
+        import inspect
+
+        from llm_proxy import _post_persona_propose
+        from persona_api import Proposal
+
+        assert (
+            inspect.signature(_post_persona_propose).parameters["target"].default
+            == Proposal.model_fields["target"].default
+        )
+
+    def test_persona_propose_failure_degrades_gracefully(self):
+        """N2: persona-API failure must yield a friendly synthetic response,
+        not a raw 500 to Telegram."""
+        body = {"messages": [{"role": "user", "content": "!persona be brief"}]}
+        with patch(
+            "llm_proxy._post_persona_propose",
+            side_effect=httpx.ConnectError("api down"),
+        ):
+            r = client.post("/v1/chat/completions", json=body, headers=AUTH_HEADER)
+        assert r.status_code == 200
+        content = r.json()["choices"][0]["message"]["content"].lower()
+        assert "unavailable" in content or "could not" in content
+
+    def test_persona_reflect_failure_degrades_gracefully(self):
+        body = {"messages": [{"role": "user", "content": "!persona reflect"}]}
+        with patch(
+            "httpx.AsyncClient.post", side_effect=httpx.ConnectError("api down")
+        ):
+            r = client.post("/v1/chat/completions", json=body, headers=AUTH_HEADER)
+        assert r.status_code == 200
+        content = r.json()["choices"][0]["message"]["content"].lower()
+        assert "unavailable" in content or "could not" in content

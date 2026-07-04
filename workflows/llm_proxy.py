@@ -638,7 +638,7 @@ async def _call_embeddings(
 async def _post_persona_propose(
     content: str,
     kind: str = "persona",
-    target: str = "feedback",
+    target: str = "",
     source: str = "feedback",
 ):
     """Post a persona proposal to the local /persona API. Returns the created row."""
@@ -654,15 +654,25 @@ async def _post_persona_propose(
 async def _handle_persona_command(args: str) -> JSONResponse:
     args = args.strip()
     if args.startswith("reflect"):
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post("http://localhost:5678/persona/reflect")
-            r.raise_for_status()
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post("http://localhost:5678/persona/reflect")
+                r.raise_for_status()
+        except httpx.HTTPError as exc:
+            return _synthetic_response(
+                f"Persona API unavailable — reflection not queued ({exc})."
+            )
         return _synthetic_response(
             "Persona reflection queued — review drafts with !tasks."
         )
     if not args:
         return _synthetic_response("Usage: !persona <feedback> | !persona reflect")
-    row = await _post_persona_propose(args)
+    try:
+        row = await _post_persona_propose(args)
+    except httpx.HTTPError as exc:
+        return _synthetic_response(
+            f"Persona API unavailable — feedback not queued ({exc})."
+        )
     return _synthetic_response(
         f"Queued persona enhancement as [DRAFT] (id {row.get('id')}). "
         "Approve via /persona/proposals/<id>/approve."
@@ -2659,9 +2669,11 @@ async def chat_completions(
     if marketing_cmd is not None:
         return await _dispatch_marketing_command(marketing_cmd, is_stream)
 
-    # Intercept !persona — explicit feedback and on-demand reflection
-    if msg_lower.startswith("!persona"):
-        args = last_user_msg.strip()[len("!persona") :]
+    # Intercept !persona / !learn (spec §6 alias) — explicit feedback and
+    # on-demand reflection
+    if msg_lower.startswith(("!persona", "!learn")):
+        prefix = "!persona" if msg_lower.startswith("!persona") else "!learn"
+        args = last_user_msg.strip()[len(prefix) :]
         resp = await _handle_persona_command(args)
         return _wrap_json_as_sse(resp) if is_stream else resp
 
