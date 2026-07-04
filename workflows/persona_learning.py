@@ -12,11 +12,12 @@ import os
 VALID_KINDS = {"identity", "persona"}
 VALID_SOURCES = {"feedback", "reflect", "scheduled", "signal", "seed"}
 CONTENT_MAX = 500
+TARGET_MAX = 80  # interpolated verbatim into rendered headings
 
 _log = logging.getLogger("clawrange.persona")
 
 
-def _validate_learning(kind, content, source):
+def _validate_learning(kind, content, source, target=""):
     """Validate a learning's fields. Returns the stripped content. Raises ValueError."""
     if kind not in VALID_KINDS:
         raise ValueError(f"kind must be one of {sorted(VALID_KINDS)}")
@@ -27,11 +28,13 @@ def _validate_learning(kind, content, source):
         raise ValueError(f"content exceeds {CONTENT_MAX} chars")
     if source not in VALID_SOURCES:
         raise ValueError(f"source must be one of {sorted(VALID_SOURCES)}")
+    if len(target or "") > TARGET_MAX:
+        raise ValueError(f"target exceeds {TARGET_MAX} chars")
     return content
 
 
 def propose(brain_db, profile_name, kind, target, content, source):
-    content = _validate_learning(kind, content, source)
+    content = _validate_learning(kind, content, source, target=target)
     task = brain_db.create_task(
         f"[DRAFT] persona {kind} enhancement ({target}): {content}",
         priority=3,
@@ -56,11 +59,17 @@ def approve(brain_db, profile_name, learning_id, render_fn):
     return brain_db.get_learning(learning_id)
 
 
-def reject(brain_db, profile_name, learning_id):
+def reject(brain_db, profile_name, learning_id, render_fn=None):
     row = brain_db.get_learning(learning_id)
     if not row or row["profile"] != profile_name:
         raise ValueError("learning not found")
-    return brain_db.set_learning_status(learning_id, "rejected")
+    was_approved = row["status"] == "approved"
+    out = brain_db.set_learning_status(learning_id, "rejected")
+    if was_approved and render_fn is not None:
+        # The rejected content is baked into the rendered files; re-render
+        # the surviving approved set so files and DB stay in sync.
+        render_fn(brain_db.list_learnings(profile=profile_name, status="approved"))
+    return out
 
 
 def export_overlay(brain_db, profile_name):
@@ -136,6 +145,7 @@ def seed_overlay(brain_db, profile_name, overlay):
                 item.get("kind", "persona"),
                 item.get("content"),
                 item.get("source", "seed"),
+                target=item.get("target") or "",
             )
         except ValueError as exc:
             _log.warning("seed_overlay skipping invalid item %r: %s", item, exc)

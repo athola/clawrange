@@ -67,7 +67,7 @@ def create_persona_router(brain_db, profile_provider, render_targets_fn) -> APIR
     def reject(learning_id: str):
         p = _profile()
         try:
-            return pl.reject(brain_db, p.name, learning_id)
+            return pl.reject(brain_db, p.name, learning_id, render_fn=_render)
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e))
 

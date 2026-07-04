@@ -136,3 +136,33 @@ def test_reflect_endpoint_creates_proposals(tmp_path, monkeypatch):
     r = client.post("/persona/reflect")
     assert r.status_code == 200
     assert db.list_learnings(status="pending")
+
+
+def test_reject_after_approve_removes_rendered_content(tmp_path):
+    """B2 regression at the API level: approve renders content into the soul
+    target; rejecting the same learning must render it back out."""
+    db = BrainDB(str(tmp_path / "b.db"))
+    db.init_db()
+    prof = Profile(name="cos", raw={"profile": "cos", "assistant": {"name": "Max"}})
+    soul = tmp_path / "soul.md"
+    app = FastAPI()
+    app.include_router(
+        create_persona_router(db, lambda: prof, lambda p: {"soul": str(soul)})
+    )
+    client = TestClient(app)
+
+    r = client.post(
+        "/persona/propose",
+        json={
+            "kind": "persona",
+            "target": "Tone",
+            "content": "Be extremely terse.",
+            "source": "feedback",
+        },
+    )
+    lid = r.json()["id"]
+    assert client.post(f"/persona/proposals/{lid}/approve").status_code == 200
+    assert "Be extremely terse." in soul.read_text()
+
+    assert client.post(f"/persona/proposals/{lid}/reject").status_code == 200
+    assert "Be extremely terse." not in soul.read_text()

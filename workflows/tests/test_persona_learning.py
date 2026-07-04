@@ -163,4 +163,52 @@ def test_scan_signals_enabled_returns_proposals(db, monkeypatch):
     for _ in range(3):
         pl.propose(db, "cos", "persona", "Tone", "Be terse.", "feedback")
     out = pl.scan_signals(db, "cos")
-    assert isinstance(out, list)  # may propose based on repetition
+    # 3+ pending on the same target must surface exactly one meta-proposal
+    assert len(out) == 1
+    assert out[0]["source"] == "signal"
+    assert out[0]["target"] == "Tone"
+    assert "Tone" in out[0]["content"]
+
+
+def test_scan_signals_below_threshold_proposes_nothing(db, monkeypatch):
+    monkeypatch.setenv("PERSONA_SIGNAL_LEARNING", "1")
+    for _ in range(2):
+        pl.propose(db, "cos", "persona", "Tone", "Be terse.", "feedback")
+    assert pl.scan_signals(db, "cos") == []
+
+
+def test_reject_after_approve_rerenders_surviving_set(db):
+    """B2 regression: rejecting a previously approved learning must re-render
+    so the rejected content is removed from the rendered targets."""
+    renders = []
+
+    def render_fn(approved):
+        renders.append([r["content"] for r in approved])
+
+    row = pl.propose(db, "cos", "persona", "Tone", "Be terse.", "feedback")
+    pl.approve(db, "cos", row["id"], render_fn=render_fn)
+    assert renders[-1] == ["Be terse."]
+
+    pl.reject(db, "cos", row["id"], render_fn=render_fn)
+    assert db.get_learning(row["id"])["status"] == "rejected"
+    assert renders[-1] == []
+
+
+def test_reject_pending_does_not_render(db):
+    """Rejecting a never-approved row needs no re-render."""
+    renders = []
+    row = pl.propose(db, "cos", "persona", "Tone", "Be terse.", "feedback")
+    pl.reject(db, "cos", row["id"], render_fn=lambda a: renders.append(a))
+    assert renders == []
+    assert db.get_learning(row["id"])["status"] == "rejected"
+
+
+def test_propose_rejects_overlong_target(db):
+    """target is interpolated verbatim into rendered headings — bound it."""
+    with pytest.raises(ValueError, match="target"):
+        pl.propose(db, "cos", "persona", "T" * 81, "valid content", "feedback")
+
+
+def test_propose_accepts_target_at_limit(db):
+    row = pl.propose(db, "cos", "persona", "T" * 80, "valid content", "feedback")
+    assert row["target"] == "T" * 80
