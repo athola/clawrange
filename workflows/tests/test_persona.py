@@ -156,3 +156,16 @@ def test_render_all_writes_targets(tmp_path):
     res = render_all(p, {"soul": str(soul), "identity": str(ident)}, [])
     assert res == {"soul": True, "identity": True}
     assert "Max" in soul.read_text() and "Name:** Max" in ident.read_text()
+
+
+def test_render_all_unwritable_target_returns_false(tmp_path):
+    """render_all's no-raise contract: an unwritable target reports False
+    instead of raising, so approve never 500s after committing DB status."""
+    from persona import render_all
+
+    p = Profile("x", {"profile": "x", "assistant": {"name": "Max"}})
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    target = blocker / "soul.md"  # parent is a file -> OSError on write
+    result = render_all(p, {"soul": str(target)}, [])
+    assert result == {"soul": False}

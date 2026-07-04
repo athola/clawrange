@@ -28,6 +28,7 @@ def _reset_brain_db():
     from app import brain_db
 
     for table in (
+        "persona_learnings",
         "research_findings",
         "research_sessions",
         "tasks",
