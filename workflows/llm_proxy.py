@@ -863,6 +863,11 @@ BRAIN (Knowledge)
   Brain slugs use hierarchy: client/acme-corp, incident/wifi-site2, person/bob-smith
   Page types: client, system, incident, decision, note, person, company, project
 
+PERSONA
+  !persona <feedback>      Queue a persona enhancement as a [DRAFT] proposal
+  !learn <feedback>        Same as !persona <feedback>
+  !persona reflect         Review recent activity and queue suggestions
+
 SYSTEM STATUS
   !tier                    Show LLM tier status and balance
   !status                  Same as !tier

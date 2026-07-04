@@ -647,6 +647,10 @@ class TestHelpCommand:
         assert "!remember" in content
         assert "!tier" in content
         assert "/brain/search" in content
+        assert "PERSONA" in content
+        assert "!persona <feedback>" in content
+        assert "!persona reflect" in content
+        assert "!learn" in content
 
     def test_help_with_metadata_prefix(self):
         msg = "some metadata block\n!help"
