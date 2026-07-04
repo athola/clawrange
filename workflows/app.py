@@ -144,10 +144,18 @@ def _current_profile():
 
     try:
         return load_profile()
-    except Exception:
-        from tenant_profile import Profile
-
-        return Profile(name="starter", raw={"profile": "starter", "assistant": {}})
+    except Exception as exc:
+        # Never substitute a placeholder profile here: /persona routes render
+        # to the tenant's real soul.md/identity.md, so a silent fallback would
+        # overwrite them with generic content. Prefer the boot-validated
+        # profile; otherwise surface the failure.
+        profile = getattr(app.state, "profile", None)
+        if profile is not None:
+            logger.warning(
+                "persona: profile reload failed, using boot profile: %s", exc
+            )
+            return profile
+        raise HTTPException(status_code=500, detail=f"profile unavailable: {exc}")
 
 
 from persona_api import create_persona_router  # noqa: E402

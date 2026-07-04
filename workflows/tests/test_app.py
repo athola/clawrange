@@ -351,3 +351,53 @@ class TestResearchEndpoint:
             "code",
             "discourse_web",
         }
+
+
+class TestCurrentProfileGuard:
+    """B1 regression: a broken profile.yaml must never resolve to the
+    placeholder starter profile and render it over real persona files."""
+
+    def _persona_app(self, tmp_path):
+        from fastapi import FastAPI
+        from brain_db import BrainDB
+        from persona_api import create_persona_router
+        from app import _current_profile
+
+        db = BrainDB(str(tmp_path / "b.db"))
+        db.init_db()
+        soul = tmp_path / "soul.md"
+        persona_app = FastAPI()
+        persona_app.include_router(
+            create_persona_router(db, _current_profile, lambda p: {"soul": str(soul)})
+        )
+        return TestClient(persona_app, raise_server_exceptions=False), soul
+
+    def _break_profile(self, tmp_path, monkeypatch):
+        profdir = tmp_path / "profiles" / "broken"
+        profdir.mkdir(parents=True)
+        (profdir / "profile.yaml").write_text("profile: [unclosed")
+        monkeypatch.setenv("CLAWRANGE_PROFILES_DIR", str(tmp_path / "profiles"))
+        monkeypatch.setenv("CLAWRANGE_PROFILE", "broken")
+
+    def test_broken_profile_is_5xx_and_writes_nothing(self, tmp_path, monkeypatch):
+        import app as app_module
+
+        self._break_profile(tmp_path, monkeypatch)
+        monkeypatch.delattr(app_module.app.state, "profile", raising=False)
+        persona_client, soul = self._persona_app(tmp_path)
+        r = persona_client.post("/persona/render")
+        assert r.status_code >= 500
+        assert not soul.exists()
+
+    def test_broken_profile_falls_back_to_boot_profile(self, tmp_path, monkeypatch):
+        import app as app_module
+        from tenant_profile import Profile
+
+        self._break_profile(tmp_path, monkeypatch)
+        boot = Profile(name="cos", raw={"profile": "cos", "assistant": {"name": "Max"}})
+        monkeypatch.setattr(app_module.app.state, "profile", boot, raising=False)
+        persona_client, soul = self._persona_app(tmp_path)
+        r = persona_client.post("/persona/render")
+        assert r.status_code == 200
+        assert soul.exists()
+        assert "Max" in soul.read_text()
