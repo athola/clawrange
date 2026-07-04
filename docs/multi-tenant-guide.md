@@ -269,8 +269,8 @@ enhancements are appended to the rendered persona under a `## Learned`
 region and persisted. Nothing is applied without approval — the same posture
 as outward-facing actions.
 
-- **Give feedback:** `!persona lead with the recommendation` queues the
-  feedback as a `[DRAFT]` proposal.
+- **Give feedback:** `!persona lead with the recommendation` (or the
+  `!learn` alias) queues the feedback as a `[DRAFT]` proposal.
 - **Reflect on demand:** `!persona reflect` reviews recent activity (through
   the LLM proxy) and queues any suggestions. A `persona_reflect` schedule can
   run the same pass on a cadence (see the `chief-of-staff` profile's
