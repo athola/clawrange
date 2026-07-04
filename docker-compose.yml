@@ -38,7 +38,9 @@ services:
       - ./data/openclaw-state:/home/node/.openclaw
       # Ephemeral scratch space — stays in ~/clawrange/data/
       - ./data/openclaw-tmp:/tmp
-      # Config templates — read-only
+      # Config templates — read-only. openclaw/identity.md is deliberately
+      # NOT mounted: it is a human-readable render artifact only; the agent
+      # reads IDENTITY.md from its workspace under data/openclaw-state.
       - ./openclaw/soul.md:/home/node/.openclaw/soul.md:ro
       - ./openclaw/soul-ops.md:/home/node/.openclaw/soul-ops.md:ro
       - ./openclaw/HEARTBEAT.md:/home/node/.openclaw/HEARTBEAT.md:ro
@@ -127,6 +129,9 @@ services:
       - ./data/brain:/data
       # OpenClaw workspace state — writable so runtime persona re-render
       # (on learning approval) can update the agent's SOUL.md / IDENTITY.md.
+      # Mounted as a whole directory rather than spec §7's narrow per-file
+      # mount because render_all writes atomically via os.replace, which
+      # breaks single-file bind mounts (the bind pins the old inode).
       - ./data/openclaw-state:/openclaw-state
     tmpfs:
       - /tmp:size=32M
