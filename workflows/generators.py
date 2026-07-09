@@ -1393,6 +1393,45 @@ async def research_pulse_generator(
     logger.info("research_pulse: all candidate topics already queued, skipping")
 
 
+INCOME_REVIEW_DESC = "[DRAFT] income: weekly strategy review"
+
+_INCOME_REVIEW_CHECKLIST = (
+    "Cover: balances and P&L vs the two benchmarks ($50 held as USDC; "
+    "$50 all-in BTC on day one), the paper sleeve's 20-week-SMA decision "
+    "and hypothetical result, fees paid this week, and proposed "
+    "adjustments with cited sources (single-source claims flagged). "
+    "Hard rules in docs/income-strategy.md apply; this task is a draft "
+    "for operator approval — never execute trades."
+)
+
+
+async def income_review_generator(brain_db, **kwargs) -> None:
+    """Enqueue the weekly $50-testbed strategy review as a [DRAFT] task.
+
+    Mirrors research_pulse: idempotent (skips while a review is still
+    pending), enqueue-first so a Telegram outage never loses the task,
+    and never acts on its own — the review is a draft the operator
+    approves on Telegram. See docs/income-strategy.md for the protocol.
+    """
+    from telegram import notify
+
+    pending = {t["description"] for t in brain_db.list_tasks(status="pending")}
+    if any(d.startswith(INCOME_REVIEW_DESC) for d in pending):
+        logger.info("income_review: review already queued, skipping")
+        return
+
+    brain_db.create_task(
+        f"{INCOME_REVIEW_DESC} — {_INCOME_REVIEW_CHECKLIST}",
+        priority=2,
+        source="schedule",
+    )
+    logger.info("income_review: enqueued weekly review")
+    if not await notify(
+        "📋 Weekly income review queued — claim the [DRAFT] task to run it."
+    ):
+        logger.warning("income_review: telegram notify failed (task kept)")
+
+
 # ─── Registry ────────────────────────────────────────────────────────
 
 GENERATORS = {
@@ -1408,4 +1447,5 @@ GENERATORS = {
     "crm_digest": crm_digest_generator,
     "persona_reflect": persona_reflect_generator,
     "research_pulse": research_pulse_generator,
+    "income_review": income_review_generator,
 }
