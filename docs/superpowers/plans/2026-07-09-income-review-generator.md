@@ -174,9 +174,11 @@ git commit -m "feat(income): weekly income_review generator enqueues draft strat
 
 ### Post-plan operator step (not a code task)
 
-Once the stack is up, schedule it for Sundays 16:00 UTC:
+Once the stack is up, schedule it for Sundays 16:00 (container-local
+time, America/Chicago). Note: cron fields pass straight to APScheduler,
+where numeric day-of-week `0` means Monday — always use the `sun` name:
 
 ```bash
 curl -sX POST localhost:5678/sched -H 'content-type: application/json' \
-  -d '{"kind": "income_review", "cron": "0 16 * * 0"}'
+  -d '{"id": "weekly-income-review", "name": "Weekly income strategy review ($50 testbed)", "kind": "income_review", "cron": "0 16 * * sun"}'
 ```
