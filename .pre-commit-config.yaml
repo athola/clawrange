@@ -52,9 +52,10 @@ repos:
         types: [python]
         pass_filenames: false
         args: [-q]
-        # Full async+sync suite (~80s). If commit-time latency bites,
-        # move this hook to `stages: [pre-push]` and run `pre-commit
-        # install --hook-type pre-push`.
+        stages: [pre-push]
+        # Full async+sync suite (~80s), gated at pre-push — not commit —
+        # to keep commits fast. Requires `pre-commit install
+        # --hook-type pre-push` to fire on push.
 
   # Docker compose validation
   - repo: https://github.com/IamTheFij/docker-pre-commit
