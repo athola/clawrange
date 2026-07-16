@@ -185,7 +185,13 @@ format-fix: ## Apply ruff formatting + safe auto-fixes
 
 .PHONY: setup env-check
 
-setup: .env ## One-time setup: create .env and generate gateway token
+.PHONY: hooks
+
+hooks: ## Install git hooks (pre-commit + pre-push) via pre-commit
+	@uv run pre-commit install -t pre-commit -t pre-push
+	@echo "Git hooks installed: pre-commit (ruff/mypy/format) + pre-push (pytest)."
+
+setup: .env hooks ## One-time setup: .env + gateway token + git hooks
 	@echo "Setup complete. Fill in OPENROUTER_API_KEY in .env, then run: make start"
 
 .env: .env.example

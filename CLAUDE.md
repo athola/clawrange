@@ -53,8 +53,9 @@ Tailscale and Caddy gateway.
   macOS and Ubuntu.
 - Python tooling is uv-managed: ruff, mypy, and pytest run via `uv run`
   against the dev group pinned in `uv.lock` (see `pyproject.toml`).
-  Pre-commit enforces ruff, ruff-format, and mypy on every commit;
-  `make lint` mirrors that gate locally.
+  Pre-commit enforces ruff, ruff-format, and mypy on every commit and the
+  full pytest suite at pre-push; `make lint` mirrors the commit gate.
+  `make setup` (or `make hooks`) installs both git hooks.
 - Docker images use `:latest` for testing: pin versions before production.
 - `.env` is gitignored. `.env.example` is the template.
 - OpenClaw runs internally on port 18789, mapped to host port 3000.
