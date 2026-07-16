@@ -51,6 +51,10 @@ Tailscale and Caddy gateway.
   to OpenRouter and Z.AI). Never call Anthropic/OpenAI/ByteDance directly.
 - Shell scripts use **Bash** (`#!/usr/bin/env bash`) and must work on
   macOS and Ubuntu.
+- Python tooling is uv-managed: ruff, mypy, and pytest run via `uv run`
+  against the dev group pinned in `uv.lock` (see `pyproject.toml`).
+  Pre-commit enforces ruff, ruff-format, and mypy on every commit;
+  `make lint` mirrors that gate locally.
 - Docker images use `:latest` for testing: pin versions before production.
 - `.env` is gitignored. `.env.example` is the template.
 - OpenClaw runs internally on port 18789, mapped to host port 3000.
@@ -69,9 +73,16 @@ make start            # bring up OpenClaw and workflows
 make start-full       # include DeerFlow
 make start-prod       # bind to 127.0.0.1 and Tailscale IP only
 make test             # run validation suite
-make test-unit        # pytest workflows/tests/
+make test-unit        # uv run pytest workflows/tests/
 make health           # quick curl health checks
 make logs             # tail docker logs
+
+# Python quality — uv-managed (ruff + mypy + pytest via pyproject.toml/uv.lock)
+make lint             # ShellCheck + ruff + mypy (mirrors the pre-commit gate)
+make format           # check YAML/JSON + ruff format (no writes)
+make format-fix       # apply ruff formatting + safe auto-fixes
+make typecheck        # uv run mypy workflows scripts tests
+make py-lint          # uv run ruff check .
 ```
 
 ## API Endpoints
