@@ -60,7 +60,7 @@
         "static resume site",
         "resume generator"
       ],
-      "posture": "Lead with: a YAML-driven resume that builds PDF and HTML. Comment with concrete examples; mention only when the post is about resume tooling specifically."
+      "posture": "Lead with: a YAML-driven resume that builds PDF and HTML. Comment with concrete examples. Mention only when the post is about resume tooling specifically."
     },
     {
       "slug": "clawrange",
@@ -93,7 +93,7 @@
         "openrouter telegram",
         "agent orchestration self-hosted"
       ],
-      "posture": "Lead with: a single-host AI ops stack (FastAPI workflows + Claude Code via OpenClaw) for tier-routed LLM access, scheduled marketing scans, and Telegram delivery. Comment with first-hand operational details (single uvicorn worker, APScheduler job persistence, balance-aware tier routing). Mention clawrange only when the post is explicitly about self-hosted Claude tooling or LLM-proxy gateways."
+      "posture": "Lead with: a single-host AI ops stack (FastAPI workflows and Claude Code via OpenClaw) for tier-routed LLM access, scheduled marketing scans, and Telegram delivery. Comment with first-hand operational details (single uvicorn worker, APScheduler job persistence, balance-aware tier routing). Mention clawrange only when the post is explicitly about self-hosted Claude tooling or LLM-proxy gateways."
     },
     {
       "slug": "personal-brand",

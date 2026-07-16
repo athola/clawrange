@@ -1,4 +1,4 @@
-# ClawRange Marketing Orchestrator — Specification
+# ClawRange Marketing Orchestrator: Specification
 
 ## Overview
 
@@ -198,10 +198,10 @@ Behavior:
 - Uses `asyncpraw.Reddit(...)` script-app flow with credentials from env
 - Translates `since` strings ("7d", "24h", "30d") to `time_filter` values for asyncpraw search
 - Sets explicit User-Agent: `clawrange-marketing-bot/0.1 by u/{REDDIT_USERNAME}`
-- Closes the Reddit instance after each call (no long-lived session — keeps memory low)
+- Closes the Reddit instance after each call (no long-lived session, keeps memory low)
 - On rate limit, sleeps based on `X-Ratelimit-Reset` header up to a 60s ceiling, then returns partial results
 - On missing credentials → returns empty list and logs warning (no exception). The caller is expected to fall back to GLM web search.
-- All HTTP errors caught and logged; never raises to caller
+- All HTTP errors caught and logged. Never raises to caller
 
 ## GitHub Adapter Contract
 
@@ -229,9 +229,9 @@ async def is_configured() -> bool: ...
 Behavior:
 - Uses `githubkit.GitHub(token=GITHUB_PAT)` (async context)
 - Search functions reach `/search/repositories` and `/search/issues`
-- Traffic functions need PAT with `repo` push scope; raises `GitHubAuthError` if 403 (handled by caller)
-- Rate-limit headers respected; logs remaining quota when below 20%
-- Missing `GITHUB_PAT` → unauthenticated 60/hr ceiling for search; traffic endpoints return None with a warning
+- Traffic functions need PAT with `repo` push scope. Raises `GitHubAuthError` if 403 (handled by caller)
+- Rate-limit headers respected. Logs remaining quota when below 20%
+- Missing `GITHUB_PAT` → unauthenticated 60/hr ceiling for search. Traffic endpoints return None with a warning
 
 ## Scheduler Contract
 
@@ -292,7 +292,7 @@ Default lists: `["ComposioHQ/awesome-claude-plugins", "hesreallyhim/awesome-clau
 
 ### custom_scan_generator(topic: str, kind: str, project_slug: str | None = None)
 
-Generic — used when Alex creates a custom schedule via `/sched add`.
+Generic: used when Alex creates a custom schedule via `/sched add`.
 
 ## Telegram Command Grammar
 
@@ -361,9 +361,9 @@ Both `/cmd` and `!cmd` accepted. The router strips the leading `!` or `/` before
 
 ### Existing Aliases (Preserved)
 
-- `!task`, `!tasks`, `!task list`, `!task tail`, `!task cancel`, `!task priority` — unchanged
-- `!remember`, `!recall`, `!page` — unchanged
-- `!tier`, `!status`, `!help` — unchanged
+- `!task`, `!tasks`, `!task list`, `!task tail`, `!task cancel`, `!task priority`: unchanged
+- `!remember`, `!recall`, `!page`: unchanged
+- `!tier`, `!status`, `!help`: unchanged
 
 New `/help` (no arg) appends a "MARKETING" section listing the `/sched`, `/scan`, `/projects`, `/marketing` verbs.
 
@@ -373,7 +373,7 @@ Existing `_handle_heartbeat()` continues to drain ONE task per cycle. Behavior u
 
 When a pending task description starts with `Scan reddit ` or `Scan github `, the heartbeat:
 1. Parses the task to extract `(kind, project_slug, topic, params)` (regex extractor)
-2. Calls the appropriate adapter directly (Reddit or GitHub) — bypassing LLM call
+2. Calls the appropriate adapter directly (Reddit or GitHub), bypassing LLM call
 3. Formats results via the same HTML helper
 4. Stores result in task and sends to Telegram
 5. Returns adapter-sourced data with citations, NOT LLM hallucinations
@@ -400,7 +400,7 @@ POSITIVE RULES:
 - Lead with the user problem solved
 - Include real upvote counts, comment counts, and timestamps when available
 - Cite source URLs for every claim
-- For comment suggestions, anchor in the user's question first; mention the project as a relevant tool second
+- For comment suggestions, anchor in the user's question first. Mention the project as a relevant tool second
 """
 
 def build_marketing_prompt(task: str, project: dict | None, evidence: list[dict]) -> str:
@@ -438,7 +438,7 @@ GITHUB_PAT=
 SCHEDULER_TZ=America/Chicago
 ```
 
-All four Reddit vars optional — adapter gracefully degrades. `GITHUB_PAT` optional — search degrades to unauthenticated quotas, traffic endpoints disabled.
+All four Reddit vars optional. Adapter gracefully degrades. `GITHUB_PAT` optional. Search degrades to unauthenticated quotas, traffic endpoints disabled.
 
 ### docker-compose.yml Changes
 
@@ -541,13 +541,13 @@ pytimeparse>=1.1
 - **Unit tests** for parser (`parse_telegram_command`) with table-driven cases
 - **Integration tests** that spin up an in-memory SQLite database and verify scheduler persistence
 - **Smoke test** in `scripts/test_workflows.sh` that hits new endpoints with curl
-- **Anti-pattern test** that runs LLM with stub provider returning canned bad output, asserts post-processing strips/flags it (or accepts bad output reports it; this is a soft guardrail)
+- **Anti-pattern test** that runs LLM with stub provider returning canned bad output, asserts post-processing strips/flags it (or accepts bad output reports it. This is a soft guardrail)
 
 Coverage gate: `pytest --cov=workflows --cov-fail-under=85` for new modules.
 
 ## Migration Notes
 
 - Existing `tasks` table unchanged (already has `source` column from prior brain mission)
-- New tables created on `BrainDB.init_db()` — additive, no destructive migration
+- New tables created on `BrainDB.init_db()`. Additive, no destructive migration.
 - Existing schedule-less behavior is the fallback if scheduler init fails
-- Roll-forward only — no rollback path needed for testbed
+- Roll-forward only. No rollback path needed for testbed.

@@ -1,14 +1,14 @@
-# lead-crm — the reference business profile.
+# lead-crm: the reference business profile.
 #
 # A worked example for a business owner: an assistant that hourly syncs
 # leads from a web portal into a local CRM, and answers relational and
 # time-series questions about those leads on a morning digest or on demand
-# via Telegram. Everything tenant-specific lives here — copy this directory,
+# via Telegram. Everything tenant-specific lives here. Copy this directory,
 # rename it, edit the fields, and set CLAWRANGE_PROFILE to the new name.
 #
 # ${VAR} tokens resolve from the environment at load time. Unset vars
 # resolve to "" and the affected connector/CRM is treated as unconfigured
-# (a missing credential disables a feature; it never crashes boot). For an
+# (a missing credential disables a feature. It never crashes boot). For an
 # offline demo, leave the portal vars unset and use `make seed-demo` to load
 # config/profiles/lead-crm/demo_leads.csv directly into the CRM.
 
@@ -30,7 +30,7 @@ assistant:
     - "Sync new leads from the portal into the CRM every hour"
     - "Report new-lead counts, status breakdowns, and weekly trends"
     - "Answer ad-hoc questions about leads from a Telegram prompt"
-    - "Never auto-contact a lead — surface and recommend, owner decides"
+    - "Never auto-contact a lead. Surface and recommend, owner decides"
 
 seeds:
   projects: []

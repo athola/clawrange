@@ -4,24 +4,24 @@
 
 **Goal:** Make assistant persona/identity declaratively configurable per use case and add an approval-gated meta-learning loop that persists enhancements, with `chief-of-staff` (Max) shipped as the worked example.
 
-**Architecture:** Extend the existing tenant-profile/persona system. A new `identity` profile block renders `IDENTITY.md`; approved persona "learnings" live in a brain table and project to a git-tracked `learned.yaml`; a propose→`[DRAFT]`→approve→non-destructive-re-render loop is exposed via a `/persona` router plus `!persona` proxy commands, a scheduled generator, and a flagged signal scan.
+**Architecture:** Extend the existing tenant-profile/persona system. A new `identity` profile block renders `IDENTITY.md`. Approved persona "learnings" live in a brain table and project to a git-tracked `learned.yaml`. A propose→`[DRAFT]`→approve→non-destructive-re-render loop is exposed via a `/persona` router plus `!persona` proxy commands, a scheduled generator, and a flagged signal scan.
 
 **Tech Stack:** Python 3.12, FastAPI, SQLite (brain_db), PyYAML, httpx, pytest. Spec: `docs/superpowers/specs/2026-06-26-persona-config-meta-learning-design.md`.
 
 ## Global Constraints
 
 - All LLM calls route through the workflows `llm_proxy` (never call providers directly).
-- Single uvicorn worker / single-process APScheduler — no new always-on services.
-- `data/` is gitignored runtime state; `config/profiles/` is git-tracked.
-- Profile load failure must never crash boot (log + degrade).
+- Single uvicorn worker / single-process APScheduler. No new always-on services.
+- `data/` is gitignored runtime state. `config/profiles/` is git-tracked.
+- Profile load failure must never crash boot (log and degrade).
 - New brain tables are additive via `CREATE TABLE IF NOT EXISTS` in `init_db`.
-- Shell stays Bash, macOS + Ubuntu compatible.
+- Shell stays Bash, macOS and Ubuntu compatible.
 - Commit messages: conventional, no AI attribution, no emojis.
 - Run unit tests with `python3 -m pytest workflows/tests/ -q` (from repo root) or `cd workflows && python3 -m pytest tests/ -q`.
 
 ---
 
-### Task 1: Profile `identity` block — validation + IDENTITY render
+### Task 1: Profile `identity` block validation and IDENTITY render
 
 **Files:**
 - Modify: `workflows/tenant_profile.py` (add identity validation in `validate`)
@@ -30,7 +30,7 @@
 - Test: `workflows/tests/test_profile.py`, `workflows/tests/test_persona.py`
 
 **Interfaces:**
-- Produces: `tenant_profile.IDENTITY_FIELDS: set[str]`; `persona.render_identity(profile) -> str`; `persona.write_identity(profile, path) -> Path`.
+- Produces: `tenant_profile.IDENTITY_FIELDS: set[str]`, `persona.render_identity(profile) -> str`, and `persona.write_identity(profile, path) -> Path`.
 - Consumes: existing `Profile.assistant` dict, `persona._TEMPLATE_PATH` pattern.
 
 - [ ] **Step 1: Create the identity template**
@@ -183,10 +183,10 @@ git commit -m "feat(persona): profile identity block renders IDENTITY.md"
 
 ---
 
-### Task 2: brain_db `persona_learnings` table + CRUD
+### Task 2: brain_db `persona_learnings` table and CRUD
 
 **Files:**
-- Modify: `workflows/brain_db.py` (table in `init_db`; `create_learning`, `list_learnings`, `get_learning`, `set_learning_status`)
+- Modify: `workflows/brain_db.py` (table in `init_db`, `create_learning`, `list_learnings`, `get_learning`, `set_learning_status`)
 - Test: `workflows/tests/test_brain_db.py`
 
 **Interfaces:**
@@ -299,7 +299,7 @@ git commit -m "feat(brain): add persona_learnings table and CRUD"
 
 ---
 
-### Task 3: Compose persona/identity with the `## Learned` overlay + atomic render
+### Task 3: Compose persona/identity with the `## Learned` overlay and atomic render
 
 **Files:**
 - Modify: `workflows/persona.py` (`compose_persona`, `compose_identity`, `render_all`)
@@ -337,7 +337,7 @@ def test_compose_appends_learned_region_and_is_non_destructive():
 Run: `cd workflows && python3 -m pytest tests/test_persona.py::test_compose_appends_learned_region_and_is_non_destructive -q`
 Expected: FAIL ("cannot import name 'compose_persona'").
 
-- [ ] **Step 3: Implement compose + render_all**
+- [ ] **Step 3: Implement compose and render_all**
 
 In `workflows/persona.py` add:
 
@@ -423,7 +423,7 @@ git commit -m "feat(persona): compose learned overlay and atomic render_all"
 
 ---
 
-### Task 4: persona_learning module — propose / approve / reject + overlay seed/export
+### Task 4: persona_learning module (propose / approve / reject and overlay seed/export)
 
 **Files:**
 - Create: `workflows/persona_learning.py`
@@ -432,11 +432,11 @@ git commit -m "feat(persona): compose learned overlay and atomic render_all"
 **Interfaces:**
 - Produces:
   - `VALID_KINDS = {"identity", "persona"}`, `CONTENT_MAX = 500`
-  - `propose(brain_db, profile_name, kind, target, content, source) -> dict` (validates; creates `[DRAFT]` task + learning row; raises `ValueError` on bad input)
+  - `propose(brain_db, profile_name, kind, target, content, source) -> dict` (validates, creates `[DRAFT]` task and learning row, and raises `ValueError` on bad input)
   - `approve(brain_db, profile, learning_id, render_fn) -> dict` (marks approved, calls `render_fn(approved_learnings)`)
   - `reject(brain_db, learning_id) -> dict`
   - `export_overlay(brain_db, profile_name) -> list[dict]` (approved rows → overlay list)
-  - `seed_overlay(brain_db, profile_name, overlay) -> int` (insert approved rows from yaml; idempotent on (target, content))
+  - `seed_overlay(brain_db, profile_name, overlay) -> int` (insert approved rows from yaml, idempotent on (target, content))
 - Consumes: `brain_db.create_learning/list_learnings/get_learning/set_learning_status/create_task`.
 
 - [ ] **Step 1: Write the failing test**
@@ -585,11 +585,11 @@ git commit -m "feat(persona): propose/approve/reject pipeline with overlay round
 
 ---
 
-### Task 5: `/persona` API router + mount + health
+### Task 5: `/persona` API router, mount, and health
 
 **Files:**
 - Create: `workflows/persona_api.py`
-- Modify: `workflows/app.py` (import + `app.include_router`)
+- Modify: `workflows/app.py` (import and `app.include_router`)
 - Test: `workflows/tests/test_persona_api.py`
 
 **Interfaces:**
@@ -791,14 +791,14 @@ git commit -m "feat(persona): /persona router for propose/approve/render"
 
 ---
 
-### Task 6: `!persona` proxy commands (explicit feedback + on-demand)
+### Task 6: `!persona` proxy commands (explicit feedback and on-demand)
 
 **Files:**
 - Modify: `workflows/llm_proxy.py` (intercept `!persona` before LLM dispatch)
 - Test: `workflows/tests/test_llm_proxy.py`
 
 **Interfaces:**
-- Consumes: `persona_learning.propose`, the workflows `/persona` routes via in-process `brain_db` import is not available in proxy; instead the proxy posts to its own HTTP API using `httpx` to `http://localhost:5678/persona/...` with `PROXY_AUTH_TOKEN` not required for `/persona` (internal). Use the existing `_synthetic_response` helper to reply.
+- Consumes: `persona_learning.propose`, the workflows `/persona` routes via in-process `brain_db` import is not available in proxy. Instead, the proxy posts to its own HTTP API using `httpx` to `http://localhost:5678/persona/...` with `PROXY_AUTH_TOKEN` not required for `/persona` (internal). Use the existing `_synthetic_response` helper to reply.
 - Produces: a `_handle_persona_command(subcmd, args) -> JSONResponse` mirroring `_handle_tier_command`.
 
 - [ ] **Step 1: Write the failing test**
@@ -824,9 +824,9 @@ class TestPersonaCommand:
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `cd workflows && python3 -m pytest tests/test_llm_proxy.py::TestPersonaCommand -q`
-Expected: FAIL (command not intercepted; `_post_persona_propose` missing).
+Expected: FAIL (command not intercepted, `_post_persona_propose` missing).
 
-- [ ] **Step 3: Implement the command + helper**
+- [ ] **Step 3: Implement the command and helper**
 
 In `workflows/llm_proxy.py` add a helper near `_call_embeddings`:
 
@@ -888,7 +888,7 @@ git commit -m "feat(persona): !persona feedback and reflect proxy commands"
 
 ---
 
-### Task 7: Scheduled `persona_reflect` generator + `/persona/reflect`
+### Task 7: Scheduled `persona_reflect` generator and `/persona/reflect`
 
 **Files:**
 - Modify: `workflows/generators.py` (`persona_reflect_generator`, register in `GENERATORS`)
@@ -896,7 +896,7 @@ git commit -m "feat(persona): !persona feedback and reflect proxy commands"
 - Test: `workflows/tests/test_persona_api.py`
 
 **Interfaces:**
-- Produces: `generators.persona_reflect_generator(brain_db, profile_name=None, **kwargs) -> None`; `GENERATORS["persona_reflect"]`.
+- Produces: `generators.persona_reflect_generator(brain_db, profile_name=None, **kwargs) -> None` and `GENERATORS["persona_reflect"]`.
 - Consumes: `persona_learning.propose`, `llm_proxy._llm_call` (route reflection through the proxy).
 
 - [ ] **Step 1: Write the failing test**
@@ -1002,7 +1002,7 @@ git commit -m "feat(persona): scheduled persona_reflect generator and reflect en
 - Test: `workflows/tests/test_persona_learning.py`
 
 **Interfaces:**
-- Produces: `scan_signals(brain_db, profile_name) -> list[dict]` — gated by env `PERSONA_SIGNAL_LEARNING`; returns `[]` unless enabled.
+- Produces: `scan_signals(brain_db, profile_name) -> list[dict]`, gated by env `PERSONA_SIGNAL_LEARNING`. Returns `[]` unless enabled.
 - Consumes: `brain_db.list_tasks` (repeated `persona` drafts as a weak signal).
 
 - [ ] **Step 1: Write the failing test**
@@ -1070,14 +1070,14 @@ git commit -m "feat(persona): flagged outcome-signal proposal source"
 
 ---
 
-### Task 9: Ship `chief-of-staff` (Max) example + wiring + docs
+### Task 9: Ship `chief-of-staff` (Max) example, wiring, and docs
 
 **Files:**
 - Create: `config/profiles/chief-of-staff/profile.yaml`
 - Create: `config/profiles/chief-of-staff/learned.yaml`
 - Modify: `workflows/generators.py` (`seed_from_profile` also calls `seed_overlay` from learned.yaml)
 - Modify: `docker-compose.yml` (rw mount so workflows can write render targets)
-- Modify: `Makefile` (`persona-export` target; extend render to identity)
+- Modify: `Makefile` (`persona-export` target, extend render to identity)
 - Modify: `docs/multi-tenant-guide.md` (Persona & meta-learning section)
 - Test: `workflows/tests/test_profile.py`
 
@@ -1126,7 +1126,7 @@ assistant:
       decisions surfaced fast.
   capabilities:
     - "Surface what matters, kill what doesn't. Signal over noise."
-    - "Anticipate needs; think three steps ahead."
+    - "Anticipate needs. Think three steps ahead."
     - "Briefings, not essays. Lead with the recommendation."
     - "Gatekeeper: filter information and tasks by impact."
     - "Tell Alex what he needs to hear, not what he wants to hear."
@@ -1212,12 +1212,12 @@ print(f"wrote {dest} ({len(overlay['learned'])} learnings)")
 
 - [ ] **Step 7: Document in the multi-tenant guide**
 
-Append a "Persona & meta-learning" section to `docs/multi-tenant-guide.md` covering: the `identity` block, `!persona <feedback>` / `!persona reflect`, approval via `/persona/proposals/<id>/approve`, and `make persona-export PROFILE=<name>` to commit the evolved persona. (Write real prose, mirroring the existing guide's tone — no placeholder text.)
+Append a "Persona & meta-learning" section to `docs/multi-tenant-guide.md` covering: the `identity` block, `!persona <feedback>` / `!persona reflect`, approval via `/persona/proposals/<id>/approve`, and `make persona-export PROFILE=<name>` to commit the evolved persona. (Write real prose, mirroring the existing guide's tone. No placeholder text.)
 
 - [ ] **Step 8: Run the full suite**
 
 Run: `python3 -m pytest workflows/tests/ -q`
-Expected: PASS (all prior + new tests).
+Expected: PASS (all prior and new tests).
 
 - [ ] **Step 9: Commit**
 
@@ -1230,8 +1230,8 @@ git commit -m "feat(persona): ship chief-of-staff (Max) example, overlay seeding
 
 ## Self-Review
 
-**Spec coverage:** §3 layers → Tasks 1–4; §4 data model → Task 2; §5 schema → Task 1; §6 components → Tasks 4–8; §7 render targets → Tasks 3,5,9; §8 data flow → Tasks 4–6,9; §9 error handling → Tasks 3,4,5 (atomic render, 400/404, idempotent); §10 testing → every task; §11 example → Task 9; §12 compat → Task 2 (additive table), Task 1 (optional identity); §13 YAGNI → Task 8 (flagged), Task 9 (export kept). No gaps.
+**Spec coverage:** §3 layers → Tasks 1–4. §4 data model → Task 2. §5 schema → Task 1. §6 components → Tasks 4–8. §7 render targets → Tasks 3,5,9. §8 data flow → Tasks 4–6,9. §9 error handling → Tasks 3,4,5 (atomic render, 400/404, idempotent). §10 testing → every task. §11 example → Task 9. §12 compat → Task 2 (additive table), Task 1 (optional identity). §13 YAGNI → Task 8 (flagged), Task 9 (export kept). No gaps.
 
-**Placeholder scan:** Task 9 Step 7 (docs) names exact content to write rather than the prose itself — acceptable for a doc step, but the implementer must write real prose, not a stub. All code steps contain runnable code.
+**Placeholder scan:** Task 9 Step 7 (docs) names exact content to write rather than the prose itself (acceptable for a doc step), but the implementer must write real prose, not a stub. All code steps contain runnable code.
 
-**Type consistency:** `create_learning/get_learning/list_learnings/set_learning_status` consistent across Tasks 2–8; `propose/approve/reject/export_overlay/seed_overlay/scan_signals` signatures consistent across Tasks 4,7,8; `render_all(profile, targets, learnings)` consistent across Tasks 3,5; router factory `create_persona_router(brain_db, profile_provider, render_targets_fn)` consistent across Tasks 5,7.
+**Type consistency:** `create_learning/get_learning/list_learnings/set_learning_status` consistent across Tasks 2–8. `propose/approve/reject/export_overlay/seed_overlay/scan_signals` signatures consistent across Tasks 4,7,8. `render_all(profile, targets, learnings)` consistent across Tasks 3,5. Router factory `create_persona_router(brain_db, profile_provider, render_targets_fn)` consistent across Tasks 5,7.

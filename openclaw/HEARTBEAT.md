@@ -1,14 +1,14 @@
 # Heartbeat Checklist
 
-Runs every 5 minutes. Handled in Python by the proxy — no LLM needed.
+Runs every 5 minutes. Handled in Python by the proxy. No LLM needed.
 
 ## What Gets Checked
 
-1. **Tier health** — any circuit breakers tripped?
-2. **Balance** — below $5.00 threshold?
-3. **Pending tasks** — anything in the queue to process?
-4. **Brain health** — is the knowledge DB accessible? (via /healthz brain status)
-5. **Research freshness** (daily, not every cycle) — has a research
+1. **Tier health**: any circuit breakers tripped?
+2. **Balance**: below $5.00 threshold?
+3. **Pending tasks**: anything in the queue to process?
+4. **Brain health**: is the knowledge DB accessible? (via /healthz brain status)
+5. **Research freshness** (daily, not every cycle): has a research
    session run in the last 24 hours? Handled server-side by the
    `research_pulse` generator: if research is stale it enqueues a
    `research:tome: <topic>` task (P3) that `scripts/tome_bridge.py`
@@ -53,4 +53,4 @@ Tiers: <status> | Balance: $X.XX
 - ONE task per cycle maximum
 - `heartbeat_ok` = silent (no Telegram notification)
 - Deduplication: don't create tasks that already exist as pending
-- Infrastructure monitoring only — Alex creates his own work tasks via `!task`
+- Infrastructure monitoring only. Alex creates his own work tasks via `!task`

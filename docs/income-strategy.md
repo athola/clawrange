@@ -1,8 +1,8 @@
-# Income Loop — $50 Crypto Testbed, Strategy v0
+# Income Loop: $50 Crypto Testbed, Strategy v0
 
 Week of 2026-07-06. Reevaluated every Sunday via the weekly review task.
 
-## Honest expectations — read this first
+## Honest expectations: read this first
 
 - **No legitimate strategy produces a reliably high weekly return.**
   Claims of "1% a day" or guaranteed weekly percentages are scams,
@@ -17,33 +17,33 @@ Week of 2026-07-06. Reevaluated every Sunday via the weekly review task.
 - Even a *great* year (+100%) turns $50 into $100. This account will
   not generate income. Its job is different:
 
-**The $50 account is a testbed.** It exists to prove the loop —
-research → propose → approve → execute → weekly review — at stakes
+**The $50 account is a testbed.** It exists to prove the loop
+(research → propose → approve → execute → weekly review) at stakes
 where mistakes cost lunch money. Capital only scales after the loop
 has a multi-week track record you trust.
 
 ## Strategy v0 (initial allocation)
 
 Venue: Kraken Pro (0.16/0.26% maker/taker) or Coinbase Advanced
-(0.40/0.60%). Use **limit orders** on the pro interface; never the
+(0.40/0.60%). Use **limit orders** on the pro interface. Never the
 instant-buy widget (~1.5–2% effective fee).
 
 | Sleeve | Amount | What | Why |
 |--------|--------|------|-----|
 | Core | $20 | BTC | The only realistic return driver at this size is market beta |
 | Core | $10 | ETH | Diversifies the beta slightly |
-| Reserve | $20 | USDC, opt into exchange rewards (~4% APY) | Dry powder + the "boring baseline" every review compares against |
+| Reserve | $20 | USDC, opt into exchange rewards (~4% APY) | Dry powder and the "boring baseline" every review compares against |
 
-**Active sleeve — paper only for the first 4 weeks.** One decision per
+**Active sleeve: paper only for the first 4 weeks.** One decision per
 week: if BTC's Friday close is below its 20-week SMA, paper-rotate the
-core to USDC; if above, hold. Log every paper decision to the brain as
+core to USDC. If above, hold. Log every paper decision to the brain as
 `income:paper: <decision + prices>`. After 4 weeks, the review decides
 whether the paper sleeve earned real execution.
 
 ## Hard risk rules (non-negotiable until a review changes them)
 
 1. No leverage, margin, futures, or options. Ever, at this size.
-2. Exchange API keys get **query + trade permissions only — never
+2. Exchange API keys get **query and trade permissions only, never
    withdrawal**. Keys live in `.env` (gitignored), nowhere else.
 3. Maximum one real order per week (fee control).
 4. Universe is BTC, ETH, USDC only. Anything else needs an approved
@@ -55,10 +55,10 @@ whether the paper sleeve earned real execution.
 ## Setup steps (operator, ~30 minutes, one time)
 
 1. Create a Kraken account, complete KYC, enable 2FA.
-2. Deposit $50 (ACH is free; card deposits eat ~2%).
+2. Deposit $50 (ACH is free. Card deposits eat ~2%).
 3. On Kraken Pro, place limit orders: ~$20 BTC, ~$10 ETH. Convert the
    remaining ~$20 to USDC and opt into rewards.
-4. Create an API key with **Query Funds + Create/Modify Orders** only.
+4. Create an API key with **Query Funds and Create/Modify Orders** only.
    Store as `EXCHANGE_API_KEY` / `EXCHANGE_API_SECRET` in `.env`.
 5. Tell John-117 the entry prices on Telegram (or add a brain note
    prefixed `income: entry`) so the weekly review has a baseline.
@@ -81,11 +81,11 @@ logged so the same idea doesn't resurface without new evidence.
 ## Telegram interaction surface
 
 - **Describe a technique**: just ask John-117 ("explain funding-rate
-  arbitrage") — routed through the LLM proxy, citation rules apply.
-- **Research a technique**: ask for deep research; John-117 queues a
+  arbitrage"), routed through the LLM proxy, citation rules apply.
+- **Research a technique**: ask for deep research. John-117 queues a
   `research:tome: <topic>` task, and the local tome bridge runs it
   through `/tome:research`.
-- **Weekly review**: arrives as a `[DRAFT]`; reply to approve/adjust.
+- **Weekly review**: arrives as a `[DRAFT]`. Reply to approve/adjust.
 - Planned (not built): `!income status` proxy command family.
 
 ## Reevaluation triggers (outside the weekly cadence)

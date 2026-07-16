@@ -1,22 +1,22 @@
 # Configure ClawRange for Your Business
 
 ClawRange ships as a **pull-down-and-configure template**. Everything that
-is specific to one operator — the assistant's persona, what it tracks, where
-it pulls data from, and what CRM it writes to — lives in a single declarative
+is specific to one operator (the assistant's persona, what it tracks, where
+it pulls data from, and what CRM it writes to) lives in a single declarative
 **tenant profile** (`config/profiles/<name>/profile.yaml`). The reusable
 machinery (connectors, CRM adapters, query execution) lives in code and is
 shared by every profile.
 
 Three profiles ship in the box, all identity-free:
 
-- **`starter`** — the default (`CLAWRANGE_PROFILE` unset → `starter`). A
+- **`starter`**: the default (`CLAWRANGE_PROFILE` unset → `starter`). A
   generic, identity-free baseline so a fresh clone runs without carrying
-  anyone's personal data. Empty seeds; the persona renders from
+  anyone's personal data. Empty seeds. The persona renders from
   `openclaw/soul.template.md`.
-- **`marketing`** — a worked content-marketing example with a verbatim
+- **`marketing`**: a worked content-marketing example with a verbatim
   John-117 persona and example open-source projects/schedules. Edit it to
   point at your own products.
-- **`lead-crm`** — a worked business example: an assistant that hourly syncs
+- **`lead-crm`**: a worked business example: an assistant that hourly syncs
   leads from a web portal into a local CRM and answers relational and
   time-series questions about them on a schedule or via a Telegram prompt.
 
@@ -27,7 +27,7 @@ identity never gets committed.
 ```bash
 cp -r config/profiles/lead-crm config/profiles/acme
 $EDITOR config/profiles/acme/profile.yaml      # set profile: acme
-make profile PROFILE=acme                        # render soul.md + set .env
+make profile PROFILE=acme                        # render soul.md and set .env
 ```
 
 ## 1. The profile at a glance
@@ -44,7 +44,7 @@ crm: {...}               # backend adapter + named query templates
 
 `${VAR}` tokens in any value are resolved from the environment at load time.
 An **unset variable resolves to `""`** and the affected connector or CRM is
-treated as *unconfigured* — it logs a warning and is skipped rather than
+treated as *unconfigured*. It logs a warning and is skipped rather than
 crashing boot. Put real secrets in `.env` (see `.env.example`), never in the
 committed profile.
 
@@ -54,7 +54,7 @@ Two ways to define the persona:
 
 - **Structured** (recommended for new tenants): set `name`, `role`,
   `owner.{name,org,context}`, and `capabilities: [...]`. The generic
-  `openclaw/soul.template.md` is filled from these fields — you write data,
+  `openclaw/soul.template.md` is filled from these fields. You write data,
   not prose.
 - **Verbatim**: set `assistant.persona_markdown` to a full markdown body and
   it is used as-is (the `marketing` profile does this to preserve John-117
@@ -69,10 +69,10 @@ make profile PROFILE=acme
 The generic template and core never contain any one operator's identity, so
 nothing leaks between deployments.
 
-## 3. Connectors — getting data in
+## 3. Connectors: getting data in
 
 A connector is a `source → transform → sink` chain. Each stage names a
-**kind** the code registers; the profile supplies the parameters.
+**kind** the code registers. The profile supplies the parameters.
 
 ### Sources (`source.kind`)
 
@@ -99,7 +99,7 @@ auth:
 ```
 
 > JS-rendered portals that need a real browser are **out of scope** for the
-> bundled sources — see "Extending" below.
+> bundled sources (see "Extending" below).
 
 ### Transforms (`transform.kind`)
 
@@ -131,7 +131,7 @@ sink:
   upsert_key: email        # insert new / update existing on this key
 ```
 
-## 4. CRM — storing and querying
+## 4. CRM: storing and querying
 
 ```yaml
 crm:
@@ -146,20 +146,20 @@ crm:
 The pipeline and query layers only ever talk to the `CRMAdapter` interface,
 so switching backends is a one-line profile change:
 
-- **`sqlite`** (default): a fully local, offline, relational + time-series
+- **`sqlite`** (default): a fully local, offline, relational and time-series
   store. Supports `run_template` (read-only SQL) for analytics.
 - **`rest`**: a documented seam stub. `upsert`/`list` map to the profile's
-  `objects` endpoints over HTTP; `run_template` raises a clear error because
+  `objects` endpoints over HTTP. `run_template` raises a clear error because
   SaaS CRMs don't run ad-hoc SQL (define a server-side report and map it in).
 
 To plug in a brand-new CRM, implement `CRMAdapter` in
 `workflows/crm/<your>_adapter.py` and register it in `crm/adapter.py`'s
 `get_adapter`.
 
-### Query templates — the only way the LLM touches data
+### Query templates: the only way the LLM touches data
 
 The LLM **never writes SQL**. It only *selects* a named template and fills
-its parameters; the SQL is authored by you and executed read-only. Each
+its parameters. The SQL is authored by you and executed read-only. Each
 template has a `name`, `description`, typed `params`, and `sql`:
 
 ```yaml
@@ -176,7 +176,7 @@ Param types: `duration` (e.g. `7d`, `24h` → binds `:since`), `enum`
 
 ## 5. Schedules and generators
 
-Standing jobs live under `seeds.schedules`; each names a **generator kind**:
+Standing jobs live under `seeds.schedules`. Each names a **generator kind**:
 
 | kind | does |
 |------|------|
@@ -203,14 +203,14 @@ referencing an undefined connector all raise a `ProfileError` immediately.
 
 ## 6. HTTP API (mounted only when the profile defines `crm`)
 
-| method + path | purpose |
+| method and path | purpose |
 |---------------|---------|
 | `POST /crm/query` `{prompt}` | NL question → `{answer, template, params, rows}` |
 | `POST /crm/query/run` `{template, params}` | run a template directly |
 | `GET  /crm/templates` | list available templates |
 | `GET  /crm/leads?status=&limit=` | list leads |
 | `POST /crm/sync/{connector_id}` | run a connector now |
-| `GET  /healthz/crm` | adapter health + configured connectors |
+| `GET  /healthz/crm` | adapter health and configured connectors |
 
 A marketing-only deployment exposes none of these.
 
@@ -233,9 +233,9 @@ path to keep the demo database outside the container.
   the kind in `tenant_profile.KNOWN_*_KINDS` so profiles fail fast.
 - **New CRM backend**: implement `CRMAdapter`, register in `get_adapter`.
 - **New generator**: add it to `workflows/generators.py` and the `GENERATORS`
-  registry; reference it by `kind` in a schedule.
+  registry. Reference it by `kind` in a schedule.
 - **Browser scraping** (JS-rendered portals): out of scope for the bundled
-  sources; add a `headless` source kind backed by the chrome tooling.
+  sources. Add a `headless` source kind backed by the chrome tooling.
 
 ## 9. Persona & meta-learning
 
@@ -252,21 +252,21 @@ assistant:
   name: "Max"
   identity:
     name: "Max"            # defaults to assistant.name when omitted
-    creature: "Chief of Staff — strategic AI operator"
+    creature: "Chief of Staff: strategic AI operator"
     vibe: "Sharp, direct, calm under pressure."
     emoji: "🎯"
     avatar: ""             # workspace-relative path, URL, or data URI
 ```
 
-`identity` is optional — profiles without it (e.g. `starter`) render no
+`identity` is optional. Profiles without it (e.g. `starter`) render no
 `IDENTITY.md`, exactly as before. Unknown identity keys fail validation at
 load, so a typo never reaches runtime.
 
 ### The meta-learning loop
 
-The assistant proposes persona enhancements; you approve them; approved
+The assistant proposes persona enhancements. You approve them. Approved
 enhancements are appended to the rendered persona under a `## Learned`
-region and persisted. Nothing is applied without approval — the same posture
+region and persisted. Nothing is applied without approval, the same posture
 as outward-facing actions.
 
 - **Give feedback:** `!persona lead with the recommendation` (or the
@@ -276,8 +276,8 @@ as outward-facing actions.
   run the same pass on a cadence (see the `chief-of-staff` profile's
   `seeds.schedules`).
 - **Approve / reject:** `POST /persona/proposals/<id>/approve` (or
-  `/reject`). Approval re-renders the persona; rejection drops the proposal.
-  Proposals and approvals are scoped to the active profile — one tenant
+  `/reject`). Approval re-renders the persona. Rejection drops the proposal.
+  Proposals and approvals are scoped to the active profile. One tenant
   cannot approve another's drafts.
 - **Inspect:** `GET /persona/proposals?status=pending`,
   `GET /persona/identity`, `GET /persona/soul`, and `GET /healthz/persona`.
@@ -294,7 +294,7 @@ make persona-export PROFILE=chief-of-staff
 This writes `config/profiles/chief-of-staff/learned.yaml`. On boot,
 `seed_from_profile` reads that overlay back into the brain (a bad or partial
 overlay is skipped with a warning, never crashing boot), so the file and the
-live store stay in sync — edit either side and re-export/re-seed.
+live store stay in sync. Edit either side and re-export/re-seed.
 
 > Outcome-signal proposals (the assistant noticing recurring corrections on
-> its own) are off by default; set `PERSONA_SIGNAL_LEARNING=1` to enable them.
+> its own) are off by default. Set `PERSONA_SIGNAL_LEARNING=1` to enable them.

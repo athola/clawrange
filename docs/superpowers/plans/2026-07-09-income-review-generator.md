@@ -4,24 +4,24 @@
 
 **Goal:** A weekly `income_review` scheduler generator that enqueues a `[DRAFT] income: weekly strategy review` task and pings Telegram, so the $50 crypto testbed gets reevaluated every Sunday without any autonomous trading.
 
-**Architecture:** One new async generator in `workflows/generators.py`, registered in `GENERATORS`, mirroring `research_pulse_generator` (idempotent enqueue into the existing brain task queue). Scheduling itself uses the existing `/sched` API at runtime — no scheduler changes.
+**Architecture:** One new async generator in `workflows/generators.py`, registered in `GENERATORS`, mirroring `research_pulse_generator` (idempotent enqueue into the existing brain task queue). Scheduling itself uses the existing `/sched` API at runtime. No scheduler changes.
 
-**Tech Stack:** Python 3.11, FastAPI service internals (`brain_db`, `telegram.notify`), pytest + pytest-asyncio.
+**Tech Stack:** Python 3.11, FastAPI service internals (`brain_db`, `telegram.notify`), pytest and pytest-asyncio.
 
 ## Global Constraints
 
 - Work happens on branch `income-loop` (current branch `variable-config` is scope-guard RED).
-- The generator must never place trades or call exchanges — it only enqueues a `[DRAFT]` task (spec: "No autonomous execution").
-- Telegram failure must not lose the task: enqueue first, notify second; `notify` never raises.
+- The generator must never place trades or call exchanges. It only enqueues a `[DRAFT]` task (spec: "No autonomous execution").
+- Telegram failure must not lose the task: enqueue first, notify second. `notify` never raises.
 - New generator must be added to the `GENERATORS` registry (CLAUDE.md convention).
-- Tests live in `workflows/tests/`; run with `cd workflows && python -m pytest tests/test_income_review.py -v`.
+- Tests live in `workflows/tests/`. Run with `cd workflows && python -m pytest tests/test_income_review.py -v`.
 
 ---
 
 ### Task 1: `income_review_generator`
 
 **Files:**
-- Modify: `workflows/generators.py` (new function above the `GENERATORS` dict; new registry entry)
+- Modify: `workflows/generators.py` (new function above the `GENERATORS` dict, and a new registry entry)
 - Test: `workflows/tests/test_income_review.py` (create)
 
 **Interfaces:**
@@ -101,7 +101,7 @@ async def test_task_survives_telegram_failure(monkeypatch):
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `cd workflows && python -m pytest tests/test_income_review.py -v`
-Expected: FAIL — `AssertionError` on registry test and `AttributeError: module 'generators' has no attribute 'income_review_generator'` on the rest.
+Expected: FAIL. `AssertionError` on registry test and `AttributeError: module 'generators' has no attribute 'income_review_generator'` on the rest.
 
 - [ ] **Step 3: Write the minimal implementation**
 
@@ -176,7 +176,7 @@ git commit -m "feat(income): weekly income_review generator enqueues draft strat
 
 Once the stack is up, schedule it for Sundays 16:00 (container-local
 time, America/Chicago). Note: cron fields pass straight to APScheduler,
-where numeric day-of-week `0` means Monday — always use the `sun` name:
+where numeric day-of-week `0` means Monday. Always use the `sun` name:
 
 ```bash
 curl -sX POST localhost:5678/sched -H 'content-type: application/json' \

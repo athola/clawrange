@@ -14,7 +14,7 @@ state.
 
 ### Goals
 - Identity (name, creature, vibe, emoji, avatar) becomes a first-class,
-  profile-driven, per-user configuration — not runtime-only state.
+  profile-driven, per-user configuration, not runtime-only state.
 - A meta-learning loop where the assistant proposes persona/identity
   enhancements, gated by operator approval, and those approved enhancements
   persist and feed back into the rendered persona.
@@ -26,9 +26,9 @@ state.
 ### Non-goals
 - No autonomous, un-approved persona changes (the project posture is
   "never an irreversible/outward action without explicit approval").
-- No new always-on services; APScheduler stays single-process / single
+- No new always-on services. APScheduler stays single-process / single
   uvicorn worker.
-- No replacement of the existing profile system — this extends it.
+- No replacement of the existing profile system. This extends it.
 
 ## 2. Existing System (what we build on)
 
@@ -37,7 +37,7 @@ state.
   `persona_markdown`). `CLAWRANGE_PROFILE` selects the active profile.
 - `workflows/persona.py` renders `openclaw/soul.template.md` →
   `openclaw/soul.md` at setup (`make profile`).
-- `workflows/tenant_profile.py` loads/validates/env-resolves the profile;
+- `workflows/tenant_profile.py` loads/validates/env-resolves the profile.
   `seed_from_profile` seeds projects/schedules into the brain.
 - Two persona surfaces exist:
   - `openclaw/soul.md` → mounted read-only as the **config-level persona**.
@@ -46,23 +46,23 @@ state.
     what was hand-edited for Max.
 
 The tension this design resolves: "others pull the repo and configure"
-needs git-tracked files; "the assistant evolves" happens in gitignored
+needs git-tracked files. "The assistant evolves" happens in gitignored
 runtime state. The **learned overlay** bridges them.
 
-## 3. Architecture (Approach 1 + benefits of 2 and 3)
+## 3. Architecture (Approach 1 and benefits of 2 and 3)
 
 Three layers, all extending the profile system:
 
 1. **Config (static, git-tracked).** `profile.yaml` gains an `identity`
    block. A new `openclaw/identity.template.md` renders `IDENTITY.md`.
 2. **Learning store (dynamic).** A brain-backed `persona_learnings` table is
-   the live store; `config/profiles/<name>/learned.yaml` is its
+   the live store. `config/profiles/<name>/learned.yaml` is its
    git-exportable projection (seed-on-boot, export-on-commit). *(Benefit
    from Approach 3: brain is the dynamic source of truth at runtime.)*
-3. **Render composition.** `compose(base + approved learnings)` writes the
+3. **Render composition.** `compose(base and approved learnings)` writes the
    agent's read surfaces **non-destructively**: the base template
    regenerates, and a marked `## Learned` region accumulates approved
-   enhancements. *(Benefit from Approach 2: identity genuinely grows; the
+   enhancements. *(Benefit from Approach 2: identity genuinely grows. The
    "evolve your soul" feel is preserved, just reproducible and gated.)*
 
 ## 4. Data Model
@@ -110,9 +110,9 @@ assistant:
 ```
 
 `identity.name` defaults to `assistant.name` when omitted (no duplication
-required). Validation (in `tenant_profile.validate`): `identity` is optional;
-when present, `creature`/`vibe`/`emoji` are strings; `emoji` length-capped;
-unknown identity keys rejected (fail fast at load, per project convention).
+required). Validation (in `tenant_profile.validate`): `identity` is optional.
+When present, `creature`/`vibe`/`emoji` are strings. `emoji` length-capped.
+Unknown identity keys rejected (fail fast at load, per project convention).
 
 ## 6. Components
 
@@ -121,13 +121,13 @@ unknown identity keys rejected (fail fast at load, per project convention).
   `write_identity(...)`, and a `render_all(profile, targets)` that writes the
   configured render targets atomically.
 - `workflows/persona_learning.py` *(new)*: `propose()`, `list_proposals()`,
-  `approve()`, `reject()`, `apply_approved()` (append to brain + trigger
+  `approve()`, `reject()`, `apply_approved()` (append to brain and trigger
   re-render), `export_overlay()`, `seed_overlay()`.
 - `workflows/persona_api.py` *(new router, mounted in `app.py`)*:
   - `POST /persona/propose {kind, target, content, source}` → store pending
-    + create `[DRAFT]` task + Telegram notice
+    + create `[DRAFT]` task and Telegram notice
   - `GET  /persona/proposals?status=&profile=`
-  - `POST /persona/proposals/{id}/approve` → apply + re-render
+  - `POST /persona/proposals/{id}/approve` → apply and re-render
   - `POST /persona/proposals/{id}/reject`
   - `POST /persona/reflect` → on-demand reflection (source=reflect)
   - `POST /persona/render` → re-render current profile to targets
@@ -151,7 +151,7 @@ Two write contexts:
   extended (it already renders `soul.md`) to also render `identity.md` and
   the workspace files under
   `data/openclaw-state/workspace*/{SOUL,IDENTITY}.md`. Host has full write
-  access; no container change needed for setup. (`make persona` may be added
+  access. No container change needed for setup. (`make persona` may be added
   as a clearer alias for this render step.)
 - **Runtime approval** (workflows container): on approve, re-render must
   reach the agent's read surfaces. The workflows service gets a **scoped
@@ -168,11 +168,11 @@ Prior render is left intact on any failure.
 ## 8. Data Flow (end-to-end)
 
 1. **Setup:** `make profile PROFILE=chief-of-staff` (extended render) → load
-   profile + `learned.yaml` → render `soul.md` + `IDENTITY.md` + workspace
+   profile and `learned.yaml` → render `soul.md`, `IDENTITY.md`, and workspace
    files → seed `persona_learnings` (approved rows) into the brain.
 2. **Feedback:** operator says e.g. "lead with the recommendation" →
-   `!persona` command → `POST /persona/propose` → pending row + `[DRAFT]`
-   task + Telegram notice.
+   `!persona` command → `POST /persona/propose` → pending row, `[DRAFT]`
+   task, and Telegram notice.
 3. **Approve:** `POST /persona/proposals/{id}/approve` (or `!persona approve
    <id>`) → mark approved in brain → append to learned overlay → atomic
    re-render of targets → confirmation.
@@ -184,39 +184,39 @@ Prior render is left intact on any failure.
 
 ## 9. Error Handling
 
-- Proposal validation: `kind ∈ {identity, persona}`; for `identity`, `target`
-  in the identity-field allowlist; content size cap → `400`.
+- Proposal validation: `kind ∈ {identity, persona}`. For `identity`, `target`
+  in the identity-field allowlist. Content size cap → `400`.
 - Brain-write failure → `503`, no partial state.
-- Atomic render with rollback (section 7); unwritable target → approval
+- Atomic render with rollback (section 7). Unwritable target → approval
   recorded, response names the failed target.
-- Approve/reject idempotent; deciding an already-decided proposal is a no-op
+- Approve/reject idempotent. Deciding an already-decided proposal is a no-op
   returning current state.
-- Missing runtime mount → setup-time render still works; runtime re-render
+- Missing runtime mount → setup-time render still works. Runtime re-render
   degrades to "approved, pending next render".
 - Profile load failure never crashes boot (existing posture preserved).
 
 ## 10. Testing (TDD)
 
-- `tests/test_persona.py` *(extend)*: render identity from profile;
-  `compose_*` merges approved learnings under `## Learned`; non-destructive
-  re-render preserves the Learned region; Max profile renders expected
-  identity + persona.
+- `tests/test_persona.py` *(extend)*: render identity from profile.
+  `compose_*` merges approved learnings under `## Learned`. Non-destructive
+  re-render preserves the Learned region. Max profile renders expected
+  identity and persona.
 - `tests/test_persona_learning.py` *(new)*: propose→list→approve/reject
-  lifecycle; approve appends overlay + marks brain; `export_overlay` /
-  `seed_overlay` round-trip symmetry; source tagging; size-cap rejection.
-- `tests/test_persona_api.py` *(new)*: auth gate; 400s; approve triggers
-  re-render (target writer mocked); `/persona/reflect` creates proposals;
+  lifecycle. Approve appends overlay and marks brain. `export_overlay` /
+  `seed_overlay` round-trip symmetry. Source tagging. Size-cap rejection.
+- `tests/test_persona_api.py` *(new)*: auth gate. 400s. Approve triggers
+  re-render (target writer mocked). `/persona/reflect` creates proposals.
   `/healthz/persona`.
-- `tests/test_profile.py` *(extend)*: identity block validation;
-  `chief-of-staff` profile loads + validates.
-- `generators`: `persona_reflect` is registered; scheduled-seed wiring.
-- Constraints honored: single uvicorn worker; no new always-on service.
+- `tests/test_profile.py` *(extend)*: identity block validation.
+  `chief-of-staff` profile loads and validates.
+- `generators`: `persona_reflect` is registered. Scheduled-seed wiring.
+- Constraints honored: single uvicorn worker. No new always-on service.
 
 ## 11. The Proven Example (Max)
 
 - `config/profiles/chief-of-staff/profile.yaml`: identity `{name: Max,
-  creature: "Chief of Staff — strategic AI operator", vibe: "...", emoji:
-  "🎯"}`; persona = Chief of Staff Mode principles; owner context for Alex.
+  creature: "Chief of Staff, strategic AI operator", vibe: "...", emoji:
+  "🎯"}`. Persona = Chief of Staff Mode principles. Owner context for Alex.
 - `config/profiles/chief-of-staff/learned.yaml`: 1–2 seeded example
   learnings (e.g. "lead with the recommendation") demonstrating the loop.
 - `docs/multi-tenant-guide.md` *(extend)*: a "Persona & meta-learning"
@@ -225,25 +225,25 @@ Prior render is left intact on any failure.
 
 ## 12. Compatibility & Migration
 
-- Existing profiles (`starter`, `lead-crm`, `marketing`) work unchanged —
-  `identity` is optional; absent `identity` → `IDENTITY.md` is not rendered
+- Existing profiles (`starter`, `lead-crm`, `marketing`) work unchanged.
+  `identity` is optional. Absent `identity` → `IDENTITY.md` is not rendered
   (current behavior). No DB migration beyond an additive
   `persona_learnings` table (created on `init_db` if missing).
 - The current hand-edited Max runtime files are superseded by the
-  `chief-of-staff` profile render; setup-time render regenerates them.
+  `chief-of-staff` profile render. Setup-time render regenerates them.
 
 ## 13. YAGNI Calls
 
 - *Outcome-signal* trigger ships minimal and flagged off by default.
-- *Export-to-yaml* round-trip is kept — it is what makes the system
+- *Export-to-yaml* round-trip is kept. It is what makes the system
   portable/reproducible for repo-pullers.
-- No web UI; approval is via API/command/Telegram draft (matches existing
+- No web UI. Approval is via API/command/Telegram draft (matches existing
   task-approval ergonomics).
 
 ## 14. Open Items for the Plan
 
 - Exact scoped rw mount for runtime render targets (narrow file mount vs.
-  workspace-dir mount) — choose narrowest that works.
+  workspace-dir mount). Choose narrowest that works.
 - Whether `openclaw/identity.md` should be a new RO config-level mount the
   agent reads, in addition to workspace `IDENTITY.md`.
 - Reflection prompt design for the `persona_reflect` generator (must route
