@@ -16,6 +16,7 @@ import pytest  # noqa: E402
 @pytest.fixture()
 def client():
     from fastapi.testclient import TestClient
+
     from app import app
 
     return TestClient(app)
@@ -52,7 +53,8 @@ def _reset_brain_db():
     try:
         brain_db._conn.execute("DELETE FROM pages_fts")
         brain_db._conn.execute(
-            "INSERT INTO pages_fts(slug, title, compiled) SELECT slug, title, compiled FROM pages"
+            "INSERT INTO pages_fts(slug, title, compiled) "
+            "SELECT slug, title, compiled FROM pages"
         )
     except Exception:
         pass

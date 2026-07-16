@@ -8,7 +8,7 @@ fires before the operator wires script-app credentials.
 
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import httpx
 from pydantic import BaseModel
@@ -118,7 +118,7 @@ async def search_subreddits(
     creds = _get_credentials()
     time_filter = _parse_since(since)
     since_hours = _parse_since_hours(since)
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+    cutoff = datetime.now(UTC) - timedelta(hours=since_hours)
 
     seen_ids: set[str] = set()
     results: list[RedditPost] = []
@@ -142,7 +142,7 @@ async def search_subreddits(
                         continue
                     seen_ids.add(post.id)
 
-                    created = datetime.fromtimestamp(post.created_utc, tz=timezone.utc)
+                    created = datetime.fromtimestamp(post.created_utc, tz=UTC)
                     if created < cutoff:
                         continue
 
@@ -197,7 +197,7 @@ async def search_all(
     user_agent = os.getenv("REDDIT_USER_AGENT", "clawrange-marketing-bot/0.1")
     time_filter = _parse_since(since)
     since_hours = _parse_since_hours(since)
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+    cutoff = datetime.now(UTC) - timedelta(hours=since_hours)
 
     seen_ids: set[str] = set()
     results: list[RedditPost] = []
@@ -233,7 +233,7 @@ async def search_all(
             continue
         seen_ids.add(pid)
 
-        created = datetime.fromtimestamp(d.get("created_utc", 0) or 0, tz=timezone.utc)
+        created = datetime.fromtimestamp(d.get("created_utc", 0) or 0, tz=UTC)
         if created < cutoff:
             continue
 
@@ -276,7 +276,7 @@ async def _public_search(
     user_agent = os.getenv("REDDIT_USER_AGENT", "clawrange-marketing-bot/0.1")
     time_filter = _parse_since(since)
     since_hours = _parse_since_hours(since)
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+    cutoff = datetime.now(UTC) - timedelta(hours=since_hours)
 
     seen_ids: set[str] = set()
     results: list[RedditPost] = []
@@ -316,9 +316,7 @@ async def _public_search(
                     continue
                 seen_ids.add(pid)
 
-                created = datetime.fromtimestamp(
-                    d.get("created_utc", 0) or 0, tz=timezone.utc
-                )
+                created = datetime.fromtimestamp(d.get("created_utc", 0) or 0, tz=UTC)
                 if created < cutoff:
                     continue
 

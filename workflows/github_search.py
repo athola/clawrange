@@ -6,7 +6,7 @@ for self-repo analytics. Gracefully degrades when credentials are missing.
 
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from pydantic import BaseModel
 
@@ -164,7 +164,7 @@ async def get_self_traffic(owner: str, repo: str) -> GitHubTrafficSnapshot | Non
             views_uniques=views_data.uniques or 0,
             clones_count=clones_data.count or 0,
             clones_uniques=clones_data.uniques or 0,
-            fetched_at=datetime.now(timezone.utc).isoformat(),
+            fetched_at=datetime.now(UTC).isoformat(),
         )
     except Exception as exc:
         logger.warning("GitHub traffic fetch failed for %s/%s: %s", owner, repo, exc)

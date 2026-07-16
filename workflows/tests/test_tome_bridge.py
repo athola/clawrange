@@ -13,7 +13,6 @@ from pathlib import Path
 
 import pytest
 
-
 # Ensure scripts/ is importable.
 _SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 sys.path.insert(0, str(_SCRIPTS))

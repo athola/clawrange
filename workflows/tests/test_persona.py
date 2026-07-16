@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pathlib
 
-from tenant_profile import Profile, load_profile
 from persona import render_persona, write_soul
+from tenant_profile import Profile, load_profile
 
 
 def _real_profiles_dir():
@@ -89,8 +89,8 @@ def test_marketing_render_contains_john117():
 
 
 def test_render_identity_fills_fields_and_defaults_name():
-    from tenant_profile import Profile
     from persona import render_identity
+    from tenant_profile import Profile
 
     p = Profile(
         name="t",
@@ -126,8 +126,8 @@ def test_write_soul_round_trips(tmp_path):
 
 
 def test_compose_appends_learned_region_and_is_non_destructive():
-    from tenant_profile import Profile
     from persona import compose_persona
+    from tenant_profile import Profile
 
     p = Profile(name="t", raw={"profile": "t", "assistant": {"name": "Max"}})
     learnings = [
@@ -147,8 +147,8 @@ def test_compose_appends_learned_region_and_is_non_destructive():
 
 
 def test_render_all_writes_targets(tmp_path):
-    from tenant_profile import Profile
     from persona import render_all
+    from tenant_profile import Profile
 
     p = Profile(name="t", raw={"profile": "t", "assistant": {"name": "Max"}})
     soul = tmp_path / "soul.md"

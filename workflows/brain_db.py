@@ -9,12 +9,12 @@ import os
 import re
 import sqlite3
 import uuid
-from datetime import datetime, timedelta, timezone
-from enum import Enum
+from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import Any
 
 
-class PageType(str, Enum):
+class PageType(StrEnum):
     CLIENT = "client"
     SYSTEM = "system"
     INCIDENT = "incident"
@@ -25,7 +25,7 @@ class PageType(str, Enum):
     PROJECT = "project"
 
 
-class LinkType(str, Enum):
+class LinkType(StrEnum):
     REFERENCES = "references"
     PARENT_OF = "parent_of"
     INCIDENT_OF = "incident_of"
@@ -35,7 +35,7 @@ class LinkType(str, Enum):
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _content_hash(title: str, compiled: str) -> str:
@@ -311,7 +311,8 @@ class BrainDB:
 
             CREATE TABLE IF NOT EXISTS research_findings (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id   TEXT NOT NULL REFERENCES research_sessions(id) ON DELETE CASCADE,
+                session_id   TEXT NOT NULL REFERENCES research_sessions(id)
+                ON DELETE CASCADE,
                 source       TEXT NOT NULL,
                 channel      TEXT NOT NULL,
                 title        TEXT NOT NULL DEFAULT '',
@@ -352,7 +353,9 @@ class BrainDB:
         if self._has_vec:
             conn.execute(f"""
                 CREATE VIRTUAL TABLE IF NOT EXISTS chunk_embeddings
-                    USING vec0(chunk_id INTEGER PRIMARY KEY, vector float[{EMBEDDING_DIM}])
+                    USING vec0(chunk_id INTEGER PRIMARY KEY, vector float[{
+                EMBEDDING_DIM
+            }])
             """)
 
         conn.commit()
@@ -364,7 +367,8 @@ class BrainDB:
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()
         fts = self._conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='view' OR (type='table' AND name LIKE '%fts%')"
+            "SELECT name FROM sqlite_master WHERE type='view' OR "
+            "(type='table' AND name LIKE '%fts%')"
         ).fetchall()
         return {r["name"] for r in rows} | {r["name"] for r in fts}
 
@@ -397,18 +401,21 @@ class BrainDB:
 
         if existing:
             self._conn.execute(
-                "UPDATE pages SET title=?, page_type=?, compiled=?, content_hash=?, updated_at=? WHERE slug=?",
+                "UPDATE pages SET title=?, page_type=?, compiled=?, "
+                "content_hash=?, updated_at=? WHERE slug=?",
                 (title, pt, compiled, chash, now, slug),
             )
         else:
             self._conn.execute(
-                "INSERT INTO pages (slug, title, page_type, compiled, content_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO pages (slug, title, page_type, compiled, "
+                "content_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (slug, title, pt, compiled, chash, now, now),
             )
 
         # Always record a version for the new content
         self._conn.execute(
-            "INSERT INTO page_versions (page_slug, compiled, content_hash, created_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO page_versions (page_slug, compiled, "
+            "content_hash, created_at) VALUES (?, ?, ?, ?)",
             (slug, compiled, chash, now),
         )
 
@@ -441,7 +448,8 @@ class BrainDB:
         if page_type:
             pt = page_type.value if isinstance(page_type, PageType) else page_type
             rows = self._conn.execute(
-                "SELECT * FROM pages WHERE page_type = ? ORDER BY updated_at DESC LIMIT ?",
+                "SELECT * FROM pages WHERE page_type = ? "
+                "ORDER BY updated_at DESC LIMIT ?",
                 (pt, limit),
             ).fetchall()
         else:
@@ -489,13 +497,15 @@ class BrainDB:
         for idx, content in enumerate(chunks):
             chash = hashlib.sha256(content.encode()).hexdigest()
             existing = self._conn.execute(
-                "SELECT content_hash FROM content_chunks WHERE page_slug = ? AND chunk_index = ?",
+                "SELECT content_hash FROM content_chunks WHERE page_slug = ? "
+                "AND chunk_index = ?",
                 (slug, idx),
             ).fetchone()
 
             if existing and existing["content_hash"] == chash:
                 row = self._conn.execute(
-                    "SELECT * FROM content_chunks WHERE page_slug = ? AND chunk_index = ?",
+                    "SELECT * FROM content_chunks WHERE page_slug = ? "
+                    "AND chunk_index = ?",
                     (slug, idx),
                 ).fetchone()
                 result.append(self._row_to_dict(row))
@@ -531,7 +541,10 @@ class BrainDB:
     # ─── Embeddings (sqlite-vec) ─────────────────────────────────
 
     def store_embedding(self, chunk_id: int, vector: list[float]) -> bool:
-        """Store a vector embedding for a content chunk. Returns False if vec unavailable."""
+        """Store a vector embedding for a content chunk.
+
+        Returns False if vec unavailable.
+        """
         if not self._has_vec:
             return False
         import struct
@@ -605,7 +618,8 @@ class BrainDB:
     ) -> dict[str, Any]:
         now = _now()
         cursor = self._conn.execute(
-            "INSERT INTO timeline (page_slug, content, source, created_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO timeline (page_slug, content, source, created_at) "
+            "VALUES (?, ?, ?, ?)",
             (page_slug, content, source, now),
         )
         self._conn.commit()
@@ -616,7 +630,8 @@ class BrainDB:
 
     def get_timeline(self, page_slug: str, limit: int = 50) -> list[dict[str, Any]]:
         rows = self._conn.execute(
-            "SELECT * FROM timeline WHERE page_slug = ? ORDER BY created_at DESC LIMIT ?",
+            "SELECT * FROM timeline WHERE page_slug = ? "
+            "ORDER BY created_at DESC LIMIT ?",
             (page_slug, limit),
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
@@ -723,7 +738,8 @@ class BrainDB:
         lt = link_type.value if isinstance(link_type, LinkType) else link_type
         try:
             cursor = self._conn.execute(
-                "INSERT INTO links (from_slug, to_slug, link_type, created_at) VALUES (?, ?, ?, ?)",
+                "INSERT INTO links (from_slug, to_slug, link_type, created_at) "
+                "VALUES (?, ?, ?, ?)",
                 (from_slug, to_slug, lt, now),
             )
             self._conn.commit()
@@ -741,7 +757,8 @@ class BrainDB:
 
     def get_links(self, slug: str) -> list[dict[str, Any]]:
         rows = self._conn.execute(
-            "SELECT * FROM links WHERE from_slug = ? OR to_slug = ? ORDER BY created_at DESC",
+            "SELECT * FROM links WHERE from_slug = ? OR to_slug = ? "
+            "ORDER BY created_at DESC",
             (slug, slug),
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
@@ -833,7 +850,9 @@ class BrainDB:
             return row["id"]
         cursor = self._conn.execute("INSERT INTO tags (name) VALUES (?)", (name,))
         self._conn.commit()
-        return cursor.lastrowid
+        rowid = cursor.lastrowid
+        assert rowid is not None, "INSERT produced no rowid"
+        return rowid
 
     def set_tags(self, page_slug: str, tag_names: list[str]) -> list[str]:
         # Remove existing tags
@@ -892,11 +911,14 @@ class BrainDB:
         task_id = str(uuid.uuid4())[:8]
         priority = max(1, min(5, priority))
         self._conn.execute(
-            "INSERT INTO tasks (id, description, priority, status, source, created_at) VALUES (?, ?, ?, 'pending', ?, ?)",
+            "INSERT INTO tasks (id, description, priority, status, source, created_at) "
+            "VALUES (?, ?, ?, 'pending', ?, ?)",
             (task_id, description, priority, source, now),
         )
         self._conn.commit()
-        return self.get_task(task_id)
+        result = self.get_task(task_id)
+        assert result is not None, "task not found after write"
+        return result
 
     def get_task(self, task_id: str) -> dict[str, Any] | None:
         row = self._conn.execute(
@@ -907,12 +929,14 @@ class BrainDB:
     def list_tasks(self, status: str | None = None) -> list[dict[str, Any]]:
         if status:
             rows = self._conn.execute(
-                "SELECT * FROM tasks WHERE status = ? ORDER BY priority ASC, created_at ASC",
+                "SELECT * FROM tasks WHERE status = ? "
+                "ORDER BY priority ASC, created_at ASC",
                 (status,),
             ).fetchall()
         else:
             rows = self._conn.execute(
-                "SELECT * FROM tasks ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'active' THEN 1 ELSE 2 END, priority ASC, created_at ASC"
+                "SELECT * FROM tasks ORDER BY CASE status WHEN 'pending' THEN 0 "
+                "WHEN 'active' THEN 1 ELSE 2 END, priority ASC, created_at ASC"
             ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
@@ -926,7 +950,9 @@ class BrainDB:
             "UPDATE tasks SET status = 'active' WHERE id = ?", (task_id,)
         )
         self._conn.commit()
-        return self.get_task(task_id)
+        result = self.get_task(task_id)
+        assert result is not None, "task not found after write"
+        return result
 
     def complete_task(
         self, task_id: str, result: str, status: str = "completed"
@@ -939,7 +965,9 @@ class BrainDB:
             (status, result, now, task_id),
         )
         self._conn.commit()
-        return self.get_task(task_id)
+        updated = self.get_task(task_id)
+        assert updated is not None, "task not found after write"
+        return updated
 
     def update_priority(self, task_id: str, priority: int) -> dict[str, Any]:
         task = self.get_task(task_id)
@@ -950,7 +978,9 @@ class BrainDB:
             "UPDATE tasks SET priority = ? WHERE id = ?", (priority, task_id)
         )
         self._conn.commit()
-        return self.get_task(task_id)
+        result = self.get_task(task_id)
+        assert result is not None, "task not found after write"
+        return result
 
     def cancel_task(self, task_id: str) -> dict[str, Any]:
         task = self.get_task(task_id)
@@ -962,7 +992,9 @@ class BrainDB:
             "UPDATE tasks SET status = 'cancelled' WHERE id = ?", (task_id,)
         )
         self._conn.commit()
-        return self.get_task(task_id)
+        result = self.get_task(task_id)
+        assert result is not None, "task not found after write"
+        return result
 
     # ─── Projects (marketing orchestrator) ───────────────────────
 
@@ -990,7 +1022,8 @@ class BrainDB:
 
         now = _now()
         self._conn.execute(
-            """INSERT INTO projects (slug, owner, repo, topics, subreddits, search_terms, posture, created_at, updated_at)
+            """INSERT INTO projects (slug, owner, repo, topics, subreddits,
+               search_terms, posture, created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(slug) DO UPDATE SET
                  owner=excluded.owner, repo=excluded.repo,
@@ -1010,7 +1043,9 @@ class BrainDB:
             ),
         )
         self._conn.commit()
-        return self.get_project(slug)
+        result = self.get_project(slug)
+        assert result is not None, "project not found after write"
+        return result
 
     def delete_project(self, slug: str) -> bool:
         cursor = self._conn.execute("DELETE FROM projects WHERE slug = ?", (slug,))
@@ -1065,7 +1100,8 @@ class BrainDB:
 
         now = _now()
         self._conn.execute(
-            """INSERT INTO schedules (id, name, kind, cron, kwargs, created_at, updated_at)
+            """INSERT INTO schedules (id, name, kind, cron, kwargs,
+               created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(id) DO UPDATE SET
                  name=excluded.name, kind=excluded.kind,
@@ -1074,7 +1110,9 @@ class BrainDB:
             (schedule_id, name, kind, cron, json.dumps(kwargs or {}), now, now),
         )
         self._conn.commit()
-        return self.get_schedule(schedule_id)
+        result = self.get_schedule(schedule_id)
+        assert result is not None, "schedule not found after write"
+        return result
 
     def update_schedule_status(
         self, schedule_id: str, last_run: str, last_status: str
@@ -1108,7 +1146,8 @@ class BrainDB:
         self, kind: str, external_id: str, project_slug: str | None = None
     ) -> None:
         self._conn.execute(
-            """INSERT OR IGNORE INTO scan_cache (kind, external_id, project_slug, seen_at)
+            """INSERT OR IGNORE INTO scan_cache (kind, external_id,
+               project_slug, seen_at)
                VALUES (?, ?, ?, ?)""",
             (kind, external_id, project_slug, _now()),
         )
@@ -1119,12 +1158,14 @@ class BrainDB:
     ) -> bool:
         if project_slug is None:
             row = self._conn.execute(
-                "SELECT 1 FROM scan_cache WHERE kind=? AND external_id=? AND project_slug IS NULL",
+                "SELECT 1 FROM scan_cache WHERE kind=? AND external_id=? "
+                "AND project_slug IS NULL",
                 (kind, external_id),
             ).fetchone()
         else:
             row = self._conn.execute(
-                "SELECT 1 FROM scan_cache WHERE kind=? AND external_id=? AND project_slug=?",
+                "SELECT 1 FROM scan_cache WHERE kind=? AND external_id=? "
+                "AND project_slug=?",
                 (kind, external_id, project_slug),
             ).fetchone()
         return row is not None
@@ -1137,19 +1178,21 @@ class BrainDB:
         placeholders = ",".join("?" * len(external_ids))
         if project_slug is None:
             rows = self._conn.execute(
-                f"SELECT external_id FROM scan_cache WHERE kind=? AND project_slug IS NULL AND external_id IN ({placeholders})",
+                f"SELECT external_id FROM scan_cache WHERE kind=? "
+                f"AND project_slug IS NULL AND external_id IN ({placeholders})",
                 (kind, *external_ids),
             ).fetchall()
         else:
             rows = self._conn.execute(
-                f"SELECT external_id FROM scan_cache WHERE kind=? AND project_slug=? AND external_id IN ({placeholders})",
+                f"SELECT external_id FROM scan_cache WHERE kind=? "
+                f"AND project_slug=? AND external_id IN ({placeholders})",
                 (kind, project_slug, *external_ids),
             ).fetchall()
         seen = {r["external_id"] for r in rows}
         return [eid for eid in external_ids if eid not in seen]
 
     def prune_scan_cache(self, max_age_days: int = 14) -> int:
-        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
         cursor = self._conn.execute(
             "DELETE FROM scan_cache WHERE seen_at < ?", (cutoff.isoformat(),)
         )
@@ -1392,7 +1435,9 @@ class BrainDB:
             (lid, profile, kind, target, content, source, task_id, now),
         )
         self._conn.commit()
-        return self.get_learning(lid)
+        result = self.get_learning(lid)
+        assert result is not None, "learning not found after write"
+        return result
 
     def get_learning(self, learning_id: str) -> dict[str, Any] | None:
         row = self._conn.execute(
@@ -1423,4 +1468,6 @@ class BrainDB:
             (status, _now(), learning_id),
         )
         self._conn.commit()
-        return self.get_learning(learning_id)
+        result = self.get_learning(learning_id)
+        assert result is not None, "learning not found after write"
+        return result

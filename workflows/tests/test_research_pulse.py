@@ -8,7 +8,7 @@ gap server-side: when research has gone stale it enqueues a
 recognises and runs through the local ``/tome:research`` session.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -24,7 +24,7 @@ def _pending_descs() -> list[str]:
 
 def _backdate_latest_session(hours: int) -> None:
     """Push the most recent research session's created_at into the past."""
-    old = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    old = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
     sid = brain_db.list_research_sessions(limit=1)[0]["id"]
     brain_db._conn.execute(
         "UPDATE research_sessions SET created_at = ? WHERE id = ?", (old, sid)

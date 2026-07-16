@@ -4,7 +4,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -340,7 +340,7 @@ def test_webhook(body: dict[str, Any] = {}):
     return {
         "status": "ok",
         "message": f"received: {summary}",
-        "receivedAt": datetime.now(timezone.utc).isoformat(),
+        "receivedAt": datetime.now(UTC).isoformat(),
         "payloadKeys": keys,
         "echo": body,
     }
@@ -465,7 +465,7 @@ async def create_schedule(body: ScheduleCreate):
 
 @app.patch("/sched/{schedule_id}")
 async def update_schedule(schedule_id: str, body: SchedulePatch):
-    from scheduler import pause_schedule, resume_schedule, add_schedule
+    from scheduler import add_schedule, pause_schedule, resume_schedule
 
     if body.paused is not None:
         if body.paused:
@@ -573,7 +573,7 @@ async def scan_reddit(body: dict[str, Any]):
 
 @app.post("/scan/github")
 async def scan_github(body: dict[str, Any]):
-    from github_search import search_repos, search_issues, get_self_traffic
+    from github_search import get_self_traffic, search_issues, search_repos
 
     kind = body.get("kind", "repos")
 
@@ -594,7 +594,7 @@ async def scan_github(body: dict[str, Any]):
         raise HTTPException(status_code=400, detail="topic is required")
 
     if kind == "repos":
-        results = await search_repos(
+        results: list = await search_repos(
             topic,
             min_stars=body.get("min_stars", 0),
             language=body.get("language"),

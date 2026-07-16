@@ -22,8 +22,9 @@ def brain_db():
 @pytest.fixture
 def client(brain_db):
     """Create a TestClient with the brain router and test DB."""
-    from brain import create_brain_router
     from fastapi import FastAPI
+
+    from brain import create_brain_router
 
     app = FastAPI()
     router = create_brain_router(brain_db)

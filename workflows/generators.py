@@ -10,8 +10,9 @@ import json
 import logging
 import math
 import statistics
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
 if TYPE_CHECKING:
@@ -306,7 +307,7 @@ async def comment_draft_generator(
 
 
 def _matched_keywords(
-    post: "RedditPost", topics: list[str], terms: list[str]
+    post: RedditPost, topics: list[str], terms: list[str]
 ) -> list[str]:
     """Return up to two project keywords/terms that literally appear
     in the post's title or snippet, search_terms first since they
@@ -322,7 +323,7 @@ def _matched_keywords(
     return matches
 
 
-def _comment_angle(post: "RedditPost") -> str:
+def _comment_angle(post: RedditPost) -> str:
     """One-line 'why we should comment' framing based on engagement.
 
     The pulse and the digest both surface the post's URL — this is
@@ -338,7 +339,7 @@ def _comment_angle(post: "RedditPost") -> str:
 
 
 def _render_pick_lines(
-    post: "RedditPost",
+    post: RedditPost,
     topics: list[str],
     terms: list[str],
     is_bonus: bool,
@@ -364,7 +365,7 @@ def _render_pick_lines(
     ]
 
 
-def _score_relevance(post: "RedditPost", topics: list[str], terms: list[str]) -> float:
+def _score_relevance(post: RedditPost, topics: list[str], terms: list[str]) -> float:
     """Keyword-overlap relevance: title + snippet vs project topics/terms.
 
     Topics weight 1.0, search_terms weight 1.5 (terms are higher-signal,
@@ -455,7 +456,7 @@ async def morning_digest_generator(
     # Per-post-id best-fit map: rel + tiny sub-affinity bump for tiebreaks
     # so a sub-affinity-only post lands in the project that subscribes to
     # its subreddit, not one that doesn't.
-    best_for_post: dict[str, tuple[dict, "RedditPost", float, bool]] = {}
+    best_for_post: dict[str, tuple[dict, RedditPost, float, bool]] = {}
 
     # Record one search impression per (sub, project) pair this cycle —
     # gives the stats table a denominator for hit-rate analysis.
@@ -517,8 +518,8 @@ async def morning_digest_generator(
 
     # Group by project, separate strict (rel > 0) from popular-bonus
     # (rel == 0, sub-affinity, score >= adaptive threshold).
-    strict_by_project: dict[str, list[tuple["RedditPost", float]]] = {}
-    bonus_by_project: dict[str, list[tuple["RedditPost", float]]] = {}
+    strict_by_project: dict[str, list[tuple[RedditPost, float]]] = {}
+    bonus_by_project: dict[str, list[tuple[RedditPost, float]]] = {}
     for project, post, rel, sub_affinity in best_for_post.values():
         slug = project["slug"]
         if rel > 0:
@@ -530,7 +531,7 @@ async def morning_digest_generator(
 
     # Final picks per project: top_per_project strict, then up to
     # popular_bonus_cap bonus picks. is_bonus flag drives the ★ render.
-    picks_by_project: dict[str, list[tuple["RedditPost", bool]]] = {}
+    picks_by_project: dict[str, list[tuple[RedditPost, bool]]] = {}
     for project in projects:
         slug = project["slug"]
         strict = strict_by_project.get(slug, [])
@@ -564,7 +565,7 @@ async def morning_digest_generator(
     try:
         brain_db.update_schedule_status(
             "morning_digest",
-            datetime.now(timezone.utc).isoformat(),
+            datetime.now(UTC).isoformat(),
             (
                 f"ok ({sum(len(v) for v in picks_by_project.values())} picks, "
                 f"{sum(len(v) for v in emerging_picks_by_project.values())} emerging, "
@@ -636,7 +637,7 @@ async def _discover_emerging(
     projects: list[dict],
     project_sub_sets: dict[str, set[str]],
     cap_per_project: int = 2,
-) -> dict[str, list["RedditPost"]]:
+) -> dict[str, list[RedditPost]]:
     """Search /r/all for each project's first term; return posts in
     non-curated subreddits that pass the project's strict relevance
     filter, capped per project. Records each match as a stat hit so
@@ -644,7 +645,7 @@ async def _discover_emerging(
     """
     from reddit_search import search_all
 
-    out: dict[str, list["RedditPost"]] = {}
+    out: dict[str, list[RedditPost]] = {}
     for project in projects:
         slug = project["slug"]
         terms = json.loads(project.get("search_terms", "[]"))
@@ -664,7 +665,7 @@ async def _discover_emerging(
             continue
 
         curated = project_sub_sets.get(slug, set())
-        emerging: list[tuple["RedditPost", float]] = []
+        emerging: list[tuple[RedditPost, float]] = []
         for post in all_posts:
             sub_lower = post.subreddit.lower()
             if not sub_lower or sub_lower in curated:
@@ -828,7 +829,7 @@ async def hot_pulse_generator(
     from reddit_search import search_subreddits
     from telegram import notify
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     # Quiet-hours gate: skip Reddit + Telegram entirely when the
     # operator is asleep. Default 00:00-05:00 America/Chicago covers
@@ -923,7 +924,7 @@ async def hot_pulse_generator(
     # (>= 1.0 for keyword hits, 0.5 for Reddit-search-only baseline),
     # and the search query that brought the post back. The query
     # becomes the "category bucket" we group by in the render.
-    best_for_post: dict[str, tuple[dict, "RedditPost", float, str]] = {}
+    best_for_post: dict[str, tuple[dict, RedditPost, float, str]] = {}
 
     for project in projects:
         slug = project["slug"]
@@ -960,14 +961,14 @@ async def hot_pulse_generator(
     # brought the post). Each project block in the digest renders one
     # subsection per category so the operator sees which area is
     # currently active.
-    by_project_by_category: dict[str, dict[str, list[tuple["RedditPost", float]]]] = {}
+    by_project_by_category: dict[str, dict[str, list[tuple[RedditPost, float]]]] = {}
     for project, post, rel, query in best_for_post.values():
         slug = project["slug"]
         by_project_by_category.setdefault(slug, {}).setdefault(query, []).append(
             (post, rel)
         )
 
-    by_project: dict[str, list[tuple["RedditPost", float]]] = {}
+    by_project: dict[str, list[tuple[RedditPost, float]]] = {}
     for slug, cat_map in by_project_by_category.items():
         for cat_picks in cat_map.values():
             by_project.setdefault(slug, []).extend(cat_picks)
@@ -987,7 +988,7 @@ async def hot_pulse_generator(
     try:
         brain_db.update_schedule_status(
             "hot_pulse",
-            datetime.now(timezone.utc).isoformat(),
+            datetime.now(UTC).isoformat(),
             f"ok ({sum(len(v) for v in by_project.values())} picks)",
         )
     except Exception as exc:
@@ -1202,7 +1203,7 @@ async def pipeline_generator(
 
     profile = profile or load_profile()
     spec = profile.connector(connector)
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
 
     if spec is None:
         logger.warning("pipeline: connector %r not defined in profile", connector)
@@ -1263,7 +1264,7 @@ async def crm_digest_generator(
 
     profile = profile or load_profile()
     queries = queries or []
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
 
     adapter = _crm_for(profile, crm)
     if adapter is None:
@@ -1340,8 +1341,8 @@ def _hours_since(iso_ts: str | None) -> float:
     except ValueError:
         return float("inf")
     if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - ts).total_seconds() / 3600.0
+        ts = ts.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - ts).total_seconds() / 3600.0
 
 
 async def research_pulse_generator(
@@ -1434,7 +1435,7 @@ async def income_review_generator(brain_db, **kwargs) -> None:
 
 # ─── Registry ────────────────────────────────────────────────────────
 
-GENERATORS = {
+GENERATORS: dict[str, Callable[..., Any]] = {
     "morning_scan": morning_scan_generator,
     "morning_digest": morning_digest_generator,
     "hot_pulse": hot_pulse_generator,

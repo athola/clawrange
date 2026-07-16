@@ -32,6 +32,20 @@ repos:
         args: [--fix]
       - id: ruff-format
 
+  # Python typechecking. Runs the mypy pinned in uv.lock via `uv run` so the
+  # hook and `make typecheck` use the exact same version (no mirror drift).
+  # Whole-program check — cross-file type narrowing — so pass_filenames is
+  # false: mypy must see the entire tree, not just staged files.
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy (typecheck via uv)
+        entry: uv run mypy
+        language: system
+        types: [python]
+        pass_filenames: false
+        args: [workflows, scripts, tests]
+
   # Docker compose validation
   - repo: https://github.com/IamTheFij/docker-pre-commit
     rev: v3.0.1

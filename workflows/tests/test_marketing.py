@@ -2,6 +2,7 @@
 generators, scheduler, and marketing command parsing."""
 
 import json
+from datetime import UTC
 
 import pytest
 
@@ -1571,7 +1572,7 @@ class TestHotPulseGenerator:
         (default 15). On throttled fires the function does NOT call
         Reddit or Telegram — just updates schedule status so the
         operator can see the cron is alive."""
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
         from unittest.mock import AsyncMock
 
         import generators
@@ -1596,7 +1597,7 @@ class TestHotPulseGenerator:
         )
 
         # Pretend we delivered 5 minutes ago — within the 15min throttle.
-        recent = datetime.now(timezone.utc) - timedelta(minutes=5)
+        recent = datetime.now(UTC) - timedelta(minutes=5)
         monkeypatch.setattr(generators, "_LAST_HOT_PULSE_DELIVERY_AT", recent)
 
         search_mock = AsyncMock(return_value=[])
@@ -1616,7 +1617,7 @@ class TestHotPulseGenerator:
     async def test_hot_pulse_delivers_after_interval_elapses(self, monkeypatch):
         """After `min_delivery_interval_minutes` has passed since the
         last delivery, the next fire delivers normally."""
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
         from unittest.mock import AsyncMock
 
         import generators
@@ -1633,7 +1634,7 @@ class TestHotPulseGenerator:
         )
 
         # Last delivery 16 minutes ago — past the 15min throttle.
-        stale = datetime.now(timezone.utc) - timedelta(minutes=16)
+        stale = datetime.now(UTC) - timedelta(minutes=16)
         monkeypatch.setattr(generators, "_LAST_HOT_PULSE_DELIVERY_AT", stale)
 
         post = RedditPost(
@@ -1662,7 +1663,7 @@ class TestHotPulseGenerator:
         """An operator can tune the delivery interval at runtime via
         the schedule's kwargs (e.g. min_delivery_interval_minutes=5
         to revert to the old behavior)."""
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
         from unittest.mock import AsyncMock
 
         import generators
@@ -1679,7 +1680,7 @@ class TestHotPulseGenerator:
         )
 
         # 6 minutes ago — past a 5min override but within the 15min default.
-        recent = datetime.now(timezone.utc) - timedelta(minutes=6)
+        recent = datetime.now(UTC) - timedelta(minutes=6)
         monkeypatch.setattr(generators, "_LAST_HOT_PULSE_DELIVERY_AT", recent)
 
         post = RedditPost(
@@ -1711,7 +1712,7 @@ class TestHotPulseGenerator:
         owner. Otherwise the loser project picks it up on the next
         fire that's still within the lookback window (cross-project
         dedup leak)."""
-        from datetime import datetime, timezone
+        from datetime import datetime
         from unittest.mock import AsyncMock
 
         import generators
@@ -1746,7 +1747,7 @@ class TestHotPulseGenerator:
             subreddit="ClaudeAI",
             score=2,
             comments=0,
-            created_utc=datetime.now(timezone.utc).isoformat(),
+            created_utc=datetime.now(UTC).isoformat(),
         )
 
         async def fake_search(*a, **kw):
@@ -1768,24 +1769,24 @@ class TestHotPulseGenerator:
         falls inside the configured local-time window in
         America/Chicago. 07:30 UTC = 01:30 CST (winter, UTC-6) or
         02:30 CDT (summer, UTC-5); both are inside [0, 5)."""
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         from generators import _is_quiet_hours
 
-        winter_utc = datetime(2026, 1, 15, 7, 30, tzinfo=timezone.utc)
-        summer_utc = datetime(2026, 7, 15, 7, 30, tzinfo=timezone.utc)
+        winter_utc = datetime(2026, 1, 15, 7, 30, tzinfo=UTC)
+        summer_utc = datetime(2026, 7, 15, 7, 30, tzinfo=UTC)
         assert _is_quiet_hours(winter_utc, 0, 5, "America/Chicago") is True
         assert _is_quiet_hours(summer_utc, 0, 5, "America/Chicago") is True
 
     def test_is_quiet_hours_outside_window_chicago(self):
         """Returns False at noon UTC, which lands at 06:00 CST /
         07:00 CDT — outside the [0, 5) sleep window."""
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         from generators import _is_quiet_hours
 
-        winter_noon_utc = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
-        summer_noon_utc = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
+        winter_noon_utc = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
+        summer_noon_utc = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
         assert _is_quiet_hours(winter_noon_utc, 0, 5, "America/Chicago") is False
         assert _is_quiet_hours(summer_noon_utc, 0, 5, "America/Chicago") is False
 
@@ -1793,11 +1794,11 @@ class TestHotPulseGenerator:
         """End hour is exclusive: 05:00 CST = 11:00 UTC (winter) is
         already OUT of quiet hours so the */5 fire at 5:00am wakes
         the operator's pulse up immediately."""
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         from generators import _is_quiet_hours
 
-        five_am_cst_utc = datetime(2026, 1, 15, 11, 0, tzinfo=timezone.utc)
+        five_am_cst_utc = datetime(2026, 1, 15, 11, 0, tzinfo=UTC)
         assert _is_quiet_hours(five_am_cst_utc, 0, 5, "America/Chicago") is False
 
     @pytest.mark.asyncio
@@ -1872,7 +1873,7 @@ class TestHotPulseGenerator:
         (5am CST boundary), the next fire must run the normal flow:
         reset the in-quiet-hours flag, call Reddit, and (if posts found)
         deliver to Telegram."""
-        from datetime import datetime, timezone
+        from datetime import datetime
         from unittest.mock import AsyncMock
 
         import generators
@@ -1903,7 +1904,7 @@ class TestHotPulseGenerator:
             url="https://reddit.com/r/ClaudeAI/post_after_sleep",
             score=42,
             comments=5,
-            created_utc=datetime.now(timezone.utc).isoformat(),
+            created_utc=datetime.now(UTC).isoformat(),
         )
 
         async def fake_search(*a, **kw):
@@ -2259,7 +2260,7 @@ class TestRedditAdapter:
         returning an empty list. This keeps the morning_digest useful
         on a fresh deploy before the operator wires script-app creds."""
         import json as _json
-        from datetime import datetime, timezone
+        from datetime import datetime
         from unittest.mock import AsyncMock, patch
 
         import httpx
@@ -2268,7 +2269,7 @@ class TestRedditAdapter:
 
         assert not await is_configured()
 
-        now_ts = datetime.now(timezone.utc).timestamp()
+        now_ts = datetime.now(UTC).timestamp()
         payload = {
             "data": {
                 "children": [

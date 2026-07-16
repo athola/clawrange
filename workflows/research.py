@@ -23,12 +23,12 @@ import asyncio
 import logging
 import re
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 logger = logging.getLogger("clawrange.research")
 
-_CURRENT_YEAR = datetime.now(tz=timezone.utc).year
+_CURRENT_YEAR = datetime.now(tz=UTC).year
 
 # Same thresholds as tome.synthesis.merger
 _PUNCTUATION_RE = re.compile(r"[^\w\s]")
@@ -385,8 +385,9 @@ async def _fetch_academic(topic: str, **kwargs: Any) -> list[Finding]:
     individual academic-channel failures should not bubble out and
     cause the whole channel to be marked as a triangulation hole.
     """
-    import httpx
     import xml.etree.ElementTree as ET
+
+    import httpx
 
     limit = int(kwargs.get("limit", 5))
 

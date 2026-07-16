@@ -10,9 +10,10 @@ Tests the edge cases fixed in the review:
 Run with: pytest tests/test_validate_stack.py -v
 """
 
-import os
 import json
+import os
 import sys
+
 import pytest
 
 # Add project root so validate_stack can find PROJECT_ROOT correctly

@@ -11,8 +11,8 @@ import json
 import logging
 import os
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.jobstores.memory import MemoryJobStore
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 logger = logging.getLogger("clawrange.scheduler")
 

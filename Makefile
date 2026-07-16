@@ -92,7 +92,7 @@ persona-demo: ## Offline walkthrough of the persona meta-learning loop (PROFILE=
 	@python3 workflows/scripts/persona_demo.py $${PROFILE:-chief-of-staff}
 
 test-unit: ## Run Python unit tests (no containers needed)
-	@python3 -m pytest workflows/tests/ -v
+	@uv run pytest workflows/tests/ -v
 
 validate: ## Validate config files and project structure
 	@python3 tests/validate_stack.py
@@ -149,20 +149,37 @@ health: ## Quick health check (no test logic, just curl)
 
 # ─── Linting ─────────────────────────────────────────────────────
 
-.PHONY: lint format
+.PHONY: lint format format-fix typecheck py-lint
 
-lint: ## Run ShellCheck on scripts
+# Python tooling (ruff + mypy + pytest) is managed by uv via pyproject.toml +
+# uv.lock. `uv run` resolves the synced .venv automatically, so no manual
+# activation is needed and versions stay pinned to the lockfile.
+
+py-lint: ## Lint Python with ruff (uv managed)
+	@uv run ruff check .
+
+typecheck: ## Typecheck Python with mypy (uv managed)
+	@uv run mypy workflows scripts tests
+
+lint: ## Run all linters: ShellCheck (scripts) + ruff + mypy (Python)
 	@if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck scripts/*.sh && echo "All scripts pass ShellCheck"; \
+		shellcheck --severity=warning scripts/*.sh && echo "All scripts pass ShellCheck"; \
 	else \
 		echo "shellcheck not installed (skipping — install with: apt install shellcheck)"; \
 	fi
+	@uv run ruff check .
+	@uv run mypy workflows scripts tests
 
-format: ## Check YAML/JSON formatting
+format: ## Check formatting: YAML/JSON + ruff format (does not modify files)
 	@command -v yamllint >/dev/null 2>&1 && yamllint -d relaxed docker-compose.yml deerflow/config.yaml || echo "yamllint not installed (skipping)"
 	@for f in openclaw/config/openclaw.json; do \
 		python3 -m json.tool "$$f" > /dev/null && echo "OK: $$f" || echo "FAIL: $$f"; \
 	done
+	@uv run ruff format --check .
+
+format-fix: ## Apply ruff formatting + safe auto-fixes
+	@uv run ruff format .
+	@uv run ruff check --fix .
 
 # ─── Setup ────────────────────────────────────────────────────────
 

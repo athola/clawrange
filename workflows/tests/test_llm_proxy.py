@@ -1,7 +1,7 @@
 """Tests for the LLM proxy with three-tier fallback."""
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -159,7 +159,8 @@ class TestProxyTierFallback:
             {
                 "role": "assistant",
                 "content": (
-                    "I'm temporarily on pause \u2014 the free API tiers are rate-limited "
+                    "I'm temporarily on pause \u2014 the free API tiers are "
+                    "rate-limited "
                     "right now. Send !paid or !claude to use the paid tier, "
                     "or try again later."
                 ),
@@ -175,7 +176,8 @@ class TestProxyTierFallback:
             )
             assert r.status_code == 200
             sent_messages = mock_caller.call_args.args[2]["messages"]
-            # 2 user messages (assistant stripped) + trailing system (anti-hallucination)
+            # 2 user messages (assistant stripped) + trailing system
+            # (anti-hallucination)
             assert len(sent_messages) == 3
             assert sent_messages[-1]["role"] == "system"
             assert not any(m["role"] == "assistant" for m in sent_messages)
@@ -209,7 +211,8 @@ class TestProxyTierFallback:
     @patch("llm_proxy._background_notify")
     @patch("llm_proxy._call_provider")
     def test_reasoning_content_used_when_content_empty(self, mock_call, _mock_bg):
-        """GLM 5.1 reasoning models put output in reasoning_content — proxy merges it."""
+        """GLM 5.1 reasoning models put output in reasoning_content — proxy merges
+        it."""
         reasoning_body = {
             "id": "test",
             "object": "chat.completion",
@@ -218,7 +221,9 @@ class TestProxyTierFallback:
                     "message": {
                         "role": "assistant",
                         "content": "",
-                        "reasoning_content": "The user said hello, so I should greet them.",
+                        "reasoning_content": (
+                            "The user said hello, so I should greet them."
+                        ),
                     }
                 }
             ],
@@ -384,7 +389,10 @@ class TestProxyTierFallback:
                 {
                     "message": {
                         "role": "assistant",
-                        "content": "Alex,Idon'tseeanyactiveresearchsub-agentsrunningrightnow.Letmecheckifthere'saresearchdocumentthatwascreated:",
+                        "content": (
+                            "Alex,Idon'tseeanyactiveresearchsub-agentsrunningrightnow."
+                            "Letmecheckifthere'saresearchdocumentthatwascreated:"
+                        ),
                     }
                 }
             ],
@@ -592,7 +600,8 @@ class TestTierCommand:
         assert "Tier Status" in content
 
     def test_command_with_unknown_prefix(self):
-        """Status command matches via last-line fallback even if metadata regex fails."""
+        """Status command matches via last-line fallback even if metadata regex
+        fails."""
         msg = "some unrecognized metadata block\nclaw status"
         r = client.post(
             "/v1/chat/completions",
@@ -1056,7 +1065,9 @@ class TestNonAnswerDetection:
                             {
                                 "message": {
                                     "role": "assistant",
-                                    "content": "Let me do my full startup sequence first.",
+                                    "content": (
+                                        "Let me do my full startup sequence first."
+                                    ),
                                 }
                             }
                         ],
@@ -1128,7 +1139,10 @@ class TestResponseSanitization:
     def test_detects_garbled_glm_output(self):
         from llm_proxy import _is_garbled
 
-        garbled = "Alex,Idon'tseeanyactiveresearchsub-agentsrunningrightnow.Letmecheckifthere'saresearchdocumentthatwascreated:"
+        garbled = (
+            "Alex,Idon'tseeanyactiveresearchsub-agentsrunningrightnow."
+            "Letmecheckifthere'saresearchdocumentthatwascreated:"
+        )
         assert _is_garbled(garbled) is True
 
     def test_normal_text_not_garbled(self):
@@ -2395,7 +2409,8 @@ class TestHeartbeatInterceptor:
                     "content": (
                         "read heartbeat.md if it exists (workspace context). "
                         "follow it strictly. do not infer or repeat old tasks "
-                        "from prior chats. if nothing needs attention, reply heartbeat_ok."
+                        "from prior chats. if nothing needs attention, reply "
+                        "heartbeat_ok."
                     ),
                 }
             ],
@@ -2403,8 +2418,9 @@ class TestHeartbeatInterceptor:
 
     def test_heartbeat_intercepted_no_llm_call(self):
         """Heartbeat message should NOT call the LLM provider for basic checks."""
-        import llm_proxy
         import time as _time
+
+        import llm_proxy
 
         # Suppress proactive LLM thinking so we only test deterministic path
         llm_proxy._proactive_state["stale_tasks"] = _time.monotonic()
@@ -2423,7 +2439,8 @@ class TestHeartbeatInterceptor:
     @patch("llm_proxy.notify", new_callable=AsyncMock, return_value=True)
     def test_heartbeat_processes_pending_task(self, mock_notify):
         """When pending tasks exist, heartbeat sends them to the LLM for work."""
-        from app import TaskCreate as TC, create_task
+        from app import TaskCreate as TC
+        from app import create_task
 
         create_task(TC(description="Test task for heartbeat", priority=2))
 
@@ -2434,7 +2451,9 @@ class TestHeartbeatInterceptor:
                     {
                         "message": {
                             "role": "assistant",
-                            "content": "Checked logs — no anomalies found in the last 24h.",
+                            "content": (
+                                "Checked logs — no anomalies found in the last 24h."
+                            ),
                         }
                     }
                 ],
@@ -2467,10 +2486,10 @@ class TestHeartbeatInterceptor:
     def test_heartbeat_silent_when_no_issues(self):
         """With no pending tasks, no infra issues, and proactive checks
         not yet due, return empty response (silent heartbeat)."""
-        import llm_proxy
-
         # Mark all proactive checks as just-ran so they don't fire
         import time as _time
+
+        import llm_proxy
 
         llm_proxy._proactive_state["stale_tasks"] = _time.monotonic()
         llm_proxy._proactive_state["llm_thinking"] = _time.monotonic()
@@ -2492,12 +2511,13 @@ class TestHeartbeatInterceptor:
         # Suppress LLM thinking
         llm_proxy._proactive_state["llm_thinking"] = __import__("time").monotonic()
 
-        from app import brain_db
         from datetime import timedelta
+
+        from app import brain_db
 
         # Create a task and backdate its created_at to 5 hours ago
         old_task = brain_db.create_task("old task from earlier")
-        old_time = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+        old_time = (datetime.now(UTC) - timedelta(hours=5)).isoformat()
         brain_db._conn.execute(
             "UPDATE tasks SET created_at = ? WHERE id = ?",
             (old_time, old_task["id"]),
@@ -2528,7 +2548,9 @@ class TestHeartbeatInterceptor:
                     {
                         "message": {
                             "role": "assistant",
-                            "content": "Review OpenRouter spending trends for the past week",
+                            "content": (
+                                "Review OpenRouter spending trends for the past week"
+                            ),
                         }
                     }
                 ],
@@ -2641,10 +2663,12 @@ class TestSemanticDedup:
         queue = [
             {
                 "id": "abc123",
-                "description": "Review ClawRange tier allocation against current MSP client load",
+                "description": (
+                    "Review ClawRange tier allocation against current MSP client load"
+                ),
                 "status": "pending",
                 "priority": 3,
-                "created_at": datetime.now(timezone.utc).isoformat(),
+                "created_at": datetime.now(UTC).isoformat(),
             }
         ]
         # Rephrased version of the same task
@@ -2658,10 +2682,12 @@ class TestSemanticDedup:
         queue = [
             {
                 "id": "abc123",
-                "description": "Review ClawRange tier allocation against MSP client load",
+                "description": (
+                    "Review ClawRange tier allocation against MSP client load"
+                ),
                 "status": "pending",
                 "priority": 3,
-                "created_at": datetime.now(timezone.utc).isoformat(),
+                "created_at": datetime.now(UTC).isoformat(),
             }
         ]
         different = "Send weekly invoice summary to accounting team"
@@ -2672,12 +2698,14 @@ class TestSemanticDedup:
         from llm_proxy import _has_recent_task
 
         old_time = (
-            datetime.now(timezone.utc) - __import__("datetime").timedelta(hours=25)
+            datetime.now(UTC) - __import__("datetime").timedelta(hours=25)
         ).isoformat()
         queue = [
             {
                 "id": "abc123",
-                "description": "Review ClawRange tier allocation against MSP client load",
+                "description": (
+                    "Review ClawRange tier allocation against MSP client load"
+                ),
                 "status": "pending",
                 "priority": 3,
                 "created_at": old_time,
@@ -2939,7 +2967,8 @@ class TestTaskNeedsWeb:
             assert _task_needs_web(desc) is False, f"unexpected web for: {desc!r}"
 
     def test_match_is_case_insensitive(self):
-        """Keyword detection lowercases the input — REDDIT and Reddit must both match."""
+        """Keyword detection lowercases the input — REDDIT and Reddit must both
+        match."""
         from llm_proxy import _task_needs_web
 
         assert _task_needs_web("Scan REDDIT for promo opportunities") is True
@@ -3058,7 +3087,8 @@ class TestLlmWorkTaskRouting:
 
 
 class TestBuildWorkPromptFormatting:
-    """_build_work_prompt injects Telegram-format rules only when web_search is enabled."""
+    """_build_work_prompt injects Telegram-format rules only when web_search
+    is enabled."""
 
     @patch.dict("os.environ", FAKE_ENV)
     def test_web_search_branch_includes_telegram_format_rules(self):

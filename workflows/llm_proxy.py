@@ -11,8 +11,9 @@ import logging
 import os
 import re
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -236,8 +237,8 @@ def _get_reset_info(resp: httpx.Response) -> str:
             continue
         # Try epoch seconds
         try:
-            reset_dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
-            delta = reset_dt - datetime.now(timezone.utc)
+            reset_dt = datetime.fromtimestamp(float(value), tz=UTC)
+            delta = reset_dt - datetime.now(UTC)
             if delta > timedelta(0):
                 mins = int(delta.total_seconds()) // 60
                 return f"at {reset_dt.strftime('%H:%M UTC')} (~{mins}min)"
@@ -291,7 +292,7 @@ def _parse_reset_from_message(msg: str) -> str:
     hours = _RESET_HOURS_RE.search(msg)
     if hours:
         h = int(hours.group(1))
-        reset_dt = datetime.now(timezone.utc) + timedelta(hours=h)
+        reset_dt = datetime.now(UTC) + timedelta(hours=h)
         return f"at ~{reset_dt.strftime('%H:%M UTC')} (~{h}h)"
 
     minutes = _RESET_MINUTES_RE.search(msg)
@@ -356,8 +357,8 @@ def _get_reset_seconds(resp: httpx.Response) -> int | None:
         if not value:
             continue
         try:
-            reset_dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
-            delta = reset_dt - datetime.now(timezone.utc)
+            reset_dt = datetime.fromtimestamp(float(value), tz=UTC)
+            delta = reset_dt - datetime.now(UTC)
             if delta > timedelta(0):
                 return max(int(delta.total_seconds()), 1)
         except (ValueError, OSError):
@@ -441,7 +442,8 @@ _INNER_TAG = re.compile(
 )
 
 
-# XML-style hallucinated tool tags: <exec command="..."></exec>, <tool_call>...</tool_call>,
+# XML-style hallucinated tool tags: <exec command="..."></exec>,
+# <tool_call>...</tool_call>,
 # and colon-suffixed variants like <tool_call:paste>...</tool_call:paste> that free-tier
 # models invent when they get OpenAI tool schemas but the upstream doesn't support
 # function calling. Alternation keeps the two cases distinct so backref groups stay
@@ -470,7 +472,8 @@ _XML_UNCLOSED_TAG = re.compile(
     rf"<(?:{_TOOL_KEYWORDS})\b[\s\S]*$",
     re.IGNORECASE,
 )
-# Hallucinated metadata tags: <session_status>...</session_status>, <system>...</system>, etc.
+# Hallucinated metadata tags: <session_status>...</session_status>,
+# <system>...</system>, etc.
 _XML_META_TAG = re.compile(
     r"<(?:session_status|system_status|thinking|internal_monologue)\b[^>]*>"
     r"[\s\S]*?"
@@ -826,7 +829,8 @@ async def _handle_tier_command() -> JSONResponse:
     lines.append("")
     if remaining is not None:
         lines.append(
-            f"Balance: ${remaining:.2f} remaining (floor: ${OPENROUTER_BALANCE_FLOOR:.2f})"
+            f"Balance: ${remaining:.2f} remaining "
+            f"(floor: ${OPENROUTER_BALANCE_FLOOR:.2f})"
         )
     else:
         lines.append("Balance: not configured (set OPENROUTER_CREDIT_BALANCE)")
@@ -1002,7 +1006,10 @@ async def _handle_sched_command(subcmd: str, args: str) -> str:
     if subcmd == "list":
         scheds = brain_db.list_schedules()
         if not scheds:
-            return 'No schedules configured. Use /sched add <name> cron "<expr>" -- <generator>'
+            return (
+                "No schedules configured. Use /sched add <name> cron "
+                '"<expr>" -- <generator>'
+            )
         lines = ["Scheduled Jobs:\n"]
         for s in scheds:
             status = "PAUSED" if s.get("paused") else "ACTIVE"
@@ -1059,8 +1066,9 @@ async def _handle_sched_command(subcmd: str, args: str) -> str:
                 f"Unknown generator: {kind}. Available: {', '.join(GENERATORS.keys())}"
             )
 
-        from scheduler import add_schedule
         import hashlib
+
+        from scheduler import add_schedule
 
         sched_id = hashlib.md5(name.encode()).hexdigest()[:8]
 
@@ -1104,7 +1112,10 @@ async def _handle_sched_command(subcmd: str, args: str) -> str:
 
         try:
             result = await run_schedule_now(None, brain_db, args.strip())
-            return f"Ran schedule: {result.get('schedule_id', args)} — {result.get('status', 'unknown')}"
+            return (
+                f"Ran schedule: {result.get('schedule_id', args)} — "
+                f"{result.get('status', 'unknown')}"
+            )
         except ValueError as e:
             return str(e)
 
@@ -1142,7 +1153,7 @@ async def _handle_scan_command(subcmd: str, args: str) -> str:
 
         from reddit_search import search_subreddits
 
-        results = await search_subreddits(
+        results: list = await search_subreddits(
             topic, subreddits, since=since, limit_per_sub=10
         )
 
@@ -1197,14 +1208,18 @@ async def _handle_scan_command(subcmd: str, args: str) -> str:
 
         lines = [f"GitHub scan ({kind}): {topic} ({len(results)} results)\n"]
         for i, r in enumerate(results[:10], 1):
-            if hasattr(r, "full_name"):
+            # search_repos returns pydantic models with two possible shapes
+            # (repo vs web/code result); narrow at runtime via hasattr and
+            # access through Any since the fields aren't statically declared.
+            item: Any = r
+            if hasattr(item, "full_name"):
                 lines.append(
-                    f"{i}. {r.full_name} ({r.stars}*)\n"
-                    f"   {r.description or 'No description'}\n"
-                    f"   {r.url}"
+                    f"{i}. {item.full_name} ({item.stars}*)\n"
+                    f"   {item.description or 'No description'}\n"
+                    f"   {item.url}"
                 )
             else:
-                lines.append(f"{i}. {r.title}\n   {r.url}")
+                lines.append(f"{i}. {item.title}\n   {item.url}")
 
         return "\n".join(lines)
 
@@ -1222,19 +1237,22 @@ async def _handle_scan_command(subcmd: str, args: str) -> str:
             if not projects:
                 return "No projects tracked. Use /projects add first."
             lines = []
-            for p in projects:
+            for proj in projects:
                 from github_search import get_self_traffic
 
-                traffic = await get_self_traffic(p["owner"], p["repo"])
+                traffic = await get_self_traffic(proj["owner"], proj["repo"])
                 if traffic:
                     lines.append(
-                        f"{p['owner']}/{p['repo']}\n"
-                        f"  Views: {traffic.views_count} ({traffic.views_uniques} unique)\n"
-                        f"  Clones: {traffic.clones_count} ({traffic.clones_uniques} unique)"
+                        f"{proj['owner']}/{proj['repo']}\n"
+                        f"  Views: {traffic.views_count} "
+                        f"({traffic.views_uniques} unique)\n"
+                        f"  Clones: {traffic.clones_count} "
+                        f"({traffic.clones_uniques} unique)"
                     )
                 else:
                     lines.append(
-                        f"{p['owner']}/{p['repo']}: traffic unavailable (needs GITHUB_PAT)"
+                        f"{proj['owner']}/{proj['repo']}: traffic unavailable "
+                        f"(needs GITHUB_PAT)"
                     )
             return "\n\n".join(lines) if lines else "No traffic data available."
 
@@ -1297,10 +1315,10 @@ async def _handle_projects_command(subcmd: str, args: str) -> str:
         for p in projects:
             import json
 
-            subs = json.loads(p.get("subreddits", "[]"))
+            sub_list = json.loads(p.get("subreddits", "[]"))
             lines.append(
                 f"  {p['slug']} — {p['owner']}/{p['repo']}\n"
-                f"    subs: {', '.join(subs[:5]) or 'none'}\n"
+                f"    subs: {', '.join(sub_list[:5]) or 'none'}\n"
                 f"    posture: {p.get('posture', 'none') or 'none'}"
             )
         return "\n".join(lines)
@@ -1327,10 +1345,16 @@ async def _handle_projects_command(subcmd: str, args: str) -> str:
         try:
             parts = shlex.split(args, posix=True)
         except ValueError:
-            return "Parse error. Usage: /projects add <slug> <owner>/<repo> [--topics ...] [--subs ...]"
+            return (
+                "Parse error. Usage: /projects add <slug> <owner>/<repo> "
+                "[--topics ...] [--subs ...]"
+            )
 
         if len(parts) < 2:
-            return 'Usage: /projects add <slug> <owner>/<repo> [--topics ...] [--subs ...] [--posture "..."]'
+            return (
+                "Usage: /projects add <slug> <owner>/<repo> "
+                '[--topics ...] [--subs ...] [--posture "..."]'
+            )
 
         slug = parts[0]
         owner_repo = parts[1]
@@ -1368,7 +1392,8 @@ async def _handle_projects_command(subcmd: str, args: str) -> str:
         "Usage:\n"
         "  /projects list\n"
         "  /projects show <slug>\n"
-        '  /projects add <slug> <owner>/<repo> [--topics ...] [--subs ...] [--posture "..."]\n'
+        "  /projects add <slug> <owner>/<repo> "
+        '[--topics ...] [--subs ...] [--posture "..."]\n'
         "  /projects rm <slug>"
     )
 
@@ -1459,7 +1484,8 @@ async def _handle_tasks_list(is_stream: bool) -> JSONResponse | StreamingRespons
         done = [t for t in tasks if t["status"] in ("completed", "failed")]
 
         lines = [
-            f"Task Queue ({len(pending)} pending, {len(active)} active, {len(done)} done)\n"
+            f"Task Queue ({len(pending)} pending, {len(active)} active, "
+            f"{len(done)} done)\n"
         ]
 
         if active:
@@ -1652,7 +1678,7 @@ def _build_thinking_prompt() -> str:
         from app import brain_db
 
         all_tasks = brain_db.list_tasks()
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        cutoff = datetime.now(UTC) - timedelta(hours=24)
         for t in all_tasks:
             try:
                 created = datetime.fromisoformat(t["created_at"])
@@ -1675,7 +1701,8 @@ def _build_thinking_prompt() -> str:
     if recent_descriptions:
         recent_list = "\n".join(f"  - {d}" for d in recent_descriptions[-10:])
         recent_block = (
-            f"\n\nTasks already created in the last 24 hours (DO NOT repeat or suggest anything similar):\n"
+            f"\n\nTasks already created in the last 24 hours "
+            f"(DO NOT repeat or suggest anything similar):\n"
             f"{recent_list}\n"
         )
 
@@ -1691,14 +1718,18 @@ def _build_thinking_prompt() -> str:
             f"\n{brain_summary}\n"
             f"{recent_block}\n"
             "RULES:\n"
-            "- Only reference clients, people, or systems that exist in the brain above.\n"
+            "- Only reference clients, people, or systems that exist in "
+            "the brain above.\n"
             "- If the brain is empty, suggest tasks that BUILD knowledge: "
             "record a client, document a system, capture a decision.\n"
             "- Do NOT invent client names, people, or events.\n"
-            "- Do NOT suggest sending emails or making calls — suggest PREPARING drafts or RESEARCHING info.\n"
-            "- Tasks should be completable by an AI with access to web search and the brain API.\n\n"
+            "- Do NOT suggest sending emails or making calls — "
+            "suggest PREPARING drafts or RESEARCHING info.\n"
+            "- Tasks should be completable by an AI with access to web search "
+            "and the brain API.\n\n"
             "Suggest exactly ONE actionable task. "
-            "Respond with ONLY the task description (one sentence, no explanation, no quotes)."
+            "Respond with ONLY the task description (one sentence, no explanation, "
+            "no quotes)."
         )
     return (
         f"You are Max, an executive assistant. Focus area: {category}. "
@@ -1798,7 +1829,7 @@ def _has_recent_task(queue: list[dict], keyword: str, hours: int = 24) -> bool:
     threshold scales with the smaller keyword set (at least 30% overlap)
     so short descriptions aren't unfairly penalised.
     """
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    cutoff = datetime.now(UTC) - timedelta(hours=hours)
     new_keywords = _extract_keywords(keyword)
     if not new_keywords:
         return False
@@ -1867,7 +1898,7 @@ async def _llm_call(
     # callers (_llm_work_task / _llm_suggest_task) degrade gracefully.
     try:
         return await asyncio.wait_for(_try_tiers(), timeout=LLM_CALL_DEADLINE)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning("LLM call exceeded %ss deadline across tiers", LLM_CALL_DEADLINE)
         return None
 
@@ -1968,7 +1999,8 @@ def _extract_openrouter_citations(annotations: list[dict]) -> str:
 
     OpenRouter's `:online` plugin returns citations on the message via:
         message.annotations[].type == "url_citation"
-        message.annotations[].url_citation = {url, title, content, start_index, end_index}
+        message.annotations[].url_citation = {url, title, content, "
+        start_index, end_index}
 
     Halo character-backstory citations (Halopedia, Master Chief Wikipedia,
     etc.) are filtered out — see _is_persona_citation. Format mirrors
@@ -2112,7 +2144,8 @@ async def _build_work_prompt(task_description: str, web_search: bool = False) ->
         "- Reference real data from the system state, brain, and web search results.\n"
         "- Do NOT invent URLs, post titles, or usernames. Only cite what you found.\n"
         "- If you have web search, use it to find live data before answering.\n"
-        "- If the task requires an action you can't perform (sending email, making calls), "
+        "- If the task requires an action you can't perform (sending email, "
+        "making calls), "
         "describe what you prepared and what Alex needs to do to finish it.\n"
         "- Be honest. 'I found nothing relevant today' is better than fabricating.\n\n"
         f"{format_rules}"
@@ -2158,7 +2191,10 @@ async def _llm_work_task(description: str) -> str:
     if result:
         print(f"[PROXY] LLM worked task: {result[:100]!r}", flush=True)
         return result
-    return f"Could not reach LLM to work this task. Alex should handle manually: {description}"
+    return (
+        f"Could not reach LLM to work this task. Alex should handle manually: "
+        f"{description}"
+    )
 
 
 # ─── Marketing Scan Interceptor ──────────────────────────────────
@@ -2183,7 +2219,8 @@ POSITIVE RULES:
 - Lead with the user problem solved
 - Include real upvote counts, comment counts, and timestamps when available
 - Cite source URLs for every claim
-- For comment suggestions, anchor in the user's question first; mention the project as a relevant tool second
+- For comment suggestions, anchor in the user's question first; mention the "
+project as a relevant tool second
 """
 
 
@@ -2204,6 +2241,7 @@ async def _try_marketing_scan(description: str, brain_db) -> str | None:
                 return None
 
             import json
+
             from reddit_search import search_subreddits
 
             topics = json.loads(project.get("topics", "[]"))
@@ -2241,7 +2279,8 @@ async def _try_marketing_scan(description: str, brain_db) -> str | None:
                 return None
 
             import json
-            from github_search import search_repos, search_issues
+
+            from github_search import search_issues, search_repos
 
             search_terms = json.loads(project.get("search_terms", "[]"))
             topics = json.loads(project.get("topics", "[]"))
@@ -2258,9 +2297,10 @@ async def _try_marketing_scan(description: str, brain_db) -> str | None:
 
             if repos:
                 lines.append("Adjacent repos:")
-                for i, r in enumerate(repos[:5], 1):
+                for i, repo in enumerate(repos[:5], 1):
                     lines.append(
-                        f"  {i}. {r.full_name} ({r.stars}*) — {r.description or ''}"
+                        f"  {i}. {repo.full_name} ({repo.stars}*) — "
+                        f"{repo.description or ''}"
                     )
 
             if issues:
@@ -2269,21 +2309,24 @@ async def _try_marketing_scan(description: str, brain_db) -> str | None:
                     lines.append(f"  {i}. {iss.title} — {iss.repository}#{iss.number}")
 
             # Mark in cache
-            for r in repos:
-                brain_db.mark_seen("github_repo", str(r.id), slug)
+            for seen_repo in repos:
+                brain_db.mark_seen("github_repo", str(seen_repo.id), slug)
 
             return "\n".join(lines)
 
         if kind == "traffic":
-            owner, repo = match.group(1), match.group(2)
+            owner, repo_name = match.group(1), match.group(2)
             from github_search import get_self_traffic
 
-            traffic = await get_self_traffic(owner, repo)
+            traffic = await get_self_traffic(owner, repo_name)
             if not traffic:
-                return f"Traffic for {owner}/{repo}: unavailable (needs GITHUB_PAT with repo scope)"
+                return (
+                    f"Traffic for {owner}/{repo_name}: unavailable "
+                    f"(needs GITHUB_PAT with repo scope)"
+                )
 
             return (
-                f"Traffic for {owner}/{repo} (14 days):\n"
+                f"Traffic for {owner}/{repo_name} (14 days):\n"
                 f"  Views: {traffic.views_count} ({traffic.views_uniques} unique)\n"
                 f"  Clones: {traffic.clones_count} ({traffic.clones_uniques} unique)"
             )
@@ -2365,7 +2408,7 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
         # Layer 2: Stale task awareness — every 30 min
         if _proactive_ready("stale_tasks"):
             _proactive_mark("stale_tasks")
-            stale_cutoff = datetime.now(timezone.utc) - timedelta(hours=4)
+            stale_cutoff = datetime.now(UTC) - timedelta(hours=4)
             stale = [
                 t
                 for t in all_tasks
@@ -2490,7 +2533,8 @@ async def _try_single_tier(
 
             if not first_content.strip():
                 print(
-                    f"[PROXY] empty response from {tier_name} after sanitization — skipping",
+                    f"[PROXY] empty response from {tier_name} after "
+                    f"sanitization — skipping",
                     flush=True,
                 )
                 _record_failure(tier_name)
@@ -2498,7 +2542,8 @@ async def _try_single_tier(
 
             if _is_non_answer(first_content):
                 print(
-                    f"[PROXY] non-answer from {tier_name}: {first_content[:80]!r} — skipping",
+                    f"[PROXY] non-answer from {tier_name}: {first_content[:80]!r} "
+                    f"— skipping",
                     flush=True,
                 )
                 # Don't _record_failure — the provider worked fine, the content
@@ -2518,7 +2563,8 @@ async def _try_single_tier(
             _record_rate_limit(tier_name)
             try:
                 print(
-                    f"[PROXY] 429 on {tier_name} — headers: {dict(resp.headers)} body: {resp.text[:500]}",
+                    f"[PROXY] 429 on {tier_name} — headers: {dict(resp.headers)} "
+                    f"body: {resp.text[:500]}",
                     flush=True,
                 )
             except Exception:
@@ -2760,7 +2806,7 @@ async def chat_completions(
             _handle_non_streaming(body, forced_tier, status_msg_id=status_msg_id),
             timeout=REQUEST_DEADLINE,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning("Request exceeded %ds deadline", REQUEST_DEADLINE)
         result = _synthetic_response(
             "I took too long to respond — the LLM providers might be slow. "

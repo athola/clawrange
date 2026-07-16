@@ -13,7 +13,6 @@ from pydantic import BaseModel
 
 from brain_db import BrainDB, LinkType, PageType
 
-
 # ─── Request/Response Models ──────────────────────────────────────
 
 

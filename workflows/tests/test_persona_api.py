@@ -1,8 +1,9 @@
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+
 from brain_db import BrainDB
-from tenant_profile import Profile
 from persona_api import create_persona_router
+from tenant_profile import Profile
 
 
 def _client(tmp_path):

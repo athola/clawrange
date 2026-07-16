@@ -359,9 +359,10 @@ class TestCurrentProfileGuard:
 
     def _persona_app(self, tmp_path):
         from fastapi import FastAPI
+
+        from app import _current_profile
         from brain_db import BrainDB
         from persona_api import create_persona_router
-        from app import _current_profile
 
         db = BrainDB(str(tmp_path / "b.db"))
         db.init_db()

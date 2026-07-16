@@ -18,8 +18,9 @@ class Proposal(BaseModel):
 
 def _run_reflection(profile_name):
     """Override point; default runs the generator. Patched in tests."""
-    from generators import persona_reflect_generator
     import asyncio
+
+    from generators import persona_reflect_generator
 
     return asyncio.run(persona_reflect_generator(None, profile_name=profile_name))
 

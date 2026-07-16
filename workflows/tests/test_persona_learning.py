@@ -1,6 +1,7 @@
 import pytest
-from brain_db import BrainDB
+
 import persona_learning as pl
+from brain_db import BrainDB
 
 
 @pytest.fixture

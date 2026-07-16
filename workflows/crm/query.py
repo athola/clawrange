@@ -16,19 +16,19 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from pytimeparse import parse as _parse_duration
 
 logger = logging.getLogger("clawrange.crm.query")
 
 
-def _since(duration: str) -> str:
+def _since(duration: object) -> str:
     """ISO timestamp for ``now - duration`` (e.g. '7d', '24h', '30m')."""
     seconds = _parse_duration(str(duration))
     if seconds is None:
         raise ValueError(f"invalid duration: {duration!r}")
-    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+    return (datetime.now(UTC) - timedelta(seconds=seconds)).isoformat()
 
 
 def coerce_params(template: dict, raw: dict | None) -> dict:

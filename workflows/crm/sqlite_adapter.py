@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
-from .adapter import CRMAdapter
+from .adapter import CRMAdapter, RecordList
 
 logger = logging.getLogger("clawrange.crm")
 
@@ -51,7 +51,7 @@ _LEAD_COLUMNS = (
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 class SQLiteCRM(CRMAdapter):
@@ -150,7 +150,7 @@ class SQLiteCRM(CRMAdapter):
         params.append(limit)
         return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
-    def run_template(self, template: dict, params: dict) -> list[dict]:
+    def run_template(self, template: dict, params: dict) -> RecordList:
         sql = (template or {}).get("sql", "")
         _guard_readonly(sql)
         conn = self._ro()

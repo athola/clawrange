@@ -1,0 +1,85 @@
+[project]
+name = "clawrange"
+version = "0.1.0"
+description = "ClawRange: personal AI ops stack (OpenClaw assistant + FastAPI workflows service)"
+requires-python = ">=3.12"
+# Runtime dependencies are mirrored in workflows/requirements.txt, which is the
+# install source for the (read-only, bind-mount-driven) Docker image. Keep the
+# two in sync; a future follow-up can derive requirements.txt via `uv export`.
+dependencies = [
+    "fastapi==0.115.12",
+    "uvicorn[standard]==0.34.2",
+    "httpx==0.28.1",
+    "sqlite-vec==0.1.9",
+    "apscheduler>=3.10.4",
+    "sqlalchemy>=2.0",
+    "asyncpraw>=7.8",
+    "githubkit>=0.11",
+    "croniter>=2.0",
+    "pytimeparse>=1.1",
+    "pyyaml==6.0.1",
+]
+
+[dependency-groups]
+# Dev tooling: pinned exactly by uv.lock. `uv sync` materializes .venv with both
+# the runtime deps above and this dev group, so `uv run pytest|ruff|mypy` work.
+dev = [
+    "ruff",
+    "mypy",
+    "pytest",
+    "pre-commit",
+]
+
+[tool.uv]
+# ClawRange is a collection of scripts run inside Docker, not an importable
+# distribution. Tell uv not to build/install the project root.
+package = false
+
+# ─── ruff (lint + format) ──────────────────────────────────────────
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+src = ["workflows", "scripts", "tests"]
+exclude = [
+    "data",
+    ".venv",
+    "n8n",
+    "deer-flow",
+    "deerflow",
+    ".mypy_cache",
+    ".ruff_cache",
+    "build",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = []
+
+# ─── mypy (typecheck) ──────────────────────────────────────────────
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+show_error_codes = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+# Non-strict baseline: the codebase is ~21% return-annotated. We gate on the
+# real inconsistencies (return-value / arg-type / valid-type) without requiring
+# a full annotation pass. Tighten incrementally from here.
+exclude = [
+    "data/",
+    "\\.venv/",
+    "n8n/",
+    "deer-flow/",
+    "deerflow/",
+    "\\.mypy_cache/",
+    "\\.ruff_cache/",
+    "build/",
+]
+
+# ─── pytest ────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+# workflows/ has no __init__.py on purpose: the app modules use flat imports
+# (from app import app, from tenant_profile import ...). Put workflows/ on the
+# path explicitly rather than introducing a package boundary.
+pythonpath = ["workflows"]
+testpaths = ["workflows/tests", "tests"]
