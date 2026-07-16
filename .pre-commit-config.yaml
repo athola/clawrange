@@ -45,6 +45,16 @@ repos:
         types: [python]
         pass_filenames: false
         args: [workflows, scripts, tests]
+      - id: pytest
+        name: pytest (full test suite via uv)
+        entry: uv run pytest
+        language: system
+        types: [python]
+        pass_filenames: false
+        args: [-q]
+        # Full async+sync suite (~80s). If commit-time latency bites,
+        # move this hook to `stages: [pre-push]` and run `pre-commit
+        # install --hook-type pre-push`.
 
   # Docker compose validation
   - repo: https://github.com/IamTheFij/docker-pre-commit
