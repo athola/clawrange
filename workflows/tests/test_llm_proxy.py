@@ -3834,3 +3834,114 @@ class TestDigestPersistence:
         assert "truncated" in text
         # The balance footer must survive truncation — it is the actionable bit.
         assert "$28.65" in text
+
+
+BLOCKED_RESULT = """# Task: Record Alex's Focus Areas & Priorities
+
+Status: BLOCKED — Need Input
+
+## What I Found
+- Brain is empty (no prior context on Alex's focus areas or clients)
+
+## What I Need From You
+To populate the brain accurately, I need you to tell me:
+1. Client segments — Who do you work with?
+2. Outreach priorities — What matters most this quarter?
+"""
+
+WORKED_RESULT = """Scanned r/msp for ticketing-automation threads over the last
+24h. Three relevant posts, links below, each with a suggested comment.
+"""
+
+
+class TestNeedsInput:
+    """A self-directed task that turns out to need Alex's private knowledge
+    must not be dumped into Telegram as a 500-char non-answer.
+
+    _is_non_answer() only fires under 300 chars, so a long, well-formatted
+    "BLOCKED -- Need Input" essay sailed through and was relayed in full.
+    """
+
+    def test_detects_blocked_result(self):
+        import llm_proxy
+
+        assert llm_proxy._needs_input(BLOCKED_RESULT) is True
+
+    def test_detects_hold_for_now_result(self):
+        import llm_proxy
+
+        text = (
+            "## Recommendation\n**Hold for now.** Before running this canary, "
+            "we need:\n1. Confirmation the fix shipped\n\n## What I Need From You\n"
+            "Should I wait for this info, or do you want me to dig in first?"
+        )
+        assert llm_proxy._needs_input(text) is True
+
+    def test_real_work_is_not_flagged(self):
+        import llm_proxy
+
+        assert llm_proxy._needs_input(WORKED_RESULT) is False
+
+    def test_empty_result_is_not_flagged(self):
+        import llm_proxy
+
+        assert llm_proxy._needs_input("") is False
+
+    def test_blocked_task_gets_compact_digest_line(self, monkeypatch):
+        """The digest carries one line naming what stalled, not the essay."""
+        import llm_proxy
+
+        line = llm_proxy._blocked_digest_line(
+            {
+                "id": "73d5f106",
+                "description": (
+                    "Record Alex's current focus areas, client segments, and "
+                    "outreach priorities into the brain"
+                ),
+            }
+        )
+        assert line.startswith("Blocked #73d5f106: needs your input —")
+        assert len(line) <= 120
+        assert "What I Need From You" not in line
+
+
+class TestThinkingPromptDoesNotAskAlex:
+    """An empty brain used to instruct the model to suggest knowledge-building
+    tasks ("record a client"), which only Alex can answer. That closed a loop:
+    empty brain -> suggest -> blocked -> brain still empty -> repeat hourly.
+    """
+
+    def _prompt(self, monkeypatch):
+        # _load_soul() reads /app/soul.md, absent under test -- without a soul
+        # _build_thinking_prompt falls back to a short branch that carries
+        # neither rule, so the assertions would pass vacuously.
+        import llm_proxy
+
+        monkeypatch.setattr(llm_proxy, "_load_soul", lambda: "You are Max.")
+        return llm_proxy._build_thinking_prompt()
+
+    def test_prompt_does_not_ask_for_knowledge_building(self, monkeypatch):
+        assert "suggest tasks that BUILD knowledge" not in self._prompt(monkeypatch)
+
+    def test_prompt_forbids_tasks_needing_alex(self, monkeypatch):
+        assert "only Alex can supply" in self._prompt(monkeypatch)
+
+
+class TestBlockedTaskStatus:
+    def test_complete_task_accepts_blocked(self):
+        from app import brain_db
+
+        t = brain_db.create_task("needs alex input", priority=3)
+        brain_db.complete_task(t["id"], "BLOCKED — Need Input", "blocked")
+        got = brain_db.get_task(t["id"])
+        assert got["status"] == "blocked"
+
+    def test_blocked_task_is_not_pending(self):
+        """A blocked task must leave the pending queue or the heartbeat
+        reworks it every cycle -- the loop this fix exists to break."""
+        from app import brain_db
+
+        t = brain_db.create_task("needs alex input", priority=3)
+        brain_db.complete_task(t["id"], "BLOCKED", "blocked")
+        pending_ids = {x["id"] for x in brain_db.list_tasks(status="pending")}
+        assert t["id"] not in pending_ids

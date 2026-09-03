@@ -957,7 +957,7 @@ class BrainDB:
     def complete_task(
         self, task_id: str, result: str, status: str = "completed"
     ) -> dict[str, Any]:
-        if status not in ("completed", "failed"):
+        if status not in ("completed", "failed", "blocked"):
             raise ValueError("Status must be completed or failed")
         now = _now()
         self._conn.execute(

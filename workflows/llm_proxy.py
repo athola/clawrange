@@ -584,6 +584,49 @@ def _is_non_answer(text: str) -> bool:
     return hits >= 3
 
 
+# A task the model cannot finish without Alex comes back as a long, tidy
+# markdown essay -- headings, "What I Need From You", a list of questions.
+# _is_non_answer() cannot see it: that one only fires under 300 chars. These
+# run past 1000. Match the request-for-input shape instead of the length.
+_NEEDS_INPUT_SIGNALS = [
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bblocked\b",
+        r"needs?\s+(your\s+)?input",
+        r"what\s+i\s+need\s+from\s+you",
+        r"need\s+from\s+you",
+        r"i\s+need\s+you\s+to",
+        r"hold\s+for\s+now",
+        r"\bwe\s+need\b",
+        r"please\s+(provide|confirm|tell|share|clarify)",
+        r"can\s+you\s+(provide|confirm|tell|share|clarify)",
+        r"do\s+you\s+want\s+me\s+to",
+        r"should\s+i\s+(wait|proceed)",
+    )
+]
+
+
+def _needs_input(text: str) -> bool:
+    """True when a task result is a request for Alex rather than work done.
+
+    Two or more signals, so a single incidental "we need" in real output
+    does not suppress a genuine result.
+    """
+    if not text:
+        return False
+    hits = sum(1 for signal in _NEEDS_INPUT_SIGNALS if signal.search(text))
+    return hits >= 2
+
+
+def _blocked_digest_line(task: dict) -> str:
+    """One compact digest line for a task stalled on Alex's input.
+
+    The full text stays on the task (GET /task/{id}); Telegram gets the
+    fact that something stalled and which task it was, not the essay.
+    """
+    return f"Blocked #{task['id']}: needs your input — {task['description'][:60]}"
+
+
 PROVIDER_URLS = {
     "openrouter": "https://openrouter.ai/api/v1/chat/completions",
     "zai": "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
@@ -1719,8 +1762,11 @@ def _build_thinking_prompt() -> str:
             "RULES:\n"
             "- Only reference clients, people, or systems that exist in "
             "the brain above.\n"
-            "- If the brain is empty, suggest tasks that BUILD knowledge: "
-            "record a client, document a system, capture a decision.\n"
+            "- Never suggest a task that needs information only Alex can "
+            "supply — his clients, priorities, or private history. An empty "
+            "brain is NOT a cue to ask him to fill it: that task comes back "
+            "blocked and the brain stays empty. Suggest work you can finish "
+            "from web search and the system state alone.\n"
             "- Do NOT invent client names, people, or events.\n"
             "- Do NOT suggest sending emails or making calls — "
             "suggest PREPARING drafts or RESEARCHING info.\n"
@@ -2066,7 +2112,9 @@ async def _gather_system_state() -> str:
     all_tasks = brain_db.list_tasks()
     pending = sum(1 for t in all_tasks if t["status"] == "pending")
     active = sum(1 for t in all_tasks if t["status"] == "active")
-    done = sum(1 for t in all_tasks if t["status"] in ("completed", "failed"))
+    done = sum(
+        1 for t in all_tasks if t["status"] in ("completed", "failed", "blocked")
+    )
 
     return (
         "CURRENT SYSTEM STATE:\n"
@@ -2602,12 +2650,20 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
                 else:
                     result = await _llm_work_task(task["description"])
 
-        brain_db.complete_task(task["id"], result, "completed")
-        # Condensed one-entry-per-task digest line; full result stays in
-        # the task queue (!tasks / GET /task/{id}).
-        _digest_record(
-            f"[{label}] #{task['id']}: {task['description']}\nResult: {result[:500]}"
-        )
+        if _needs_input(result):
+            # The model asked Alex a question instead of finishing. Close it
+            # as blocked so it leaves the pending queue -- left pending it is
+            # reworked every cycle -- and spend one digest line on it.
+            brain_db.complete_task(task["id"], result, "blocked")
+            _digest_record(_blocked_digest_line(task))
+        else:
+            brain_db.complete_task(task["id"], result, "completed")
+            # Condensed one-entry-per-task digest line; full result stays in
+            # the task queue (!tasks / GET /task/{id}).
+            _digest_record(
+                f"[{label}] #{task['id']}: {task['description']}\n"
+                f"Result: {result[:500]}"
+            )
 
         # No direct Telegram notification: the digest line above carries
         # the completion, at most once per hour.
