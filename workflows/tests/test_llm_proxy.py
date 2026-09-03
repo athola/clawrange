@@ -3945,3 +3945,38 @@ class TestBlockedTaskStatus:
         brain_db.complete_task(t["id"], "BLOCKED", "blocked")
         pending_ids = {x["id"] for x in brain_db.list_tasks(status="pending")}
         assert t["id"] not in pending_ids
+
+
+class TestNeedsInputPrecision:
+    """Guards found by running the detector over all 846 stored results.
+
+    A first cut counted request-for-input phrases anywhere in the body and
+    flagged 232 of 846 (27%) -- real deliverables, silently binned.
+    """
+
+    def test_prepared_work_naming_next_steps_is_not_blocked(self):
+        """The work prompt asks the model to say "what Alex needs to do to
+        finish it", so that phrasing appears in 208 real results."""
+        import llm_proxy
+
+        text = (
+            "# Draft comment for r/msp\n"
+            "**Status:** Ready to post. Draft below.\n\n"
+            "## What I Need From You\n"
+            "Post it to the thread; I can't post on your behalf.\n"
+        )
+        assert llm_proxy._needs_input(text) is False
+
+    def test_blocked_subsection_does_not_bin_the_deliverable(self):
+        """One blocked angle inside finished work is still finished work."""
+        import llm_proxy
+
+        text = (
+            "# Draft: Content Package\n"
+            "**Status:** Ready for review. Three angles structured below.\n\n"
+            + "Angle 1 detail. "
+            * 40
+            + "\n## Angle 2: Reddit comment (BLOCKED—needs live data)\n"
+            "**What I need from you:** the positioning.\n"
+        )
+        assert llm_proxy._needs_input(text) is False

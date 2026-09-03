@@ -585,37 +585,40 @@ def _is_non_answer(text: str) -> bool:
 
 
 # A task the model cannot finish without Alex comes back as a long, tidy
-# markdown essay -- headings, "What I Need From You", a list of questions.
-# _is_non_answer() cannot see it: that one only fires under 300 chars. These
-# run past 1000. Match the request-for-input shape instead of the length.
+# markdown essay. _is_non_answer() cannot see it: that one only fires under
+# 300 chars and these run past 1000.
+#
+# Match the status declaration in the HEADER, not a request for input
+# anywhere in the body. Checked against the 846 stored task results:
+#
+#   "what i need from you"  -> 208 hits, nearly all real deliverables. The
+#       work prompt asks for exactly that ("describe what you prepared and
+#       what Alex needs to do to finish it"), so it is not a blocked signal.
+#   header-anchored below   -> 21 hits (2.5%), including both essays that
+#       reached Telegram today.
+#
+# Anchoring to the header also keeps a finished deliverable whose one
+# sub-section is blocked ("Angle 2 (BLOCKED-needs live data)") from being
+# binned whole.
+_NEEDS_INPUT_HEAD = 400
+
 _NEEDS_INPUT_SIGNALS = [
     re.compile(p, re.IGNORECASE)
     for p in (
-        r"\bblocked\b",
-        r"needs?\s+(your\s+)?input",
-        r"what\s+i\s+need\s+from\s+you",
-        r"need\s+from\s+you",
-        r"i\s+need\s+you\s+to",
-        r"hold\s+for\s+now",
-        r"\bwe\s+need\b",
-        r"please\s+(provide|confirm|tell|share|clarify)",
-        r"can\s+you\s+(provide|confirm|tell|share|clarify)",
-        r"do\s+you\s+want\s+me\s+to",
-        r"should\s+i\s+(wait|proceed)",
+        r"status:\s*\**\s*blocked",
+        r"\bblocked\b\s*[^a-z0-9]{0,4}\s*need",
+        r"\bhold for now\b",
+        r"before\s+[^.]{0,60}\bwe need\b",
     )
 ]
 
 
 def _needs_input(text: str) -> bool:
-    """True when a task result is a request for Alex rather than work done.
-
-    Two or more signals, so a single incidental "we need" in real output
-    does not suppress a genuine result.
-    """
+    """True when a task result declares itself blocked on Alex's input."""
     if not text:
         return False
-    hits = sum(1 for signal in _NEEDS_INPUT_SIGNALS if signal.search(text))
-    return hits >= 2
+    head = text[:_NEEDS_INPUT_HEAD]
+    return any(signal.search(head) for signal in _NEEDS_INPUT_SIGNALS)
 
 
 def _blocked_digest_line(task: dict) -> str:
