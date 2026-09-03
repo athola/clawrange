@@ -298,3 +298,22 @@ live store stay in sync. Edit either side and re-export/re-seed.
 
 > Outcome-signal proposals (the assistant noticing recurring corrections on
 > its own) are off by default. Set `PERSONA_SIGNAL_LEARNING=1` to enable them.
+
+### Why three layers
+
+The persona system reconciles two opposing requirements: "anyone who pulls
+the repo can configure the assistant" wants git-tracked files, while "the
+assistant improves itself over time" happens in runtime state that cannot
+be hand-edited into git. Three layers bridge them:
+
+1. **Config (static, git-tracked)** — `profile.yaml` persona/identity
+   blocks are the authored baseline everyone inherits.
+2. **Learning store (dynamic)** — the brain's `persona_learnings` table is
+   the live record of proposals and approvals, scoped per profile.
+3. **Learned overlay (portable)** — `learned.yaml` is the git-exportable
+   projection of approved learnings, seeded back into the brain on boot.
+
+Renders are non-destructive: approved learnings are appended under a
+`## Learned` region rather than rewriting the authored blocks, and every
+render goes through the same atomic `render_all`, so the authored baseline
+always remains the source a fresh clone starts from.

@@ -49,3 +49,10 @@ venv/
 
 # Attune mission state (local tooling, machine-specific)
 .attune/
+
+# Session artifacts (plans/specs/research live in docs/ proper)
+docs/superpowers/
+reviews/
+.review/
+.tome/
+docs/research/
