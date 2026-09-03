@@ -2,9 +2,17 @@
 
 from unittest.mock import AsyncMock, patch
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from app import app
+import app as app_module
+import llm_proxy
+from app import _current_profile, app
+from brain_db import BrainDB
+from llm_proxy import _extract_task_command
+from persona_api import create_persona_router
+from research import Finding
+from tenant_profile import Profile
 
 client = TestClient(app)
 
@@ -86,8 +94,6 @@ class TestTierStatus:
     )
     @patch("llm_proxy._last_tier_used", None)
     def test_tripped_tier_shows_tripped(self, _mock_balance):
-        import llm_proxy
-
         # Trip the circuit breaker for a tier
         llm_proxy._circuit_state["openrouter-free"] = {
             "failures": llm_proxy.CIRCUIT_FAILURE_THRESHOLD,
@@ -245,34 +251,24 @@ class TestTaskCommandDetection:
     THEN it correctly classifies them."""
 
     def test_create_task(self):
-        from llm_proxy import _extract_task_command
-
         result = _extract_task_command("!task check z.ai for new models")
         assert result == {"type": "create", "description": "check z.ai for new models"}
 
     def test_list_tasks(self):
-        from llm_proxy import _extract_task_command
-
         assert _extract_task_command("!tasks")["type"] == "list"
         assert _extract_task_command("/tasks")["type"] == "list"
         assert _extract_task_command("!task")["type"] == "list"
         assert _extract_task_command("!task list")["type"] == "list"
 
     def test_cancel_task(self):
-        from llm_proxy import _extract_task_command
-
         result = _extract_task_command("!task cancel abc123")
         assert result == {"type": "action", "action": "cancel", "args": "abc123"}
 
     def test_priority_task(self):
-        from llm_proxy import _extract_task_command
-
         result = _extract_task_command("!task priority abc123 1")
         assert result == {"type": "action", "action": "priority", "args": "abc123 1"}
 
     def test_non_task_message(self):
-        from llm_proxy import _extract_task_command
-
         assert _extract_task_command("hello world") is None
         assert _extract_task_command("what tasks do I have") is None
 
@@ -284,8 +280,6 @@ class TestResearchEndpoint:
     """End-to-end tests for /research and /research/sessions."""
 
     def test_post_research_persists_session(self, monkeypatch):
-        from research import Finding
-
         async def fake_orch(topic, channels=None, **kwargs):
             return {
                 "topic": topic,
@@ -358,12 +352,6 @@ class TestCurrentProfileGuard:
     placeholder starter profile and render it over real persona files."""
 
     def _persona_app(self, tmp_path):
-        from fastapi import FastAPI
-
-        from app import _current_profile
-        from brain_db import BrainDB
-        from persona_api import create_persona_router
-
         db = BrainDB(str(tmp_path / "b.db"))
         db.init_db()
         soul = tmp_path / "soul.md"
@@ -381,8 +369,6 @@ class TestCurrentProfileGuard:
         monkeypatch.setenv("CLAWRANGE_PROFILE", "broken")
 
     def test_broken_profile_is_5xx_and_writes_nothing(self, tmp_path, monkeypatch):
-        import app as app_module
-
         self._break_profile(tmp_path, monkeypatch)
         monkeypatch.delattr(app_module.app.state, "profile", raising=False)
         persona_client, soul = self._persona_app(tmp_path)
@@ -391,9 +377,6 @@ class TestCurrentProfileGuard:
         assert not soul.exists()
 
     def test_broken_profile_falls_back_to_boot_profile(self, tmp_path, monkeypatch):
-        import app as app_module
-        from tenant_profile import Profile
-
         self._break_profile(tmp_path, monkeypatch)
         boot = Profile(name="cos", raw={"profile": "cos", "assistant": {"name": "Max"}})
         monkeypatch.setattr(app_module.app.state, "profile", boot, raising=False)

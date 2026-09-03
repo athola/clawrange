@@ -15,8 +15,21 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
+import github_search
+import llm_proxy
+import persona_learning as pl
+import reddit_search
+import telegram
+import tenant_profile
+from connectors import run_connector
+from crm import get_adapter
+
 if TYPE_CHECKING:
     from reddit_search import RedditPost
+
+# NOTE on deferred imports: ``app`` imports this module at module scope, so
+# the ``from app import brain_db`` fallback below must stay function-local
+# (cycle guard).
 
 logger = logging.getLogger("clawrange.generators")
 
@@ -140,7 +153,6 @@ async def awesome_lists_watch_generator(
     brain_db, lists: list[str] | None = None, **kwargs
 ) -> None:
     """Check awesome-lists for tracked projects, enqueue PR tasks when missing."""
-    from github_search import check_awesome_list
 
     projects = brain_db.list_projects()
     target_lists = _AWESOME_LISTS
@@ -153,7 +165,9 @@ async def awesome_lists_watch_generator(
 
     for list_owner, list_repo in target_lists:
         target_urls = [f"github.com/{p['owner']}/{p['repo']}" for p in projects]
-        found = await check_awesome_list(list_owner, list_repo, target_urls)
+        found = await github_search.check_awesome_list(
+            list_owner, list_repo, target_urls
+        )
 
         for project in projects:
             url = f"github.com/{project['owner']}/{project['repo']}"
@@ -418,8 +432,6 @@ async def morning_digest_generator(
     queued — the operator reads, taps the direct URL, and writes
     their own replies.
     """
-    from reddit_search import search_subreddits
-    from telegram import notify
 
     projects = brain_db.list_projects()
     if project_slugs:
@@ -476,7 +488,7 @@ async def morning_digest_generator(
 
         for query in queries:
             try:
-                posts = await search_subreddits(
+                posts = await reddit_search.search_subreddits(
                     query,
                     scan_subreddits,
                     since="24h",
@@ -607,7 +619,7 @@ async def morning_digest_generator(
         lines.append(report)
 
     digest = "\n".join(lines).strip()
-    delivered = await notify(digest)
+    delivered = await telegram.notify(digest)
     if not delivered:
         logger.warning("morning_digest: telegram delivery failed; not marking seen")
         return
@@ -643,7 +655,6 @@ async def _discover_emerging(
     filter, capped per project. Records each match as a stat hit so
     sustained emerging subs accumulate toward auto-promotion.
     """
-    from reddit_search import search_all
 
     out: dict[str, list[RedditPost]] = {}
     for project in projects:
@@ -654,7 +665,7 @@ async def _discover_emerging(
             continue
         query = (terms or topics)[0]
         try:
-            all_posts = await search_all(query, since="24h", limit=15)
+            all_posts = await reddit_search.search_all(query, since="24h", limit=15)
         except Exception as exc:
             logger.warning(
                 "morning_digest: discovery search failed for %s/%s: %s",
@@ -826,8 +837,6 @@ async def hot_pulse_generator(
     (logged as a heartbeat WARNING so the cron is still observable).
     """
     global _LAST_HOT_PULSE_DELIVERY_AT, _HOT_PULSE_IN_QUIET_HOURS
-    from reddit_search import search_subreddits
-    from telegram import notify
 
     now = datetime.now(UTC)
 
@@ -934,7 +943,7 @@ async def hot_pulse_generator(
 
         for query in queries:
             try:
-                posts = await search_subreddits(
+                posts = await reddit_search.search_subreddits(
                     query,
                     scan_subreddits,
                     since=window,
@@ -1043,7 +1052,7 @@ async def hot_pulse_generator(
         lines.append("")
 
     pulse = "\n".join(lines).strip()
-    delivered = await notify(pulse)
+    delivered = await telegram.notify(pulse)
     if not delivered:
         logger.warning("hot_pulse: telegram delivery failed; not marking seen")
         return
@@ -1134,8 +1143,6 @@ def seed_from_profile(brain_db, profile) -> list[dict]:
     # Seed approved persona learnings from the profile's learned.yaml overlay
     # (the git-portable projection of the brain's approved meta-learnings).
     try:
-        import persona_learning as pl
-
         pl.seed_overlay(brain_db, profile.name, pl.load_overlay(profile.name))
     except Exception as exc:  # never crash boot on a bad overlay
         logger.warning("seed_from_profile: learned overlay skipped: %s", exc)
@@ -1145,9 +1152,8 @@ def seed_from_profile(brain_db, profile) -> list[dict]:
 
 def seed_default_schedules(brain_db) -> list[dict]:
     """Seed the active profile's schedules (back-compat entry point)."""
-    from tenant_profile import load_profile
 
-    return _seed_schedules_from_profile(brain_db, load_profile())
+    return _seed_schedules_from_profile(brain_db, tenant_profile.load_profile())
 
 
 def seed_default_projects(brain_db) -> list[dict]:
@@ -1155,9 +1161,8 @@ def seed_default_projects(brain_db) -> list[dict]:
 
     Loads the profile named by CLAWRANGE_PROFILE (default "marketing").
     """
-    from tenant_profile import load_profile
 
-    return seed_from_profile(brain_db, load_profile())
+    return seed_from_profile(brain_db, tenant_profile.load_profile())
 
 
 # ─── CRM generators (lead-crm profile) ───────────────────────────────
@@ -1175,7 +1180,6 @@ def _crm_for(profile, crm):
     if not (profile and profile.crm):
         logger.warning("crm generator: profile has no crm configured; skipping")
         return None
-    from crm import get_adapter
 
     adapter = get_adapter(profile.crm)
     adapter.init()
@@ -1198,10 +1202,8 @@ async def pipeline_generator(
     were written) posts a one-line Telegram summary. Never auto-crashes the
     heartbeat: unknown connectors / fetch errors degrade to a logged status.
     """
-    from connectors import run_connector
-    from tenant_profile import load_profile
 
-    profile = profile or load_profile()
+    profile = profile or tenant_profile.load_profile()
     spec = profile.connector(connector)
     now = datetime.now(UTC).isoformat()
 
@@ -1233,9 +1235,7 @@ async def pipeline_generator(
         )
 
     if counts["written"]:
-        from telegram import notify
-
-        await notify(
+        await telegram.notify(
             f"Lead sync ({connector}): {counts['written']} written "
             f"({counts['fetched']} fetched, {counts['kept']} kept)."
         )
@@ -1260,9 +1260,8 @@ async def crm_digest_generator(
     reported inline rather than raising.
     """
     from crm.query import _format_rows, find_template, run_query
-    from tenant_profile import load_profile
 
-    profile = profile or load_profile()
+    profile = profile or tenant_profile.load_profile()
     queries = queries or []
     now = datetime.now(UTC).isoformat()
 
@@ -1293,9 +1292,7 @@ async def crm_digest_generator(
             schedule_id, now, f"ok ({len(queries)} queries)"
         )
 
-    from telegram import notify
-
-    await notify(digest)
+    await telegram.notify(digest)
     return digest
 
 
@@ -1306,8 +1303,6 @@ async def persona_reflect_generator(brain_db, profile_name=None, **kwargs) -> No
     suggestion as a [DRAFT] persona proposal. Degrades to a no-op if the
     proxy is unavailable.
     """
-    import persona_learning as pl
-    from llm_proxy import _llm_call
 
     profile_name = profile_name or "starter"
     prompt = (
@@ -1315,7 +1310,7 @@ async def persona_reflect_generator(brain_db, profile_name=None, **kwargs) -> No
         "persona adjustment (tone/format/priority). Reply with a single "
         "imperative sentence, or 'none'."
     )
-    suggestion = await _llm_call(prompt, max_tokens=80)
+    suggestion = await llm_proxy._llm_call(prompt, max_tokens=80)
     if not suggestion or suggestion.strip().lower().startswith("none"):
         return
     if brain_db is None:
@@ -1414,7 +1409,6 @@ async def income_review_generator(brain_db, **kwargs) -> None:
     and never acts on its own — the review is a draft the operator
     approves on Telegram. See docs/income-strategy.md for the protocol.
     """
-    from telegram import notify
 
     pending = {t["description"] for t in brain_db.list_tasks(status="pending")}
     if any(d.startswith(INCOME_REVIEW_DESC) for d in pending):
@@ -1427,7 +1421,7 @@ async def income_review_generator(brain_db, **kwargs) -> None:
         source="schedule",
     )
     logger.info("income_review: enqueued weekly review")
-    if not await notify(
+    if not await telegram.notify(
         "📋 Weekly income review queued — claim the [DRAFT] task to run it."
     ):
         logger.warning("income_review: telegram notify failed (task kept)")

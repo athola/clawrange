@@ -4,6 +4,7 @@ Calls GitHub's Search API for repos and issues, and the Traffic API
 for self-repo analytics. Gracefully degrades when credentials are missing.
 """
 
+import base64
 import logging
 import os
 from datetime import UTC, datetime
@@ -184,7 +185,6 @@ async def check_awesome_list(
 
     try:
         resp = client.rest.repos.get_readme(owner=list_owner, repo=list_repo)
-        import base64
 
         content = base64.b64decode(resp.parsed_data.content).decode()
         return {url: url in content for url in target_urls}

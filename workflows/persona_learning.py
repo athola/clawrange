@@ -9,6 +9,10 @@ from __future__ import annotations
 import logging
 import os
 
+import yaml
+
+import tenant_profile
+
 VALID_KINDS = {"identity", "persona"}
 VALID_SOURCES = {"feedback", "reflect", "scheduled", "signal", "seed"}
 CONTENT_MAX = 500
@@ -119,11 +123,7 @@ def load_overlay(profile_name):
     ``config/profiles/<name>/learned.yaml``. Missing file or empty overlay
     returns ``[]`` (never raises) so setup and boot stay resilient.
     """
-    import yaml
-
-    from tenant_profile import default_profiles_dir
-
-    path = default_profiles_dir() / profile_name / "learned.yaml"
+    path = tenant_profile.default_profiles_dir() / profile_name / "learned.yaml"
     if not path.exists():
         return []
     data = yaml.safe_load(path.read_text()) or {}

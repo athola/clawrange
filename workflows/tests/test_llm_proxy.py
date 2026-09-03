@@ -2436,7 +2436,7 @@ class TestHeartbeatInterceptor:
             assert r.status_code == 200
             mock_caller.assert_not_called()
 
-    @patch("llm_proxy.notify", new_callable=AsyncMock, return_value=True)
+    @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
     def test_heartbeat_processes_pending_task(self, mock_notify):
         """When pending tasks exist, heartbeat sends them to the LLM for work."""
         from app import TaskCreate as TC

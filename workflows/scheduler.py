@@ -10,9 +10,12 @@ connection) and fail at startup.
 import json
 import logging
 import os
+import re
 
 from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+from generators import GENERATORS
 
 logger = logging.getLogger("clawrange.scheduler")
 
@@ -42,7 +45,6 @@ def init_scheduler(brain_db) -> AsyncIOScheduler | None:
 
 def _register_job(scheduler: AsyncIOScheduler, sched: dict, brain_db) -> None:
     """Register a single schedule as an APScheduler job."""
-    from generators import GENERATORS
 
     kind = sched["kind"]
     if kind not in GENERATORS:
@@ -98,7 +100,6 @@ def _parse_cron(cron_str: str) -> dict:
 
 def _parse_duration(duration_str: str) -> dict:
     """Convert 'every Nh' or 'every Nm' to cron-like interval kwargs."""
-    import re
 
     match = re.match(r"every\s+(\d+)\s*([mhd])", duration_str.lower())
     if not match:
@@ -178,8 +179,6 @@ async def run_schedule_now(
     sched = brain_db.get_schedule(schedule_id)
     if not sched:
         raise ValueError(f"Schedule not found: {schedule_id}")
-
-    from generators import GENERATORS
 
     kind = sched["kind"]
     if kind not in GENERATORS:

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 import persona_learning as pl
+from generators import persona_reflect_generator
 from persona import compose_identity, compose_persona, render_all
 
 
@@ -18,10 +21,6 @@ class Proposal(BaseModel):
 
 def _run_reflection(profile_name):
     """Override point; default runs the generator. Patched in tests."""
-    import asyncio
-
-    from generators import persona_reflect_generator
-
     return asyncio.run(persona_reflect_generator(None, profile_name=profile_name))
 
 

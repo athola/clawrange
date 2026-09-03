@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import pathlib
 
-from persona import render_persona, write_soul
+from persona import (
+    compose_persona,
+    render_all,
+    render_identity,
+    render_persona,
+    write_soul,
+)
 from tenant_profile import Profile, load_profile
 
 
@@ -89,9 +95,6 @@ def test_marketing_render_contains_john117():
 
 
 def test_render_identity_fills_fields_and_defaults_name():
-    from persona import render_identity
-    from tenant_profile import Profile
-
     p = Profile(
         name="t",
         raw={
@@ -126,9 +129,6 @@ def test_write_soul_round_trips(tmp_path):
 
 
 def test_compose_appends_learned_region_and_is_non_destructive():
-    from persona import compose_persona
-    from tenant_profile import Profile
-
     p = Profile(name="t", raw={"profile": "t", "assistant": {"name": "Max"}})
     learnings = [
         {
@@ -147,9 +147,6 @@ def test_compose_appends_learned_region_and_is_non_destructive():
 
 
 def test_render_all_writes_targets(tmp_path):
-    from persona import render_all
-    from tenant_profile import Profile
-
     p = Profile(name="t", raw={"profile": "t", "assistant": {"name": "Max"}})
     soul = tmp_path / "soul.md"
     ident = tmp_path / "IDENTITY.md"
@@ -161,7 +158,6 @@ def test_render_all_writes_targets(tmp_path):
 def test_render_all_unwritable_target_returns_false(tmp_path):
     """render_all's no-raise contract: an unwritable target reports False
     instead of raising, so approve never 500s after committing DB status."""
-    from persona import render_all
 
     p = Profile("x", {"profile": "x", "assistant": {"name": "Max"}})
     blocker = tmp_path / "blocker"

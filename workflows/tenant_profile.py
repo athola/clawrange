@@ -143,6 +143,10 @@ def validate(
         )
 
     if known_generator_kinds is None:
+        # Function-local on purpose: generators imports tenant_profile at
+        # module level, so a top-level import here would be circular. The
+        # `known_generator_kinds` parameter lets tests inject the registry
+        # without importing generators at all.
         from generators import GENERATORS
 
         known_generator_kinds = set(GENERATORS)

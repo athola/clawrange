@@ -21,10 +21,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
+import sys
+import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+
+import httpx
+
+import llm_proxy
+from github_search import search_repos
+from reddit_search import search_subreddits
 
 logger = logging.getLogger("clawrange.research")
 
@@ -280,7 +289,6 @@ def channel_health() -> dict[str, dict[str, Any]]:
     GITHUB_PAT not set) so they can fix the actual gap rather than
     chase phantom logic bugs.
     """
-    import os
 
     report: dict[str, dict[str, Any]] = {}
 
@@ -326,7 +334,6 @@ def channel_health() -> dict[str, dict[str, Any]]:
 
 async def _fetch_reddit(topic: str, **kwargs: Any) -> list[Finding]:
     """Wrap reddit_search.search_subreddits and emit Findings."""
-    from reddit_search import search_subreddits
 
     subreddits = kwargs.get("subreddits", ["ClaudeAI", "LocalLLaMA", "SideProject"])
     posts = await search_subreddits(
@@ -351,7 +358,6 @@ async def _fetch_reddit(topic: str, **kwargs: Any) -> list[Finding]:
 
 async def _fetch_github(topic: str, **kwargs: Any) -> list[Finding]:
     """Wrap github_search.search_repos and emit Findings."""
-    from github_search import search_repos
 
     repos = await search_repos(
         topic,
@@ -385,9 +391,6 @@ async def _fetch_academic(topic: str, **kwargs: Any) -> list[Finding]:
     individual academic-channel failures should not bubble out and
     cause the whole channel to be marked as a triangulation hole.
     """
-    import xml.etree.ElementTree as ET
-
-    import httpx
 
     limit = int(kwargs.get("limit", 5))
 
@@ -497,7 +500,6 @@ async def _fetch_triz(topic: str, **kwargs: Any) -> list[Finding]:
     synthesized finding; the prompt steers GLM toward concrete
     analogies with a domain-bridge mapping.
     """
-    from llm_proxy import _llm_call
 
     prompt = (
         f"TRIZ-style cross-domain analysis for: {topic}\n\n"
@@ -507,7 +509,7 @@ async def _fetch_triz(topic: str, **kwargs: Any) -> list[Finding]:
         "analogy in one sentence, and explain the bridge mapping in "
         "one sentence. Be specific."
     )
-    text = await _llm_call(prompt, max_tokens=600, web_search=True)
+    text = await llm_proxy._llm_call(prompt, max_tokens=600, web_search=True)
     if not text:
         return []
     return [
@@ -530,14 +532,13 @@ async def _fetch_web(topic: str, **kwargs: Any) -> list[Finding]:
     are already a synthesis. The caller should treat this as a
     summary, not a list of pages.
     """
-    from llm_proxy import _llm_call
 
     prompt = (
         f"Web research request: {topic}\n\n"
         "Return a tight summary with the top 3 sources. For each, "
         "include the URL."
     )
-    text = await _llm_call(prompt, max_tokens=800, web_search=True)
+    text = await llm_proxy._llm_call(prompt, max_tokens=800, web_search=True)
     if not text:
         return []
     return [
@@ -596,8 +597,6 @@ async def orchestrate_research(
 
     selected = channels or list(_DEFAULT_CHANNELS)
     selected = ["discourse_web" if c == "web" else c for c in selected]
-
-    import sys
 
     mod = sys.modules[__name__]
 

@@ -40,10 +40,10 @@
           "workspaceAccess": "ro"
         },
         "heartbeat": {
-          "every": "5m",
+          "every": "10m",
           "target": "telegram",
           "to": "${TELEGRAM_CHAT_ID}",
-          "activeHours": { "start": "07:00", "end": "22:00" },
+          "activeHours": { "start": "08:00", "end": "20:00" },
           "isolatedSession": true,
           "lightContext": false
         },

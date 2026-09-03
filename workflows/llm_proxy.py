@@ -6,6 +6,7 @@ successful response in OpenAI-compatible format (streaming or non-streaming).
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -19,7 +20,14 @@ import httpx
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from telegram import delete_message, edit_status, notify, send_status, send_typing
+import github_search
+import reddit_search
+import telegram
+
+# NOTE on deferred imports: ``app`` imports this module at module scope and
+# ``generators``/``scheduler`` import it transitively, so every use of
+# ``app``, ``generators``, and ``scheduler`` below stays function-local
+# (cycle guard).
 
 logger = logging.getLogger("clawrange.llm_proxy")
 
@@ -159,7 +167,7 @@ def _background_notify(tier_name: str, message: str) -> None:
 
     Telegram notifications go to the user's conversation chat and look like
     garbled bot responses. Rate limit events are logged for debugging only.
-    Explicit admin alerts (balance guard) use notify() directly.
+    Explicit admin alerts (balance guard) use telegram.notify() directly.
     """
     if not _should_notify(tier_name):
         return
@@ -170,7 +178,7 @@ def _background_notify(tier_name: str, message: str) -> None:
 async def _safe_notify(message: str) -> None:
     """Fire-and-forget wrapper that logs failures instead of raising."""
     try:
-        await notify(message)
+        await telegram.notify(message)
     except Exception:
         logger.exception("Notification delivery failed")
 
@@ -1066,8 +1074,6 @@ async def _handle_sched_command(subcmd: str, args: str) -> str:
                 f"Unknown generator: {kind}. Available: {', '.join(GENERATORS.keys())}"
             )
 
-        import hashlib
-
         from scheduler import add_schedule
 
         sched_id = hashlib.md5(name.encode()).hexdigest()[:8]
@@ -1144,16 +1150,12 @@ async def _handle_scan_command(subcmd: str, args: str) -> str:
         if not subreddits and project_slug:
             project = brain_db.get_project(project_slug)
             if project:
-                import json
-
                 subreddits = json.loads(project.get("subreddits", "[]"))
 
         if not subreddits:
             subreddits = ["ClaudeAI", "LocalLLaMA", "SideProject"]
 
-        from reddit_search import search_subreddits
-
-        results: list = await search_subreddits(
+        results: list = await reddit_search.search_subreddits(
             topic, subreddits, since=since, limit_per_sub=10
         )
 
@@ -1195,13 +1197,9 @@ async def _handle_scan_command(subcmd: str, args: str) -> str:
             return "Usage: /scan github <topic> [--kind repos|issues] [--stars 5]"
 
         if kind == "issues":
-            from github_search import search_issues
-
-            results = await search_issues(topic)
+            results = await github_search.search_issues(topic)
         else:
-            from github_search import search_repos
-
-            results = await search_repos(topic, min_stars=min_stars)
+            results = await github_search.search_repos(topic, min_stars=min_stars)
 
         if not results:
             return f"No GitHub results for '{topic}'"
@@ -1238,9 +1236,9 @@ async def _handle_scan_command(subcmd: str, args: str) -> str:
                 return "No projects tracked. Use /projects add first."
             lines = []
             for proj in projects:
-                from github_search import get_self_traffic
-
-                traffic = await get_self_traffic(proj["owner"], proj["repo"])
+                traffic = await github_search.get_self_traffic(
+                    proj["owner"], proj["repo"]
+                )
                 if traffic:
                     lines.append(
                         f"{proj['owner']}/{proj['repo']}\n"
@@ -1259,9 +1257,10 @@ async def _handle_scan_command(subcmd: str, args: str) -> str:
         project = brain_db.get_project(slug)
         if not project:
             return f"Project not found: {slug}"
-        from github_search import get_self_traffic
 
-        traffic = await get_self_traffic(project["owner"], project["repo"])
+        traffic = await github_search.get_self_traffic(
+            project["owner"], project["repo"]
+        )
         if not traffic:
             return "Traffic unavailable — needs GITHUB_PAT with repo scope"
         return (
@@ -1313,8 +1312,6 @@ async def _handle_projects_command(subcmd: str, args: str) -> str:
             return "No projects tracked. Use /projects add <slug> <owner>/<repo>"
         lines = ["Tracked Projects:\n"]
         for p in projects:
-            import json
-
             sub_list = json.loads(p.get("subreddits", "[]"))
             lines.append(
                 f"  {p['slug']} — {p['owner']}/{p['repo']}\n"
@@ -1328,7 +1325,6 @@ async def _handle_projects_command(subcmd: str, args: str) -> str:
         project = brain_db.get_project(slug)
         if not project:
             return f"Project not found: {slug}"
-        import json
 
         return (
             f"Project: {project['slug']}\n"
@@ -2240,10 +2236,6 @@ async def _try_marketing_scan(description: str, brain_db) -> str | None:
             if not project:
                 return None
 
-            import json
-
-            from reddit_search import search_subreddits
-
             topics = json.loads(project.get("topics", "[]"))
             subreddits = json.loads(project.get("subreddits", "[]"))
             search_terms = json.loads(project.get("search_terms", "[]"))
@@ -2251,7 +2243,7 @@ async def _try_marketing_scan(description: str, brain_db) -> str | None:
             query = (
                 " OR ".join(search_terms[:3]) if search_terms else " ".join(topics[:3])
             )
-            results = await search_subreddits(
+            results = await reddit_search.search_subreddits(
                 query, subreddits or ["ClaudeAI", "LocalLLaMA", "SideProject"]
             )
 
@@ -2278,18 +2270,14 @@ async def _try_marketing_scan(description: str, brain_db) -> str | None:
             if not project:
                 return None
 
-            import json
-
-            from github_search import search_issues, search_repos
-
             search_terms = json.loads(project.get("search_terms", "[]"))
             topics = json.loads(project.get("topics", "[]"))
             query = (
                 " OR ".join(search_terms[:3]) if search_terms else " ".join(topics[:3])
             )
 
-            repos = await search_repos(query, min_stars=5, limit=10)
-            issues = await search_issues(query, limit=10)
+            repos = await github_search.search_repos(query, min_stars=5, limit=10)
+            issues = await github_search.search_issues(query, limit=10)
 
             lines = [
                 f"GitHub scan for {slug} ({len(repos)} repos, {len(issues)} issues):\n"
@@ -2316,9 +2304,8 @@ async def _try_marketing_scan(description: str, brain_db) -> str | None:
 
         if kind == "traffic":
             owner, repo_name = match.group(1), match.group(2)
-            from github_search import get_self_traffic
 
-            traffic = await get_self_traffic(owner, repo_name)
+            traffic = await github_search.get_self_traffic(owner, repo_name)
             if not traffic:
                 return (
                     f"Traffic for {owner}/{repo_name}: unavailable "
@@ -2378,7 +2365,7 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
         lines.append(f"Result: {result}")
 
         # Direct Telegram notification
-        await notify(
+        await telegram.notify(
             f"[{label}] Task completed: #{task['id']}\n"
             f"{task['description']}\n\n"
             f"Result: {result}"
@@ -2484,8 +2471,10 @@ async def _try_single_tier(
     api_key = os.getenv(provider_config["env_key"], "")
 
     if status_msg_id:
-        asyncio.create_task(send_typing())
-        asyncio.create_task(edit_status(status_msg_id, f"\u23f3 {tier['description']}"))
+        asyncio.create_task(telegram.send_typing())
+        asyncio.create_task(
+            telegram.edit_status(status_msg_id, f"\u23f3 {tier['description']}")
+        )
 
     try:
         non_stream_body = {**body, "stream": False}
@@ -2795,8 +2784,8 @@ async def chat_completions(
         print("[PROXY] no tier hint — racing all free tiers", flush=True)
 
     # Show typing indicator and send a transient status message
-    asyncio.create_task(send_typing())
-    status_msg_id = await send_status("\u23f3")
+    asyncio.create_task(telegram.send_typing())
+    status_msg_id = await telegram.send_status("\u23f3")
 
     # Always use non-streaming internally for full sanitization + garbled
     # detection, then re-wrap as SSE if the client requested streaming.
@@ -2815,7 +2804,7 @@ async def chat_completions(
 
     # Remove the status message — OpenClaw delivers the real response
     if status_msg_id:
-        asyncio.create_task(delete_message(status_msg_id))
+        asyncio.create_task(telegram.delete_message(status_msg_id))
 
     if is_stream and isinstance(result, JSONResponse):
         return _wrap_json_as_sse(result)
@@ -2852,7 +2841,7 @@ async def _handle_non_streaming(
         if tier_name == "openrouter-paid":
             remaining = await _check_openrouter_balance()
             if remaining is not None and remaining <= OPENROUTER_BALANCE_FLOOR:
-                await notify(
+                await telegram.notify(
                     f"*Balance guard* — ${remaining:.2f} remaining"
                     f"\nSkipping `{tier_name}` to protect free-tier quota"
                 )
@@ -2915,7 +2904,7 @@ async def _handle_non_streaming(
                 )
                 if status_msg_id:
                     asyncio.create_task(
-                        edit_status(
+                        telegram.edit_status(
                             status_msg_id, f"\u23f3 Rate limited — retrying in {wait}s"
                         )
                     )
