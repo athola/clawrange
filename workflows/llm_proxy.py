@@ -1869,6 +1869,14 @@ async def _llm_call(
                 continue
             provider = tier["provider"]
 
+            if provider == "openrouter":
+                remaining = await _check_openrouter_balance()
+                # Same rule as the racing path: a zero/negative balance
+                # 402s on every OpenRouter model — go straight to the next
+                # tier instead of burning a doomed provider attempt.
+                if remaining is not None and remaining <= 0:
+                    continue
+
             provider_config = CONFIG["providers"][provider]
             api_key = os.getenv(provider_config["env_key"], "")
             if not api_key:
@@ -2063,7 +2071,9 @@ async def _gather_system_state() -> str:
     return (
         "CURRENT SYSTEM STATE:\n"
         "Tiers:\n" + "\n".join(tier_lines) + "\n"
-        f"Balance: {balance} (floor: ${OPENROUTER_BALANCE_FLOOR:.2f})\n"
+        f"OpenRouter balance: {balance} (floor: ${OPENROUTER_BALANCE_FLOOR:.2f}). "
+        "zai-direct is a separate provider with its own quota and is not "
+        "affected by this balance.\n"
         f"Last tier used: {_last_tier_used or 'none'}\n"
         f"Task queue: {pending} pending, {active} active, {done} done"
     )
@@ -2386,12 +2396,12 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
                 t = brain_db.create_task(desc, priority=2)
                 tasks_created.append(t)
 
-        if remaining is not None and remaining < 5.0:
+        if remaining is not None and remaining < OPENROUTER_BALANCE_FLOOR:
             desc = f"Low balance alert: ${remaining:.2f} remaining"
-            if not any(
-                "Low balance alert" in t["description"] and t["status"] == "pending"
-                for t in all_tasks
-            ):
+            # Any alert in the last 24h counts, completed or not. The old
+            # pending-only dedup re-created the alert every cycle once the
+            # previous one completed, spamming Telegram with duplicates.
+            if not _has_recent_task(all_tasks, "Low balance alert", hours=24):
                 t = brain_db.create_task(desc, priority=1)
                 tasks_created.append(t)
 
@@ -2839,15 +2849,24 @@ async def _handle_non_streaming(
             continue
         if provider not in PROVIDER_URLS:
             continue
+        if provider == "openrouter":
+            remaining = await _check_openrouter_balance()
+            # A zero/negative balance blocks every OpenRouter model —
+            # free-tier included — with 402 payment-required errors. Skip
+            # the whole provider so zai-direct carries traffic instead of
+            # every request stalling through failed OpenRouter attempts.
+            if remaining is not None and remaining <= 0:
+                if _should_notify("balance-guard"):
+                    await telegram.notify(
+                        f"*Balance guard* — OpenRouter balance ${remaining:.2f}.\n"
+                        "Routing around OpenRouter until it's topped up."
+                    )
+                continue
         if tier_name == "openrouter-paid" and not forced_tier:
             continue
         if tier_name == "openrouter-paid":
             remaining = await _check_openrouter_balance()
             if remaining is not None and remaining <= OPENROUTER_BALANCE_FLOOR:
-                await telegram.notify(
-                    f"*Balance guard* — ${remaining:.2f} remaining"
-                    f"\nSkipping `{tier_name}` to protect free-tier quota"
-                )
                 continue
         available.append(tier)
 

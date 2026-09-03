@@ -135,6 +135,57 @@ class TestProxyTierFallback:
         assert r.json()["_clawrange_tier"] == "zai-direct"
 
     @patch("llm_proxy._background_notify")
+    @patch("telegram.notify", new_callable=AsyncMock)
+    @patch("llm_proxy._check_openrouter_balance", new_callable=AsyncMock)
+    @patch("llm_proxy._call_provider", side_effect=_all_succeed)
+    def test_zero_balance_routes_around_openrouter(
+        self, mock_call, mock_balance, mock_tg, _mock_bg
+    ):
+        """A zero/negative balance blocks every OpenRouter model (free
+        included) with 402s — skip the provider entirely so zai-direct
+        carries traffic instead of stalling."""
+        import llm_proxy
+
+        mock_balance.return_value = -1.28
+        llm_proxy._notification_last_sent.clear()
+        try:
+            r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
+            assert r.status_code == 200
+            assert r.json()["_clawrange_tier"] == "zai-direct"
+            providers = [c.args[0] for c in mock_call.call_args_list]
+            assert "openrouter" not in providers
+        finally:
+            llm_proxy._notification_last_sent.clear()
+
+    @patch("llm_proxy._background_notify")
+    @patch("telegram.notify", new_callable=AsyncMock)
+    @patch("llm_proxy._check_openrouter_balance", new_callable=AsyncMock)
+    @patch("llm_proxy._call_provider", side_effect=_all_succeed)
+    def test_balance_guard_notify_throttled(
+        self, mock_call, mock_balance, mock_tg, _mock_bg
+    ):
+        """The skip notice fires at most once per debounce window, not
+        once per skipped tier per request."""
+        import llm_proxy
+
+        mock_balance.return_value = -1.28
+        llm_proxy._notification_last_sent.clear()
+        try:
+            for _ in range(2):
+                r = client.post(
+                    "/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER
+                )
+                assert r.status_code == 200
+            guard_calls = [
+                c
+                for c in mock_tg.call_args_list
+                if "Balance guard" in (c.args[0] if c.args else "")
+            ]
+            assert len(guard_calls) <= 1
+        finally:
+            llm_proxy._notification_last_sent.clear()
+
+    @patch("llm_proxy._background_notify")
     @patch("llm_proxy._call_provider", side_effect=_all_rate_limited)
     def test_all_tiers_exhausted_returns_synthetic(self, mock_call, mock_bg):
         """When all tiers are rate limited, return a friendly synthetic response."""
@@ -2473,6 +2524,46 @@ class TestHeartbeatInterceptor:
         completed = [t for t in tasks if t["status"] == "completed"]
         assert len(completed) >= 1
         assert "no anomalies" in completed[0]["result"]
+
+    @patch("llm_proxy._llm_suggest_task", new_callable=AsyncMock, return_value=None)
+    @patch("llm_proxy._check_openrouter_balance", new_callable=AsyncMock)
+    def test_low_balance_alert_not_recreated_after_completion(
+        self, mock_balance, _mock_suggest
+    ):
+        """A completed alert within 24h suppresses new alerts: the old
+        pending-only dedup recreated the alert every cycle, spamming
+        Telegram with a duplicate wall of text per heartbeat."""
+
+        from app import brain_db
+
+        mock_balance.return_value = 3.0
+
+        existing = brain_db.create_task(
+            "Low balance alert: $3.00 remaining", priority=1
+        )
+        brain_db.complete_task(existing["id"], "noted", "completed")
+        baseline = len(
+            [
+                t
+                for t in brain_db.list_tasks()
+                if "Low balance alert" in t["description"]
+            ]
+        )
+        assert baseline == 1
+
+        r = client.post(
+            "/v1/chat/completions",
+            json=self._heartbeat_body(),
+            headers=AUTH_HEADER,
+        )
+        assert r.status_code == 200
+        alerts = [
+            t for t in brain_db.list_tasks() if "Low balance alert" in t["description"]
+        ]
+        assert len(alerts) == 1, (
+            f"expected no new alert, got {[t['id'] for t in alerts]}"
+        )
+        assert alerts[0]["id"] == existing["id"]
 
     def test_heartbeat_silent_when_no_issues(self):
         """With no pending tasks, no infra issues, and proactive checks
