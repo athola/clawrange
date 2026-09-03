@@ -1,6 +1,7 @@
 """Tests for the LLM proxy with three-tier fallback."""
 
 import json
+import time
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
@@ -50,6 +51,8 @@ def _reset_state():
 
     llm_proxy._circuit_state.clear()
     llm_proxy._notification_last_sent.clear()
+    llm_proxy._digest_state["lines"] = []
+    llm_proxy._digest_state["last_flush"] = time.monotonic()
 
 
 # ─── Provider mock helpers ────────────────────────────────────────
@@ -2479,10 +2482,19 @@ class TestHeartbeatInterceptor:
             mock_caller.assert_not_called()
 
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
-    def test_heartbeat_processes_pending_task(self, mock_notify):
-        """When pending tasks exist, heartbeat sends them to the LLM for work."""
+    def test_heartbeat_processes_pending_task_hourly_digest(self, mock_notify):
+        """Task completions buffer into the hourly digest: no per-completion
+        Telegram notification, silent heartbeat response, and the buffered
+        result delivered as the next digest once the hour elapses."""
+        import time as _time
+
+        import llm_proxy
         from app import TaskCreate as TC
         from app import create_task
+
+        # Suppress proactive layers so only the pending task is processed
+        llm_proxy._proactive_state["stale_tasks"] = _time.monotonic()
+        llm_proxy._proactive_state["llm_thinking"] = _time.monotonic()
 
         create_task(TC(description="Test task for heartbeat", priority=2))
 
@@ -2509,14 +2521,11 @@ class TestHeartbeatInterceptor:
                 headers=AUTH_HEADER,
             )
             content = r.json()["choices"][0]["message"]["content"]
-            assert "ALEX" in content or "SYSTEM" in content
-            assert "no anomalies" in content
+            assert content == ""  # silent: completion buffered, not relayed
             mock_caller.assert_called_once()
 
-        # Verify Telegram notification was sent
-        mock_notify.assert_called_once()
-        notify_text = mock_notify.call_args[0][0]
-        assert "Task completed" in notify_text
+        # No per-completion Telegram notification
+        mock_notify.assert_not_called()
 
         from app import brain_db
 
@@ -2524,6 +2533,21 @@ class TestHeartbeatInterceptor:
         completed = [t for t in tasks if t["status"] == "completed"]
         assert len(completed) >= 1
         assert "no anomalies" in completed[0]["result"]
+
+        # An hour later the digest delivers the buffered completion
+        llm_proxy._digest_state["last_flush"] = (
+            _time.monotonic() - llm_proxy.HEARTBEAT_DIGEST_INTERVAL - 1
+        )
+        r = client.post(
+            "/v1/chat/completions",
+            json=self._heartbeat_body(),
+            headers=AUTH_HEADER,
+        )
+        content = r.json()["choices"][0]["message"]["content"]
+        assert "Test task for heartbeat" in content
+        assert "no anomalies" in content
+        # Digest rides the heartbeat response; still no direct notify
+        mock_notify.assert_not_called()
 
     @patch("llm_proxy._llm_suggest_task", new_callable=AsyncMock, return_value=None)
     @patch("llm_proxy._check_openrouter_balance", new_callable=AsyncMock)
@@ -2612,8 +2636,23 @@ class TestHeartbeatInterceptor:
             headers=AUTH_HEADER,
         )
         content = r.json()["choices"][0]["message"]["content"]
-        # Should process the old task (it's pending)
-        assert "SYSTEM" in content or "[TASK]" in content
+        # The stale task is processed and buffered into the digest; the
+        # heartbeat response itself stays silent.
+        assert content == ""
+        statuses = {t["id"]: t["status"] for t in brain_db.list_tasks()}
+        assert statuses[old_task["id"]] == "completed"
+
+        # ...and the completion surfaces in the next hourly digest
+        llm_proxy._digest_state["last_flush"] = (
+            time.monotonic() - llm_proxy.HEARTBEAT_DIGEST_INTERVAL - 1
+        )
+        r = client.post(
+            "/v1/chat/completions",
+            json=self._heartbeat_body(),
+            headers=AUTH_HEADER,
+        )
+        content = r.json()["choices"][0]["message"]["content"]
+        assert "old task from earlier" in content
 
     def test_heartbeat_llm_thinking(self):
         """Heartbeat asks the LLM for a task suggestion when due."""
@@ -2646,7 +2685,18 @@ class TestHeartbeatInterceptor:
                 headers=AUTH_HEADER,
             )
             content = r.json()["choices"][0]["message"]["content"]
-            assert "Created" in content
+            assert content == ""  # created tasks buffer into the digest
+
+            # Once the digest hour elapses the suggestion is delivered
+            llm_proxy._digest_state["last_flush"] = (
+                time.monotonic() - llm_proxy.HEARTBEAT_DIGEST_INTERVAL - 1
+            )
+            r = client.post(
+                "/v1/chat/completions",
+                json=self._heartbeat_body(),
+                headers=AUTH_HEADER,
+            )
+            content = r.json()["choices"][0]["message"]["content"]
             assert "OpenRouter spending" in content
 
         from app import brain_db

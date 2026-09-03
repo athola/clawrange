@@ -2338,6 +2338,45 @@ async def _try_marketing_scan(description: str, brain_db) -> str | None:
     return None
 
 
+# ─── Heartbeat Digest ──────────────────────────────────────────────
+# The heartbeat runs every 10 minutes, but Telegram should hear from it
+# at most hourly. Completed work buffers here and is delivered as the
+# heartbeat response (which OpenClaw relays to Telegram) once the hour
+# elapses — every other cycle stays silent.
+
+HEARTBEAT_DIGEST_INTERVAL = 3600.0  # seconds between Telegram digests
+
+_digest_state: dict = {"lines": [], "last_flush": time.monotonic()}
+
+
+def _digest_record(line: str) -> None:
+    """Buffer one digest line for the next hourly flush."""
+    _digest_state["lines"].append(line)
+
+
+def _digest_due(now: float | None = None) -> bool:
+    now = now if now is not None else time.monotonic()
+    return now - _digest_state["last_flush"] >= HEARTBEAT_DIGEST_INTERVAL
+
+
+def _digest_take(now: float, remaining: float | None, tripped: list[str]) -> str:
+    """Drain the buffer into the digest text, or '' when there is nothing.
+
+    A due interval with an empty buffer stays silent — no empty chit-chat.
+    """
+    lines = _digest_state["lines"]
+    _digest_state["lines"] = []
+    _digest_state["last_flush"] = now
+    if not lines:
+        return ""
+    out = [f"Heartbeat digest ({len(lines)} item(s) this hour):", *lines]
+    if tripped:
+        out.append(f"Tiers: {', '.join(tripped)} TRIPPED")
+    if remaining is not None:
+        out.append(f"OpenRouter balance: ${remaining:.2f}")
+    return "\n".join(out)
+
+
 async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse:
     """Run heartbeat checks in Python instead of relying on the LLM.
 
@@ -2345,10 +2384,13 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
     1. Infrastructure monitoring — tripped tiers, low balance (every cycle)
     2. Task queue awareness — stale task nudges (every 30 min)
     3. LLM-powered thinking — self-directed task suggestions (every 1 hr)
+
+    Everything worth reporting buffers into the hourly digest instead of
+    messaging per event; the digest is returned as this response (relayed
+    to Telegram by OpenClaw) at most once per HEARTBEAT_DIGEST_INTERVAL.
     """
     from app import brain_db
 
-    lines: list[str] = []
     tasks_created: list[dict] = []
 
     # ── 1. Tier status ──────────────────────────────────────────
@@ -2374,15 +2416,15 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
             result = await _llm_work_task(task["description"])
 
         brain_db.complete_task(task["id"], result, "completed")
-        lines.append(f"[{label}] #{task['id']}: {task['description']}")
-        lines.append(f"Result: {result}")
-
-        # Direct Telegram notification
-        await telegram.notify(
-            f"[{label}] Task completed: #{task['id']}\n"
-            f"{task['description']}\n\n"
-            f"Result: {result}"
+        # Condensed one-entry-per-task digest line; full result stays in
+        # the task queue (!tasks / GET /task/{id}).
+        _digest_record(
+            f"[{label}] #{task['id']}: {task['description']}\nResult: {result[:500]}"
         )
+
+        # No direct Telegram notification: the digest line above carries
+        # the completion, at most once per hour.
+
     else:
         # ── PROACTIVE SCAN ──────────────────────────────────────
         all_tasks = brain_db.list_tasks()
@@ -2390,9 +2432,9 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
         # Layer 1: Infrastructure — every cycle
         for name in tripped:
             desc = f"Investigate tier recovery: {name}"
-            if not any(
-                t["description"] == desc and t["status"] == "pending" for t in all_tasks
-            ):
+            # 24h dedup regardless of status — pending-only dedup had the
+            # same recreate-after-complete loop as the balance alert.
+            if not _has_recent_task(all_tasks, desc, hours=24):
                 t = brain_db.create_task(desc, priority=2)
                 tasks_created.append(t)
 
@@ -2429,22 +2471,18 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
                 tasks_created.append(t)
 
     # ── 3. Build response ───────────────────────────────────────
-    # Only send a visible response when there's something worth reporting.
-    # Empty heartbeat_ok is silent — OpenClaw won't relay it to Telegram.
-    if not lines and not tasks_created:
-        resp = _synthetic_response("")
+    # Created tasks buffer into the digest alongside completions. The
+    # response is non-empty only when the hourly digest is due, so the
+    # 10-minute heartbeat stays silent on Telegram except once per hour
+    # (OpenClaw relays non-empty heartbeat responses, not empty ones).
+    for t in tasks_created:
+        _digest_record(f"Created #{t['id']} [P{t['priority']}] {t['description'][:60]}")
+
+    if _digest_due():
+        text = _digest_take(time.monotonic(), remaining, tripped)
     else:
-        if tasks_created:
-            lines.append(f"Created {len(tasks_created)} task(s):")
-            for t in tasks_created:
-                lines.append(f"  #{t['id']} [P{t['priority']}] {t['description'][:60]}")
-
-        if tripped:
-            lines.append(f"Tiers: {', '.join(tripped)} TRIPPED")
-        if remaining is not None:
-            lines.append(f"Balance: ${remaining:.2f}")
-
-        resp = _synthetic_response("\n".join(lines))
+        text = ""
+    resp = _synthetic_response(text)
 
     if is_stream:
         return _wrap_json_as_sse(resp)

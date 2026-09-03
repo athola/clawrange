@@ -1,56 +1,63 @@
 # Heartbeat Checklist
 
-Runs every 5 minutes. Handled in Python by the proxy. No LLM needed.
+Runs every 10 minutes (08:00–20:00 active hours). Handled in Python by
+the proxy. No LLM needed.
 
 ## What Gets Checked
 
 1. **Tier health**: any circuit breakers tripped?
-2. **Balance**: below $5.00 threshold?
-3. **Pending tasks**: anything in the queue to process?
+2. **OpenRouter balance**: read live from the OpenRouter credits API
+   (`/api/v1/credits`), cached 5 minutes. Below the floor
+   (`OPENROUTER_BALANCE_FLOOR`, default $10) → alert task. At or below
+   $0 → OpenRouter tiers are skipped entirely and zai-direct carries
+   traffic (no stalling, no failed attempts).
+3. **Pending tasks**: anything in the queue to process? One per cycle.
 4. **Brain health**: is the knowledge DB accessible? (via /healthz brain status)
 5. **Research freshness** (daily, not every cycle): has a research
    session run in the last 24 hours? Handled server-side by the
    `research_pulse` generator: if research is stale it enqueues a
    `research:tome: <topic>` task (P3) that `scripts/tome_bridge.py`
-   runs through the local `/tome:research` session. The personas have
-   no POST tool, so they never trigger research directly.
+   runs through the local `/tome:research` session.
 
 ## Behavior
 
 ### No pending tasks → Proactive Scan
 - If a tier is tripped, create a task: `Investigate tier recovery: <name>` (P2)
-- If balance is below $5.00, create a task: `Low balance alert: $X.XX remaining` (P1)
-- If nothing triggers → respond `heartbeat_ok` (silent, no Telegram notification)
+- If the OpenRouter balance is below the floor, create a task:
+  `Low balance alert: $X.XX remaining` (P1)
+- If nothing triggers → respond empty (silent, no Telegram notification)
 
 ### Pending tasks exist → Process One
 - Claim the highest-priority pending task
-- Mark it completed with acknowledgment
-- Report the result
+- Run it: structured scans via the marketing scanners, research-shaped
+  tasks via the `/research` orchestrator (real Reddit/GitHub/web results
+  with URLs), everything else via the LLM
+- Mark it completed with the result
 
-## Response Format
+## Reporting: hourly digest, not per-event messages
 
-**No issues, no tasks:**
-```
-heartbeat_ok
-```
+Everything worth reporting (task completions, created tasks) buffers
+into a digest. The heartbeat response is non-empty only when the digest
+is due (at most once per hour) — OpenClaw relays non-empty responses to
+Telegram, so the cadence on the phone is one condensed message per
+hour, not one per 10-minute cycle.
 
-**Task completed:**
+**Digest (hourly, only when there is buffered work):**
 ```
-[TASK] #<id>: <description>
+Heartbeat digest (N item(s) this hour):
+[ALEX|SYSTEM] #<id>: <description>
 Result: <summary>
-Tiers: all ready | Balance: $X.XX
+Created #<id> [P<n>] <description>
+Tiers: <tripped> TRIPPED | OpenRouter balance: $X.XX
 ```
 
-**Issue found:**
-```
-Created N task(s):
-  #<id> [P<n>] <description>
-Tiers: <status> | Balance: $X.XX
-```
+Any other cycle responds empty (silent).
 
 ## Rules
 
 - ONE task per cycle maximum
-- `heartbeat_ok` = silent (no Telegram notification)
-- Deduplication: don't create tasks that already exist as pending
+- Empty response = silent (no Telegram notification)
+- Deduplication: don't recreate an alert/investigation task if a
+  similar one exists from the last 24 hours regardless of status —
+  completed alerts count, or they would be recreated every cycle
 - Infrastructure monitoring only. Alex creates his own work tasks via `!task`
