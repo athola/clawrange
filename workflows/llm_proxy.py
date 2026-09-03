@@ -2434,6 +2434,41 @@ def _digest_take(now: float, remaining: float | None, tripped: list[str]) -> str
     return "\n".join(out)
 
 
+_ALERT_TASK_PREFIXES = ("low balance alert:", "investigate tier recovery:")
+
+
+def _is_status_alert(description: str) -> bool:
+    """True for tasks the heartbeat's proactive scan created to flag state.
+
+    These close with live facts below — sending them through the LLM
+    dramatizes them into alarmist reports and can assert stale numbers
+    (the value in the description is minutes old, or a phantom from a
+    superseded balance source).
+    """
+    return description.strip().lower().startswith(_ALERT_TASK_PREFIXES)
+
+
+def _status_alert_result(description: str, remaining: float | None) -> str:
+    """Factual closing note for a status-alert task, from live state."""
+    balance = f"${remaining:.2f}" if remaining is not None else "unknown"
+    if remaining is None:
+        routing = "balance unknown (credits API unreachable)"
+    elif remaining <= 0:
+        routing = "openrouter skipped (depleted), zai-direct carrying traffic"
+    else:
+        routing = "openrouter active"
+    lowered = description.lower()
+    if lowered.startswith("investigate tier recovery:"):
+        name = description.split(":", 1)[1].strip()
+        if _circuit_open(name):
+            state = "TRIPPED (circuit open)"
+        else:
+            state = "recovered (circuit closed)"
+        return f"Tier {name}: {state}. OpenRouter balance: {balance}."
+    floor = f"${OPENROUTER_BALANCE_FLOOR:.0f}"
+    return f"Live status: OpenRouter balance {balance} (floor {floor}); {routing}."
+
+
 async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse:
     """Run heartbeat checks in Python instead of relying on the LLM.
 
@@ -2465,17 +2500,21 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
         label = "ALEX" if source == "user" else "SYSTEM"
         brain_db.claim_task(task["id"])
 
-        # Structured interception, in order: marketing scans, then
-        # research-shaped tasks (web-capable orchestrator), then the LLM.
-        scan_result = await _try_marketing_scan(task["description"], brain_db)
-        if scan_result is not None:
-            result = scan_result
+        # Structured interception, in order: self-created status alerts
+        # (closed with live facts, never the LLM), then marketing scans,
+        # then research-shaped tasks (web-capable orchestrator), then the LLM.
+        if _is_status_alert(task["description"]):
+            result = _status_alert_result(task["description"], remaining)
         else:
-            research_result = await _try_research_task(task["description"])
-            if research_result is not None:
-                result = research_result
+            scan_result = await _try_marketing_scan(task["description"], brain_db)
+            if scan_result is not None:
+                result = scan_result
             else:
-                result = await _llm_work_task(task["description"])
+                research_result = await _try_research_task(task["description"])
+                if research_result is not None:
+                    result = research_result
+                else:
+                    result = await _llm_work_task(task["description"])
 
         brain_db.complete_task(task["id"], result, "completed")
         # Condensed one-entry-per-task digest line; full result stays in

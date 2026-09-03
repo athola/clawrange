@@ -2731,6 +2731,73 @@ class TestHeartbeatInterceptor:
         )
         assert alerts[0]["id"] == existing["id"]
 
+    @patch("llm_proxy._call_provider", new_callable=AsyncMock)
+    @patch("llm_proxy._check_openrouter_balance", new_callable=AsyncMock)
+    def test_status_alert_closes_with_live_facts_not_llm(
+        self, mock_balance, mock_caller
+    ):
+        """A queued balance alert (e.g. a phantom negative recorded before
+        the credits-API fix) completes with the LIVE balance from Python —
+        the LLM never sees it, so it cannot dramatize stale numbers into
+        an alarmist report."""
+        import time as _time
+
+        import llm_proxy
+        from app import brain_db
+
+        llm_proxy._proactive_state["stale_tasks"] = _time.monotonic()
+        llm_proxy._proactive_state["llm_thinking"] = _time.monotonic()
+
+        mock_balance.return_value = 28.69
+        t = brain_db.create_task("Low balance alert: $-1.33 remaining", priority=1)
+
+        r = client.post(
+            "/v1/chat/completions",
+            json=self._heartbeat_body(),
+            headers=AUTH_HEADER,
+        )
+        assert r.status_code == 200
+        mock_caller.assert_not_called()  # no LLM for status alerts
+
+        done = brain_db.get_task(t["id"])
+        assert done["status"] == "completed"
+        assert "$28.69" in done["result"]
+        assert "openrouter active" in done["result"]
+        assert "-1.33" not in done["result"]
+
+    @patch("llm_proxy._call_provider", new_callable=AsyncMock)
+    @patch("llm_proxy._check_openrouter_balance", new_callable=AsyncMock)
+    def test_tier_recovery_alert_closes_with_live_state(
+        self, mock_balance, mock_caller
+    ):
+        """Tier-recovery alert tasks also close in Python with the current
+        circuit state."""
+        import time as _time
+
+        import llm_proxy
+        from app import brain_db
+
+        llm_proxy._proactive_state["stale_tasks"] = _time.monotonic()
+        llm_proxy._proactive_state["llm_thinking"] = _time.monotonic()
+
+        mock_balance.return_value = 28.69
+        t = brain_db.create_task(
+            "Investigate tier recovery: openrouter-free", priority=2
+        )
+
+        r = client.post(
+            "/v1/chat/completions",
+            json=self._heartbeat_body(),
+            headers=AUTH_HEADER,
+        )
+        assert r.status_code == 200
+        mock_caller.assert_not_called()
+
+        done = brain_db.get_task(t["id"])
+        assert done["status"] == "completed"
+        assert "openrouter-free" in done["result"]
+        assert "recovered (circuit closed)" in done["result"]
+
     def test_heartbeat_silent_when_no_issues(self):
         """With no pending tasks, no infra issues, and proactive checks
         not yet due, return empty response (silent heartbeat)."""
