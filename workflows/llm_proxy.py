@@ -2233,6 +2233,61 @@ project as a relevant tool second
 """
 
 
+# ─── Research Router ────────────────────────────────────────────────
+# The chat personas have no web tooling (the LLM can only stall or ask
+# Alex to authorize tools it will never have), but the workflow service
+# is web-capable: the research orchestrator fans out to Reddit, GitHub,
+# and web search server-side. Research-shaped heartbeat tasks route
+# there and come back with real, citable URLs.
+
+_RESEARCH_INTENT = re.compile(
+    r"\b(search|research|find|look\s*up|surface|scan|identify)\b", re.IGNORECASE
+)
+_RESEARCH_TARGET = re.compile(
+    r"\b(reddit|subreddit|hacker\s*news|\bhn\b|threads?|posts?|articles?|"
+    r"forums?|discussions?|conversations?|papers?|arxiv|github|repos?|"
+    r"web|online|internet)\w*\b",
+    re.IGNORECASE,
+)
+
+
+async def _try_research_task(description: str) -> str | None:
+    """Run a research-shaped task through the research orchestrator.
+
+    Returns condensed findings text when the task matches (intent verb +
+    external source target), None when it doesn't so the LLM path handles
+    it. A failure inside the orchestrator also returns None — the LLM
+    attempt is a better fallback than a hard error.
+    """
+    if not (
+        _RESEARCH_INTENT.search(description) and _RESEARCH_TARGET.search(description)
+    ):
+        return None
+
+    # Function-local on purpose (cycle guard): research imports this
+    # module at module scope for _llm_call, so a top-level import here
+    # would be circular.
+    import research
+
+    try:
+        result = await research.orchestrate_research(
+            description,
+            channels=["discourse", "code", "discourse_web"],
+        )
+    except Exception:
+        logger.exception("research router: orchestrator failed")
+        return None
+
+    findings = result.get("findings", [])
+    if not findings:
+        return f"Research: no findings for '{description}'."
+
+    lines = [f"Research findings for '{description}' ({len(findings)}):"]
+    for i, f in enumerate(findings[:8], 1):
+        lines.append(f"{i}. [{f['channel']}] {f['title'][:90]}\n   {f['url']}")
+    return "\n".join(lines)
+
+
 async def _try_marketing_scan(description: str, brain_db) -> str | None:
     """Detect and execute structured marketing scan tasks.
 
@@ -2344,7 +2399,9 @@ async def _try_marketing_scan(description: str, brain_db) -> str | None:
 # heartbeat response (which OpenClaw relays to Telegram) once the hour
 # elapses — every other cycle stays silent.
 
-HEARTBEAT_DIGEST_INTERVAL = 3600.0  # seconds between Telegram digests
+HEARTBEAT_DIGEST_INTERVAL = float(
+    os.getenv("HEARTBEAT_DIGEST_INTERVAL", "3600")
+)  # seconds between Telegram digests; independent of heartbeat cadence
 
 _digest_state: dict = {"lines": [], "last_flush": time.monotonic()}
 
@@ -2408,12 +2465,17 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
         label = "ALEX" if source == "user" else "SYSTEM"
         brain_db.claim_task(task["id"])
 
-        # Check if this is a structured marketing scan task
+        # Structured interception, in order: marketing scans, then
+        # research-shaped tasks (web-capable orchestrator), then the LLM.
         scan_result = await _try_marketing_scan(task["description"], brain_db)
         if scan_result is not None:
             result = scan_result
         else:
-            result = await _llm_work_task(task["description"])
+            research_result = await _try_research_task(task["description"])
+            if research_result is not None:
+                result = research_result
+            else:
+                result = await _llm_work_task(task["description"])
 
         brain_db.complete_task(task["id"], result, "completed")
         # Condensed one-entry-per-task digest line; full result stays in

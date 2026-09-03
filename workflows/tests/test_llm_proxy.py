@@ -2429,6 +2429,148 @@ class TestIsRateLimitedBodyParsing:
         assert _is_rate_limited(resp) is False
 
 
+# ─── Research Router ──────────────────────────────────────────────
+
+
+@patch.dict("os.environ", FAKE_ENV)
+@patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
+class TestResearchRouter:
+    """Research-shaped tasks route to the web-capable orchestrator
+    instead of the tool-less chat LLM."""
+
+    def setup_method(self):
+        _reset_state()
+
+    @patch("research.orchestrate_research", new_callable=AsyncMock)
+    def test_research_task_runs_orchestrator(self, mock_orch):
+        import asyncio
+
+        import llm_proxy
+
+        mock_orch.return_value = {
+            "findings": [
+                {
+                    "channel": "discourse",
+                    "title": "How do you capture trade-skill knowledge?",
+                    "url": "https://reddit.com/r/trades/x",
+                    "relevance": 9,
+                    "summary": "field-capture discussion",
+                }
+            ]
+        }
+        result = asyncio.run(
+            llm_proxy._try_research_task(
+                "Search Reddit for live threads on trade-skill knowledge capture"
+            )
+        )
+        assert result is not None
+        assert "reddit.com/r/trades/x" in result
+        mock_orch.assert_called_once()
+        assert mock_orch.call_args.kwargs["channels"] == [
+            "discourse",
+            "code",
+            "discourse_web",
+        ]
+
+    def test_non_research_task_returns_none(self):
+        import asyncio
+
+        import llm_proxy
+
+        assert asyncio.run(llm_proxy._try_research_task("Check z.ai pricing")) is None
+        assert asyncio.run(llm_proxy._try_research_task("Reply to Alex")) is None
+
+    @patch("research.orchestrate_research", new_callable=AsyncMock)
+    def test_no_findings_reported(self, mock_orch):
+        import asyncio
+
+        import llm_proxy
+
+        mock_orch.return_value = {"findings": []}
+        result = asyncio.run(
+            llm_proxy._try_research_task("research web articles on tacit knowledge")
+        )
+        assert result is not None
+        assert "no findings" in result.lower()
+
+    @patch("research.orchestrate_research", new_callable=AsyncMock)
+    def test_orchestrator_failure_falls_back_to_llm(self, mock_orch):
+        import asyncio
+
+        import llm_proxy
+
+        mock_orch.side_effect = RuntimeError("channels down")
+        result = asyncio.run(
+            llm_proxy._try_research_task("find reddit threads on chrome extensions")
+        )
+        assert result is None
+
+    @patch("research.orchestrate_research", new_callable=AsyncMock)
+    def test_heartbeat_processes_research_task_via_orchestrator(self, mock_orch):
+        """A queued research task completes with real citable URLs, and
+        the heartbeat response stays silent (digest carries it)."""
+        import time as _t
+
+        import llm_proxy
+        from app import TaskCreate as TC
+        from app import create_task
+
+        llm_proxy._proactive_state["stale_tasks"] = _t.monotonic()
+        llm_proxy._proactive_state["llm_thinking"] = _t.monotonic()
+
+        mock_orch.return_value = {
+            "findings": [
+                {
+                    "channel": "discourse",
+                    "title": "HN: Tools for capturing field knowledge",
+                    "url": "https://news.ycombinator.com/item?id=1",
+                    "relevance": 8,
+                    "summary": "hn thread",
+                }
+            ]
+        }
+        t = create_task(
+            TC(
+                description=(
+                    "Search Reddit and HN for live threads on trade-skill "
+                    "knowledge capture"
+                ),
+                priority=1,
+            )
+        )
+
+        r = client.post(
+            "/v1/chat/completions",
+            json=self._hb_body(),
+            headers=AUTH_HEADER,
+        )
+        assert r.status_code == 200
+        assert r.json()["choices"][0]["message"]["content"] == ""
+
+        from app import brain_db
+
+        done = brain_db.get_task(t["id"])
+        assert done["status"] == "completed"
+        assert "news.ycombinator.com" in done["result"]
+        mock_orch.assert_called_once()
+
+    @staticmethod
+    def _hb_body():
+        return {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "read heartbeat.md if it exists (workspace context). "
+                        "follow it strictly. do not infer or repeat old tasks "
+                        "from prior chats. if nothing needs attention, reply "
+                        "with exactly: heartbeat_ok"
+                    ),
+                }
+            ]
+        }
+
+
 # ─── Heartbeat Interceptor ──────────────────────────────────────
 
 
