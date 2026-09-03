@@ -2667,6 +2667,10 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
 
     if _digest_due():
         text = _digest_take(time.time(), remaining, tripped)
+        # OpenClaw logs only Telegram *failures*, so a silent digest and a
+        # dropped one look identical downstream. Log the handoff to give the
+        # two logs a correlation point.
+        print(f"[PROXY] digest flushed: {len(text)} chars", flush=True)
     else:
         text = ""
     resp = _synthetic_response(text)
