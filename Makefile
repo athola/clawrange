@@ -163,7 +163,7 @@ typecheck: ## Typecheck Python with mypy (uv managed)
 
 lint: ## Run all linters: ShellCheck (scripts) + ruff + mypy (Python)
 	@if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck --severity=warning scripts/*.sh && echo "All scripts pass ShellCheck"; \
+		shellcheck --severity=warning scripts/*.sh workflows/*.sh && echo "All scripts pass ShellCheck"; \
 	else \
 		echo "shellcheck not installed (skipping — install with: apt install shellcheck)"; \
 	fi

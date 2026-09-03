@@ -121,6 +121,9 @@ services:
       - ./workflows/crm_api.py:/app/crm_api.py:ro
       - ./workflows/connectors:/app/connectors:ro
       - ./workflows/crm:/app/crm:ro
+      # Supervisor entrypoint — exits non-zero on sustained healthz failure
+      # so restart: unless-stopped recovers a wedged --reload reloader.
+      - ./workflows/entrypoint.sh:/app/entrypoint.sh:ro
       # Tenant profiles — load_profile() resolves CLAWRANGE_PROFILE here.
       - ./config/profiles:/config/profiles:ro
       # Soul — gives Max its persona context for self-directed tasks
@@ -141,7 +144,6 @@ services:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
       - PROXY_AUTH_TOKEN=${PROXY_AUTH_TOKEN}
-      - OPENROUTER_CREDIT_BALANCE=${OPENROUTER_CREDIT_BALANCE:-0}
       - REDDIT_CLIENT_ID=${REDDIT_CLIENT_ID:-}
       - REDDIT_CLIENT_SECRET=${REDDIT_CLIENT_SECRET:-}
       - REDDIT_USERNAME=${REDDIT_USERNAME:-}
@@ -153,6 +155,9 @@ services:
       - CLAWRANGE_PROFILE=${CLAWRANGE_PROFILE:-starter}
       # Where the OpenClaw workspace state is mounted (runtime persona render).
       - OPENCLAW_STATE_DIR=/openclaw-state
+      # Telegram digest window for heartbeat reporting (seconds). Independent
+      # of the heartbeat cadence (every 10m, set in openclaw.json).
+      - HEARTBEAT_DIGEST_INTERVAL=${HEARTBEAT_DIGEST_INTERVAL:-3600}
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped
