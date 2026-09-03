@@ -108,7 +108,6 @@ def _record_rate_limit(tier_name: str) -> None:
 
 # ─── Balance Guard (protect $10 free-tier threshold) ─────────────
 
-OPENROUTER_CREDIT_BALANCE = float(os.getenv("OPENROUTER_CREDIT_BALANCE", "0"))
 OPENROUTER_BALANCE_FLOOR = float(os.getenv("OPENROUTER_BALANCE_FLOOR", "10.0"))
 
 _balance_cache: dict[str, float | None] = {"remaining": None, "checked_at": 0.0}
@@ -116,31 +115,35 @@ _BALANCE_CHECK_INTERVAL = 300  # re-check at most every 5 minutes
 
 
 async def _check_openrouter_balance() -> float | None:
-    """Return estimated remaining OpenRouter balance, or None if unknown.
+    """Return remaining OpenRouter balance from the credits API, or None.
 
-    Calls the /auth/key endpoint at most once per _BALANCE_CHECK_INTERVAL.
+    GET /api/v1/credits reports {total_credits, total_usage}; the remaining
+    balance is the difference, read straight from the API so it stays true
+    after deposits and top-ups (no locally-configured constant to drift).
+    Cached for _BALANCE_CHECK_INTERVAL; on failure falls back to the last
+    known value.
     """
     now = time.monotonic()
     if now - (_balance_cache.get("checked_at") or 0) < _BALANCE_CHECK_INTERVAL:
         return _balance_cache.get("remaining")
 
     api_key = os.getenv("OPENROUTER_API_KEY", "")
-    if not api_key or not OPENROUTER_CREDIT_BALANCE:
-        return None
+    if not api_key:
+        return _balance_cache.get("remaining")
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
-                "https://openrouter.ai/api/v1/auth/key",
+                "https://openrouter.ai/api/v1/credits",
                 headers={"Authorization": f"Bearer {api_key}"},
             )
             if resp.status_code == 200:
-                usage = resp.json().get("data", {}).get("usage", 0)
-                remaining = OPENROUTER_CREDIT_BALANCE - usage
+                data = resp.json().get("data", {})
+                remaining = float(data["total_credits"]) - float(data["total_usage"])
                 _balance_cache["remaining"] = remaining
                 _balance_cache["checked_at"] = now
                 return remaining
-    except httpx.HTTPError:
+    except (httpx.HTTPError, KeyError, TypeError, ValueError):
         pass
 
     return _balance_cache.get("remaining")
@@ -837,11 +840,11 @@ async def _handle_tier_command() -> JSONResponse:
     lines.append("")
     if remaining is not None:
         lines.append(
-            f"Balance: ${remaining:.2f} remaining "
+            f"OpenRouter balance: ${remaining:.2f} remaining "
             f"(floor: ${OPENROUTER_BALANCE_FLOOR:.2f})"
         )
     else:
-        lines.append("Balance: not configured (set OPENROUTER_CREDIT_BALANCE)")
+        lines.append("OpenRouter balance: not configured (set OPENROUTER_API_KEY)")
 
     if _last_tier_used:
         lines.append(f"Last used: {_last_tier_used}")

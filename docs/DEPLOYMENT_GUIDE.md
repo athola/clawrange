@@ -216,7 +216,8 @@ Your personal devices can still reach everything as the tailnet owner.
 - [ ] Docker ports bound to 127.0.0.1 and Tailscale IP only (`make start-prod`)
 - [ ] `OPENCLAW_GATEWAY_TOKEN` set to random value
 - [ ] `PROXY_AUTH_TOKEN` set to random value (gates the workflows LLM proxy)
-- [ ] `OPENROUTER_API_KEY` set in `.env`. `OPENROUTER_CREDIT_BALANCE` reflects actual deposit
+- [ ] `OPENROUTER_API_KEY` set in `.env`; balance is read live from the
+  OpenRouter credits API (`/api/v1/credits`)
 - [ ] Pin Docker images to specific versions before production
   (e.g. `ghcr.io/openclaw/openclaw:2026.3.24`)
 - [ ] Workflows runs single uvicorn worker (default: do not raise)

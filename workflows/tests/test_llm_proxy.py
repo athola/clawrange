@@ -516,29 +516,28 @@ class TestBalanceGuard:
 
         import llm_proxy
 
-        original = llm_proxy.OPENROUTER_CREDIT_BALANCE
-        llm_proxy.OPENROUTER_CREDIT_BALANCE = 0
         llm_proxy._balance_cache.clear()
         try:
-            result = asyncio.run(llm_proxy._check_openrouter_balance())
+            with patch.dict("os.environ", {"OPENROUTER_API_KEY": ""}):
+                result = asyncio.run(llm_proxy._check_openrouter_balance())
             assert result is None
         finally:
-            llm_proxy.OPENROUTER_CREDIT_BALANCE = original
+            llm_proxy._balance_cache.clear()
 
     @patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"})
-    def test_balance_calculation(self):
-        """Verify remaining = credit_balance - usage."""
+    def test_balance_reads_credits_api(self):
+        """remaining = total_credits - total_usage, straight from /credits."""
         import asyncio
 
         import llm_proxy
 
-        original_balance = llm_proxy.OPENROUTER_CREDIT_BALANCE
-        llm_proxy.OPENROUTER_CREDIT_BALANCE = 15.0
         llm_proxy._balance_cache.clear()
 
         mock_resp = httpx.Response(
             200,
-            content=json.dumps({"data": {"usage": 5.50}}).encode(),
+            content=json.dumps(
+                {"data": {"total_credits": 28.69, "total_usage": 5.50}}
+            ).encode(),
         )
         mock_client = AsyncMock()
         mock_client.get = AsyncMock(return_value=mock_resp)
@@ -548,9 +547,10 @@ class TestBalanceGuard:
         try:
             with patch("llm_proxy.httpx.AsyncClient", return_value=mock_client):
                 result = asyncio.run(llm_proxy._check_openrouter_balance())
-                assert result == 9.50  # 15.0 - 5.50
+                assert result == 23.19  # 28.69 - 5.50
+                called_url = mock_client.get.call_args[0][0]
+                assert called_url.endswith("/api/v1/credits")
         finally:
-            llm_proxy.OPENROUTER_CREDIT_BALANCE = original_balance
             llm_proxy._balance_cache.clear()
 
 
@@ -1984,8 +1984,6 @@ class TestBalanceCache:
 
         import llm_proxy
 
-        original = llm_proxy.OPENROUTER_CREDIT_BALANCE
-        llm_proxy.OPENROUTER_CREDIT_BALANCE = 20.0
         llm_proxy._balance_cache.clear()
         # Pre-populate cache
         llm_proxy._balance_cache["remaining"] = 15.0
@@ -1995,7 +1993,6 @@ class TestBalanceCache:
             result = asyncio.run(llm_proxy._check_openrouter_balance())
             assert result == 15.0  # Returned cached, no HTTP call needed
         finally:
-            llm_proxy.OPENROUTER_CREDIT_BALANCE = original
             llm_proxy._balance_cache.clear()
 
     @patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"})
@@ -2006,8 +2003,6 @@ class TestBalanceCache:
 
         import llm_proxy
 
-        original = llm_proxy.OPENROUTER_CREDIT_BALANCE
-        llm_proxy.OPENROUTER_CREDIT_BALANCE = 20.0
         llm_proxy._balance_cache.clear()
         # Set cache as expired
         llm_proxy._balance_cache["remaining"] = 15.0
@@ -2016,7 +2011,10 @@ class TestBalanceCache:
         )
 
         mock_resp = httpx.Response(
-            200, content=json.dumps({"data": {"usage": 8.0}}).encode()
+            200,
+            content=json.dumps(
+                {"data": {"total_credits": 20.0, "total_usage": 8.0}}
+            ).encode(),
         )
         mock_client = AsyncMock()
         mock_client.get = AsyncMock(return_value=mock_resp)
@@ -2029,7 +2027,6 @@ class TestBalanceCache:
             assert result == 12.0  # 20.0 - 8.0
             mock_client.get.assert_called_once()
         finally:
-            llm_proxy.OPENROUTER_CREDIT_BALANCE = original
             llm_proxy._balance_cache.clear()
 
     def test_returns_none_when_api_key_missing(self):
@@ -2037,8 +2034,6 @@ class TestBalanceCache:
 
         import llm_proxy
 
-        original = llm_proxy.OPENROUTER_CREDIT_BALANCE
-        llm_proxy.OPENROUTER_CREDIT_BALANCE = 20.0
         llm_proxy._balance_cache.clear()
 
         try:
@@ -2046,7 +2041,6 @@ class TestBalanceCache:
                 result = asyncio.run(llm_proxy._check_openrouter_balance())
             assert result is None
         finally:
-            llm_proxy.OPENROUTER_CREDIT_BALANCE = original
             llm_proxy._balance_cache.clear()
 
     @patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"})
@@ -2057,8 +2051,6 @@ class TestBalanceCache:
 
         import llm_proxy
 
-        original = llm_proxy.OPENROUTER_CREDIT_BALANCE
-        llm_proxy.OPENROUTER_CREDIT_BALANCE = 20.0
         llm_proxy._balance_cache.clear()
         # Stale cache
         llm_proxy._balance_cache["remaining"] = 10.0
@@ -2076,7 +2068,6 @@ class TestBalanceCache:
                 result = asyncio.run(llm_proxy._check_openrouter_balance())
             assert result == 10.0  # Stale cache returned
         finally:
-            llm_proxy.OPENROUTER_CREDIT_BALANCE = original
             llm_proxy._balance_cache.clear()
 
 
