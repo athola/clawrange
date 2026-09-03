@@ -2403,16 +2403,81 @@ HEARTBEAT_DIGEST_INTERVAL = float(
     os.getenv("HEARTBEAT_DIGEST_INTERVAL", "3600")
 )  # seconds between Telegram digests; independent of heartbeat cadence
 
-_digest_state: dict = {"lines": [], "last_flush": time.monotonic()}
+# Telegram rejects a sendMessage body over 4096 chars with a 400 and the
+# whole digest is lost, so cap the text we hand OpenClaw to relay.
+TELEGRAM_MAX_CHARS = 4096
+
+
+def _digest_state_path() -> str:
+    return os.getenv("HEARTBEAT_DIGEST_STATE", "/data/heartbeat_digest.json")
+
+
+# ``last_flush`` stays None until loaded from disk. It is wall-clock
+# (``time.time()``), not ``time.monotonic()``: monotonic's zero point is
+# per-process, so it cannot survive the restart this state exists to survive.
+_digest_state: dict = {"lines": [], "last_flush": None}
+
+
+def _digest_load() -> None:
+    """Load the buffer and flush clock from disk, once per process.
+
+    The digest is the only path from the heartbeat to Telegram. Holding its
+    clock in memory meant every container recreate and every ``uvicorn
+    --reload`` reset it to zero and dropped the buffer, so a process cycling
+    faster than HEARTBEAT_DIGEST_INTERVAL never reported at all.
+
+    A missing file leaves ``last_flush`` at 0.0 so the first heartbeat after
+    a fresh deploy is due immediately instead of costing a silent hour. A
+    corrupt file falls back to the same defaults — the heartbeat must never
+    fail on unreadable state.
+    """
+    if _digest_state["last_flush"] is not None:
+        return
+    _digest_state["lines"] = []
+    _digest_state["last_flush"] = 0.0
+    try:
+        with open(_digest_state_path()) as fh:
+            saved = json.load(fh)
+        if isinstance(saved, dict):
+            lines = saved.get("lines")
+            if isinstance(lines, list):
+                _digest_state["lines"] = [str(x) for x in lines]
+            _digest_state["last_flush"] = float(saved.get("last_flush") or 0.0)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def _digest_save() -> None:
+    """Persist the buffer and clock atomically (tmp + ``os.replace``)."""
+    path = _digest_state_path()
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as fh:
+            json.dump(
+                {
+                    "lines": _digest_state["lines"],
+                    "last_flush": _digest_state["last_flush"],
+                },
+                fh,
+            )
+        os.replace(tmp, path)
+    except OSError as exc:
+        print(f"[PROXY] digest state save failed: {exc}", flush=True)
 
 
 def _digest_record(line: str) -> None:
     """Buffer one digest line for the next hourly flush."""
+    _digest_load()
     _digest_state["lines"].append(line)
+    _digest_save()
 
 
 def _digest_due(now: float | None = None) -> bool:
-    now = now if now is not None else time.monotonic()
+    _digest_load()
+    now = now if now is not None else time.time()
     return now - _digest_state["last_flush"] >= HEARTBEAT_DIGEST_INTERVAL
 
 
@@ -2421,17 +2486,38 @@ def _digest_take(now: float, remaining: float | None, tripped: list[str]) -> str
 
     A due interval with an empty buffer stays silent — no empty chit-chat.
     """
+    _digest_load()
     lines = _digest_state["lines"]
     _digest_state["lines"] = []
     _digest_state["last_flush"] = now
+    _digest_save()
     if not lines:
         return ""
-    out = [f"Heartbeat digest ({len(lines)} item(s) this hour):", *lines]
+    footer = []
     if tripped:
-        out.append(f"Tiers: {', '.join(tripped)} TRIPPED")
+        footer.append(f"Tiers: {', '.join(tripped)} TRIPPED")
     if remaining is not None:
-        out.append(f"OpenRouter balance: ${remaining:.2f}")
-    return "\n".join(out)
+        footer.append(f"OpenRouter balance: ${remaining:.2f}")
+    return _digest_format(lines, footer)
+
+
+def _digest_format(lines: list[str], footer: list[str]) -> str:
+    """Join header, lines and footer within Telegram's length limit.
+
+    Oldest items are kept and the overflow is counted, so a busy hour
+    degrades into a shorter digest instead of a 400 that loses all of it.
+    """
+    kept = list(lines)
+    while True:
+        dropped = len(lines) - len(kept)
+        out = [f"Heartbeat digest ({len(lines)} item(s) this hour):", *kept]
+        if dropped:
+            out.append(f"… {dropped} more item(s) truncated")
+        out.extend(footer)
+        text = "\n".join(out)
+        if len(text) <= TELEGRAM_MAX_CHARS or not kept:
+            return text[:TELEGRAM_MAX_CHARS]
+        kept.pop()
 
 
 _ALERT_TASK_PREFIXES = ("low balance alert:", "investigate tier recovery:")
@@ -2580,7 +2666,7 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
         _digest_record(f"Created #{t['id']} [P{t['priority']}] {t['description'][:60]}")
 
     if _digest_due():
-        text = _digest_take(time.monotonic(), remaining, tripped)
+        text = _digest_take(time.time(), remaining, tripped)
     else:
         text = ""
     resp = _synthetic_response(text)

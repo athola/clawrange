@@ -52,7 +52,7 @@ def _reset_state():
     llm_proxy._circuit_state.clear()
     llm_proxy._notification_last_sent.clear()
     llm_proxy._digest_state["lines"] = []
-    llm_proxy._digest_state["last_flush"] = time.monotonic()
+    llm_proxy._digest_state["last_flush"] = time.time()
 
 
 # ─── Provider mock helpers ────────────────────────────────────────
@@ -2678,7 +2678,7 @@ class TestHeartbeatInterceptor:
 
         # An hour later the digest delivers the buffered completion
         llm_proxy._digest_state["last_flush"] = (
-            _time.monotonic() - llm_proxy.HEARTBEAT_DIGEST_INTERVAL - 1
+            _time.time() - llm_proxy.HEARTBEAT_DIGEST_INTERVAL - 1
         )
         r = client.post(
             "/v1/chat/completions",
@@ -2853,7 +2853,7 @@ class TestHeartbeatInterceptor:
 
         # ...and the completion surfaces in the next hourly digest
         llm_proxy._digest_state["last_flush"] = (
-            time.monotonic() - llm_proxy.HEARTBEAT_DIGEST_INTERVAL - 1
+            time.time() - llm_proxy.HEARTBEAT_DIGEST_INTERVAL - 1
         )
         r = client.post(
             "/v1/chat/completions",
@@ -2898,7 +2898,7 @@ class TestHeartbeatInterceptor:
 
             # Once the digest hour elapses the suggestion is delivered
             llm_proxy._digest_state["last_flush"] = (
-                time.monotonic() - llm_proxy.HEARTBEAT_DIGEST_INTERVAL - 1
+                time.time() - llm_proxy.HEARTBEAT_DIGEST_INTERVAL - 1
             )
             r = client.post(
                 "/v1/chat/completions",
@@ -3764,3 +3764,73 @@ class TestPersonaCommand:
         assert r.status_code == 200
         content = r.json()["choices"][0]["message"]["content"].lower()
         assert "unavailable" in content or "could not" in content
+
+
+class TestDigestPersistence:
+    """The heartbeat digest is the only path to Telegram, so its clock and
+    buffer must survive a process restart.
+
+    Before this, ``_digest_state`` was built at import with
+    ``time.monotonic()``. Every container recreate or ``uvicorn --reload``
+    reset the clock to zero and dropped the buffer, so a process restarting
+    more often than HEARTBEAT_DIGEST_INTERVAL never reported at all.
+    """
+
+    def _fresh(self, monkeypatch, tmp_path):
+        import llm_proxy
+
+        state_file = tmp_path / "digest.json"
+        monkeypatch.setenv("HEARTBEAT_DIGEST_STATE", str(state_file))
+        monkeypatch.setattr(
+            llm_proxy, "_digest_state", {"lines": [], "last_flush": None}
+        )
+        return llm_proxy, state_file
+
+    def test_buffered_lines_survive_restart(self, monkeypatch, tmp_path):
+        proxy, state_file = self._fresh(monkeypatch, tmp_path)
+        proxy._digest_record("Created #1 [P3] investigate tier recovery")
+        proxy._digest_record("[SYSTEM] #2: low balance")
+
+        # Simulate the re-import that a restart or --reload performs.
+        monkeypatch.setattr(proxy, "_digest_state", {"lines": [], "last_flush": None})
+        proxy._digest_load()
+
+        assert proxy._digest_state["lines"] == [
+            "Created #1 [P3] investigate tier recovery",
+            "[SYSTEM] #2: low balance",
+        ]
+
+    def test_clock_survives_restart(self, monkeypatch, tmp_path):
+        proxy, _ = self._fresh(monkeypatch, tmp_path)
+        now = time.time()
+        proxy._digest_record("something")
+        proxy._digest_take(now, None, [])
+
+        monkeypatch.setattr(proxy, "_digest_state", {"lines": [], "last_flush": None})
+        # A restart one second later must NOT reset the hour.
+        assert proxy._digest_due(now + 1) is False
+
+    def test_due_immediately_when_no_state_file(self, monkeypatch, tmp_path):
+        proxy, _ = self._fresh(monkeypatch, tmp_path)
+        # A fresh deploy must not cost a silent hour.
+        assert proxy._digest_due(time.time()) is True
+
+    def test_corrupt_state_file_does_not_raise(self, monkeypatch, tmp_path):
+        proxy, state_file = self._fresh(monkeypatch, tmp_path)
+        state_file.write_text("{not json")
+        proxy._digest_load()
+        assert proxy._digest_state["lines"] == []
+
+    def test_digest_caps_at_telegram_limit(self, monkeypatch, tmp_path):
+        proxy, _ = self._fresh(monkeypatch, tmp_path)
+        # 40 lines x ~550 chars is far past Telegram's 4096-char sendMessage
+        # limit; an oversized body is rejected 400 and the digest is lost.
+        for i in range(40):
+            proxy._digest_record(f"[SYSTEM] #{i}: " + "x" * 540)
+
+        text = proxy._digest_take(time.time(), 28.65, [])
+
+        assert len(text) <= proxy.TELEGRAM_MAX_CHARS
+        assert "truncated" in text
+        # The balance footer must survive truncation — it is the actionable bit.
+        assert "$28.65" in text
