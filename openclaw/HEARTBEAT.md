@@ -53,6 +53,13 @@ Tiers: <tripped> TRIPPED | OpenRouter balance: $X.XX
 
 Any other cycle responds empty (silent).
 
+**Relay the digest verbatim.** Do not expand it, reformat it, add
+headings, or append recommendations — the digest is already the
+finished message. Telegram rejects a sendMessage body over 4096
+characters with a 400 and the whole delivery is dropped, so an
+elaborated digest can be lost entirely. The proxy caps what it hands
+over at 4096; that budget only holds if the text is passed through.
+
 ## Rules
 
 - ONE task per cycle maximum

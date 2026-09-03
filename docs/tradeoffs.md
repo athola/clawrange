@@ -56,7 +56,10 @@ Decisions, the alternatives weighed, and what was given up. Newest first.
     `SOUL_PATH` (which `app.py:90` already does), so nothing nests under
     `/app`. This also reconciles `app.py:93`, which renders to
     `/openclaw/soul.md` — a path with no bind mount today, so that render is
-    invisible to the host. **Recommended, on main.**
+    invisible to the host. **Recommended, on main.** Confirmed live in the
+    workflows startup log: `init_profile: persona render skipped: [Errno 30]
+    Read-only file system: '/openclaw'` — the render does not merely miss the
+    host, it fails outright against the container's read-only root.
 - **Negative consequences**: A new `workflows/` module still needs a
   `docker-compose.yml` edit before `uvicorn --reload` can see it, and a
   rename-in-place on a mounted file still serves stale code until restart.
