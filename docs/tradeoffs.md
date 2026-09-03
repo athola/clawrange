@@ -6,6 +6,7 @@ Decisions, the alternatives weighed, and what was given up. Newest first.
 
 | ID | Phase | Status | Decision |
 |----|-------|--------|----------|
+| TR-004 | execute | proposed | Keep per-file dev mounts; directory mount blocked by the nested soul.md bind |
 | TR-003 | plan | proposed | Regression-lock marketing seeds (RED equivalence test) before deleting constants |
 | TR-002 | specify | proposed | Minimal CRMAdapter interface and templated-SQL only (no LLM raw SQL) |
 | TR-001 | brainstorm | proposed | Multi-tenant via hybrid declarative profile and connector registry |
@@ -21,6 +22,45 @@ Decisions, the alternatives weighed, and what was given up. Newest first.
 - **Options weighed**: ...
 - **Negative consequences**: ...
 -->
+
+## TR-004: Keep per-file dev mounts until the soul.md bind moves out of /app
+
+- **Phase**: execute
+- **Status**: proposed
+- **Decision (Y-statement)**: In the context of the workflows dev hot-reload
+  mounts, facing the trap that a per-file bind pins an inode and keeps serving
+  pre-commit code after git or `ruff-format` replaces the file via
+  `os.replace`, we decided to **keep the ~20 per-file mounts and the
+  restart-on-commit ritual for now**, to achieve a working stack without
+  growing an already red-zone branch, accepting that editing a mounted module
+  through a rename still needs `docker compose up -d workflows`.
+- **Evidence**: `./workflows:/app:ro` was tried and fails at container init:
+
+      Error response from daemon: failed to create task for container:
+      ... error mounting "/home/alext/clawrange/openclaw/soul.md" to rootfs
+      at "/app/soul.md": create mountpoint for /app/soul.md mount:
+      make mountpoint "/app/soul.md": read-only file system
+
+  runc must create the `/app/soul.md` mountpoint before binding onto it, and
+  with the whole tree mounted `:ro` that parent is read-only. `soul.md` is not
+  in `workflows/`, so there is no existing file to bind over. The one-line
+  swap does not exist.
+- **Options weighed**:
+  - `./workflows:/app` read-write (drop `:ro`): runc then creates the
+    mountpoint *inside the host tree*, leaving a stray `workflows/soul.md`
+    in the repo, plus root-owned `__pycache__`. Rejected.
+  - Commit a placeholder `workflows/soul.md`: a fresh clone works only after
+    someone recreates it, and it shadows `llm_proxy._SOUL_MD_PATH` on host
+    runs. Rejected.
+  - Mount `./openclaw:/openclaw:ro` and make `llm_proxy._SOUL_MD_PATH` honor
+    `SOUL_PATH` (which `app.py:90` already does), so nothing nests under
+    `/app`. This also reconciles `app.py:93`, which renders to
+    `/openclaw/soul.md` — a path with no bind mount today, so that render is
+    invisible to the host. **Recommended, on main.**
+- **Negative consequences**: A new `workflows/` module still needs a
+  `docker-compose.yml` edit before `uvicorn --reload` can see it, and a
+  rename-in-place on a mounted file still serves stale code until restart.
+- **Reversibility**: HIGH. Config-only, plus one line in `llm_proxy.py`.
 
 ## TR-003: Regression-lock marketing seeds before deleting constants
 
