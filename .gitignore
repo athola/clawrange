@@ -46,3 +46,6 @@ __pycache__/
 .pytest_cache/
 venv/
 .venv/
+
+# Attune mission state (local tooling, machine-specific)
+.attune/
