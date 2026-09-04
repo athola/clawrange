@@ -37,17 +37,24 @@ the proxy. No LLM needed.
 ## Reporting: hourly digest, not per-event messages
 
 Everything worth reporting (task completions, created tasks) buffers
-into a digest. The heartbeat response is non-empty only when the digest
-is due (at most once per hour) — OpenClaw relays non-empty responses to
-Telegram, so the cadence on the phone is one condensed message per
-hour, not one per 10-minute cycle.
+into a digest. At most once per hour, the flush delivers it as a small
+burst of Telegram messages: each item goes out directly from the
+workflows service (one message per item, so long results arrive whole —
+the proxy chunks any item past Telegram's 4096-character limit and
+marks continuations with a leading `…`), followed by one closing
+summary that this heartbeat response carries and OpenClaw relays.
 
-**Digest (hourly, only when there is buffered work or open questions):**
+**Direct item messages (sent by the proxy, arrive first):**
 ```
 Heartbeat digest (N item(s) this hour):
 [ALEX|SYSTEM] #<id>: <description>
 Result: <summary>
 Created #<id> [P<n>] <description>
+```
+
+**Closing summary (this response — relay it):**
+```
+Heartbeat digest: N item(s) this hour — sent as M message(s) above.
 Waiting on you: #<id> <description>
 Tiers: <tripped> TRIPPED | OpenRouter balance: $X.XX
 ```
@@ -55,18 +62,19 @@ Tiers: <tripped> TRIPPED | OpenRouter balance: $X.XX
 Any other cycle responds empty (silent).
 
 **Waiting-on-you lines** re-surface tasks whose result came back
-BLOCKED (a question for Alex) — they stay in the digest footer until a
+BLOCKED (a question for Alex) — they stay in the summary footer until a
 later task answers them or they age out (7 days), because the ask-once
 design otherwise goes mute while waiting on the answer. When the digest
-has no other content, it still sends as `Heartbeat digest: nothing new
-this hour.` plus those lines.
+has no other content, the response is still `Heartbeat digest: nothing
+new this hour.` plus those lines.
 
-**Relay the digest verbatim.** Do not expand it, reformat it, add
-headings, or append recommendations — the digest is already the
-finished message. Telegram rejects a sendMessage body over 4096
-characters with a 400 and the whole delivery is dropped, so an
-elaborated digest can be lost entirely. The proxy caps what it hands
-over at 4096; that budget only holds if the text is passed through.
+**Relay the summary verbatim.** Do not expand it, reformat it, add
+headings, or append recommendations — the item messages have already
+been sent by the proxy; the summary is the finished closing message.
+Telegram rejects a sendMessage body over 4096 characters with a 400 and
+the whole delivery is dropped, so an elaborated summary can be lost
+entirely. The proxy caps what it hands over at 4096; that budget only
+holds if the text is passed through.
 
 ## Watchdog (scheduler-side, not the heartbeat)
 

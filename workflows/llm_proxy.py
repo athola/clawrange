@@ -2546,8 +2546,18 @@ HEARTBEAT_DIGEST_INTERVAL = float(
 )  # seconds between Telegram digests; independent of heartbeat cadence
 
 # Telegram rejects a sendMessage body over 4096 chars with a 400 and the
-# whole digest is lost, so cap the text we hand OpenClaw to relay.
+# whole digest is lost. Items go out as one direct message each (the
+# OpenClaw relay is structurally a single message), so the limit governs
+# per-message chunking, not how many items survive the hour.
 TELEGRAM_MAX_CHARS = 4096
+
+HEARTBEAT_DIGEST_MAX_MESSAGES = int(
+    os.getenv("HEARTBEAT_DIGEST_MAX_MESSAGES", "20")
+)  # direct sends per flush; Telegram rate-limits bots to ~20 msgs/min/chat
+
+DIGEST_RESULT_LIMIT = int(
+    os.getenv("HEARTBEAT_DIGEST_RESULT_LIMIT", "3500")
+)  # chars of a task result buffered per digest item (room for one message)
 
 
 def _digest_state_path() -> str:
@@ -2646,8 +2656,13 @@ def _digest_take(
     remaining: float | None,
     tripped: list[str],
     waiting: list[str] | None = None,
-) -> str:
-    """Drain the buffer into the digest text, or '' when there is nothing.
+) -> tuple[list[str], str]:
+    """Drain the buffer into direct messages plus the relayed summary.
+
+    Returns ``(messages, summary)``: each message is one digest item (sent
+    straight to Telegram by the caller); the summary rides the heartbeat
+    response, which OpenClaw relays — keeping an independent channel for
+    the actionable footer (open questions, tripped tiers, balance).
 
     A due interval with an empty buffer stays silent — no empty chit-chat —
     unless unanswered questions are waiting on Alex: that silence is
@@ -2659,16 +2674,24 @@ def _digest_take(
     _digest_state["lines"] = []
     _digest_state["last_flush"] = now
     _digest_save()
-    if not lines and not waiting:
-        return ""
     footer = list(waiting)
     if tripped:
         footer.append(f"Tiers: {', '.join(tripped)} TRIPPED")
     if remaining is not None:
         footer.append(f"OpenRouter balance: ${remaining:.2f}")
     if not lines:
-        return "\n".join(["Heartbeat digest: nothing new this hour.", *footer])
-    return _digest_format(lines, footer)
+        if not footer:
+            return [], ""
+        return [], "\n".join(["Heartbeat digest: nothing new this hour.", *footer])
+    messages = _digest_messages(lines)
+    summary = "\n".join(
+        [
+            f"Heartbeat digest: {len(lines)} item(s) this hour — "
+            f"sent as {len(messages)} message(s) above.",
+            *footer,
+        ]
+    )
+    return messages, summary
 
 
 def _clip_result(text: str, limit: int = 500) -> str:
@@ -2691,25 +2714,68 @@ def _clip_result(text: str, limit: int = 500) -> str:
     return text[: cut + 1].rstrip() + "…"
 
 
-def _digest_format(lines: list[str], footer: list[str]) -> str:
-    """Join header, lines and footer within Telegram's length limit.
+def _split_for_telegram(text: str, limit: int = TELEGRAM_MAX_CHARS) -> list[str]:
+    """Split one over-long digest item into sendable parts.
 
-    Oldest items are kept and the overflow is counted, so a busy hour
-    degrades into a shorter digest instead of a 400 that loses all of it.
+    Cuts preferentially after a sentence terminator or newline, then at a
+    word boundary, hard-cutting only when the item has neither. Continuation
+    parts carry an ellipsis prefix so a burst of messages reads as one item
+    flowing on rather than unrelated entries.
     """
-    kept = list(lines)
-    while True:
-        dropped = len(lines) - len(kept)
-        item_word = "item" if len(lines) == 1 else "items"
-        out = [f"Heartbeat digest ({len(lines)} {item_word} this hour):", *kept]
-        if dropped:
-            more_word = "item" if dropped == 1 else "items"
-            out.append(f"… {dropped} more {more_word} truncated")
-        out.extend(footer)
-        text = "\n".join(out)
-        if len(text) <= TELEGRAM_MAX_CHARS or not kept:
-            return text[:TELEGRAM_MAX_CHARS]
-        kept.pop()
+    if len(text) <= limit:
+        return [text]
+    parts: list[str] = []
+    rest = text
+    while rest:
+        if len(rest) <= limit:
+            parts.append("… " + rest)
+            break
+        head = rest[:limit]
+        cut = max(
+            head.rfind(". "), head.rfind("! "), head.rfind("? "), head.rfind("\n")
+        )
+        if cut < limit // 2:
+            cut = head.rfind(" ")
+        if cut <= 0:
+            cut = limit
+        parts.append(rest[: cut + 1].rstrip())
+        rest = rest[cut + 1 :].lstrip()
+    return parts
+
+
+def _digest_messages(lines: list[str]) -> list[str]:
+    """One Telegram message per buffered item, oldest first.
+
+    The hour's header rides the first message; an item longer than the send
+    limit chunks across messages instead of being clipped. A runaway hour
+    (scheduler bug, burst of created-task lines) stops at
+    HEARTBEAT_DIGEST_MAX_MESSAGES direct sends — Telegram rate-limits bots —
+    and names what was deferred so nothing is silently lost.
+    """
+    item_word = "item" if len(lines) == 1 else "items"
+    header = f"Heartbeat digest ({len(lines)} {item_word} this hour):"
+    # Leave headroom on every part for the header or the "…" continuation.
+    budget = TELEGRAM_MAX_CHARS - 64
+    kept = lines[:HEARTBEAT_DIGEST_MAX_MESSAGES]
+    deferred = len(lines) - len(kept)
+    if deferred:
+        # The pointer line is itself a direct send: it takes the last slot.
+        kept = kept[:-1]
+        deferred += 1
+    messages: list[str] = []
+    for idx, line in enumerate(kept):
+        parts = _split_for_telegram(line, limit=budget)
+        for part_idx, part in enumerate(parts):
+            if idx == 0 and part_idx == 0:
+                messages.append(f"{header}\n\n{part}")
+            else:
+                messages.append(part if part_idx == 0 else f"… {part}")
+    if deferred > 0:
+        more_word = "item" if deferred == 1 else "items"
+        messages.append(
+            f"… {deferred} more {more_word} this hour — see the task queue (GET /task)"
+        )
+    return messages
 
 
 _ALERT_TASK_PREFIXES = ("low balance alert:", "investigate tier recovery:")
@@ -2756,8 +2822,11 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
     3. LLM-powered thinking — self-directed task suggestions (every 1 hr)
 
     Everything worth reporting buffers into the hourly digest instead of
-    messaging per event; the digest is returned as this response (relayed
-    to Telegram by OpenClaw) at most once per HEARTBEAT_DIGEST_INTERVAL.
+    messaging per event. At most once per HEARTBEAT_DIGEST_INTERVAL the
+    flush sends each item straight to Telegram (one message per item) and
+    returns a short closing summary as this response, which OpenClaw
+    relays — so long results arrive whole instead of clipped to fit the
+    single relayed message.
     """
     from app import brain_db
 
@@ -2806,11 +2875,12 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
             _digest_record(_blocked_digest_line(task))
         else:
             brain_db.complete_task(task["id"], result, "completed")
-            # Condensed one-entry-per-task digest line; full result stays in
-            # the task queue (!tasks / GET /task/{id}).
+            # One digest item per task; the result gets most of a Telegram
+            # message now that items flush as separate messages. The full
+            # result still lives on the task (!tasks / GET /task/{id}).
             _digest_record(
                 f"[{label}] #{task['id']}: {task['description']}\n"
-                f"Result: {_clip_result(result)}"
+                f"Result: {_clip_result(result, limit=DIGEST_RESULT_LIMIT)}"
             )
 
         # No direct Telegram notification: the digest line above carries
@@ -2871,16 +2941,31 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
         _digest_record(f"Created #{t['id']} [P{t['priority']}] {t['description'][:60]}")
 
     if _digest_due():
-        text = _digest_take(
+        messages, text = _digest_take(
             time.time(),
             remaining,
             tripped,
             waiting=_waiting_on_you_lines(all_tasks),
         )
+        # Items go straight to Telegram — one message each — before the
+        # response returns, so they land ahead of the relayed summary.
+        # Sequential sends keep the burst in order (header, oldest first).
+        failed = 0
+        for msg in messages:
+            if not await telegram.notify(msg):
+                failed += 1
+        if failed:
+            text += (
+                f"\n{failed} digest message(s) failed to send — "
+                "full results remain in the task queue (GET /task)."
+            )
         # OpenClaw logs only Telegram *failures*, so a silent digest and a
         # dropped one look identical downstream. Log the handoff to give the
         # two logs a correlation point.
-        print(f"[PROXY] digest flushed: {len(text)} chars", flush=True)
+        print(
+            f"[PROXY] digest flushed: {len(messages)} message(s), {failed} failed",
+            flush=True,
+        )
     else:
         text = ""
     resp = _synthetic_response(text)

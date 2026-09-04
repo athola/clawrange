@@ -2722,7 +2722,9 @@ class TestHeartbeatInterceptor:
         assert len(completed) >= 1
         assert "no anomalies" in completed[0]["result"]
 
-        # An hour later the digest delivers the buffered completion
+        # An hour later the digest delivers the buffered completion: the
+        # item goes straight to Telegram and the relayed response is the
+        # closing summary.
         llm_proxy._digest_state["last_flush"] = (
             _time.time() - llm_proxy.HEARTBEAT_DIGEST_INTERVAL - 1
         )
@@ -2732,10 +2734,59 @@ class TestHeartbeatInterceptor:
             headers=AUTH_HEADER,
         )
         content = r.json()["choices"][0]["message"]["content"]
-        assert "Test task for heartbeat" in content
-        assert "no anomalies" in content
-        # Digest rides the heartbeat response; still no direct notify
-        mock_notify.assert_not_called()
+        assert "1 item(s) this hour" in content
+        sent = [call.args[0] for call in mock_notify.await_args_list]
+        assert any(
+            "Test task for heartbeat" in text and "no anomalies" in text
+            for text in sent
+        )
+
+    @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
+    def test_digest_carries_long_results_unclipped(self, mock_notify):
+        """Research-shaped results ran past the old 500-char digest clip and
+        arrived cut mid-word. A result now gets most of a Telegram message:
+        the sentinel at char 2,000 must survive, bounded by the send limit."""
+        import time as _time
+
+        import llm_proxy
+        from app import TaskCreate as TC
+        from app import create_task
+
+        llm_proxy._proactive_state["stale_tasks"] = _time.monotonic()
+        llm_proxy._proactive_state["llm_thinking"] = _time.monotonic()
+
+        create_task(TC(description="Long result task", priority=2))
+
+        long_result = (
+            "Filler sentence. " * 125
+            + "PAST-OLD-CLIP survives past the old 500-char cut. "
+            + "Tail filler sentence. " * 125
+        )
+        mock_resp = _mock_response(
+            200,
+            {"choices": [{"message": {"role": "assistant", "content": long_result}}]},
+        )
+        mock_caller = AsyncMock(return_value=mock_resp)
+        with patch("llm_proxy._call_provider", mock_caller):
+            r = client.post(
+                "/v1/chat/completions",
+                json=self._heartbeat_body(),
+                headers=AUTH_HEADER,
+            )
+            assert r.status_code == 200
+
+        llm_proxy._digest_state["last_flush"] = (
+            _time.time() - llm_proxy.HEARTBEAT_DIGEST_INTERVAL - 1
+        )
+        client.post(
+            "/v1/chat/completions",
+            json=self._heartbeat_body(),
+            headers=AUTH_HEADER,
+        )
+
+        sent = [call.args[0] for call in mock_notify.await_args_list]
+        assert any("PAST-OLD-CLIP" in text for text in sent)
+        assert all(len(text) <= llm_proxy.TELEGRAM_MAX_CHARS for text in sent)
 
     @patch("llm_proxy._llm_suggest_task", new_callable=AsyncMock, return_value=None)
     @patch("llm_proxy._check_openrouter_balance", new_callable=AsyncMock)
@@ -2863,7 +2914,8 @@ class TestHeartbeatInterceptor:
         content = r.json()["choices"][0]["message"]["content"]
         assert content == ""
 
-    def test_heartbeat_stale_task_detection(self):
+    @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
+    def test_heartbeat_stale_task_detection(self, mock_notify):
         """Heartbeat processes stale pending tasks and creates nudge tasks."""
         import llm_proxy
 
@@ -2907,9 +2959,13 @@ class TestHeartbeatInterceptor:
             headers=AUTH_HEADER,
         )
         content = r.json()["choices"][0]["message"]["content"]
-        assert "old task from earlier" in content
+        # The item goes straight to Telegram; the relayed response summarizes.
+        assert "this hour" in content
+        sent = [call.args[0] for call in mock_notify.await_args_list]
+        assert any("old task from earlier" in text for text in sent)
 
-    def test_heartbeat_llm_thinking(self):
+    @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
+    def test_heartbeat_llm_thinking(self, mock_notify):
         """Heartbeat asks the LLM for a task suggestion when due."""
         import llm_proxy
 
@@ -2952,7 +3008,9 @@ class TestHeartbeatInterceptor:
                 headers=AUTH_HEADER,
             )
             content = r.json()["choices"][0]["message"]["content"]
-            assert "OpenRouter spending" in content
+            assert "this hour" in content
+            sent = [call.args[0] for call in mock_notify.await_args_list]
+            assert any("OpenRouter spending" in text for text in sent)
 
         from app import brain_db
 
@@ -3870,16 +3928,111 @@ class TestDigestPersistence:
     def test_digest_caps_at_telegram_limit(self, monkeypatch, tmp_path):
         proxy, _ = self._fresh(monkeypatch, tmp_path)
         # 40 lines x ~550 chars is far past Telegram's 4096-char sendMessage
-        # limit; an oversized body is rejected 400 and the digest is lost.
+        # limit. Items must never be dropped to fit: each gets its own
+        # message, and the relayed summary keeps the actionable footer.
         for i in range(40):
             proxy._digest_record(f"[SYSTEM] #{i}: " + "x" * 540)
 
-        text = proxy._digest_take(time.time(), 28.65, [])
+        messages, summary = proxy._digest_take(time.time(), 28.65, [])
 
-        assert len(text) <= proxy.TELEGRAM_MAX_CHARS
-        assert "truncated" in text
-        # The balance footer must survive truncation — it is the actionable bit.
-        assert "$28.65" in text
+        assert messages
+        assert all(len(m) <= proxy.TELEGRAM_MAX_CHARS for m in messages)
+        # The overflow pointer names what was deferred — nothing silently lost.
+        assert "more item" in messages[-1]
+        # The balance footer must survive — it is the actionable bit.
+        assert "$28.65" in summary
+
+
+class TestDigestMultiMessageFlush:
+    """The digest rode the heartbeat response, which OpenClaw relays as a
+    single Telegram message — so a busy hour truncated results to 500 chars
+    and dropped whole items to fit 4096.
+
+    The flush now sends one message per item straight to Telegram and leaves
+    the heartbeat response as a short closing summary. Long items chunk
+    across messages instead of being clipped; a runaway hour caps the direct
+    sends (Telegram rate-limits bots to ~20 messages/minute per chat).
+    """
+
+    def _fresh(self, monkeypatch, tmp_path):
+        import llm_proxy
+
+        monkeypatch.setenv("HEARTBEAT_DIGEST_STATE", str(tmp_path / "digest.json"))
+        monkeypatch.setattr(
+            llm_proxy, "_digest_state", {"lines": [], "last_flush": None}
+        )
+        return llm_proxy
+
+    def test_one_message_per_item_with_header_on_first(self, monkeypatch, tmp_path):
+        proxy = self._fresh(monkeypatch, tmp_path)
+        proxy._digest_record("[SYSTEM] #1: first")
+        proxy._digest_record("[SYSTEM] #2: second")
+
+        messages, summary = proxy._digest_take(time.time(), 28.65, [])
+
+        assert messages == [
+            "Heartbeat digest (2 items this hour):\n\n[SYSTEM] #1: first",
+            "[SYSTEM] #2: second",
+        ]
+        assert all(len(m) <= proxy.TELEGRAM_MAX_CHARS for m in messages)
+        # The relayed summary carries the actionable footer.
+        assert "2 item(s) this hour" in summary
+        assert "$28.65" in summary
+
+    def test_single_item_uses_singular_header(self, monkeypatch, tmp_path):
+        proxy = self._fresh(monkeypatch, tmp_path)
+        proxy._digest_record("[SYSTEM] #1: only")
+
+        messages, summary = proxy._digest_take(time.time(), None, [])
+
+        assert messages[0].startswith("Heartbeat digest (1 item this hour):")
+        assert "1 item(s) this hour" in summary
+
+    def test_oversized_item_chunks_instead_of_dropping(self, monkeypatch, tmp_path):
+        proxy = self._fresh(monkeypatch, tmp_path)
+        # No sentence or word boundaries: forces hard cuts at the limit.
+        proxy._digest_record("[SYSTEM] #1: " + "x" * 9000 + " TAIL-SENTINEL")
+
+        messages, _ = proxy._digest_take(time.time(), None, [])
+
+        assert len(messages) >= 3
+        assert all(len(m) <= proxy.TELEGRAM_MAX_CHARS for m in messages)
+        # The tail survives — the old single-message format dropped it.
+        assert messages[-1].endswith("TAIL-SENTINEL")
+        # Continuations are marked so the burst reads as one item.
+        assert all(m.startswith("…") for m in messages[1:])
+
+    def test_runaway_hour_caps_direct_messages(self, monkeypatch, tmp_path):
+        proxy = self._fresh(monkeypatch, tmp_path)
+        for i in range(30):
+            proxy._digest_record(f"[SYSTEM] #{i}: item")
+
+        messages, summary = proxy._digest_take(time.time(), None, [])
+
+        # 19 item messages + 1 pointer = the 20-send cap, pointer names the 11
+        # deferred items — nothing silently lost.
+        assert len(messages) == proxy.HEARTBEAT_DIGEST_MAX_MESSAGES
+        assert "11 more item" in messages[-1]
+        assert "30 item(s) this hour" in summary
+
+    def test_silent_hour_with_no_footer_stays_silent(self, monkeypatch, tmp_path):
+        proxy = self._fresh(monkeypatch, tmp_path)
+
+        messages, summary = proxy._digest_take(time.time(), None, [])
+
+        assert messages == []
+        assert summary == ""
+
+    def test_waiting_questions_surface_without_items(self, monkeypatch, tmp_path):
+        proxy = self._fresh(monkeypatch, tmp_path)
+
+        messages, summary = proxy._digest_take(
+            time.time(), None, [], waiting=["Waiting on you: #12 — domain?"]
+        )
+
+        assert messages == []
+        assert "nothing new this hour" in summary
+        assert "domain?" in summary
 
 
 BLOCKED_RESULT = """# Task: Record Alex's Focus Areas & Priorities
@@ -4181,34 +4334,35 @@ class TestDigestTakeWaiting:
 
     def test_waiting_only_makes_digest_nonempty(self, monkeypatch, tmp_path):
         proxy = self._fresh(monkeypatch, tmp_path)
-        text = proxy._digest_take(
+        messages, summary = proxy._digest_take(
             time.time(), 28.64, [], waiting=["Waiting on you: #abc focus areas"]
         )
-        assert text != ""
-        assert "nothing new" in text
-        assert "#abc" in text
-        assert "$28.64" in text
+        assert messages == []
+        assert summary != ""
+        assert "nothing new" in summary
+        assert "#abc" in summary
+        assert "$28.64" in summary
 
     def test_waiting_appended_after_buffered_lines(self, monkeypatch, tmp_path):
         proxy = self._fresh(monkeypatch, tmp_path)
         proxy._digest_record("[SYSTEM] #1: did a thing")
-        text = proxy._digest_take(
+        messages, summary = proxy._digest_take(
             time.time(), None, [], waiting=["Waiting on you: #abc focus areas"]
         )
-        assert "did a thing" in text
-        assert "#abc" in text
+        assert any("did a thing" in m for m in messages)
+        assert "#abc" in summary
 
     def test_empty_and_no_waiting_stays_silent(self, monkeypatch, tmp_path):
         proxy = self._fresh(monkeypatch, tmp_path)
-        assert proxy._digest_take(time.time(), None, []) == ""
+        assert proxy._digest_take(time.time(), None, []) == ([], "")
 
     def test_digest_header_pluralizes(self, monkeypatch, tmp_path):
         proxy = self._fresh(monkeypatch, tmp_path)
-        text = proxy._digest_format(["[SYSTEM] #1: did a thing"], [])
-        assert "1 item this hour" in text
-        assert "item(s)" not in text
-        text = proxy._digest_format(["a", "b"], [])
-        assert "2 items this hour" in text
+        messages = proxy._digest_messages(["[SYSTEM] #1: did a thing"])
+        assert "1 item this hour" in messages[0]
+        assert "item(s)" not in messages[0]
+        messages = proxy._digest_messages(["a", "b"])
+        assert "2 items this hour" in messages[0]
 
 
 class TestClipResult:
