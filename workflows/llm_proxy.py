@@ -630,6 +630,88 @@ def _blocked_digest_line(task: dict) -> str:
     return f"Blocked #{task['id']}: needs your input — {task['description'][:60]}"
 
 
+# A blocked task asked Alex a question and left the pending queue; dedup
+# then stops the LLM re-raising it. Without a re-surface, the ask-once
+# design goes mute while waiting on an answer — indistinguishable on the
+# phone from a dead assistant.
+WAITING_ON_YOU_WINDOW_DAYS = 7
+WAITING_ON_YOU_MAX_LINES = 3
+
+
+def _parse_task_time(value: object) -> datetime | None:
+    """Parse a task's created_at/completed_at, or None if unusable."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _descriptions_overlap(a: dict, b: dict) -> bool:
+    """Same rule as _has_recent_task: >=2 shared keywords, 30% of the
+    smaller keyword set."""
+    ka = _extract_keywords(a["description"])
+    kb = _extract_keywords(b["description"])
+    if not ka or not kb:
+        return False
+    smaller = min(len(ka), len(kb))
+    return len(ka & kb) >= max(2, int(smaller * 0.3))
+
+
+def _waiting_on_you_lines(
+    all_tasks: list[dict], now: datetime | None = None
+) -> list[str]:
+    """Digest footer lines for tasks blocked on Alex's input.
+
+    A question drops off when it ages past the window, when a later
+    overlapping task completes successfully (the answer landed), or when
+    a newer duplicate question supersedes it. Capped: the footer is a
+    nudge, not a backlog view — more than a handful of open questions
+    is a different problem.
+    """
+    now = now or datetime.now(UTC)
+    cutoff = now - timedelta(days=WAITING_ON_YOU_WINDOW_DAYS)
+
+    answered = [
+        t
+        for t in all_tasks
+        if t.get("status") == "completed"
+        and not _needs_input(t.get("result") or "")
+        and (_parse_task_time(t.get("completed_at")) or now) > cutoff
+    ]
+
+    waiting = []
+    for t in all_tasks:
+        completed = _parse_task_time(t.get("completed_at"))
+        if completed is None or completed < cutoff:
+            continue
+        if t.get("status") != "blocked" and not _needs_input(t.get("result") or ""):
+            continue
+        if any(
+            _descriptions_overlap(t, a)
+            and (_parse_task_time(a.get("completed_at")) or now) > completed
+            for a in answered
+        ):
+            continue
+        waiting.append(t)
+
+    # Newest first so a newer duplicate question replaces the older one.
+    waiting.sort(
+        key=lambda t: _parse_task_time(t.get("completed_at")) or cutoff,
+        reverse=True,
+    )
+    kept: list[dict] = []
+    for t in waiting:
+        if any(_descriptions_overlap(t, k) for k in kept):
+            continue
+        kept.append(t)
+        if len(kept) == WAITING_ON_YOU_MAX_LINES:
+            break
+    kept.reverse()  # oldest first reads better in the digest
+    return [f"Waiting on you: #{t['id']} {t['description'][:60]}" for t in kept]
+
+
 PROVIDER_URLS = {
     "openrouter": "https://openrouter.ai/api/v1/chat/completions",
     "zai": "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
@@ -2469,6 +2551,24 @@ def _digest_state_path() -> str:
 _digest_state: dict = {"lines": [], "last_flush": None}
 
 
+def record_heartbeat_seen(now: float | None = None) -> None:
+    """Stamp the last heartbeat arrival for the watchdog (watchdog.py).
+
+    The digest only flushes when a heartbeat prompt arrives, so this
+    stamp is how the scheduler-side watchdog tells a quiet hour from a
+    dead OpenClaw. Written every heartbeat (~10 min), so a plain file
+    is cheap and restart-safe.
+    """
+    path = os.getenv("HEARTBEAT_SEEN_PATH", "/data/heartbeat_seen.json")
+    try:
+        with open(path, "w") as fh:
+            json.dump({"ts": now if now is not None else time.time()}, fh)
+    except OSError as exc:
+        # The stamp is an observability aid; a heartbeat must never fail
+        # because it could not be recorded.
+        print(f"[PROXY] heartbeat-seen stamp failed: {exc}", flush=True)
+
+
 def _digest_load() -> None:
     """Load the buffer and flush clock from disk, once per process.
 
@@ -2532,23 +2632,33 @@ def _digest_due(now: float | None = None) -> bool:
     return now - _digest_state["last_flush"] >= HEARTBEAT_DIGEST_INTERVAL
 
 
-def _digest_take(now: float, remaining: float | None, tripped: list[str]) -> str:
+def _digest_take(
+    now: float,
+    remaining: float | None,
+    tripped: list[str],
+    waiting: list[str] | None = None,
+) -> str:
     """Drain the buffer into the digest text, or '' when there is nothing.
 
-    A due interval with an empty buffer stays silent — no empty chit-chat.
+    A due interval with an empty buffer stays silent — no empty chit-chat —
+    unless unanswered questions are waiting on Alex: that silence is
+    indistinguishable from a dead assistant, so the questions surface.
     """
+    waiting = waiting or []
     _digest_load()
     lines = _digest_state["lines"]
     _digest_state["lines"] = []
     _digest_state["last_flush"] = now
     _digest_save()
-    if not lines:
+    if not lines and not waiting:
         return ""
-    footer = []
+    footer = list(waiting)
     if tripped:
         footer.append(f"Tiers: {', '.join(tripped)} TRIPPED")
     if remaining is not None:
         footer.append(f"OpenRouter balance: ${remaining:.2f}")
+    if not lines:
+        return "\n".join(["Heartbeat digest: nothing new this hour.", *footer])
     return _digest_format(lines, footer)
 
 
@@ -2620,12 +2730,16 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
     """
     from app import brain_db
 
+    record_heartbeat_seen()
+
     tasks_created: list[dict] = []
 
     # ── 1. Tier status ──────────────────────────────────────────
     tripped = [tier["name"] for tier in CONFIG["tiers"] if _circuit_open(tier["name"])]
 
     remaining = await _check_openrouter_balance()
+
+    all_tasks = brain_db.list_tasks()
 
     # ── 2. Check for pending tasks ──────────────────────────────
     # Process one task per cycle — both system-generated and user-created.
@@ -2673,7 +2787,8 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
 
     else:
         # ── PROACTIVE SCAN ──────────────────────────────────────
-        all_tasks = brain_db.list_tasks()
+        # (all_tasks is fetched before the pending branch: the digest
+        # footer also needs it to re-surface blocked questions.)
 
         # Layer 1: Infrastructure — every cycle
         for name in tripped:
@@ -2725,7 +2840,12 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
         _digest_record(f"Created #{t['id']} [P{t['priority']}] {t['description'][:60]}")
 
     if _digest_due():
-        text = _digest_take(time.time(), remaining, tripped)
+        text = _digest_take(
+            time.time(),
+            remaining,
+            tripped,
+            waiting=_waiting_on_you_lines(all_tasks),
+        )
         # OpenClaw logs only Telegram *failures*, so a silent digest and a
         # dropped one look identical downstream. Log the handoff to give the
         # two logs a correlation point.

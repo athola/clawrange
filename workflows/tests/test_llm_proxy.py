@@ -2,7 +2,7 @@
 
 import json
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -3980,3 +3980,178 @@ class TestNeedsInputPrecision:
             "**What I need from you:** the positioning.\n"
         )
         assert llm_proxy._needs_input(text) is False
+
+
+# ─── Waiting-on-you digest footer ─────────────────────────────────
+# A task that came back BLOCKED asked Alex a question. The ask-once
+# design (blocked tasks leave the pending queue and dedup stops the
+# LLM re-suggesting them) made the system go mute while waiting on an
+# answer. The digest footer re-surfaces those questions until a later
+# task answers them.
+
+
+def _wtask(
+    tid: str,
+    desc: str,
+    result: str = "",
+    status: str = "completed",
+    completed_at: datetime | None = None,
+) -> dict:
+    return {
+        "id": tid,
+        "description": desc,
+        "result": result,
+        "status": status,
+        "completed_at": (completed_at or datetime.now(UTC)).isoformat(),
+        "created_at": (completed_at or datetime.now(UTC)).isoformat(),
+    }
+
+
+class TestWaitingOnYouLines:
+    def _lines(self, *tasks, now=None):
+        import llm_proxy
+
+        return llm_proxy._waiting_on_you_lines(list(tasks), now=now)
+
+    def test_blocked_result_surfaces(self):
+        """A recently completed task whose result declares BLOCKED gets a
+        waiting line naming the task."""
+        hour_ago = datetime.now(UTC) - timedelta(hours=1)
+        lines = self._lines(
+            _wtask(
+                "abc12345",
+                "Record Alex's focus areas",
+                BLOCKED_RESULT,
+                completed_at=hour_ago,
+            )
+        )
+        assert len(lines) == 1
+        assert "abc12345" in lines[0]
+        assert "Record Alex's focus areas" in lines[0]
+        assert lines[0].startswith("Waiting on you")
+
+    def test_blocked_status_surfaces_even_without_signal_text(self):
+        """Status='blocked' counts even if the result text lacks a
+        detector signal (defense in depth: the detector is heuristic)."""
+        hour_ago = datetime.now(UTC) - timedelta(hours=1)
+        lines = self._lines(
+            _wtask(
+                "bbb22222",
+                "Draft the launch email",
+                "no signal here",
+                status="blocked",
+                completed_at=hour_ago,
+            )
+        )
+        assert len(lines) == 1
+
+    def test_superseded_by_later_success(self):
+        """Once a later task with overlapping keywords completes
+        successfully, the older blocked question is answered: drop it."""
+        two_days_ago = datetime.now(UTC) - timedelta(days=2)
+        one_day_ago = datetime.now(UTC) - timedelta(days=1)
+        lines = self._lines(
+            _wtask(
+                "ccc33333",
+                "Record Alex's focus areas and client segments",
+                BLOCKED_RESULT,
+                completed_at=two_days_ago,
+            ),
+            _wtask(
+                "ddd44444",
+                "Record Alex's focus areas and client segments",
+                "Stored: focus areas, segments, priorities in the brain.",
+                completed_at=one_day_ago,
+            ),
+        )
+        assert lines == []
+
+    def test_expired_after_window(self):
+        """Blocked questions older than the 7-day window stop nagging."""
+        eight_days_ago = datetime.now(UTC) - timedelta(days=8)
+        lines = self._lines(
+            _wtask(
+                "eee55555", "Old question", BLOCKED_RESULT, completed_at=eight_days_ago
+            )
+        )
+        assert lines == []
+
+    def test_near_duplicates_keep_only_newest(self):
+        """The LLM re-suggests the same blocked task after the dedup
+        window expires; the footer must not stack both."""
+        old = datetime.now(UTC) - timedelta(days=3)
+        new = datetime.now(UTC) - timedelta(hours=2)
+        lines = self._lines(
+            _wtask(
+                "fff66666",
+                "Record Alex's current focus areas and segments",
+                BLOCKED_RESULT,
+                completed_at=old,
+            ),
+            _wtask(
+                "7777777g",
+                "Record Alex's current focus areas and segments",
+                BLOCKED_RESULT,
+                completed_at=new,
+            ),
+        )
+        assert len(lines) == 1
+        assert "7777777g" in lines[0]
+
+    def test_caps_at_three(self):
+        now = datetime.now(UTC)
+        descs = [
+            "Verify stripe billing handles usage overage",
+            "Draft the github auth migration runbook",
+            "Scan r/sideproject for launch feedback",
+            "Export the CRM leads into notion",
+            "Triage linear backlog by customer impact",
+        ]
+        tasks = [
+            _wtask(
+                f"t{i:08x}",
+                desc,
+                BLOCKED_RESULT,
+                completed_at=now - timedelta(hours=i + 1),
+            )
+            for i, desc in enumerate(descs)
+        ]
+        assert len(self._lines(*tasks)) == 3
+
+
+class TestDigestTakeWaiting:
+    """The digest must be non-empty when the only content is unanswered
+    questions — that is exactly the silence that looked like breakage."""
+
+    def _fresh(self, monkeypatch, tmp_path):
+        import llm_proxy
+
+        state_file = tmp_path / "digest.json"
+        monkeypatch.setenv("HEARTBEAT_DIGEST_STATE", str(state_file))
+        monkeypatch.setattr(
+            llm_proxy, "_digest_state", {"lines": [], "last_flush": None}
+        )
+        return llm_proxy
+
+    def test_waiting_only_makes_digest_nonempty(self, monkeypatch, tmp_path):
+        proxy = self._fresh(monkeypatch, tmp_path)
+        text = proxy._digest_take(
+            time.time(), 28.64, [], waiting=["Waiting on you: #abc focus areas"]
+        )
+        assert text != ""
+        assert "nothing new" in text
+        assert "#abc" in text
+        assert "$28.64" in text
+
+    def test_waiting_appended_after_buffered_lines(self, monkeypatch, tmp_path):
+        proxy = self._fresh(monkeypatch, tmp_path)
+        proxy._digest_record("[SYSTEM] #1: did a thing")
+        text = proxy._digest_take(
+            time.time(), None, [], waiting=["Waiting on you: #abc focus areas"]
+        )
+        assert "did a thing" in text
+        assert "#abc" in text
+
+    def test_empty_and_no_waiting_stays_silent(self, monkeypatch, tmp_path):
+        proxy = self._fresh(monkeypatch, tmp_path)
+        assert proxy._digest_take(time.time(), None, []) == ""
