@@ -38,7 +38,7 @@ def main() -> int:
         rows = list(csv.DictReader(fh))
 
     cleaned = leads_clean(rows, connector["transform"])
-    crm = get_adapter(profile.crm)
+    crm = get_adapter(profile.crm or {})
     crm.init()
     upsert_key = connector["sink"].get("upsert_key", "email")
     written = crm.upsert("leads", cleaned, upsert_key)

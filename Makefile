@@ -76,8 +76,23 @@ tome-bridge: ## Run one bridge pass for research:tome tasks
 tome-bridge-watch: ## Watch task queue for research:tome tasks
 	@python3 scripts/tome_bridge.py --watch --interval 60
 
+persona-export: ## Export approved persona learnings to learned.yaml (PROFILE=<name>)
+	@python3 workflows/scripts/persona_export.py $(PROFILE)
+
+persona: ## Render soul.md + identity.md from a profile's identity + learned overlay (PROFILE=<name>)
+	@test -n "$(PROFILE)" || { echo "usage: make persona PROFILE=<name>"; exit 1; }
+	@python3 -c "import sys; sys.path.insert(0,'workflows'); \
+from persona import render_all; from tenant_profile import load_profile; \
+import persona_learning as pl; \
+p=load_profile('$(PROFILE)'); \
+r=render_all(p, {'soul':'openclaw/soul.md','identity':'openclaw/identity.md'}, pl.load_overlay('$(PROFILE)')); \
+print('rendered ->', {k:('ok' if v else 'failed') for k,v in r.items()})"
+
+persona-demo: ## Offline walkthrough of the persona meta-learning loop (PROFILE=<name>)
+	@python3 workflows/scripts/persona_demo.py $${PROFILE:-chief-of-staff}
+
 test-unit: ## Run Python unit tests (no containers needed)
-	@python3 -m pytest workflows/tests/ -v
+	@uv run pytest workflows/tests/ -v
 
 validate: ## Validate config files and project structure
 	@python3 tests/validate_stack.py
@@ -87,7 +102,7 @@ validate: ## Validate config files and project structure
 
 # ─── Tenant Profiles (multi-tenant template) ──────────────────────
 
-.PHONY: profile seed-demo
+.PHONY: profile persona persona-demo seed-demo persona-export
 
 profile: ## Render openclaw/soul.md from a profile + set it in .env (PROFILE=<name>)
 	@test -n "$(PROFILE)" || { echo "usage: make profile PROFILE=<name>"; exit 1; }
@@ -134,26 +149,49 @@ health: ## Quick health check (no test logic, just curl)
 
 # ─── Linting ─────────────────────────────────────────────────────
 
-.PHONY: lint format
+.PHONY: lint format format-fix typecheck py-lint
 
-lint: ## Run ShellCheck on scripts
+# Python tooling (ruff + mypy + pytest) is managed by uv via pyproject.toml +
+# uv.lock. `uv run` resolves the synced .venv automatically, so no manual
+# activation is needed and versions stay pinned to the lockfile.
+
+py-lint: ## Lint Python with ruff (uv managed)
+	@uv run ruff check .
+
+typecheck: ## Typecheck Python with mypy (uv managed)
+	@uv run mypy workflows scripts tests
+
+lint: ## Run all linters: ShellCheck (scripts) + ruff + mypy (Python)
 	@if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck scripts/*.sh && echo "All scripts pass ShellCheck"; \
+		shellcheck --severity=warning scripts/*.sh workflows/*.sh && echo "All scripts pass ShellCheck"; \
 	else \
 		echo "shellcheck not installed (skipping — install with: apt install shellcheck)"; \
 	fi
+	@uv run ruff check .
+	@uv run mypy workflows scripts tests
 
-format: ## Check YAML/JSON formatting
+format: ## Check formatting: YAML/JSON + ruff format (does not modify files)
 	@command -v yamllint >/dev/null 2>&1 && yamllint -d relaxed docker-compose.yml deerflow/config.yaml || echo "yamllint not installed (skipping)"
 	@for f in openclaw/config/openclaw.json; do \
 		python3 -m json.tool "$$f" > /dev/null && echo "OK: $$f" || echo "FAIL: $$f"; \
 	done
+	@uv run ruff format --check .
+
+format-fix: ## Apply ruff formatting + safe auto-fixes
+	@uv run ruff format .
+	@uv run ruff check --fix .
 
 # ─── Setup ────────────────────────────────────────────────────────
 
 .PHONY: setup env-check
 
-setup: .env ## One-time setup: create .env and generate gateway token
+.PHONY: hooks
+
+hooks: ## Install git hooks (pre-commit + pre-push) via pre-commit
+	@uv run pre-commit install -t pre-commit -t pre-push
+	@echo "Git hooks installed: pre-commit (ruff/mypy/format) + pre-push (pytest)."
+
+setup: .env hooks ## One-time setup: .env + gateway token + git hooks
 	@echo "Setup complete. Fill in OPENROUTER_API_KEY in .env, then run: make start"
 
 .env: .env.example

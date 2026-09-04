@@ -38,7 +38,9 @@ services:
       - ./data/openclaw-state:/home/node/.openclaw
       # Ephemeral scratch space — stays in ~/clawrange/data/
       - ./data/openclaw-tmp:/tmp
-      # Config templates — read-only
+      # Config templates — read-only. openclaw/identity.md is deliberately
+      # NOT mounted: it is a human-readable render artifact only; the agent
+      # reads IDENTITY.md from its workspace under data/openclaw-state.
       - ./openclaw/soul.md:/home/node/.openclaw/soul.md:ro
       - ./openclaw/soul-ops.md:/home/node/.openclaw/soul-ops.md:ro
       - ./openclaw/HEARTBEAT.md:/home/node/.openclaw/HEARTBEAT.md:ro
@@ -49,7 +51,8 @@ services:
       - ./scripts/healthcheck-openclaw.sh:/opt/healthcheck.sh:ro
     environment:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
-      - OPENCLAW_TZ=${TIMEZONE:-America/Chicago}
+      # Timezone is NOT set via env: OpenClaw only reads
+      # agents.defaults.userTimezone in openclaw.json
       - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
       - PROXY_AUTH_TOKEN=${PROXY_AUTH_TOKEN}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
@@ -105,6 +108,7 @@ services:
       - ./workflows/llm_proxy.py:/app/llm_proxy.py:ro
       - ./workflows/models.json:/app/models.json:ro
       - ./workflows/scheduler.py:/app/scheduler.py:ro
+      - ./workflows/watchdog.py:/app/watchdog.py:ro
       - ./workflows/generators.py:/app/generators.py:ro
       - ./workflows/reddit_search.py:/app/reddit_search.py:ro
       - ./workflows/github_search.py:/app/github_search.py:ro
@@ -114,15 +118,26 @@ services:
       - ./workflows/research.py:/app/research.py:ro
       - ./workflows/tenant_profile.py:/app/tenant_profile.py:ro
       - ./workflows/persona.py:/app/persona.py:ro
+      - ./workflows/persona_api.py:/app/persona_api.py:ro
+      - ./workflows/persona_learning.py:/app/persona_learning.py:ro
       - ./workflows/crm_api.py:/app/crm_api.py:ro
       - ./workflows/connectors:/app/connectors:ro
       - ./workflows/crm:/app/crm:ro
+      # Supervisor entrypoint — exits non-zero on sustained healthz failure
+      # so restart: unless-stopped recovers a wedged --reload reloader.
+      - ./workflows/entrypoint.sh:/app/entrypoint.sh:ro
       # Tenant profiles — load_profile() resolves CLAWRANGE_PROFILE here.
       - ./config/profiles:/config/profiles:ro
       # Soul — gives Max its persona context for self-directed tasks
       - ./openclaw/soul.md:/app/soul.md:ro
       # Brain — persistent knowledge storage
       - ./data/brain:/data
+      # OpenClaw workspace state — writable so runtime persona re-render
+      # (on learning approval) can update the agent's SOUL.md / IDENTITY.md.
+      # Mounted as a whole directory rather than spec §7's narrow per-file
+      # mount because render_all writes atomically via os.replace, which
+      # breaks single-file bind mounts (the bind pins the old inode).
+      - ./data/openclaw-state:/openclaw-state
     tmpfs:
       - /tmp:size=32M
     environment:
@@ -131,7 +146,6 @@ services:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
       - PROXY_AUTH_TOKEN=${PROXY_AUTH_TOKEN}
-      - OPENROUTER_CREDIT_BALANCE=${OPENROUTER_CREDIT_BALANCE:-0}
       - REDDIT_CLIENT_ID=${REDDIT_CLIENT_ID:-}
       - REDDIT_CLIENT_SECRET=${REDDIT_CLIENT_SECRET:-}
       - REDDIT_USERNAME=${REDDIT_USERNAME:-}
@@ -141,6 +155,11 @@ services:
       - SCHEDULER_TZ=${SCHEDULER_TZ:-America/Chicago}
       # Which tenant profile to load (defaults to the identity-free starter).
       - CLAWRANGE_PROFILE=${CLAWRANGE_PROFILE:-starter}
+      # Where the OpenClaw workspace state is mounted (runtime persona render).
+      - OPENCLAW_STATE_DIR=/openclaw-state
+      # Telegram digest window for heartbeat reporting (seconds). Independent
+      # of the heartbeat cadence (every 10m, set in openclaw.json).
+      - HEARTBEAT_DIGEST_INTERVAL=${HEARTBEAT_DIGEST_INTERVAL:-3600}
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped

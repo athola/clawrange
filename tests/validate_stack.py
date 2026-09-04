@@ -207,7 +207,8 @@ def check_deerflow_data_sovereignty() -> TestResult:
     violations = [endpoint for endpoint in blocklist if endpoint in config_text]
     if violations:
         result.fail_(
-            f"Direct endpoints found: {', '.join(violations)} — must route through OpenRouter"
+            f"Direct endpoints found: {', '.join(violations)} "
+            f"— must route through OpenRouter"
         )
         return result
     # Check that base_url values specifically contain openrouter.ai

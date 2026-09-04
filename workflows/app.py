@@ -4,16 +4,35 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+import github_search
+import llm_proxy
+import reddit_search
+import research
 from brain import create_brain_router
 from brain_db import BrainDB
+from crm import get_adapter
+from crm_api import create_crm_router
+from generators import seed_from_profile
 from llm_proxy import router as llm_router
+from persona import write_soul
+from persona_api import create_persona_router
+from scheduler import (
+    add_schedule,
+    init_scheduler,
+    list_scheduled_jobs,
+    pause_schedule,
+    remove_schedule,
+    resume_schedule,
+    run_schedule_now,
+)
 from telegram import notify
+from tenant_profile import load_profile
 
 # Wire INFO-level logging for the clawrange.* loggers so cron
 # heartbeats and digest delivery confirmations show up in
@@ -55,10 +74,6 @@ def init_profile(
     leaves the marketing-style baseline (no CRM) untouched. ``http_client`` is
     injectable so the connector-sync route can be tested offline.
     """
-    from generators import seed_from_profile
-    from persona import write_soul
-    from tenant_profile import load_profile
-
     if profile is None:
         try:
             profile = load_profile()
@@ -89,9 +104,6 @@ def init_profile(
     seed_from_profile(brain_db, profile)
 
     if profile.crm:
-        from crm import get_adapter
-        from crm_api import create_crm_router
-
         crm = get_adapter(profile.crm)
         crm.init()
         app.state.crm = crm
@@ -103,8 +115,6 @@ def init_profile(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from scheduler import init_scheduler
-
     init_profile(app, brain_db)
     scheduler = init_scheduler(brain_db)
     app.state.scheduler = scheduler
@@ -116,6 +126,47 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="ClawRange Workflows", version="3.0.0", lifespan=lifespan)
 app.include_router(llm_router)
 app.include_router(create_brain_router(brain_db), prefix="/brain")
+
+
+def _persona_render_targets(profile):
+    repo = os.path.dirname(os.path.dirname(__file__))
+    state = os.environ.get(
+        "OPENCLAW_STATE_DIR", os.path.join(repo, "data", "openclaw-state")
+    )
+    return {
+        "soul": os.path.join(repo, "openclaw", "soul.md"),
+        "identity": os.path.join(repo, "openclaw", "identity.md"),
+        "workspace_soul": [
+            os.path.join(state, "workspace", "SOUL.md"),
+            os.path.join(state, "workspace-max-ops", "SOUL.md"),
+        ],
+        "workspace_identity": [
+            os.path.join(state, "workspace", "IDENTITY.md"),
+            os.path.join(state, "workspace-max-ops", "IDENTITY.md"),
+        ],
+    }
+
+
+def _current_profile():
+    try:
+        return load_profile()
+    except Exception as exc:
+        # Never substitute a placeholder profile here: /persona routes render
+        # to the tenant's real soul.md/identity.md, so a silent fallback would
+        # overwrite them with generic content. Prefer the boot-validated
+        # profile; otherwise surface the failure.
+        profile = getattr(app.state, "profile", None)
+        if profile is not None:
+            logger.warning(
+                "persona: profile reload failed, using boot profile: %s", exc
+            )
+            return profile
+        raise HTTPException(status_code=500, detail=f"profile unavailable: {exc}")
+
+
+app.include_router(
+    create_persona_router(brain_db, _current_profile, _persona_render_targets)
+)
 
 
 # ─── Task Queue (Persistent via BrainDB) ──────────────────────────
@@ -212,20 +263,12 @@ def healthz():
 
 @app.get("/tier")
 async def tier_status():
-    from llm_proxy import (
-        CONFIG,
-        OPENROUTER_BALANCE_FLOOR,
-        _check_openrouter_balance,
-        _circuit_open,
-        _last_tier_used,
-    )
-
     tiers = []
-    for tier in CONFIG["tiers"]:
+    for tier in llm_proxy.CONFIG["tiers"]:
         name = tier["name"]
-        if _circuit_open(name):
+        if llm_proxy._circuit_open(name):
             marker = "TRIPPED"
-        elif name == _last_tier_used:
+        elif name == llm_proxy._last_tier_used:
             marker = "ACTIVE"
         else:
             marker = "ready"
@@ -233,14 +276,14 @@ async def tier_status():
             {"name": name, "status": marker, "description": tier["description"]}
         )
 
-    remaining = await _check_openrouter_balance()
+    remaining = await llm_proxy._check_openrouter_balance()
     return {
         "tiers": tiers,
-        "last_used": _last_tier_used or "none",
+        "last_used": llm_proxy._last_tier_used or "none",
         "balance_remaining": f"${remaining:.2f}"
         if remaining is not None
         else "not configured",
-        "balance_floor": f"${OPENROUTER_BALANCE_FLOOR:.2f}",
+        "balance_floor": f"${llm_proxy.OPENROUTER_BALANCE_FLOOR:.2f}",
         "paid_auto_fallback": "off",
     }
 
@@ -248,33 +291,24 @@ async def tier_status():
 @app.post("/tier/notify")
 async def tier_notify():
     """Send tier status to Telegram — hit this endpoint to get status in chat."""
-    from llm_proxy import (
-        CONFIG,
-        OPENROUTER_BALANCE_FLOOR,
-        _check_openrouter_balance,
-        _circuit_open,
-        _last_tier_used,
-    )
-
     lines = ["*Tier Status*\n"]
-    for tier in CONFIG["tiers"]:
+    for tier in llm_proxy.CONFIG["tiers"]:
         name = tier["name"]
-        if _circuit_open(name):
+        if llm_proxy._circuit_open(name):
             marker = "TRIPPED"
-        elif name == _last_tier_used:
+        elif name == llm_proxy._last_tier_used:
             marker = "ACTIVE"
         else:
             marker = "ready"
         lines.append(f"  [{marker}] {name}")
 
-    remaining = await _check_openrouter_balance()
+    remaining = await llm_proxy._check_openrouter_balance()
     if remaining is not None:
-        lines.append(
-            f"\nBalance: ${remaining:.2f} (floor: ${OPENROUTER_BALANCE_FLOOR:.2f})"
-        )
+        floor = llm_proxy.OPENROUTER_BALANCE_FLOOR
+        lines.append(f"\nBalance: ${remaining:.2f} (floor: ${floor:.2f})")
     else:
         lines.append("\nBalance: not configured")
-    lines.append(f"Last used: {_last_tier_used or 'none'}")
+    lines.append(f"Last used: {llm_proxy._last_tier_used or 'none'}")
     lines.append("Paid fallback: off (use 'paid' keyword)")
 
     text = "\n".join(lines)
@@ -293,7 +327,7 @@ def test_webhook(body: dict[str, Any] = {}):
     return {
         "status": "ok",
         "message": f"received: {summary}",
-        "receivedAt": datetime.now(timezone.utc).isoformat(),
+        "receivedAt": datetime.now(UTC).isoformat(),
         "payloadKeys": keys,
         "echo": body,
     }
@@ -367,8 +401,6 @@ class SchedulePatch(BaseModel):
 
 @app.get("/sched")
 async def list_schedules():
-    from scheduler import list_scheduled_jobs
-
     scheds = brain_db.list_schedules()
     jobs = (
         list_scheduled_jobs(app.state.scheduler)
@@ -384,8 +416,6 @@ async def list_schedules():
 
 @app.get("/sched/{schedule_id}")
 async def get_schedule(schedule_id: str):
-    from scheduler import list_scheduled_jobs
-
     sched = brain_db.get_schedule(schedule_id)
     if not sched:
         raise HTTPException(status_code=404, detail="Schedule not found")
@@ -402,8 +432,6 @@ async def get_schedule(schedule_id: str):
 
 @app.post("/sched")
 async def create_schedule(body: ScheduleCreate):
-    from scheduler import add_schedule
-
     sched = await add_schedule(
         app.state.scheduler if hasattr(app.state, "scheduler") else None,
         brain_db,
@@ -418,8 +446,6 @@ async def create_schedule(body: ScheduleCreate):
 
 @app.patch("/sched/{schedule_id}")
 async def update_schedule(schedule_id: str, body: SchedulePatch):
-    from scheduler import pause_schedule, resume_schedule, add_schedule
-
     if body.paused is not None:
         if body.paused:
             return await pause_schedule(
@@ -455,8 +481,6 @@ async def update_schedule(schedule_id: str, body: SchedulePatch):
 
 @app.delete("/sched/{schedule_id}")
 async def delete_schedule(schedule_id: str):
-    from scheduler import remove_schedule
-
     if not await remove_schedule(
         app.state.scheduler if hasattr(app.state, "scheduler") else None,
         brain_db,
@@ -468,8 +492,6 @@ async def delete_schedule(schedule_id: str):
 
 @app.post("/sched/{schedule_id}/run")
 async def run_schedule(schedule_id: str):
-    from scheduler import run_schedule_now
-
     try:
         return await run_schedule_now(
             app.state.scheduler if hasattr(app.state, "scheduler") else None,
@@ -485,8 +507,6 @@ async def run_schedule(schedule_id: str):
 
 @app.post("/scan/reddit")
 async def scan_reddit(body: dict[str, Any]):
-    from reddit_search import search_subreddits
-
     topic = body.get("topic", "")
     if not topic:
         raise HTTPException(status_code=400, detail="topic is required")
@@ -502,7 +522,7 @@ async def scan_reddit(body: dict[str, Any]):
     if not subreddits:
         subreddits = ["ClaudeAI", "LocalLLaMA", "SideProject"]
 
-    results = await search_subreddits(
+    results = await reddit_search.search_subreddits(
         topic,
         subreddits,
         since=body.get("since", "7d"),
@@ -526,8 +546,6 @@ async def scan_reddit(body: dict[str, Any]):
 
 @app.post("/scan/github")
 async def scan_github(body: dict[str, Any]):
-    from github_search import search_repos, search_issues, get_self_traffic
-
     kind = body.get("kind", "repos")
 
     if kind == "self_traffic":
@@ -539,7 +557,9 @@ async def scan_github(body: dict[str, Any]):
         project = brain_db.get_project(project_slug)
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
-        traffic = await get_self_traffic(project["owner"], project["repo"])
+        traffic = await github_search.get_self_traffic(
+            project["owner"], project["repo"]
+        )
         return {"traffic": traffic.model_dump() if traffic else None}
 
     topic = body.get("topic", "")
@@ -547,7 +567,7 @@ async def scan_github(body: dict[str, Any]):
         raise HTTPException(status_code=400, detail="topic is required")
 
     if kind == "repos":
-        results = await search_repos(
+        results: list = await github_search.search_repos(
             topic,
             min_stars=body.get("min_stars", 0),
             language=body.get("language"),
@@ -560,7 +580,7 @@ async def scan_github(body: dict[str, Any]):
             "kind": kind,
         }
     elif kind == "issues":
-        results = await search_issues(topic, limit=body.get("limit", 25))
+        results = await github_search.search_issues(topic, limit=body.get("limit", 25))
         return {
             "results": [r.model_dump() for r in results],
             "total": len(results),
@@ -576,13 +596,11 @@ async def scan_github(body: dict[str, Any]):
 
 @app.post("/scan/web")
 async def scan_web(body: dict[str, Any]):
-    from llm_proxy import _llm_call
-
     prompt = body.get("prompt", "")
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
 
-    result = await _llm_call(prompt, max_tokens=1500, web_search=True)
+    result = await llm_proxy._llm_call(prompt, max_tokens=1500, web_search=True)
     return {"result": result or "", "query": prompt}
 
 
@@ -599,7 +617,7 @@ class ResearchRequest(BaseModel):
 
 
 @app.post("/research")
-async def research(body: ResearchRequest):
+async def run_research(body: ResearchRequest):
     """Run a multi-source research session and return ranked findings.
 
     Channels default to discourse (Reddit), code (GitHub), and
@@ -612,8 +630,6 @@ async def research(body: ResearchRequest):
     the fanout. The response includes `session_id` for follow-up
     queries against `/research/sessions/{id}`.
     """
-    from research import orchestrate_research
-
     if not body.topic.strip():
         raise HTTPException(status_code=400, detail="topic is required")
 
@@ -625,7 +641,9 @@ async def research(body: ResearchRequest):
     if body.subreddits:
         kwargs["subreddits"] = body.subreddits
 
-    result = await orchestrate_research(body.topic, channels=body.channels, **kwargs)
+    result = await research.orchestrate_research(
+        body.topic, channels=body.channels, **kwargs
+    )
 
     session = brain_db.create_research_session(body.topic, result["channels"])
     for f in result["findings"]:
@@ -648,9 +666,7 @@ async def research(body: ResearchRequest):
 @app.get("/healthz/research")
 def healthz_research():
     """Per-channel research orchestrator readiness report."""
-    from research import channel_health
-
-    report = channel_health()
+    report = research.channel_health()
     healthy = sum(1 for v in report.values() if v["configured"])
     return {
         "channels": report,

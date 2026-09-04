@@ -1,7 +1,7 @@
 # ClawRange Testbed Guide
 
 Local validation environment for the ClawRange stack:
-OpenClaw + Workflows (FastAPI) + optional DeerFlow + optional Ollama.
+OpenClaw, Workflows (FastAPI), optional DeerFlow, and optional Ollama.
 
 ## Quick Start
 
@@ -10,11 +10,11 @@ OpenClaw + Workflows (FastAPI) + optional DeerFlow + optional Ollama.
 cd ~/clawrange
 
 # 2. Create your environment file and fill in your OpenRouter API key
-#    Get one at https://openrouter.ai/settings/keys — keep balance above $10
+#    Get one at https://openrouter.ai/settings/keys (keep balance above $10)
 make setup
 nano .env
 
-# 3. Start the core stack (OpenClaw + Workflows)
+# 3. Start the core stack (OpenClaw and Workflows)
 make start
 
 # 4. Confirm services are healthy
@@ -41,14 +41,14 @@ returns responses shaped by `openclaw/soul.md`. The default persona is
 http://localhost:3000.
 
 **Workflows** is the FastAPI service that replaced n8n. It owns the
-brain database (SQLite + optional embeddings), the persistent task
+brain database (SQLite and optional embeddings), the persistent task
 queue, the OpenAI-compatible LLM proxy with tiered routing, the
 APScheduler-driven cron jobs, and the marketing scanners
-(Reddit + GitHub). Endpoints live at http://localhost:5678 — see
-[specification.md](specification.md) for the full surface.
+(Reddit and GitHub). Endpoints live at http://localhost:5678 (see
+[specification.md](specification.md) for the full surface).
 
 **DeerFlow** is the deep research layer (optional). When a question
-needs broad research — market analysis, regulatory deep dives — DeerFlow
+needs broad research (market analysis, regulatory deep dives), DeerFlow
 dispatches sub-agents that search the web, synthesize findings, and
 produce structured reports. Overkill for most daily ops. Runs at
 http://localhost:2026 when started with `--with-deerflow`.
@@ -80,7 +80,7 @@ can be run on their own:
 Use the Python suites for offline validation (no services required):
 
 ```bash
-make validate                                    # config + structure checks
+make validate                                    # config and structure checks
 python3 tests/validate_stack.py                  # structure check only
 python3 -m pytest tests/test_validate_stack.py   # validate_stack unit tests
 make test-unit                                   # workflows/tests/ pytest
@@ -98,10 +98,10 @@ routing, marketing scanners, and Telegram formatting.
 | OpenRouter API key invalid | OpenClaw returns errors, completion tests fail | Check key at https://openrouter.ai/settings/keys. Verify balance > $0. |
 | OpenRouter balance zero | LLM calls return 402 errors | Add credits at https://openrouter.ai/credits |
 | OpenClaw can't reach Workflows | Tool/proxy calls from OpenClaw fail | Both must be on `msp-network`. Check `docker network ls` and `docker network inspect msp-network`. |
-| DeerFlow using ByteDance endpoints | Research calls go to Doubao/Volcengine | Check `deer-flow/config.yaml` — all models must have `base_url: https://openrouter.ai/api/v1` |
+| DeerFlow using ByteDance endpoints | Research calls go to Doubao/Volcengine | Check `deer-flow/config.yaml`. All models must have `base_url: https://openrouter.ai/api/v1` |
 | Ollama out of memory | `out of memory` or killed process | Use a smaller model: `ollama run llama3.2:1b`. Or close other apps to free RAM. |
-| Schedules not firing | `/sched` shows next_fire_time but no tasks created | Workflows must run with a single uvicorn worker; check container memory and `make logs-workflows`. |
-| Reddit/GitHub scans return empty | `/scan/reddit` or `/scan/github` empty results | Confirm credentials in `.env` (REDDIT_*, GITHUB_PAT). Missing creds degrade gracefully — no exception, just empty list. |
+| Schedules not firing | `/sched` shows next_fire_time but no tasks created | Workflows must run with a single uvicorn worker. Check container memory and `make logs-workflows`. |
+| Reddit/GitHub scans return empty | `/scan/reddit` or `/scan/github` empty results | Confirm credentials in `.env` (REDDIT_*, GITHUB_PAT). Missing creds degrade gracefully (no exception, just empty list). |
 
 ## Cost Estimation
 
@@ -125,7 +125,7 @@ Monitor in real-time: OpenRouter dashboard shows per-model token usage and cost 
 
 ## Moving to Production
 
-When deploying to the live host (DigitalOcean Droplet + ThinkCentre M75q),
+When deploying to the live host (DigitalOcean Droplet and ThinkCentre M75q),
 see [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md) for the full Tailscale +
 Caddy walkthrough. Key shifts vs. the local testbed:
 
@@ -138,7 +138,7 @@ Caddy walkthrough. Key shifts vs. the local testbed:
 | **Workflows** | Hot-reload bind mounts | Image-baked code, single uvicorn worker |
 | **Brain DB** | `data/brain/brain.db` (bind mount) | Persistent volume with backup strategy |
 | **Secrets** | `.env` file | Docker secrets or sealed env |
-| **Monitoring** | Manual test scripts | Uptime Kuma + Telegram alerts (`/tier/notify`) |
+| **Monitoring** | Manual test scripts | Uptime Kuma and Telegram alerts (`/tier/notify`) |
 | **DeerFlow** | Optional, local | Runs on Droplet only when needed |
 | **Ollama** | Test on laptop | Runs on ThinkCentre for air-gapped fallback |
 
@@ -154,7 +154,7 @@ The default persona is wired for the operator. To repoint the stack:
 
 1. Replace `openclaw/soul.md` with the new operator's persona and
    `openclaw/soul-ops.md` with their ops-mode instructions. Keep
-   responses tight — Telegram is the main channel.
+   responses tight. Telegram is the main channel.
 2. Reseed the marketing orchestrator: `POST /projects` with the new
    slugs/repos, then `POST /sched` for any cron jobs that should run.
 3. Update `openclaw/HEARTBEAT.md` if the heartbeat cadence or task
@@ -162,5 +162,5 @@ The default persona is wired for the operator. To repoint the stack:
 4. Re-run `make test` to confirm health, completion, and webhook
    canary still pass.
 
-The brain database is operator-specific — wipe `data/brain/brain.db`
+The brain database is operator-specific. Wipe `data/brain/brain.db`
 before reseeding if you want a clean slate.

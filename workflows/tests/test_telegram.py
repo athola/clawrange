@@ -1,8 +1,9 @@
 """Tests for the Telegram notification module."""
 
+from unittest.mock import AsyncMock, patch
+
 import httpx
 import pytest
-from unittest.mock import AsyncMock, patch
 
 import telegram
 

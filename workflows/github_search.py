@@ -4,9 +4,10 @@ Calls GitHub's Search API for repos and issues, and the Traffic API
 for self-repo analytics. Gracefully degrades when credentials are missing.
 """
 
+import base64
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from pydantic import BaseModel
 
@@ -164,7 +165,7 @@ async def get_self_traffic(owner: str, repo: str) -> GitHubTrafficSnapshot | Non
             views_uniques=views_data.uniques or 0,
             clones_count=clones_data.count or 0,
             clones_uniques=clones_data.uniques or 0,
-            fetched_at=datetime.now(timezone.utc).isoformat(),
+            fetched_at=datetime.now(UTC).isoformat(),
         )
     except Exception as exc:
         logger.warning("GitHub traffic fetch failed for %s/%s: %s", owner, repo, exc)
@@ -184,7 +185,6 @@ async def check_awesome_list(
 
     try:
         resp = client.rest.repos.get_readme(owner=list_owner, repo=list_repo)
-        import base64
 
         content = base64.b64decode(resp.parsed_data.content).decode()
         return {url: url in content for url in target_urls}

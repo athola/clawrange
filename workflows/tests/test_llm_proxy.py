@@ -1,7 +1,8 @@
 """Tests for the LLM proxy with three-tier fallback."""
 
 import json
-from datetime import datetime, timezone
+import time
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -50,6 +51,8 @@ def _reset_state():
 
     llm_proxy._circuit_state.clear()
     llm_proxy._notification_last_sent.clear()
+    llm_proxy._digest_state["lines"] = []
+    llm_proxy._digest_state["last_flush"] = time.time()
 
 
 # ─── Provider mock helpers ────────────────────────────────────────
@@ -135,6 +138,57 @@ class TestProxyTierFallback:
         assert r.json()["_clawrange_tier"] == "zai-direct"
 
     @patch("llm_proxy._background_notify")
+    @patch("telegram.notify", new_callable=AsyncMock)
+    @patch("llm_proxy._check_openrouter_balance", new_callable=AsyncMock)
+    @patch("llm_proxy._call_provider", side_effect=_all_succeed)
+    def test_zero_balance_routes_around_openrouter(
+        self, mock_call, mock_balance, mock_tg, _mock_bg
+    ):
+        """A zero/negative balance blocks every OpenRouter model (free
+        included) with 402s — skip the provider entirely so zai-direct
+        carries traffic instead of stalling."""
+        import llm_proxy
+
+        mock_balance.return_value = -1.28
+        llm_proxy._notification_last_sent.clear()
+        try:
+            r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
+            assert r.status_code == 200
+            assert r.json()["_clawrange_tier"] == "zai-direct"
+            providers = [c.args[0] for c in mock_call.call_args_list]
+            assert "openrouter" not in providers
+        finally:
+            llm_proxy._notification_last_sent.clear()
+
+    @patch("llm_proxy._background_notify")
+    @patch("telegram.notify", new_callable=AsyncMock)
+    @patch("llm_proxy._check_openrouter_balance", new_callable=AsyncMock)
+    @patch("llm_proxy._call_provider", side_effect=_all_succeed)
+    def test_balance_guard_notify_throttled(
+        self, mock_call, mock_balance, mock_tg, _mock_bg
+    ):
+        """The skip notice fires at most once per debounce window, not
+        once per skipped tier per request."""
+        import llm_proxy
+
+        mock_balance.return_value = -1.28
+        llm_proxy._notification_last_sent.clear()
+        try:
+            for _ in range(2):
+                r = client.post(
+                    "/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER
+                )
+                assert r.status_code == 200
+            guard_calls = [
+                c
+                for c in mock_tg.call_args_list
+                if "Balance guard" in (c.args[0] if c.args else "")
+            ]
+            assert len(guard_calls) <= 1
+        finally:
+            llm_proxy._notification_last_sent.clear()
+
+    @patch("llm_proxy._background_notify")
     @patch("llm_proxy._call_provider", side_effect=_all_rate_limited)
     def test_all_tiers_exhausted_returns_synthetic(self, mock_call, mock_bg):
         """When all tiers are rate limited, return a friendly synthetic response."""
@@ -159,7 +213,8 @@ class TestProxyTierFallback:
             {
                 "role": "assistant",
                 "content": (
-                    "I'm temporarily on pause \u2014 the free API tiers are rate-limited "
+                    "I'm temporarily on pause \u2014 the free API tiers are "
+                    "rate-limited "
                     "right now. Send !paid or !claude to use the paid tier, "
                     "or try again later."
                 ),
@@ -175,7 +230,8 @@ class TestProxyTierFallback:
             )
             assert r.status_code == 200
             sent_messages = mock_caller.call_args.args[2]["messages"]
-            # 2 user messages (assistant stripped) + trailing system (anti-hallucination)
+            # 2 user messages (assistant stripped) + trailing system
+            # (anti-hallucination)
             assert len(sent_messages) == 3
             assert sent_messages[-1]["role"] == "system"
             assert not any(m["role"] == "assistant" for m in sent_messages)
@@ -209,7 +265,8 @@ class TestProxyTierFallback:
     @patch("llm_proxy._background_notify")
     @patch("llm_proxy._call_provider")
     def test_reasoning_content_used_when_content_empty(self, mock_call, _mock_bg):
-        """GLM 5.1 reasoning models put output in reasoning_content — proxy merges it."""
+        """GLM 5.1 reasoning models put output in reasoning_content — proxy merges
+        it."""
         reasoning_body = {
             "id": "test",
             "object": "chat.completion",
@@ -218,7 +275,9 @@ class TestProxyTierFallback:
                     "message": {
                         "role": "assistant",
                         "content": "",
-                        "reasoning_content": "The user said hello, so I should greet them.",
+                        "reasoning_content": (
+                            "The user said hello, so I should greet them."
+                        ),
                     }
                 }
             ],
@@ -384,7 +443,10 @@ class TestProxyTierFallback:
                 {
                     "message": {
                         "role": "assistant",
-                        "content": "Alex,Idon'tseeanyactiveresearchsub-agentsrunningrightnow.Letmecheckifthere'saresearchdocumentthatwascreated:",
+                        "content": (
+                            "Alex,Idon'tseeanyactiveresearchsub-agentsrunningrightnow."
+                            "Letmecheckifthere'saresearchdocumentthatwascreated:"
+                        ),
                     }
                 }
             ],
@@ -508,29 +570,28 @@ class TestBalanceGuard:
 
         import llm_proxy
 
-        original = llm_proxy.OPENROUTER_CREDIT_BALANCE
-        llm_proxy.OPENROUTER_CREDIT_BALANCE = 0
         llm_proxy._balance_cache.clear()
         try:
-            result = asyncio.run(llm_proxy._check_openrouter_balance())
+            with patch.dict("os.environ", {"OPENROUTER_API_KEY": ""}):
+                result = asyncio.run(llm_proxy._check_openrouter_balance())
             assert result is None
         finally:
-            llm_proxy.OPENROUTER_CREDIT_BALANCE = original
+            llm_proxy._balance_cache.clear()
 
     @patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"})
-    def test_balance_calculation(self):
-        """Verify remaining = credit_balance - usage."""
+    def test_balance_reads_credits_api(self):
+        """remaining = total_credits - total_usage, straight from /credits."""
         import asyncio
 
         import llm_proxy
 
-        original_balance = llm_proxy.OPENROUTER_CREDIT_BALANCE
-        llm_proxy.OPENROUTER_CREDIT_BALANCE = 15.0
         llm_proxy._balance_cache.clear()
 
         mock_resp = httpx.Response(
             200,
-            content=json.dumps({"data": {"usage": 5.50}}).encode(),
+            content=json.dumps(
+                {"data": {"total_credits": 28.69, "total_usage": 5.50}}
+            ).encode(),
         )
         mock_client = AsyncMock()
         mock_client.get = AsyncMock(return_value=mock_resp)
@@ -540,9 +601,10 @@ class TestBalanceGuard:
         try:
             with patch("llm_proxy.httpx.AsyncClient", return_value=mock_client):
                 result = asyncio.run(llm_proxy._check_openrouter_balance())
-                assert result == 9.50  # 15.0 - 5.50
+                assert result == 23.19  # 28.69 - 5.50
+                called_url = mock_client.get.call_args[0][0]
+                assert called_url.endswith("/api/v1/credits")
         finally:
-            llm_proxy.OPENROUTER_CREDIT_BALANCE = original_balance
             llm_proxy._balance_cache.clear()
 
 
@@ -592,7 +654,8 @@ class TestTierCommand:
         assert "Tier Status" in content
 
     def test_command_with_unknown_prefix(self):
-        """Status command matches via last-line fallback even if metadata regex fails."""
+        """Status command matches via last-line fallback even if metadata regex
+        fails."""
         msg = "some unrecognized metadata block\nclaw status"
         r = client.post(
             "/v1/chat/completions",
@@ -647,6 +710,10 @@ class TestHelpCommand:
         assert "!remember" in content
         assert "!tier" in content
         assert "/brain/search" in content
+        assert "PERSONA" in content
+        assert "!persona <feedback>" in content
+        assert "!persona reflect" in content
+        assert "!learn" in content
 
     def test_help_with_metadata_prefix(self):
         msg = "some metadata block\n!help"
@@ -1052,7 +1119,9 @@ class TestNonAnswerDetection:
                             {
                                 "message": {
                                     "role": "assistant",
-                                    "content": "Let me do my full startup sequence first.",
+                                    "content": (
+                                        "Let me do my full startup sequence first."
+                                    ),
                                 }
                             }
                         ],
@@ -1124,7 +1193,10 @@ class TestResponseSanitization:
     def test_detects_garbled_glm_output(self):
         from llm_proxy import _is_garbled
 
-        garbled = "Alex,Idon'tseeanyactiveresearchsub-agentsrunningrightnow.Letmecheckifthere'saresearchdocumentthatwascreated:"
+        garbled = (
+            "Alex,Idon'tseeanyactiveresearchsub-agentsrunningrightnow."
+            "Letmecheckifthere'saresearchdocumentthatwascreated:"
+        )
         assert _is_garbled(garbled) is True
 
     def test_normal_text_not_garbled(self):
@@ -1966,8 +2038,6 @@ class TestBalanceCache:
 
         import llm_proxy
 
-        original = llm_proxy.OPENROUTER_CREDIT_BALANCE
-        llm_proxy.OPENROUTER_CREDIT_BALANCE = 20.0
         llm_proxy._balance_cache.clear()
         # Pre-populate cache
         llm_proxy._balance_cache["remaining"] = 15.0
@@ -1977,7 +2047,6 @@ class TestBalanceCache:
             result = asyncio.run(llm_proxy._check_openrouter_balance())
             assert result == 15.0  # Returned cached, no HTTP call needed
         finally:
-            llm_proxy.OPENROUTER_CREDIT_BALANCE = original
             llm_proxy._balance_cache.clear()
 
     @patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"})
@@ -1988,8 +2057,6 @@ class TestBalanceCache:
 
         import llm_proxy
 
-        original = llm_proxy.OPENROUTER_CREDIT_BALANCE
-        llm_proxy.OPENROUTER_CREDIT_BALANCE = 20.0
         llm_proxy._balance_cache.clear()
         # Set cache as expired
         llm_proxy._balance_cache["remaining"] = 15.0
@@ -1998,7 +2065,10 @@ class TestBalanceCache:
         )
 
         mock_resp = httpx.Response(
-            200, content=json.dumps({"data": {"usage": 8.0}}).encode()
+            200,
+            content=json.dumps(
+                {"data": {"total_credits": 20.0, "total_usage": 8.0}}
+            ).encode(),
         )
         mock_client = AsyncMock()
         mock_client.get = AsyncMock(return_value=mock_resp)
@@ -2011,7 +2081,6 @@ class TestBalanceCache:
             assert result == 12.0  # 20.0 - 8.0
             mock_client.get.assert_called_once()
         finally:
-            llm_proxy.OPENROUTER_CREDIT_BALANCE = original
             llm_proxy._balance_cache.clear()
 
     def test_returns_none_when_api_key_missing(self):
@@ -2019,8 +2088,6 @@ class TestBalanceCache:
 
         import llm_proxy
 
-        original = llm_proxy.OPENROUTER_CREDIT_BALANCE
-        llm_proxy.OPENROUTER_CREDIT_BALANCE = 20.0
         llm_proxy._balance_cache.clear()
 
         try:
@@ -2028,7 +2095,6 @@ class TestBalanceCache:
                 result = asyncio.run(llm_proxy._check_openrouter_balance())
             assert result is None
         finally:
-            llm_proxy.OPENROUTER_CREDIT_BALANCE = original
             llm_proxy._balance_cache.clear()
 
     @patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"})
@@ -2039,8 +2105,6 @@ class TestBalanceCache:
 
         import llm_proxy
 
-        original = llm_proxy.OPENROUTER_CREDIT_BALANCE
-        llm_proxy.OPENROUTER_CREDIT_BALANCE = 20.0
         llm_proxy._balance_cache.clear()
         # Stale cache
         llm_proxy._balance_cache["remaining"] = 10.0
@@ -2058,7 +2122,6 @@ class TestBalanceCache:
                 result = asyncio.run(llm_proxy._check_openrouter_balance())
             assert result == 10.0  # Stale cache returned
         finally:
-            llm_proxy.OPENROUTER_CREDIT_BALANCE = original
             llm_proxy._balance_cache.clear()
 
 
@@ -2366,6 +2429,194 @@ class TestIsRateLimitedBodyParsing:
         assert _is_rate_limited(resp) is False
 
 
+# ─── Research Router ──────────────────────────────────────────────
+
+
+@patch.dict("os.environ", FAKE_ENV)
+@patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
+class TestResearchRouter:
+    """Research-shaped tasks route to the web-capable orchestrator
+    instead of the tool-less chat LLM."""
+
+    def setup_method(self):
+        _reset_state()
+
+    @patch("research.orchestrate_research", new_callable=AsyncMock)
+    def test_research_task_runs_orchestrator(self, mock_orch):
+        import asyncio
+
+        import llm_proxy
+
+        mock_orch.return_value = {
+            "findings": [
+                {
+                    "channel": "discourse",
+                    "title": "How do you capture trade-skill knowledge?",
+                    "url": "https://reddit.com/r/trades/x",
+                    "relevance": 9,
+                    "summary": "field-capture discussion",
+                }
+            ]
+        }
+        result = asyncio.run(
+            llm_proxy._try_research_task(
+                "Search Reddit for live threads on trade-skill knowledge capture"
+            )
+        )
+        assert result is not None
+        assert "reddit.com/r/trades/x" in result
+        mock_orch.assert_called_once()
+        assert mock_orch.call_args.kwargs["channels"] == [
+            "discourse",
+            "code",
+            "discourse_web",
+        ]
+
+    def test_non_research_task_returns_none(self):
+        import asyncio
+
+        import llm_proxy
+
+        assert asyncio.run(llm_proxy._try_research_task("Check z.ai pricing")) is None
+        assert asyncio.run(llm_proxy._try_research_task("Reply to Alex")) is None
+
+    @patch("research.orchestrate_research", new_callable=AsyncMock)
+    def test_content_idea_task_not_hijacked_by_research_router(self, mock_orch):
+        """The content-idea template quotes research words ("research on",
+        "surfaced", "Reddit/HN comment") but is a drafting job for the LLM.
+        The orchestrator must not steal it and re-run research."""
+        import asyncio
+
+        import llm_proxy
+
+        desc = (
+            "Content idea for claude-night-market: research on 'trade-skill "
+            'capture\' surfaced "TRIZ analogies" (). Draft three angles - '
+            "(1) technical post, (2) useful Reddit/HN comment, (3) X thread."
+        )
+        result = asyncio.run(llm_proxy._try_research_task(desc))
+        assert result is None
+        mock_orch.assert_not_called()
+
+    @patch("research.orchestrate_research", new_callable=AsyncMock)
+    def test_findings_header_does_not_echo_description(self, mock_orch):
+        """The digest line already shows the task description above the
+        result; echoing it inside the result header just doubles the text
+        and crowds the blocked-detector's 400-char head window."""
+        import asyncio
+
+        import llm_proxy
+
+        mock_orch.return_value = {
+            "findings": [
+                {
+                    "channel": "discourse",
+                    "title": "What chrome extensions do trades use?",
+                    "url": "https://reddit.com/r/trades/x",
+                }
+            ]
+        }
+        result = asyncio.run(
+            llm_proxy._try_research_task(
+                "Search Reddit for live threads on trade-skill knowledge capture"
+            )
+        )
+        assert result is not None
+        assert result.startswith("Research findings (1):")
+        assert "trade-skill knowledge capture" not in result
+        assert "reddit.com/r/trades/x" in result
+
+    @patch("research.orchestrate_research", new_callable=AsyncMock)
+    def test_no_findings_reported(self, mock_orch):
+        import asyncio
+
+        import llm_proxy
+
+        mock_orch.return_value = {"findings": []}
+        result = asyncio.run(
+            llm_proxy._try_research_task("research web articles on tacit knowledge")
+        )
+        assert result is not None
+        assert "no findings" in result.lower()
+
+    @patch("research.orchestrate_research", new_callable=AsyncMock)
+    def test_orchestrator_failure_falls_back_to_llm(self, mock_orch):
+        import asyncio
+
+        import llm_proxy
+
+        mock_orch.side_effect = RuntimeError("channels down")
+        result = asyncio.run(
+            llm_proxy._try_research_task("find reddit threads on chrome extensions")
+        )
+        assert result is None
+
+    @patch("research.orchestrate_research", new_callable=AsyncMock)
+    def test_heartbeat_processes_research_task_via_orchestrator(self, mock_orch):
+        """A queued research task completes with real citable URLs, and
+        the heartbeat response stays silent (digest carries it)."""
+        import time as _t
+
+        import llm_proxy
+        from app import TaskCreate as TC
+        from app import create_task
+
+        llm_proxy._proactive_state["stale_tasks"] = _t.monotonic()
+        llm_proxy._proactive_state["llm_thinking"] = _t.monotonic()
+
+        mock_orch.return_value = {
+            "findings": [
+                {
+                    "channel": "discourse",
+                    "title": "HN: Tools for capturing field knowledge",
+                    "url": "https://news.ycombinator.com/item?id=1",
+                    "relevance": 8,
+                    "summary": "hn thread",
+                }
+            ]
+        }
+        t = create_task(
+            TC(
+                description=(
+                    "Search Reddit and HN for live threads on trade-skill "
+                    "knowledge capture"
+                ),
+                priority=1,
+            )
+        )
+
+        r = client.post(
+            "/v1/chat/completions",
+            json=self._hb_body(),
+            headers=AUTH_HEADER,
+        )
+        assert r.status_code == 200
+        assert r.json()["choices"][0]["message"]["content"] == ""
+
+        from app import brain_db
+
+        done = brain_db.get_task(t["id"])
+        assert done["status"] == "completed"
+        assert "news.ycombinator.com" in done["result"]
+        mock_orch.assert_called_once()
+
+    @staticmethod
+    def _hb_body():
+        return {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "read heartbeat.md if it exists (workspace context). "
+                        "follow it strictly. do not infer or repeat old tasks "
+                        "from prior chats. if nothing needs attention, reply "
+                        "with exactly: heartbeat_ok"
+                    ),
+                }
+            ]
+        }
+
+
 # ─── Heartbeat Interceptor ──────────────────────────────────────
 
 
@@ -2391,7 +2642,8 @@ class TestHeartbeatInterceptor:
                     "content": (
                         "read heartbeat.md if it exists (workspace context). "
                         "follow it strictly. do not infer or repeat old tasks "
-                        "from prior chats. if nothing needs attention, reply heartbeat_ok."
+                        "from prior chats. if nothing needs attention, reply "
+                        "heartbeat_ok."
                     ),
                 }
             ],
@@ -2399,8 +2651,9 @@ class TestHeartbeatInterceptor:
 
     def test_heartbeat_intercepted_no_llm_call(self):
         """Heartbeat message should NOT call the LLM provider for basic checks."""
-        import llm_proxy
         import time as _time
+
+        import llm_proxy
 
         # Suppress proactive LLM thinking so we only test deterministic path
         llm_proxy._proactive_state["stale_tasks"] = _time.monotonic()
@@ -2416,10 +2669,20 @@ class TestHeartbeatInterceptor:
             assert r.status_code == 200
             mock_caller.assert_not_called()
 
-    @patch("llm_proxy.notify", new_callable=AsyncMock, return_value=True)
-    def test_heartbeat_processes_pending_task(self, mock_notify):
-        """When pending tasks exist, heartbeat sends them to the LLM for work."""
-        from app import TaskCreate as TC, create_task
+    @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
+    def test_heartbeat_processes_pending_task_hourly_digest(self, mock_notify):
+        """Task completions buffer into the hourly digest: no per-completion
+        Telegram notification, silent heartbeat response, and the buffered
+        result delivered as the next digest once the hour elapses."""
+        import time as _time
+
+        import llm_proxy
+        from app import TaskCreate as TC
+        from app import create_task
+
+        # Suppress proactive layers so only the pending task is processed
+        llm_proxy._proactive_state["stale_tasks"] = _time.monotonic()
+        llm_proxy._proactive_state["llm_thinking"] = _time.monotonic()
 
         create_task(TC(description="Test task for heartbeat", priority=2))
 
@@ -2430,7 +2693,9 @@ class TestHeartbeatInterceptor:
                     {
                         "message": {
                             "role": "assistant",
-                            "content": "Checked logs — no anomalies found in the last 24h.",
+                            "content": (
+                                "Checked logs — no anomalies found in the last 24h."
+                            ),
                         }
                     }
                 ],
@@ -2444,14 +2709,11 @@ class TestHeartbeatInterceptor:
                 headers=AUTH_HEADER,
             )
             content = r.json()["choices"][0]["message"]["content"]
-            assert "ALEX" in content or "SYSTEM" in content
-            assert "no anomalies" in content
+            assert content == ""  # silent: completion buffered, not relayed
             mock_caller.assert_called_once()
 
-        # Verify Telegram notification was sent
-        mock_notify.assert_called_once()
-        notify_text = mock_notify.call_args[0][0]
-        assert "Task completed" in notify_text
+        # No per-completion Telegram notification
+        mock_notify.assert_not_called()
 
         from app import brain_db
 
@@ -2460,13 +2722,186 @@ class TestHeartbeatInterceptor:
         assert len(completed) >= 1
         assert "no anomalies" in completed[0]["result"]
 
+        # An hour later the digest delivers the buffered completion: the
+        # item goes straight to Telegram and the relayed response is the
+        # closing summary.
+        llm_proxy._digest_state["last_flush"] = (
+            _time.time() - llm_proxy.HEARTBEAT_DIGEST_INTERVAL - 1
+        )
+        r = client.post(
+            "/v1/chat/completions",
+            json=self._heartbeat_body(),
+            headers=AUTH_HEADER,
+        )
+        content = r.json()["choices"][0]["message"]["content"]
+        assert "1 item(s) this hour" in content
+        sent = [call.args[0] for call in mock_notify.await_args_list]
+        assert any(
+            "Test task for heartbeat" in text and "no anomalies" in text
+            for text in sent
+        )
+
+    @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
+    def test_digest_carries_long_results_unclipped(self, mock_notify):
+        """Research-shaped results ran past the old 500-char digest clip and
+        arrived cut mid-word. A result now gets most of a Telegram message:
+        the sentinel at char 2,000 must survive, bounded by the send limit."""
+        import time as _time
+
+        import llm_proxy
+        from app import TaskCreate as TC
+        from app import create_task
+
+        llm_proxy._proactive_state["stale_tasks"] = _time.monotonic()
+        llm_proxy._proactive_state["llm_thinking"] = _time.monotonic()
+
+        create_task(TC(description="Long result task", priority=2))
+
+        long_result = (
+            "Filler sentence. " * 125
+            + "PAST-OLD-CLIP survives past the old 500-char cut. "
+            + "Tail filler sentence. " * 125
+        )
+        mock_resp = _mock_response(
+            200,
+            {"choices": [{"message": {"role": "assistant", "content": long_result}}]},
+        )
+        mock_caller = AsyncMock(return_value=mock_resp)
+        with patch("llm_proxy._call_provider", mock_caller):
+            r = client.post(
+                "/v1/chat/completions",
+                json=self._heartbeat_body(),
+                headers=AUTH_HEADER,
+            )
+            assert r.status_code == 200
+
+        llm_proxy._digest_state["last_flush"] = (
+            _time.time() - llm_proxy.HEARTBEAT_DIGEST_INTERVAL - 1
+        )
+        client.post(
+            "/v1/chat/completions",
+            json=self._heartbeat_body(),
+            headers=AUTH_HEADER,
+        )
+
+        sent = [call.args[0] for call in mock_notify.await_args_list]
+        assert any("PAST-OLD-CLIP" in text for text in sent)
+        assert all(len(text) <= llm_proxy.TELEGRAM_MAX_CHARS for text in sent)
+
+    @patch("llm_proxy._llm_suggest_task", new_callable=AsyncMock, return_value=None)
+    @patch("llm_proxy._check_openrouter_balance", new_callable=AsyncMock)
+    def test_low_balance_alert_not_recreated_after_completion(
+        self, mock_balance, _mock_suggest
+    ):
+        """A completed alert within 24h suppresses new alerts: the old
+        pending-only dedup recreated the alert every cycle, spamming
+        Telegram with a duplicate wall of text per heartbeat."""
+
+        from app import brain_db
+
+        mock_balance.return_value = 3.0
+
+        existing = brain_db.create_task(
+            "Low balance alert: $3.00 remaining", priority=1
+        )
+        brain_db.complete_task(existing["id"], "noted", "completed")
+        baseline = len(
+            [
+                t
+                for t in brain_db.list_tasks()
+                if "Low balance alert" in t["description"]
+            ]
+        )
+        assert baseline == 1
+
+        r = client.post(
+            "/v1/chat/completions",
+            json=self._heartbeat_body(),
+            headers=AUTH_HEADER,
+        )
+        assert r.status_code == 200
+        alerts = [
+            t for t in brain_db.list_tasks() if "Low balance alert" in t["description"]
+        ]
+        assert len(alerts) == 1, (
+            f"expected no new alert, got {[t['id'] for t in alerts]}"
+        )
+        assert alerts[0]["id"] == existing["id"]
+
+    @patch("llm_proxy._call_provider", new_callable=AsyncMock)
+    @patch("llm_proxy._check_openrouter_balance", new_callable=AsyncMock)
+    def test_status_alert_closes_with_live_facts_not_llm(
+        self, mock_balance, mock_caller
+    ):
+        """A queued balance alert (e.g. a phantom negative recorded before
+        the credits-API fix) completes with the LIVE balance from Python —
+        the LLM never sees it, so it cannot dramatize stale numbers into
+        an alarmist report."""
+        import time as _time
+
+        import llm_proxy
+        from app import brain_db
+
+        llm_proxy._proactive_state["stale_tasks"] = _time.monotonic()
+        llm_proxy._proactive_state["llm_thinking"] = _time.monotonic()
+
+        mock_balance.return_value = 28.69
+        t = brain_db.create_task("Low balance alert: $-1.33 remaining", priority=1)
+
+        r = client.post(
+            "/v1/chat/completions",
+            json=self._heartbeat_body(),
+            headers=AUTH_HEADER,
+        )
+        assert r.status_code == 200
+        mock_caller.assert_not_called()  # no LLM for status alerts
+
+        done = brain_db.get_task(t["id"])
+        assert done["status"] == "completed"
+        assert "$28.69" in done["result"]
+        assert "openrouter active" in done["result"]
+        assert "-1.33" not in done["result"]
+
+    @patch("llm_proxy._call_provider", new_callable=AsyncMock)
+    @patch("llm_proxy._check_openrouter_balance", new_callable=AsyncMock)
+    def test_tier_recovery_alert_closes_with_live_state(
+        self, mock_balance, mock_caller
+    ):
+        """Tier-recovery alert tasks also close in Python with the current
+        circuit state."""
+        import time as _time
+
+        import llm_proxy
+        from app import brain_db
+
+        llm_proxy._proactive_state["stale_tasks"] = _time.monotonic()
+        llm_proxy._proactive_state["llm_thinking"] = _time.monotonic()
+
+        mock_balance.return_value = 28.69
+        t = brain_db.create_task(
+            "Investigate tier recovery: openrouter-free", priority=2
+        )
+
+        r = client.post(
+            "/v1/chat/completions",
+            json=self._heartbeat_body(),
+            headers=AUTH_HEADER,
+        )
+        assert r.status_code == 200
+        mock_caller.assert_not_called()
+
+        done = brain_db.get_task(t["id"])
+        assert done["status"] == "completed"
+        assert "openrouter-free" in done["result"]
+        assert "recovered (circuit closed)" in done["result"]
+
     def test_heartbeat_silent_when_no_issues(self):
         """With no pending tasks, no infra issues, and proactive checks
         not yet due, return empty response (silent heartbeat)."""
-        import llm_proxy
-
         # Mark all proactive checks as just-ran so they don't fire
         import time as _time
+
+        import llm_proxy
 
         llm_proxy._proactive_state["stale_tasks"] = _time.monotonic()
         llm_proxy._proactive_state["llm_thinking"] = _time.monotonic()
@@ -2479,7 +2914,8 @@ class TestHeartbeatInterceptor:
         content = r.json()["choices"][0]["message"]["content"]
         assert content == ""
 
-    def test_heartbeat_stale_task_detection(self):
+    @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
+    def test_heartbeat_stale_task_detection(self, mock_notify):
         """Heartbeat processes stale pending tasks and creates nudge tasks."""
         import llm_proxy
 
@@ -2488,12 +2924,13 @@ class TestHeartbeatInterceptor:
         # Suppress LLM thinking
         llm_proxy._proactive_state["llm_thinking"] = __import__("time").monotonic()
 
-        from app import brain_db
         from datetime import timedelta
+
+        from app import brain_db
 
         # Create a task and backdate its created_at to 5 hours ago
         old_task = brain_db.create_task("old task from earlier")
-        old_time = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+        old_time = (datetime.now(UTC) - timedelta(hours=5)).isoformat()
         brain_db._conn.execute(
             "UPDATE tasks SET created_at = ? WHERE id = ?",
             (old_time, old_task["id"]),
@@ -2506,10 +2943,29 @@ class TestHeartbeatInterceptor:
             headers=AUTH_HEADER,
         )
         content = r.json()["choices"][0]["message"]["content"]
-        # Should process the old task (it's pending)
-        assert "SYSTEM" in content or "[TASK]" in content
+        # The stale task is processed and buffered into the digest; the
+        # heartbeat response itself stays silent.
+        assert content == ""
+        statuses = {t["id"]: t["status"] for t in brain_db.list_tasks()}
+        assert statuses[old_task["id"]] == "completed"
 
-    def test_heartbeat_llm_thinking(self):
+        # ...and the completion surfaces in the next hourly digest
+        llm_proxy._digest_state["last_flush"] = (
+            time.time() - llm_proxy.HEARTBEAT_DIGEST_INTERVAL - 1
+        )
+        r = client.post(
+            "/v1/chat/completions",
+            json=self._heartbeat_body(),
+            headers=AUTH_HEADER,
+        )
+        content = r.json()["choices"][0]["message"]["content"]
+        # The item goes straight to Telegram; the relayed response summarizes.
+        assert "this hour" in content
+        sent = [call.args[0] for call in mock_notify.await_args_list]
+        assert any("old task from earlier" in text for text in sent)
+
+    @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
+    def test_heartbeat_llm_thinking(self, mock_notify):
         """Heartbeat asks the LLM for a task suggestion when due."""
         import llm_proxy
 
@@ -2524,7 +2980,9 @@ class TestHeartbeatInterceptor:
                     {
                         "message": {
                             "role": "assistant",
-                            "content": "Review OpenRouter spending trends for the past week",
+                            "content": (
+                                "Review OpenRouter spending trends for the past week"
+                            ),
                         }
                     }
                 ],
@@ -2538,8 +2996,21 @@ class TestHeartbeatInterceptor:
                 headers=AUTH_HEADER,
             )
             content = r.json()["choices"][0]["message"]["content"]
-            assert "Created" in content
-            assert "OpenRouter spending" in content
+            assert content == ""  # created tasks buffer into the digest
+
+            # Once the digest hour elapses the suggestion is delivered
+            llm_proxy._digest_state["last_flush"] = (
+                time.time() - llm_proxy.HEARTBEAT_DIGEST_INTERVAL - 1
+            )
+            r = client.post(
+                "/v1/chat/completions",
+                json=self._heartbeat_body(),
+                headers=AUTH_HEADER,
+            )
+            content = r.json()["choices"][0]["message"]["content"]
+            assert "this hour" in content
+            sent = [call.args[0] for call in mock_notify.await_args_list]
+            assert any("OpenRouter spending" in text for text in sent)
 
         from app import brain_db
 
@@ -2637,10 +3108,12 @@ class TestSemanticDedup:
         queue = [
             {
                 "id": "abc123",
-                "description": "Review ClawRange tier allocation against current MSP client load",
+                "description": (
+                    "Review ClawRange tier allocation against current MSP client load"
+                ),
                 "status": "pending",
                 "priority": 3,
-                "created_at": datetime.now(timezone.utc).isoformat(),
+                "created_at": datetime.now(UTC).isoformat(),
             }
         ]
         # Rephrased version of the same task
@@ -2654,10 +3127,12 @@ class TestSemanticDedup:
         queue = [
             {
                 "id": "abc123",
-                "description": "Review ClawRange tier allocation against MSP client load",
+                "description": (
+                    "Review ClawRange tier allocation against MSP client load"
+                ),
                 "status": "pending",
                 "priority": 3,
-                "created_at": datetime.now(timezone.utc).isoformat(),
+                "created_at": datetime.now(UTC).isoformat(),
             }
         ]
         different = "Send weekly invoice summary to accounting team"
@@ -2668,12 +3143,14 @@ class TestSemanticDedup:
         from llm_proxy import _has_recent_task
 
         old_time = (
-            datetime.now(timezone.utc) - __import__("datetime").timedelta(hours=25)
+            datetime.now(UTC) - __import__("datetime").timedelta(hours=25)
         ).isoformat()
         queue = [
             {
                 "id": "abc123",
-                "description": "Review ClawRange tier allocation against MSP client load",
+                "description": (
+                    "Review ClawRange tier allocation against MSP client load"
+                ),
                 "status": "pending",
                 "priority": 3,
                 "created_at": old_time,
@@ -2935,7 +3412,8 @@ class TestTaskNeedsWeb:
             assert _task_needs_web(desc) is False, f"unexpected web for: {desc!r}"
 
     def test_match_is_case_insensitive(self):
-        """Keyword detection lowercases the input — REDDIT and Reddit must both match."""
+        """Keyword detection lowercases the input — REDDIT and Reddit must both
+        match."""
         from llm_proxy import _task_needs_web
 
         assert _task_needs_web("Scan REDDIT for promo opportunities") is True
@@ -3054,7 +3532,8 @@ class TestLlmWorkTaskRouting:
 
 
 class TestBuildWorkPromptFormatting:
-    """_build_work_prompt injects Telegram-format rules only when web_search is enabled."""
+    """_build_work_prompt injects Telegram-format rules only when web_search
+    is enabled."""
 
     @patch.dict("os.environ", FAKE_ENV)
     def test_web_search_branch_includes_telegram_format_rules(self):
@@ -3210,3 +3689,716 @@ class TestAntiHallucinationTrailer:
         assert "tool_call" in content.lower()
         # Explicitly forbids XML/bracket alternatives
         assert "xml" in content.lower() or "bracket" in content.lower()
+
+
+# ─── Embeddings (Zhipu-backed, for OpenClaw memory) ───────────────
+
+EMBED_BODY = {"input": "remember this", "model": "text-embedding-3-small"}
+
+FAKE_EMBED_RESPONSE = {
+    "object": "list",
+    "model": "embedding-3",
+    "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2, 0.3]}],
+    "usage": {"prompt_tokens": 3, "total_tokens": 3},
+}
+
+
+@patch.dict("os.environ", FAKE_ENV)
+@patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
+class TestEmbeddings:
+    """The /v1/embeddings route proxies to Zhipu so OpenClaw memory has a
+    convention-clean embeddings backend (everything still goes through the
+    proxy; no direct provider keys in the agents)."""
+
+    def test_rejects_missing_auth(self):
+        r = client.post("/v1/embeddings", json=EMBED_BODY)
+        assert r.status_code == 401
+
+    def test_missing_input_returns_400(self):
+        r = client.post(
+            "/v1/embeddings", json={"model": "embedding-3"}, headers=AUTH_HEADER
+        )
+        assert r.status_code == 400
+
+    @patch("llm_proxy._call_embeddings", new_callable=AsyncMock)
+    def test_returns_embeddings_via_zai(self, mock_call):
+        mock_call.return_value = _mock_response(200, FAKE_EMBED_RESPONSE)
+        r = client.post("/v1/embeddings", json=EMBED_BODY, headers=AUTH_HEADER)
+        assert r.status_code == 200
+        data = r.json()
+        assert data["data"][0]["embedding"] == [0.1, 0.2, 0.3]
+        # Unknown (OpenAI-named) model is overridden to the Zhipu default,
+        # and the call is authed with ZAI_API_KEY.
+        called = mock_call.call_args
+        assert (
+            called.kwargs.get("model", called.args[1] if len(called.args) > 1 else None)
+            == "embedding-3"
+        )
+        assert (
+            called.kwargs.get(
+                "api_key", called.args[2] if len(called.args) > 2 else None
+            )
+            == "test-key"
+        )
+
+    @patch("llm_proxy._call_embeddings", new_callable=AsyncMock)
+    def test_honors_explicit_zhipu_model(self, mock_call):
+        mock_call.return_value = _mock_response(200, FAKE_EMBED_RESPONSE)
+        r = client.post(
+            "/v1/embeddings",
+            json={"input": "x", "model": "embedding-2"},
+            headers=AUTH_HEADER,
+        )
+        assert r.status_code == 200
+        called = mock_call.call_args
+        passed_model = called.kwargs.get(
+            "model", called.args[1] if len(called.args) > 1 else None
+        )
+        assert passed_model == "embedding-2"
+
+    @patch("llm_proxy._call_embeddings", new_callable=AsyncMock)
+    def test_prefers_dedicated_embed_key(self, mock_call):
+        """A dedicated ZAI_EMBED_API_KEY (for a key with embeddings access)
+        takes precedence over the chat ZAI_API_KEY."""
+        mock_call.return_value = _mock_response(200, FAKE_EMBED_RESPONSE)
+        with patch.dict(
+            "os.environ", {"ZAI_EMBED_API_KEY": "embed-key-789"}, clear=False
+        ):
+            r = client.post("/v1/embeddings", json=EMBED_BODY, headers=AUTH_HEADER)
+        assert r.status_code == 200
+        called = mock_call.call_args
+        passed_key = called.kwargs.get(
+            "api_key", called.args[2] if len(called.args) > 2 else None
+        )
+        assert passed_key == "embed-key-789"
+
+    def test_missing_zai_key_returns_503(self):
+        with patch.dict(
+            "os.environ", {"ZAI_API_KEY": "", "ZAI_EMBED_API_KEY": ""}, clear=False
+        ):
+            r = client.post("/v1/embeddings", json=EMBED_BODY, headers=AUTH_HEADER)
+        assert r.status_code == 503
+
+    @patch("llm_proxy._call_embeddings", new_callable=AsyncMock)
+    def test_upstream_non_200_maps_to_same_status(self, mock_call):
+        """Upstream errors must surface as errors, never as HTTP 200 bodies
+        that OpenClaw memory would ingest as embeddings."""
+        mock_call.return_value = _mock_response(429, {"error": "rate limited"})
+        r = client.post("/v1/embeddings", json=EMBED_BODY, headers=AUTH_HEADER)
+        assert r.status_code == 429
+        assert "429" in r.json()["detail"]
+
+    @patch("llm_proxy._call_embeddings", new_callable=AsyncMock)
+    def test_upstream_transport_error_is_502(self, mock_call):
+        mock_call.side_effect = httpx.ConnectError("boom")
+        r = client.post("/v1/embeddings", json=EMBED_BODY, headers=AUTH_HEADER)
+        assert r.status_code == 502
+
+
+@patch.dict("os.environ", FAKE_ENV)
+@patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
+class TestPersonaCommand:
+    def test_persona_feedback_intercepted(self):
+        body = {
+            "messages": [
+                {"role": "user", "content": "!persona lead with the recommendation"}
+            ]
+        }
+        with patch("llm_proxy._post_persona_propose", return_value={"id": "ab12"}) as m:
+            r = client.post("/v1/chat/completions", json=body, headers=AUTH_HEADER)
+        assert r.status_code == 200
+        assert m.called
+        content = r.json()["choices"][0]["message"]["content"].lower()
+        assert "draft" in content or "queued" in content
+
+    def test_persona_command_case_insensitive(self):
+        body = {
+            "messages": [
+                {"role": "user", "content": "!Persona Lead with THE recommendation"}
+            ]
+        }
+        with patch("llm_proxy._post_persona_propose", return_value={"id": "cd34"}) as m:
+            r = client.post("/v1/chat/completions", json=body, headers=AUTH_HEADER)
+        assert r.status_code == 200
+        assert m.called
+        # the proposed content must preserve original casing of the args
+        assert "Lead with THE recommendation" in m.call_args.args[0]
+
+    def test_learn_alias_intercepted(self):
+        """Spec §6: !learn <feedback> is an alias for !persona <feedback>."""
+        body = {"messages": [{"role": "user", "content": "!learn keep answers short"}]}
+        with patch("llm_proxy._post_persona_propose", return_value={"id": "ef56"}) as m:
+            r = client.post("/v1/chat/completions", json=body, headers=AUTH_HEADER)
+        assert r.status_code == 200
+        assert m.called
+        assert "keep answers short" in m.call_args.args[0]
+
+    def test_propose_default_target_matches_api_default(self):
+        """N1: llm_proxy's propose helper and the /persona API must agree on
+        the default target so bare feedback renders under the same heading."""
+        import inspect
+
+        from llm_proxy import _post_persona_propose
+        from persona_api import Proposal
+
+        assert (
+            inspect.signature(_post_persona_propose).parameters["target"].default
+            == Proposal.model_fields["target"].default
+        )
+
+    def test_persona_propose_failure_degrades_gracefully(self):
+        """N2: persona-API failure must yield a friendly synthetic response,
+        not a raw 500 to Telegram."""
+        body = {"messages": [{"role": "user", "content": "!persona be brief"}]}
+        with patch(
+            "llm_proxy._post_persona_propose",
+            side_effect=httpx.ConnectError("api down"),
+        ):
+            r = client.post("/v1/chat/completions", json=body, headers=AUTH_HEADER)
+        assert r.status_code == 200
+        content = r.json()["choices"][0]["message"]["content"].lower()
+        assert "unavailable" in content or "could not" in content
+
+    def test_persona_reflect_failure_degrades_gracefully(self):
+        body = {"messages": [{"role": "user", "content": "!persona reflect"}]}
+        with patch(
+            "httpx.AsyncClient.post", side_effect=httpx.ConnectError("api down")
+        ):
+            r = client.post("/v1/chat/completions", json=body, headers=AUTH_HEADER)
+        assert r.status_code == 200
+        content = r.json()["choices"][0]["message"]["content"].lower()
+        assert "unavailable" in content or "could not" in content
+
+
+class TestDigestPersistence:
+    """The heartbeat digest is the only path to Telegram, so its clock and
+    buffer must survive a process restart.
+
+    Before this, ``_digest_state`` was built at import with
+    ``time.monotonic()``. Every container recreate or ``uvicorn --reload``
+    reset the clock to zero and dropped the buffer, so a process restarting
+    more often than HEARTBEAT_DIGEST_INTERVAL never reported at all.
+    """
+
+    def _fresh(self, monkeypatch, tmp_path):
+        import llm_proxy
+
+        state_file = tmp_path / "digest.json"
+        monkeypatch.setenv("HEARTBEAT_DIGEST_STATE", str(state_file))
+        monkeypatch.setattr(
+            llm_proxy, "_digest_state", {"lines": [], "last_flush": None}
+        )
+        return llm_proxy, state_file
+
+    def test_buffered_lines_survive_restart(self, monkeypatch, tmp_path):
+        proxy, state_file = self._fresh(monkeypatch, tmp_path)
+        proxy._digest_record("Created #1 [P3] investigate tier recovery")
+        proxy._digest_record("[SYSTEM] #2: low balance")
+
+        # Simulate the re-import that a restart or --reload performs.
+        monkeypatch.setattr(proxy, "_digest_state", {"lines": [], "last_flush": None})
+        proxy._digest_load()
+
+        assert proxy._digest_state["lines"] == [
+            "Created #1 [P3] investigate tier recovery",
+            "[SYSTEM] #2: low balance",
+        ]
+
+    def test_clock_survives_restart(self, monkeypatch, tmp_path):
+        proxy, _ = self._fresh(monkeypatch, tmp_path)
+        now = time.time()
+        proxy._digest_record("something")
+        proxy._digest_take(now, None, [])
+
+        monkeypatch.setattr(proxy, "_digest_state", {"lines": [], "last_flush": None})
+        # A restart one second later must NOT reset the hour.
+        assert proxy._digest_due(now + 1) is False
+
+    def test_due_immediately_when_no_state_file(self, monkeypatch, tmp_path):
+        proxy, _ = self._fresh(monkeypatch, tmp_path)
+        # A fresh deploy must not cost a silent hour.
+        assert proxy._digest_due(time.time()) is True
+
+    def test_corrupt_state_file_does_not_raise(self, monkeypatch, tmp_path):
+        proxy, state_file = self._fresh(monkeypatch, tmp_path)
+        state_file.write_text("{not json")
+        proxy._digest_load()
+        assert proxy._digest_state["lines"] == []
+
+    def test_digest_caps_at_telegram_limit(self, monkeypatch, tmp_path):
+        proxy, _ = self._fresh(monkeypatch, tmp_path)
+        # 40 lines x ~550 chars is far past Telegram's 4096-char sendMessage
+        # limit. Items must never be dropped to fit: each gets its own
+        # message, and the relayed summary keeps the actionable footer.
+        for i in range(40):
+            proxy._digest_record(f"[SYSTEM] #{i}: " + "x" * 540)
+
+        messages, summary = proxy._digest_take(time.time(), 28.65, [])
+
+        assert messages
+        assert all(len(m) <= proxy.TELEGRAM_MAX_CHARS for m in messages)
+        # The overflow pointer names what was deferred — nothing silently lost.
+        assert "more item" in messages[-1]
+        # The balance footer must survive — it is the actionable bit.
+        assert "$28.65" in summary
+
+
+class TestDigestMultiMessageFlush:
+    """The digest rode the heartbeat response, which OpenClaw relays as a
+    single Telegram message — so a busy hour truncated results to 500 chars
+    and dropped whole items to fit 4096.
+
+    The flush now sends one message per item straight to Telegram and leaves
+    the heartbeat response as a short closing summary. Long items chunk
+    across messages instead of being clipped; a runaway hour caps the direct
+    sends (Telegram rate-limits bots to ~20 messages/minute per chat).
+    """
+
+    def _fresh(self, monkeypatch, tmp_path):
+        import llm_proxy
+
+        monkeypatch.setenv("HEARTBEAT_DIGEST_STATE", str(tmp_path / "digest.json"))
+        monkeypatch.setattr(
+            llm_proxy, "_digest_state", {"lines": [], "last_flush": None}
+        )
+        return llm_proxy
+
+    def test_one_message_per_item_with_header_on_first(self, monkeypatch, tmp_path):
+        proxy = self._fresh(monkeypatch, tmp_path)
+        proxy._digest_record("[SYSTEM] #1: first")
+        proxy._digest_record("[SYSTEM] #2: second")
+
+        messages, summary = proxy._digest_take(time.time(), 28.65, [])
+
+        assert messages == [
+            "Heartbeat digest (2 items this hour):\n\n[SYSTEM] #1: first",
+            "[SYSTEM] #2: second",
+        ]
+        assert all(len(m) <= proxy.TELEGRAM_MAX_CHARS for m in messages)
+        # The relayed summary carries the actionable footer.
+        assert "2 item(s) this hour" in summary
+        assert "$28.65" in summary
+
+    def test_single_item_uses_singular_header(self, monkeypatch, tmp_path):
+        proxy = self._fresh(monkeypatch, tmp_path)
+        proxy._digest_record("[SYSTEM] #1: only")
+
+        messages, summary = proxy._digest_take(time.time(), None, [])
+
+        assert messages[0].startswith("Heartbeat digest (1 item this hour):")
+        assert "1 item(s) this hour" in summary
+
+    def test_oversized_item_chunks_instead_of_dropping(self, monkeypatch, tmp_path):
+        proxy = self._fresh(monkeypatch, tmp_path)
+        # No sentence or word boundaries: forces hard cuts at the limit.
+        proxy._digest_record("[SYSTEM] #1: " + "x" * 9000 + " TAIL-SENTINEL")
+
+        messages, _ = proxy._digest_take(time.time(), None, [])
+
+        assert len(messages) >= 3
+        assert all(len(m) <= proxy.TELEGRAM_MAX_CHARS for m in messages)
+        # The tail survives — the old single-message format dropped it.
+        assert messages[-1].endswith("TAIL-SENTINEL")
+        # Continuations are marked so the burst reads as one item.
+        assert all(m.startswith("…") for m in messages[1:])
+
+    def test_runaway_hour_caps_direct_messages(self, monkeypatch, tmp_path):
+        proxy = self._fresh(monkeypatch, tmp_path)
+        for i in range(30):
+            proxy._digest_record(f"[SYSTEM] #{i}: item")
+
+        messages, summary = proxy._digest_take(time.time(), None, [])
+
+        # 19 item messages + 1 pointer = the 20-send cap, pointer names the 11
+        # deferred items — nothing silently lost.
+        assert len(messages) == proxy.HEARTBEAT_DIGEST_MAX_MESSAGES
+        assert "11 more item" in messages[-1]
+        assert "30 item(s) this hour" in summary
+
+    def test_silent_hour_with_no_footer_stays_silent(self, monkeypatch, tmp_path):
+        proxy = self._fresh(monkeypatch, tmp_path)
+
+        messages, summary = proxy._digest_take(time.time(), None, [])
+
+        assert messages == []
+        assert summary == ""
+
+    def test_waiting_questions_surface_without_items(self, monkeypatch, tmp_path):
+        proxy = self._fresh(monkeypatch, tmp_path)
+
+        messages, summary = proxy._digest_take(
+            time.time(), None, [], waiting=["Waiting on you: #12 — domain?"]
+        )
+
+        assert messages == []
+        assert "nothing new this hour" in summary
+        assert "domain?" in summary
+
+
+BLOCKED_RESULT = """# Task: Record Alex's Focus Areas & Priorities
+
+Status: BLOCKED — Need Input
+
+## What I Found
+- Brain is empty (no prior context on Alex's focus areas or clients)
+
+## What I Need From You
+To populate the brain accurately, I need you to tell me:
+1. Client segments — Who do you work with?
+2. Outreach priorities — What matters most this quarter?
+"""
+
+WORKED_RESULT = """Scanned r/msp for ticketing-automation threads over the last
+24h. Three relevant posts, links below, each with a suggested comment.
+"""
+
+
+class TestNeedsInput:
+    """A self-directed task that turns out to need Alex's private knowledge
+    must not be dumped into Telegram as a 500-char non-answer.
+
+    _is_non_answer() only fires under 300 chars, so a long, well-formatted
+    "BLOCKED -- Need Input" essay sailed through and was relayed in full.
+    """
+
+    def test_detects_blocked_result(self):
+        import llm_proxy
+
+        assert llm_proxy._needs_input(BLOCKED_RESULT) is True
+
+    def test_detects_hold_for_now_result(self):
+        import llm_proxy
+
+        text = (
+            "## Recommendation\n**Hold for now.** Before running this canary, "
+            "we need:\n1. Confirmation the fix shipped\n\n## What I Need From You\n"
+            "Should I wait for this info, or do you want me to dig in first?"
+        )
+        assert llm_proxy._needs_input(text) is True
+
+    def test_real_work_is_not_flagged(self):
+        import llm_proxy
+
+        assert llm_proxy._needs_input(WORKED_RESULT) is False
+
+    def test_empty_result_is_not_flagged(self):
+        import llm_proxy
+
+        assert llm_proxy._needs_input("") is False
+
+    def test_blocked_task_gets_compact_digest_line(self, monkeypatch):
+        """The digest carries one line naming what stalled, not the essay."""
+        import llm_proxy
+
+        line = llm_proxy._blocked_digest_line(
+            {
+                "id": "73d5f106",
+                "description": (
+                    "Record Alex's current focus areas, client segments, and "
+                    "outreach priorities into the brain"
+                ),
+            }
+        )
+        assert line.startswith("Blocked #73d5f106: needs your input —")
+        assert len(line) <= 120
+        assert "What I Need From You" not in line
+
+
+class TestThinkingPromptDoesNotAskAlex:
+    """An empty brain used to instruct the model to suggest knowledge-building
+    tasks ("record a client"), which only Alex can answer. That closed a loop:
+    empty brain -> suggest -> blocked -> brain still empty -> repeat hourly.
+    """
+
+    def _prompt(self, monkeypatch):
+        # _load_soul() reads /app/soul.md, absent under test -- without a soul
+        # _build_thinking_prompt falls back to a short branch that carries
+        # neither rule, so the assertions would pass vacuously.
+        import llm_proxy
+
+        monkeypatch.setattr(llm_proxy, "_load_soul", lambda: "You are Max.")
+        return llm_proxy._build_thinking_prompt()
+
+    def test_prompt_does_not_ask_for_knowledge_building(self, monkeypatch):
+        assert "suggest tasks that BUILD knowledge" not in self._prompt(monkeypatch)
+
+    def test_prompt_forbids_tasks_needing_alex(self, monkeypatch):
+        assert "only Alex can supply" in self._prompt(monkeypatch)
+
+
+class TestBlockedTaskStatus:
+    def test_complete_task_accepts_blocked(self):
+        from app import brain_db
+
+        t = brain_db.create_task("needs alex input", priority=3)
+        brain_db.complete_task(t["id"], "BLOCKED — Need Input", "blocked")
+        got = brain_db.get_task(t["id"])
+        assert got["status"] == "blocked"
+
+    def test_blocked_task_is_not_pending(self):
+        """A blocked task must leave the pending queue or the heartbeat
+        reworks it every cycle -- the loop this fix exists to break."""
+        from app import brain_db
+
+        t = brain_db.create_task("needs alex input", priority=3)
+        brain_db.complete_task(t["id"], "BLOCKED", "blocked")
+        pending_ids = {x["id"] for x in brain_db.list_tasks(status="pending")}
+        assert t["id"] not in pending_ids
+
+
+class TestNeedsInputPrecision:
+    """Guards found by running the detector over all 846 stored results.
+
+    A first cut counted request-for-input phrases anywhere in the body and
+    flagged 232 of 846 (27%) -- real deliverables, silently binned.
+    """
+
+    def test_prepared_work_naming_next_steps_is_not_blocked(self):
+        """The work prompt asks the model to say "what Alex needs to do to
+        finish it", so that phrasing appears in 208 real results."""
+        import llm_proxy
+
+        text = (
+            "# Draft comment for r/msp\n"
+            "**Status:** Ready to post. Draft below.\n\n"
+            "## What I Need From You\n"
+            "Post it to the thread; I can't post on your behalf.\n"
+        )
+        assert llm_proxy._needs_input(text) is False
+
+    def test_blocked_subsection_does_not_bin_the_deliverable(self):
+        """One blocked angle inside finished work is still finished work."""
+        import llm_proxy
+
+        text = (
+            "# Draft: Content Package\n"
+            "**Status:** Ready for review. Three angles structured below.\n\n"
+            + "Angle 1 detail. "
+            * 40
+            + "\n## Angle 2: Reddit comment (BLOCKED—needs live data)\n"
+            "**What I need from you:** the positioning.\n"
+        )
+        assert llm_proxy._needs_input(text) is False
+
+
+# ─── Waiting-on-you digest footer ─────────────────────────────────
+# A task that came back BLOCKED asked Alex a question. The ask-once
+# design (blocked tasks leave the pending queue and dedup stops the
+# LLM re-suggesting them) made the system go mute while waiting on an
+# answer. The digest footer re-surfaces those questions until a later
+# task answers them.
+
+
+def _wtask(
+    tid: str,
+    desc: str,
+    result: str = "",
+    status: str = "completed",
+    completed_at: datetime | None = None,
+) -> dict:
+    return {
+        "id": tid,
+        "description": desc,
+        "result": result,
+        "status": status,
+        "completed_at": (completed_at or datetime.now(UTC)).isoformat(),
+        "created_at": (completed_at or datetime.now(UTC)).isoformat(),
+    }
+
+
+class TestWaitingOnYouLines:
+    def _lines(self, *tasks, now=None):
+        import llm_proxy
+
+        return llm_proxy._waiting_on_you_lines(list(tasks), now=now)
+
+    def test_blocked_result_surfaces(self):
+        """A recently completed task whose result declares BLOCKED gets a
+        waiting line naming the task."""
+        hour_ago = datetime.now(UTC) - timedelta(hours=1)
+        lines = self._lines(
+            _wtask(
+                "abc12345",
+                "Record Alex's focus areas",
+                BLOCKED_RESULT,
+                completed_at=hour_ago,
+            )
+        )
+        assert len(lines) == 1
+        assert "abc12345" in lines[0]
+        assert "Record Alex's focus areas" in lines[0]
+        assert lines[0].startswith("Waiting on you")
+
+    def test_blocked_status_surfaces_even_without_signal_text(self):
+        """Status='blocked' counts even if the result text lacks a
+        detector signal (defense in depth: the detector is heuristic)."""
+        hour_ago = datetime.now(UTC) - timedelta(hours=1)
+        lines = self._lines(
+            _wtask(
+                "bbb22222",
+                "Draft the launch email",
+                "no signal here",
+                status="blocked",
+                completed_at=hour_ago,
+            )
+        )
+        assert len(lines) == 1
+
+    def test_superseded_by_later_success(self):
+        """Once a later task with overlapping keywords completes
+        successfully, the older blocked question is answered: drop it."""
+        two_days_ago = datetime.now(UTC) - timedelta(days=2)
+        one_day_ago = datetime.now(UTC) - timedelta(days=1)
+        lines = self._lines(
+            _wtask(
+                "ccc33333",
+                "Record Alex's focus areas and client segments",
+                BLOCKED_RESULT,
+                completed_at=two_days_ago,
+            ),
+            _wtask(
+                "ddd44444",
+                "Record Alex's focus areas and client segments",
+                "Stored: focus areas, segments, priorities in the brain.",
+                completed_at=one_day_ago,
+            ),
+        )
+        assert lines == []
+
+    def test_expired_after_window(self):
+        """Blocked questions older than the 7-day window stop nagging."""
+        eight_days_ago = datetime.now(UTC) - timedelta(days=8)
+        lines = self._lines(
+            _wtask(
+                "eee55555", "Old question", BLOCKED_RESULT, completed_at=eight_days_ago
+            )
+        )
+        assert lines == []
+
+    def test_near_duplicates_keep_only_newest(self):
+        """The LLM re-suggests the same blocked task after the dedup
+        window expires; the footer must not stack both."""
+        old = datetime.now(UTC) - timedelta(days=3)
+        new = datetime.now(UTC) - timedelta(hours=2)
+        lines = self._lines(
+            _wtask(
+                "fff66666",
+                "Record Alex's current focus areas and segments",
+                BLOCKED_RESULT,
+                completed_at=old,
+            ),
+            _wtask(
+                "7777777g",
+                "Record Alex's current focus areas and segments",
+                BLOCKED_RESULT,
+                completed_at=new,
+            ),
+        )
+        assert len(lines) == 1
+        assert "7777777g" in lines[0]
+
+    def test_caps_at_three(self):
+        now = datetime.now(UTC)
+        descs = [
+            "Verify stripe billing handles usage overage",
+            "Draft the github auth migration runbook",
+            "Scan r/sideproject for launch feedback",
+            "Export the CRM leads into notion",
+            "Triage linear backlog by customer impact",
+        ]
+        tasks = [
+            _wtask(
+                f"t{i:08x}",
+                desc,
+                BLOCKED_RESULT,
+                completed_at=now - timedelta(hours=i + 1),
+            )
+            for i, desc in enumerate(descs)
+        ]
+        assert len(self._lines(*tasks)) == 3
+
+
+class TestDigestTakeWaiting:
+    """The digest must be non-empty when the only content is unanswered
+    questions — that is exactly the silence that looked like breakage."""
+
+    def _fresh(self, monkeypatch, tmp_path):
+        import llm_proxy
+
+        state_file = tmp_path / "digest.json"
+        monkeypatch.setenv("HEARTBEAT_DIGEST_STATE", str(state_file))
+        monkeypatch.setattr(
+            llm_proxy, "_digest_state", {"lines": [], "last_flush": None}
+        )
+        return llm_proxy
+
+    def test_waiting_only_makes_digest_nonempty(self, monkeypatch, tmp_path):
+        proxy = self._fresh(monkeypatch, tmp_path)
+        messages, summary = proxy._digest_take(
+            time.time(), 28.64, [], waiting=["Waiting on you: #abc focus areas"]
+        )
+        assert messages == []
+        assert summary != ""
+        assert "nothing new" in summary
+        assert "#abc" in summary
+        assert "$28.64" in summary
+
+    def test_waiting_appended_after_buffered_lines(self, monkeypatch, tmp_path):
+        proxy = self._fresh(monkeypatch, tmp_path)
+        proxy._digest_record("[SYSTEM] #1: did a thing")
+        messages, summary = proxy._digest_take(
+            time.time(), None, [], waiting=["Waiting on you: #abc focus areas"]
+        )
+        assert any("did a thing" in m for m in messages)
+        assert "#abc" in summary
+
+    def test_empty_and_no_waiting_stays_silent(self, monkeypatch, tmp_path):
+        proxy = self._fresh(monkeypatch, tmp_path)
+        assert proxy._digest_take(time.time(), None, []) == ([], "")
+
+    def test_digest_header_pluralizes(self, monkeypatch, tmp_path):
+        proxy = self._fresh(monkeypatch, tmp_path)
+        messages = proxy._digest_messages(["[SYSTEM] #1: did a thing"])
+        assert "1 item this hour" in messages[0]
+        assert "item(s)" not in messages[0]
+        messages = proxy._digest_messages(["a", "b"])
+        assert "2 items this hour" in messages[0]
+
+
+class TestClipResult:
+    def test_short_result_unchanged(self):
+        import llm_proxy
+
+        assert llm_proxy._clip_result("done") == "done"
+
+    def test_long_result_clips_at_sentence_boundary(self):
+        import llm_proxy
+
+        long = "word " * 80 + "Final sentence. " + "word " * 60
+        clipped = llm_proxy._clip_result(long, limit=500)
+        assert len(clipped) <= 500
+        assert clipped.endswith("…")
+        # The last whole sentence inside the budget survives.
+        assert clipped.rstrip("…").endswith("Final sentence.")
+
+    def test_early_sentence_mark_prefers_word_boundary(self):
+        """A lone terminator near the start must not waste the budget."""
+        import llm_proxy
+
+        long = "No. " + "word " * 120
+        clipped = llm_proxy._clip_result(long, limit=500)
+        assert len(clipped) > 100
+        assert clipped.endswith("…")
+        assert "word" in clipped
+
+    def test_no_sentence_mark_falls_back_to_word_boundary(self):
+        import llm_proxy
+
+        long = " ".join(f"w{i}" for i in range(200))
+        clipped = llm_proxy._clip_result(long, limit=500)
+        assert len(clipped) <= 500
+        assert clipped.endswith("…")
+        head = clipped.rstrip("…")
+        # The clipped head is a prefix of the original at a word break.
+        assert long.startswith(head)
+        assert long[len(head) : len(head) + 1] == " "

@@ -43,7 +43,6 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from typing import Optional
 
 logger = logging.getLogger("tome_bridge")
 
@@ -58,7 +57,7 @@ _TOME_PATTERNS = (
 )
 
 
-def extract_topic(description: str) -> Optional[str]:
+def extract_topic(description: str) -> str | None:
     """Return the topic string if the description is a tome-bound task.
 
     Pure function so tests can verify dispatch decisions without any
@@ -74,7 +73,7 @@ def extract_topic(description: str) -> Optional[str]:
     return None
 
 
-def http_json(method: str, url: str, payload: Optional[dict] = None) -> dict:
+def http_json(method: str, url: str, payload: dict | None = None) -> dict:
     """Minimal stdlib JSON HTTP helper (avoids httpx dependency)."""
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(

@@ -6,19 +6,28 @@ successful response in OpenAI-compatible format (streaming or non-streaming).
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from telegram import delete_message, edit_status, notify, send_status, send_typing
+import github_search
+import reddit_search
+import telegram
+
+# NOTE on deferred imports: ``app`` imports this module at module scope and
+# ``generators``/``scheduler`` import it transitively, so every use of
+# ``app``, ``generators``, and ``scheduler`` below stays function-local
+# (cycle guard).
 
 logger = logging.getLogger("clawrange.llm_proxy")
 
@@ -99,7 +108,6 @@ def _record_rate_limit(tier_name: str) -> None:
 
 # ─── Balance Guard (protect $10 free-tier threshold) ─────────────
 
-OPENROUTER_CREDIT_BALANCE = float(os.getenv("OPENROUTER_CREDIT_BALANCE", "0"))
 OPENROUTER_BALANCE_FLOOR = float(os.getenv("OPENROUTER_BALANCE_FLOOR", "10.0"))
 
 _balance_cache: dict[str, float | None] = {"remaining": None, "checked_at": 0.0}
@@ -107,31 +115,35 @@ _BALANCE_CHECK_INTERVAL = 300  # re-check at most every 5 minutes
 
 
 async def _check_openrouter_balance() -> float | None:
-    """Return estimated remaining OpenRouter balance, or None if unknown.
+    """Return remaining OpenRouter balance from the credits API, or None.
 
-    Calls the /auth/key endpoint at most once per _BALANCE_CHECK_INTERVAL.
+    GET /api/v1/credits reports {total_credits, total_usage}; the remaining
+    balance is the difference, read straight from the API so it stays true
+    after deposits and top-ups (no locally-configured constant to drift).
+    Cached for _BALANCE_CHECK_INTERVAL; on failure falls back to the last
+    known value.
     """
     now = time.monotonic()
     if now - (_balance_cache.get("checked_at") or 0) < _BALANCE_CHECK_INTERVAL:
         return _balance_cache.get("remaining")
 
     api_key = os.getenv("OPENROUTER_API_KEY", "")
-    if not api_key or not OPENROUTER_CREDIT_BALANCE:
-        return None
+    if not api_key:
+        return _balance_cache.get("remaining")
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
-                "https://openrouter.ai/api/v1/auth/key",
+                "https://openrouter.ai/api/v1/credits",
                 headers={"Authorization": f"Bearer {api_key}"},
             )
             if resp.status_code == 200:
-                usage = resp.json().get("data", {}).get("usage", 0)
-                remaining = OPENROUTER_CREDIT_BALANCE - usage
+                data = resp.json().get("data", {})
+                remaining = float(data["total_credits"]) - float(data["total_usage"])
                 _balance_cache["remaining"] = remaining
                 _balance_cache["checked_at"] = now
                 return remaining
-    except httpx.HTTPError:
+    except (httpx.HTTPError, KeyError, TypeError, ValueError):
         pass
 
     return _balance_cache.get("remaining")
@@ -158,7 +170,7 @@ def _background_notify(tier_name: str, message: str) -> None:
 
     Telegram notifications go to the user's conversation chat and look like
     garbled bot responses. Rate limit events are logged for debugging only.
-    Explicit admin alerts (balance guard) use notify() directly.
+    Explicit admin alerts (balance guard) use telegram.notify() directly.
     """
     if not _should_notify(tier_name):
         return
@@ -169,7 +181,7 @@ def _background_notify(tier_name: str, message: str) -> None:
 async def _safe_notify(message: str) -> None:
     """Fire-and-forget wrapper that logs failures instead of raising."""
     try:
-        await notify(message)
+        await telegram.notify(message)
     except Exception:
         logger.exception("Notification delivery failed")
 
@@ -236,8 +248,8 @@ def _get_reset_info(resp: httpx.Response) -> str:
             continue
         # Try epoch seconds
         try:
-            reset_dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
-            delta = reset_dt - datetime.now(timezone.utc)
+            reset_dt = datetime.fromtimestamp(float(value), tz=UTC)
+            delta = reset_dt - datetime.now(UTC)
             if delta > timedelta(0):
                 mins = int(delta.total_seconds()) // 60
                 return f"at {reset_dt.strftime('%H:%M UTC')} (~{mins}min)"
@@ -291,7 +303,7 @@ def _parse_reset_from_message(msg: str) -> str:
     hours = _RESET_HOURS_RE.search(msg)
     if hours:
         h = int(hours.group(1))
-        reset_dt = datetime.now(timezone.utc) + timedelta(hours=h)
+        reset_dt = datetime.now(UTC) + timedelta(hours=h)
         return f"at ~{reset_dt.strftime('%H:%M UTC')} (~{h}h)"
 
     minutes = _RESET_MINUTES_RE.search(msg)
@@ -356,8 +368,8 @@ def _get_reset_seconds(resp: httpx.Response) -> int | None:
         if not value:
             continue
         try:
-            reset_dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
-            delta = reset_dt - datetime.now(timezone.utc)
+            reset_dt = datetime.fromtimestamp(float(value), tz=UTC)
+            delta = reset_dt - datetime.now(UTC)
             if delta > timedelta(0):
                 return max(int(delta.total_seconds()), 1)
         except (ValueError, OSError):
@@ -441,7 +453,8 @@ _INNER_TAG = re.compile(
 )
 
 
-# XML-style hallucinated tool tags: <exec command="..."></exec>, <tool_call>...</tool_call>,
+# XML-style hallucinated tool tags: <exec command="..."></exec>,
+# <tool_call>...</tool_call>,
 # and colon-suffixed variants like <tool_call:paste>...</tool_call:paste> that free-tier
 # models invent when they get OpenAI tool schemas but the upstream doesn't support
 # function calling. Alternation keeps the two cases distinct so backref groups stay
@@ -470,7 +483,8 @@ _XML_UNCLOSED_TAG = re.compile(
     rf"<(?:{_TOOL_KEYWORDS})\b[\s\S]*$",
     re.IGNORECASE,
 )
-# Hallucinated metadata tags: <session_status>...</session_status>, <system>...</system>, etc.
+# Hallucinated metadata tags: <session_status>...</session_status>,
+# <system>...</system>, etc.
 _XML_META_TAG = re.compile(
     r"<(?:session_status|system_status|thinking|internal_monologue)\b[^>]*>"
     r"[\s\S]*?"
@@ -570,6 +584,134 @@ def _is_non_answer(text: str) -> bool:
     return hits >= 3
 
 
+# A task the model cannot finish without Alex comes back as a long, tidy
+# markdown essay. _is_non_answer() cannot see it: that one only fires under
+# 300 chars and these run past 1000.
+#
+# Match the status declaration in the HEADER, not a request for input
+# anywhere in the body. Checked against the 846 stored task results:
+#
+#   "what i need from you"  -> 208 hits, nearly all real deliverables. The
+#       work prompt asks for exactly that ("describe what you prepared and
+#       what Alex needs to do to finish it"), so it is not a blocked signal.
+#   header-anchored below   -> 21 hits (2.5%), including both essays that
+#       reached Telegram today.
+#
+# Anchoring to the header also keeps a finished deliverable whose one
+# sub-section is blocked ("Angle 2 (BLOCKED-needs live data)") from being
+# binned whole.
+_NEEDS_INPUT_HEAD = 400
+
+_NEEDS_INPUT_SIGNALS = [
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"status:\s*\**\s*blocked",
+        r"\bblocked\b\s*[^a-z0-9]{0,4}\s*need",
+        r"\bhold for now\b",
+        r"before\s+[^.]{0,60}\bwe need\b",
+    )
+]
+
+
+def _needs_input(text: str) -> bool:
+    """True when a task result declares itself blocked on Alex's input."""
+    if not text:
+        return False
+    head = text[:_NEEDS_INPUT_HEAD]
+    return any(signal.search(head) for signal in _NEEDS_INPUT_SIGNALS)
+
+
+def _blocked_digest_line(task: dict) -> str:
+    """One compact digest line for a task stalled on Alex's input.
+
+    The full text stays on the task (GET /task/{id}); Telegram gets the
+    fact that something stalled and which task it was, not the essay.
+    """
+    return f"Blocked #{task['id']}: needs your input — {task['description'][:60]}"
+
+
+# A blocked task asked Alex a question and left the pending queue; dedup
+# then stops the LLM re-raising it. Without a re-surface, the ask-once
+# design goes mute while waiting on an answer — indistinguishable on the
+# phone from a dead assistant.
+WAITING_ON_YOU_WINDOW_DAYS = 7
+WAITING_ON_YOU_MAX_LINES = 3
+
+
+def _parse_task_time(value: object) -> datetime | None:
+    """Parse a task's created_at/completed_at, or None if unusable."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _descriptions_overlap(a: dict, b: dict) -> bool:
+    """Same rule as _has_recent_task: >=2 shared keywords, 30% of the
+    smaller keyword set."""
+    ka = _extract_keywords(a["description"])
+    kb = _extract_keywords(b["description"])
+    if not ka or not kb:
+        return False
+    smaller = min(len(ka), len(kb))
+    return len(ka & kb) >= max(2, int(smaller * 0.3))
+
+
+def _waiting_on_you_lines(
+    all_tasks: list[dict], now: datetime | None = None
+) -> list[str]:
+    """Digest footer lines for tasks blocked on Alex's input.
+
+    A question drops off when it ages past the window, when a later
+    overlapping task completes successfully (the answer landed), or when
+    a newer duplicate question supersedes it. Capped: the footer is a
+    nudge, not a backlog view — more than a handful of open questions
+    is a different problem.
+    """
+    now = now or datetime.now(UTC)
+    cutoff = now - timedelta(days=WAITING_ON_YOU_WINDOW_DAYS)
+
+    answered = [
+        t
+        for t in all_tasks
+        if t.get("status") == "completed"
+        and not _needs_input(t.get("result") or "")
+        and (_parse_task_time(t.get("completed_at")) or now) > cutoff
+    ]
+
+    waiting = []
+    for t in all_tasks:
+        completed = _parse_task_time(t.get("completed_at"))
+        if completed is None or completed < cutoff:
+            continue
+        if t.get("status") != "blocked" and not _needs_input(t.get("result") or ""):
+            continue
+        if any(
+            _descriptions_overlap(t, a)
+            and (_parse_task_time(a.get("completed_at")) or now) > completed
+            for a in answered
+        ):
+            continue
+        waiting.append(t)
+
+    # Newest first so a newer duplicate question replaces the older one.
+    waiting.sort(
+        key=lambda t: _parse_task_time(t.get("completed_at")) or cutoff,
+        reverse=True,
+    )
+    kept: list[dict] = []
+    for t in waiting:
+        if any(_descriptions_overlap(t, k) for k in kept):
+            continue
+        kept.append(t)
+        if len(kept) == WAITING_ON_YOU_MAX_LINES:
+            break
+    kept.reverse()  # oldest first reads better in the digest
+    return [f"Waiting on you: #{t['id']} {t['description'][:60]}" for t in kept]
+
+
 PROVIDER_URLS = {
     "openrouter": "https://openrouter.ai/api/v1/chat/completions",
     "zai": "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
@@ -595,6 +737,88 @@ async def _call_provider(
             },
             json=payload,
         )
+
+
+# ─── Embeddings (Zhipu-backed) ─────────────────────────────────────
+#
+# OpenClaw's memory search needs an embeddings provider. Per project
+# convention every model call routes through this proxy (never a direct
+# provider key in the agent), so we expose an OpenAI-compatible
+# /v1/embeddings endpoint backed by Zhipu's embedding model — reusing the
+# ZAI_API_KEY already configured for chat. Point OpenClaw memory at the
+# clawrange-proxy provider with model "embedding-3".
+
+ZAI_EMBEDDINGS_URL = os.getenv(
+    "ZAI_EMBED_URL", "https://open.bigmodel.cn/api/paas/v4/embeddings"
+)
+EMBED_MODEL = os.getenv("ZAI_EMBED_MODEL", "embedding-3")
+
+
+async def _call_embeddings(
+    inputs: str | list[str], model: str, api_key: str
+) -> httpx.Response:
+    """POST an embeddings request to Zhipu. Returns the raw response.
+
+    Zhipu's v4 embeddings API is OpenAI-compatible in both request
+    (``{model, input}``) and response (``{object: "list", data: [...]}``)
+    shape, so the body passes through unchanged.
+    """
+    async with httpx.AsyncClient(timeout=PROVIDER_TIMEOUT) as client:
+        return await client.post(
+            ZAI_EMBEDDINGS_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={"model": model, "input": inputs},
+        )
+
+
+# ─── Persona Helpers ────────────────────────────────────────────────
+
+
+async def _post_persona_propose(
+    content: str,
+    kind: str = "persona",
+    target: str = "",
+    source: str = "feedback",
+):
+    """Post a persona proposal to the local /persona API. Returns the created row."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(
+            "http://localhost:5678/persona/propose",
+            json={"kind": kind, "target": target, "content": content, "source": source},
+        )
+        r.raise_for_status()
+        return r.json()
+
+
+async def _handle_persona_command(args: str) -> JSONResponse:
+    args = args.strip()
+    if args.startswith("reflect"):
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post("http://localhost:5678/persona/reflect")
+                r.raise_for_status()
+        except httpx.HTTPError as exc:
+            return _synthetic_response(
+                f"Persona API unavailable — reflection not queued ({exc})."
+            )
+        return _synthetic_response(
+            "Persona reflection queued — review drafts with !tasks."
+        )
+    if not args:
+        return _synthetic_response("Usage: !persona <feedback> | !persona reflect")
+    try:
+        row = await _post_persona_propose(args)
+    except httpx.HTTPError as exc:
+        return _synthetic_response(
+            f"Persona API unavailable — feedback not queued ({exc})."
+        )
+    return _synthetic_response(
+        f"Queued persona enhancement as [DRAFT] (id {row.get('id')}). "
+        "Approve via /persona/proposals/<id>/approve."
+    )
 
 
 # ─── Tier Routing Hints ────────────────────────────────────────────
@@ -744,10 +968,11 @@ async def _handle_tier_command() -> JSONResponse:
     lines.append("")
     if remaining is not None:
         lines.append(
-            f"Balance: ${remaining:.2f} remaining (floor: ${OPENROUTER_BALANCE_FLOOR:.2f})"
+            f"OpenRouter balance: ${remaining:.2f} remaining "
+            f"(floor: ${OPENROUTER_BALANCE_FLOOR:.2f})"
         )
     else:
-        lines.append("Balance: not configured (set OPENROUTER_CREDIT_BALANCE)")
+        lines.append("OpenRouter balance: not configured (set OPENROUTER_API_KEY)")
 
     if _last_tier_used:
         lines.append(f"Last used: {_last_tier_used}")
@@ -780,6 +1005,11 @@ BRAIN (Knowledge)
 
   Brain slugs use hierarchy: client/acme-corp, incident/wifi-site2, person/bob-smith
   Page types: client, system, incident, decision, note, person, company, project
+
+PERSONA
+  !persona <feedback>      Queue a persona enhancement as a [DRAFT] proposal
+  !learn <feedback>        Same as !persona <feedback>
+  !persona reflect         Review recent activity and queue suggestions
 
 SYSTEM STATUS
   !tier                    Show LLM tier status and balance
@@ -915,7 +1145,10 @@ async def _handle_sched_command(subcmd: str, args: str) -> str:
     if subcmd == "list":
         scheds = brain_db.list_schedules()
         if not scheds:
-            return 'No schedules configured. Use /sched add <name> cron "<expr>" -- <generator>'
+            return (
+                "No schedules configured. Use /sched add <name> cron "
+                '"<expr>" -- <generator>'
+            )
         lines = ["Scheduled Jobs:\n"]
         for s in scheds:
             status = "PAUSED" if s.get("paused") else "ACTIVE"
@@ -973,7 +1206,6 @@ async def _handle_sched_command(subcmd: str, args: str) -> str:
             )
 
         from scheduler import add_schedule
-        import hashlib
 
         sched_id = hashlib.md5(name.encode()).hexdigest()[:8]
 
@@ -1017,7 +1249,10 @@ async def _handle_sched_command(subcmd: str, args: str) -> str:
 
         try:
             result = await run_schedule_now(None, brain_db, args.strip())
-            return f"Ran schedule: {result.get('schedule_id', args)} — {result.get('status', 'unknown')}"
+            return (
+                f"Ran schedule: {result.get('schedule_id', args)} — "
+                f"{result.get('status', 'unknown')}"
+            )
         except ValueError as e:
             return str(e)
 
@@ -1046,16 +1281,12 @@ async def _handle_scan_command(subcmd: str, args: str) -> str:
         if not subreddits and project_slug:
             project = brain_db.get_project(project_slug)
             if project:
-                import json
-
                 subreddits = json.loads(project.get("subreddits", "[]"))
 
         if not subreddits:
             subreddits = ["ClaudeAI", "LocalLLaMA", "SideProject"]
 
-        from reddit_search import search_subreddits
-
-        results = await search_subreddits(
+        results: list = await reddit_search.search_subreddits(
             topic, subreddits, since=since, limit_per_sub=10
         )
 
@@ -1097,27 +1328,27 @@ async def _handle_scan_command(subcmd: str, args: str) -> str:
             return "Usage: /scan github <topic> [--kind repos|issues] [--stars 5]"
 
         if kind == "issues":
-            from github_search import search_issues
-
-            results = await search_issues(topic)
+            results = await github_search.search_issues(topic)
         else:
-            from github_search import search_repos
-
-            results = await search_repos(topic, min_stars=min_stars)
+            results = await github_search.search_repos(topic, min_stars=min_stars)
 
         if not results:
             return f"No GitHub results for '{topic}'"
 
         lines = [f"GitHub scan ({kind}): {topic} ({len(results)} results)\n"]
         for i, r in enumerate(results[:10], 1):
-            if hasattr(r, "full_name"):
+            # search_repos returns pydantic models with two possible shapes
+            # (repo vs web/code result); narrow at runtime via hasattr and
+            # access through Any since the fields aren't statically declared.
+            item: Any = r
+            if hasattr(item, "full_name"):
                 lines.append(
-                    f"{i}. {r.full_name} ({r.stars}*)\n"
-                    f"   {r.description or 'No description'}\n"
-                    f"   {r.url}"
+                    f"{i}. {item.full_name} ({item.stars}*)\n"
+                    f"   {item.description or 'No description'}\n"
+                    f"   {item.url}"
                 )
             else:
-                lines.append(f"{i}. {r.title}\n   {r.url}")
+                lines.append(f"{i}. {item.title}\n   {item.url}")
 
         return "\n".join(lines)
 
@@ -1135,28 +1366,32 @@ async def _handle_scan_command(subcmd: str, args: str) -> str:
             if not projects:
                 return "No projects tracked. Use /projects add first."
             lines = []
-            for p in projects:
-                from github_search import get_self_traffic
-
-                traffic = await get_self_traffic(p["owner"], p["repo"])
+            for proj in projects:
+                traffic = await github_search.get_self_traffic(
+                    proj["owner"], proj["repo"]
+                )
                 if traffic:
                     lines.append(
-                        f"{p['owner']}/{p['repo']}\n"
-                        f"  Views: {traffic.views_count} ({traffic.views_uniques} unique)\n"
-                        f"  Clones: {traffic.clones_count} ({traffic.clones_uniques} unique)"
+                        f"{proj['owner']}/{proj['repo']}\n"
+                        f"  Views: {traffic.views_count} "
+                        f"({traffic.views_uniques} unique)\n"
+                        f"  Clones: {traffic.clones_count} "
+                        f"({traffic.clones_uniques} unique)"
                     )
                 else:
                     lines.append(
-                        f"{p['owner']}/{p['repo']}: traffic unavailable (needs GITHUB_PAT)"
+                        f"{proj['owner']}/{proj['repo']}: traffic unavailable "
+                        f"(needs GITHUB_PAT)"
                     )
             return "\n\n".join(lines) if lines else "No traffic data available."
 
         project = brain_db.get_project(slug)
         if not project:
             return f"Project not found: {slug}"
-        from github_search import get_self_traffic
 
-        traffic = await get_self_traffic(project["owner"], project["repo"])
+        traffic = await github_search.get_self_traffic(
+            project["owner"], project["repo"]
+        )
         if not traffic:
             return "Traffic unavailable — needs GITHUB_PAT with repo scope"
         return (
@@ -1208,12 +1443,10 @@ async def _handle_projects_command(subcmd: str, args: str) -> str:
             return "No projects tracked. Use /projects add <slug> <owner>/<repo>"
         lines = ["Tracked Projects:\n"]
         for p in projects:
-            import json
-
-            subs = json.loads(p.get("subreddits", "[]"))
+            sub_list = json.loads(p.get("subreddits", "[]"))
             lines.append(
                 f"  {p['slug']} — {p['owner']}/{p['repo']}\n"
-                f"    subs: {', '.join(subs[:5]) or 'none'}\n"
+                f"    subs: {', '.join(sub_list[:5]) or 'none'}\n"
                 f"    posture: {p.get('posture', 'none') or 'none'}"
             )
         return "\n".join(lines)
@@ -1223,7 +1456,6 @@ async def _handle_projects_command(subcmd: str, args: str) -> str:
         project = brain_db.get_project(slug)
         if not project:
             return f"Project not found: {slug}"
-        import json
 
         return (
             f"Project: {project['slug']}\n"
@@ -1240,10 +1472,16 @@ async def _handle_projects_command(subcmd: str, args: str) -> str:
         try:
             parts = shlex.split(args, posix=True)
         except ValueError:
-            return "Parse error. Usage: /projects add <slug> <owner>/<repo> [--topics ...] [--subs ...]"
+            return (
+                "Parse error. Usage: /projects add <slug> <owner>/<repo> "
+                "[--topics ...] [--subs ...]"
+            )
 
         if len(parts) < 2:
-            return 'Usage: /projects add <slug> <owner>/<repo> [--topics ...] [--subs ...] [--posture "..."]'
+            return (
+                "Usage: /projects add <slug> <owner>/<repo> "
+                '[--topics ...] [--subs ...] [--posture "..."]'
+            )
 
         slug = parts[0]
         owner_repo = parts[1]
@@ -1281,7 +1519,8 @@ async def _handle_projects_command(subcmd: str, args: str) -> str:
         "Usage:\n"
         "  /projects list\n"
         "  /projects show <slug>\n"
-        '  /projects add <slug> <owner>/<repo> [--topics ...] [--subs ...] [--posture "..."]\n'
+        "  /projects add <slug> <owner>/<repo> "
+        '[--topics ...] [--subs ...] [--posture "..."]\n'
         "  /projects rm <slug>"
     )
 
@@ -1372,7 +1611,8 @@ async def _handle_tasks_list(is_stream: bool) -> JSONResponse | StreamingRespons
         done = [t for t in tasks if t["status"] in ("completed", "failed")]
 
         lines = [
-            f"Task Queue ({len(pending)} pending, {len(active)} active, {len(done)} done)\n"
+            f"Task Queue ({len(pending)} pending, {len(active)} active, "
+            f"{len(done)} done)\n"
         ]
 
         if active:
@@ -1565,7 +1805,7 @@ def _build_thinking_prompt() -> str:
         from app import brain_db
 
         all_tasks = brain_db.list_tasks()
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        cutoff = datetime.now(UTC) - timedelta(hours=24)
         for t in all_tasks:
             try:
                 created = datetime.fromisoformat(t["created_at"])
@@ -1588,7 +1828,8 @@ def _build_thinking_prompt() -> str:
     if recent_descriptions:
         recent_list = "\n".join(f"  - {d}" for d in recent_descriptions[-10:])
         recent_block = (
-            f"\n\nTasks already created in the last 24 hours (DO NOT repeat or suggest anything similar):\n"
+            f"\n\nTasks already created in the last 24 hours "
+            f"(DO NOT repeat or suggest anything similar):\n"
             f"{recent_list}\n"
         )
 
@@ -1604,14 +1845,21 @@ def _build_thinking_prompt() -> str:
             f"\n{brain_summary}\n"
             f"{recent_block}\n"
             "RULES:\n"
-            "- Only reference clients, people, or systems that exist in the brain above.\n"
-            "- If the brain is empty, suggest tasks that BUILD knowledge: "
-            "record a client, document a system, capture a decision.\n"
+            "- Only reference clients, people, or systems that exist in "
+            "the brain above.\n"
+            "- Never suggest a task that needs information only Alex can "
+            "supply — his clients, priorities, or private history. An empty "
+            "brain is NOT a cue to ask him to fill it: that task comes back "
+            "blocked and the brain stays empty. Suggest work you can finish "
+            "from web search and the system state alone.\n"
             "- Do NOT invent client names, people, or events.\n"
-            "- Do NOT suggest sending emails or making calls — suggest PREPARING drafts or RESEARCHING info.\n"
-            "- Tasks should be completable by an AI with access to web search and the brain API.\n\n"
+            "- Do NOT suggest sending emails or making calls — "
+            "suggest PREPARING drafts or RESEARCHING info.\n"
+            "- Tasks should be completable by an AI with access to web search "
+            "and the brain API.\n\n"
             "Suggest exactly ONE actionable task. "
-            "Respond with ONLY the task description (one sentence, no explanation, no quotes)."
+            "Respond with ONLY the task description (one sentence, no explanation, "
+            "no quotes)."
         )
     return (
         f"You are Max, an executive assistant. Focus area: {category}. "
@@ -1711,7 +1959,7 @@ def _has_recent_task(queue: list[dict], keyword: str, hours: int = 24) -> bool:
     threshold scales with the smaller keyword set (at least 30% overlap)
     so short descriptions aren't unfairly penalised.
     """
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    cutoff = datetime.now(UTC) - timedelta(hours=hours)
     new_keywords = _extract_keywords(keyword)
     if not new_keywords:
         return False
@@ -1752,6 +2000,14 @@ async def _llm_call(
                 continue
             provider = tier["provider"]
 
+            if provider == "openrouter":
+                remaining = await _check_openrouter_balance()
+                # Same rule as the racing path: a zero/negative balance
+                # 402s on every OpenRouter model — go straight to the next
+                # tier instead of burning a doomed provider attempt.
+                if remaining is not None and remaining <= 0:
+                    continue
+
             provider_config = CONFIG["providers"][provider]
             api_key = os.getenv(provider_config["env_key"], "")
             if not api_key:
@@ -1780,7 +2036,7 @@ async def _llm_call(
     # callers (_llm_work_task / _llm_suggest_task) degrade gracefully.
     try:
         return await asyncio.wait_for(_try_tiers(), timeout=LLM_CALL_DEADLINE)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning("LLM call exceeded %ss deadline across tiers", LLM_CALL_DEADLINE)
         return None
 
@@ -1881,7 +2137,8 @@ def _extract_openrouter_citations(annotations: list[dict]) -> str:
 
     OpenRouter's `:online` plugin returns citations on the message via:
         message.annotations[].type == "url_citation"
-        message.annotations[].url_citation = {url, title, content, start_index, end_index}
+        message.annotations[].url_citation = {url, title, content, "
+        start_index, end_index}
 
     Halo character-backstory citations (Halopedia, Master Chief Wikipedia,
     etc.) are filtered out — see _is_persona_citation. Format mirrors
@@ -1940,12 +2197,16 @@ async def _gather_system_state() -> str:
     all_tasks = brain_db.list_tasks()
     pending = sum(1 for t in all_tasks if t["status"] == "pending")
     active = sum(1 for t in all_tasks if t["status"] == "active")
-    done = sum(1 for t in all_tasks if t["status"] in ("completed", "failed"))
+    done = sum(
+        1 for t in all_tasks if t["status"] in ("completed", "failed", "blocked")
+    )
 
     return (
         "CURRENT SYSTEM STATE:\n"
         "Tiers:\n" + "\n".join(tier_lines) + "\n"
-        f"Balance: {balance} (floor: ${OPENROUTER_BALANCE_FLOOR:.2f})\n"
+        f"OpenRouter balance: {balance} (floor: ${OPENROUTER_BALANCE_FLOOR:.2f}). "
+        "zai-direct is a separate provider with its own quota and is not "
+        "affected by this balance.\n"
         f"Last tier used: {_last_tier_used or 'none'}\n"
         f"Task queue: {pending} pending, {active} active, {done} done"
     )
@@ -2025,7 +2286,8 @@ async def _build_work_prompt(task_description: str, web_search: bool = False) ->
         "- Reference real data from the system state, brain, and web search results.\n"
         "- Do NOT invent URLs, post titles, or usernames. Only cite what you found.\n"
         "- If you have web search, use it to find live data before answering.\n"
-        "- If the task requires an action you can't perform (sending email, making calls), "
+        "- If the task requires an action you can't perform (sending email, "
+        "making calls), "
         "describe what you prepared and what Alex needs to do to finish it.\n"
         "- Be honest. 'I found nothing relevant today' is better than fabricating.\n\n"
         f"{format_rules}"
@@ -2071,7 +2333,10 @@ async def _llm_work_task(description: str) -> str:
     if result:
         print(f"[PROXY] LLM worked task: {result[:100]!r}", flush=True)
         return result
-    return f"Could not reach LLM to work this task. Alex should handle manually: {description}"
+    return (
+        f"Could not reach LLM to work this task. Alex should handle manually: "
+        f"{description}"
+    )
 
 
 # ─── Marketing Scan Interceptor ──────────────────────────────────
@@ -2096,8 +2361,73 @@ POSITIVE RULES:
 - Lead with the user problem solved
 - Include real upvote counts, comment counts, and timestamps when available
 - Cite source URLs for every claim
-- For comment suggestions, anchor in the user's question first; mention the project as a relevant tool second
+- For comment suggestions, anchor in the user's question first; mention the "
+project as a relevant tool second
 """
+
+
+# ─── Research Router ────────────────────────────────────────────────
+# The chat personas have no web tooling (the LLM can only stall or ask
+# Alex to authorize tools it will never have), but the workflow service
+# is web-capable: the research orchestrator fans out to Reddit, GitHub,
+# and web search server-side. Research-shaped heartbeat tasks route
+# there and come back with real, citable URLs.
+
+_RESEARCH_INTENT = re.compile(
+    r"\b(search|research|find|look\s*up|surface|scan|identify)\b", re.IGNORECASE
+)
+_RESEARCH_TARGET = re.compile(
+    r"\b(reddit|subreddit|hacker\s*news|\bhn\b|threads?|posts?|articles?|"
+    r"forums?|discussions?|conversations?|papers?|arxiv|github|repos?|"
+    r"web|online|internet)\w*\b",
+    re.IGNORECASE,
+)
+
+
+async def _try_research_task(description: str) -> str | None:
+    """Run a research-shaped task through the research orchestrator.
+
+    Returns condensed findings text when the task matches (intent verb +
+    external source target), None when it doesn't so the LLM path handles
+    it. A failure inside the orchestrator also returns None — the LLM
+    attempt is a better fallback than a hard error.
+    """
+    if not (
+        _RESEARCH_INTENT.search(description) and _RESEARCH_TARGET.search(description)
+    ):
+        return None
+
+    # Content-idea tasks quote research vocabulary in their template
+    # ("research on ... surfaced ... Reddit/HN comment") but are drafting
+    # jobs for the LLM. Routing them here re-runs research on the whole
+    # description instead of drafting the angles, so hand them back.
+    if description.strip().lower().startswith("content idea for"):
+        return None
+
+    # Function-local on purpose (cycle guard): research imports this
+    # module at module scope for _llm_call, so a top-level import here
+    # would be circular.
+    import research
+
+    try:
+        result = await research.orchestrate_research(
+            description,
+            channels=["discourse", "code", "discourse_web"],
+        )
+    except Exception:
+        logger.exception("research router: orchestrator failed")
+        return None
+
+    findings = result.get("findings", [])
+    if not findings:
+        return "Research: no findings."
+
+    # No description echo: the digest line already prints it above the
+    # result, and re-embedding it here crowds _needs_input's head window.
+    lines = [f"Research findings ({len(findings)}):"]
+    for i, f in enumerate(findings[:8], 1):
+        lines.append(f"{i}. [{f['channel']}] {f['title'][:90]}\n   {f['url']}")
+    return "\n".join(lines)
 
 
 async def _try_marketing_scan(description: str, brain_db) -> str | None:
@@ -2116,9 +2446,6 @@ async def _try_marketing_scan(description: str, brain_db) -> str | None:
             if not project:
                 return None
 
-            import json
-            from reddit_search import search_subreddits
-
             topics = json.loads(project.get("topics", "[]"))
             subreddits = json.loads(project.get("subreddits", "[]"))
             search_terms = json.loads(project.get("search_terms", "[]"))
@@ -2126,7 +2453,7 @@ async def _try_marketing_scan(description: str, brain_db) -> str | None:
             query = (
                 " OR ".join(search_terms[:3]) if search_terms else " ".join(topics[:3])
             )
-            results = await search_subreddits(
+            results = await reddit_search.search_subreddits(
                 query, subreddits or ["ClaudeAI", "LocalLLaMA", "SideProject"]
             )
 
@@ -2153,17 +2480,14 @@ async def _try_marketing_scan(description: str, brain_db) -> str | None:
             if not project:
                 return None
 
-            import json
-            from github_search import search_repos, search_issues
-
             search_terms = json.loads(project.get("search_terms", "[]"))
             topics = json.loads(project.get("topics", "[]"))
             query = (
                 " OR ".join(search_terms[:3]) if search_terms else " ".join(topics[:3])
             )
 
-            repos = await search_repos(query, min_stars=5, limit=10)
-            issues = await search_issues(query, limit=10)
+            repos = await github_search.search_repos(query, min_stars=5, limit=10)
+            issues = await github_search.search_issues(query, limit=10)
 
             lines = [
                 f"GitHub scan for {slug} ({len(repos)} repos, {len(issues)} issues):\n"
@@ -2171,9 +2495,10 @@ async def _try_marketing_scan(description: str, brain_db) -> str | None:
 
             if repos:
                 lines.append("Adjacent repos:")
-                for i, r in enumerate(repos[:5], 1):
+                for i, repo in enumerate(repos[:5], 1):
                     lines.append(
-                        f"  {i}. {r.full_name} ({r.stars}*) — {r.description or ''}"
+                        f"  {i}. {repo.full_name} ({repo.stars}*) — "
+                        f"{repo.description or ''}"
                     )
 
             if issues:
@@ -2182,21 +2507,23 @@ async def _try_marketing_scan(description: str, brain_db) -> str | None:
                     lines.append(f"  {i}. {iss.title} — {iss.repository}#{iss.number}")
 
             # Mark in cache
-            for r in repos:
-                brain_db.mark_seen("github_repo", str(r.id), slug)
+            for seen_repo in repos:
+                brain_db.mark_seen("github_repo", str(seen_repo.id), slug)
 
             return "\n".join(lines)
 
         if kind == "traffic":
-            owner, repo = match.group(1), match.group(2)
-            from github_search import get_self_traffic
+            owner, repo_name = match.group(1), match.group(2)
 
-            traffic = await get_self_traffic(owner, repo)
+            traffic = await github_search.get_self_traffic(owner, repo_name)
             if not traffic:
-                return f"Traffic for {owner}/{repo}: unavailable (needs GITHUB_PAT with repo scope)"
+                return (
+                    f"Traffic for {owner}/{repo_name}: unavailable "
+                    f"(needs GITHUB_PAT with repo scope)"
+                )
 
             return (
-                f"Traffic for {owner}/{repo} (14 days):\n"
+                f"Traffic for {owner}/{repo_name} (14 days):\n"
                 f"  Views: {traffic.views_count} ({traffic.views_uniques} unique)\n"
                 f"  Clones: {traffic.clones_count} ({traffic.clones_uniques} unique)"
             )
@@ -2208,6 +2535,284 @@ async def _try_marketing_scan(description: str, brain_db) -> str | None:
     return None
 
 
+# ─── Heartbeat Digest ──────────────────────────────────────────────
+# The heartbeat runs every 10 minutes, but Telegram should hear from it
+# at most hourly. Completed work buffers here and is delivered as the
+# heartbeat response (which OpenClaw relays to Telegram) once the hour
+# elapses — every other cycle stays silent.
+
+HEARTBEAT_DIGEST_INTERVAL = float(
+    os.getenv("HEARTBEAT_DIGEST_INTERVAL", "3600")
+)  # seconds between Telegram digests; independent of heartbeat cadence
+
+# Telegram rejects a sendMessage body over 4096 chars with a 400 and the
+# whole digest is lost. Items go out as one direct message each (the
+# OpenClaw relay is structurally a single message), so the limit governs
+# per-message chunking, not how many items survive the hour.
+TELEGRAM_MAX_CHARS = 4096
+
+HEARTBEAT_DIGEST_MAX_MESSAGES = int(
+    os.getenv("HEARTBEAT_DIGEST_MAX_MESSAGES", "20")
+)  # direct sends per flush; Telegram rate-limits bots to ~20 msgs/min/chat
+
+DIGEST_RESULT_LIMIT = int(
+    os.getenv("HEARTBEAT_DIGEST_RESULT_LIMIT", "3500")
+)  # chars of a task result buffered per digest item (room for one message)
+
+
+def _digest_state_path() -> str:
+    return os.getenv("HEARTBEAT_DIGEST_STATE", "/data/heartbeat_digest.json")
+
+
+# ``last_flush`` stays None until loaded from disk. It is wall-clock
+# (``time.time()``), not ``time.monotonic()``: monotonic's zero point is
+# per-process, so it cannot survive the restart this state exists to survive.
+_digest_state: dict = {"lines": [], "last_flush": None}
+
+
+def record_heartbeat_seen(now: float | None = None) -> None:
+    """Stamp the last heartbeat arrival for the watchdog (watchdog.py).
+
+    The digest only flushes when a heartbeat prompt arrives, so this
+    stamp is how the scheduler-side watchdog tells a quiet hour from a
+    dead OpenClaw. Written every heartbeat (~10 min), so a plain file
+    is cheap and restart-safe.
+    """
+    path = os.getenv("HEARTBEAT_SEEN_PATH", "/data/heartbeat_seen.json")
+    try:
+        with open(path, "w") as fh:
+            json.dump({"ts": now if now is not None else time.time()}, fh)
+    except OSError as exc:
+        # The stamp is an observability aid; a heartbeat must never fail
+        # because it could not be recorded.
+        print(f"[PROXY] heartbeat-seen stamp failed: {exc}", flush=True)
+
+
+def _digest_load() -> None:
+    """Load the buffer and flush clock from disk, once per process.
+
+    The digest is the only path from the heartbeat to Telegram. Holding its
+    clock in memory meant every container recreate and every ``uvicorn
+    --reload`` reset it to zero and dropped the buffer, so a process cycling
+    faster than HEARTBEAT_DIGEST_INTERVAL never reported at all.
+
+    A missing file leaves ``last_flush`` at 0.0 so the first heartbeat after
+    a fresh deploy is due immediately instead of costing a silent hour. A
+    corrupt file falls back to the same defaults — the heartbeat must never
+    fail on unreadable state.
+    """
+    if _digest_state["last_flush"] is not None:
+        return
+    _digest_state["lines"] = []
+    _digest_state["last_flush"] = 0.0
+    try:
+        with open(_digest_state_path()) as fh:
+            saved = json.load(fh)
+        if isinstance(saved, dict):
+            lines = saved.get("lines")
+            if isinstance(lines, list):
+                _digest_state["lines"] = [str(x) for x in lines]
+            _digest_state["last_flush"] = float(saved.get("last_flush") or 0.0)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def _digest_save() -> None:
+    """Persist the buffer and clock atomically (tmp + ``os.replace``)."""
+    path = _digest_state_path()
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as fh:
+            json.dump(
+                {
+                    "lines": _digest_state["lines"],
+                    "last_flush": _digest_state["last_flush"],
+                },
+                fh,
+            )
+        os.replace(tmp, path)
+    except OSError as exc:
+        print(f"[PROXY] digest state save failed: {exc}", flush=True)
+
+
+def _digest_record(line: str) -> None:
+    """Buffer one digest line for the next hourly flush."""
+    _digest_load()
+    _digest_state["lines"].append(line)
+    _digest_save()
+
+
+def _digest_due(now: float | None = None) -> bool:
+    _digest_load()
+    now = now if now is not None else time.time()
+    return now - _digest_state["last_flush"] >= HEARTBEAT_DIGEST_INTERVAL
+
+
+def _digest_take(
+    now: float,
+    remaining: float | None,
+    tripped: list[str],
+    waiting: list[str] | None = None,
+) -> tuple[list[str], str]:
+    """Drain the buffer into direct messages plus the relayed summary.
+
+    Returns ``(messages, summary)``: each message is one digest item (sent
+    straight to Telegram by the caller); the summary rides the heartbeat
+    response, which OpenClaw relays — keeping an independent channel for
+    the actionable footer (open questions, tripped tiers, balance).
+
+    A due interval with an empty buffer stays silent — no empty chit-chat —
+    unless unanswered questions are waiting on Alex: that silence is
+    indistinguishable from a dead assistant, so the questions surface.
+    """
+    waiting = waiting or []
+    _digest_load()
+    lines = _digest_state["lines"]
+    _digest_state["lines"] = []
+    _digest_state["last_flush"] = now
+    _digest_save()
+    footer = list(waiting)
+    if tripped:
+        footer.append(f"Tiers: {', '.join(tripped)} TRIPPED")
+    if remaining is not None:
+        footer.append(f"OpenRouter balance: ${remaining:.2f}")
+    if not lines:
+        if not footer:
+            return [], ""
+        return [], "\n".join(["Heartbeat digest: nothing new this hour.", *footer])
+    messages = _digest_messages(lines)
+    summary = "\n".join(
+        [
+            f"Heartbeat digest: {len(lines)} item(s) this hour — "
+            f"sent as {len(messages)} message(s) above.",
+            *footer,
+        ]
+    )
+    return messages, summary
+
+
+def _clip_result(text: str, limit: int = 500) -> str:
+    """Shorten a task result for one digest line without cutting mid-word.
+
+    Cuts after the last sentence terminator inside the limit (word boundary
+    as fallback) and marks the cut with an ellipsis; the full result stays
+    on the task (GET /task/{id}).
+    """
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    cut = max(head.rfind("."), head.rfind("!"), head.rfind("?"))
+    if cut < limit // 2:
+        # The last sentence end is too far back to waste the budget on;
+        # a word boundary keeps more of the result.
+        cut = head.rfind(" ")
+    if cut <= 0:
+        return head.rstrip() + "…"
+    return text[: cut + 1].rstrip() + "…"
+
+
+def _split_for_telegram(text: str, limit: int = TELEGRAM_MAX_CHARS) -> list[str]:
+    """Split one over-long digest item into sendable parts.
+
+    Cuts preferentially after a sentence terminator or newline, then at a
+    word boundary, hard-cutting only when the item has neither. Continuation
+    parts carry an ellipsis prefix so a burst of messages reads as one item
+    flowing on rather than unrelated entries.
+    """
+    if len(text) <= limit:
+        return [text]
+    parts: list[str] = []
+    rest = text
+    while rest:
+        if len(rest) <= limit:
+            parts.append("… " + rest)
+            break
+        head = rest[:limit]
+        cut = max(
+            head.rfind(". "), head.rfind("! "), head.rfind("? "), head.rfind("\n")
+        )
+        if cut < limit // 2:
+            cut = head.rfind(" ")
+        if cut <= 0:
+            cut = limit
+        parts.append(rest[: cut + 1].rstrip())
+        rest = rest[cut + 1 :].lstrip()
+    return parts
+
+
+def _digest_messages(lines: list[str]) -> list[str]:
+    """One Telegram message per buffered item, oldest first.
+
+    The hour's header rides the first message; an item longer than the send
+    limit chunks across messages instead of being clipped. A runaway hour
+    (scheduler bug, burst of created-task lines) stops at
+    HEARTBEAT_DIGEST_MAX_MESSAGES direct sends — Telegram rate-limits bots —
+    and names what was deferred so nothing is silently lost.
+    """
+    item_word = "item" if len(lines) == 1 else "items"
+    header = f"Heartbeat digest ({len(lines)} {item_word} this hour):"
+    # Leave headroom on every part for the header or the "…" continuation.
+    budget = TELEGRAM_MAX_CHARS - 64
+    kept = lines[:HEARTBEAT_DIGEST_MAX_MESSAGES]
+    deferred = len(lines) - len(kept)
+    if deferred:
+        # The pointer line is itself a direct send: it takes the last slot.
+        kept = kept[:-1]
+        deferred += 1
+    messages: list[str] = []
+    for idx, line in enumerate(kept):
+        parts = _split_for_telegram(line, limit=budget)
+        for part_idx, part in enumerate(parts):
+            if idx == 0 and part_idx == 0:
+                messages.append(f"{header}\n\n{part}")
+            else:
+                messages.append(part if part_idx == 0 else f"… {part}")
+    if deferred > 0:
+        more_word = "item" if deferred == 1 else "items"
+        messages.append(
+            f"… {deferred} more {more_word} this hour — see the task queue (GET /task)"
+        )
+    return messages
+
+
+_ALERT_TASK_PREFIXES = ("low balance alert:", "investigate tier recovery:")
+
+
+def _is_status_alert(description: str) -> bool:
+    """True for tasks the heartbeat's proactive scan created to flag state.
+
+    These close with live facts below — sending them through the LLM
+    dramatizes them into alarmist reports and can assert stale numbers
+    (the value in the description is minutes old, or a phantom from a
+    superseded balance source).
+    """
+    return description.strip().lower().startswith(_ALERT_TASK_PREFIXES)
+
+
+def _status_alert_result(description: str, remaining: float | None) -> str:
+    """Factual closing note for a status-alert task, from live state."""
+    balance = f"${remaining:.2f}" if remaining is not None else "unknown"
+    if remaining is None:
+        routing = "balance unknown (credits API unreachable)"
+    elif remaining <= 0:
+        routing = "openrouter skipped (depleted), zai-direct carrying traffic"
+    else:
+        routing = "openrouter active"
+    lowered = description.lower()
+    if lowered.startswith("investigate tier recovery:"):
+        name = description.split(":", 1)[1].strip()
+        if _circuit_open(name):
+            state = "TRIPPED (circuit open)"
+        else:
+            state = "recovered (circuit closed)"
+        return f"Tier {name}: {state}. OpenRouter balance: {balance}."
+    floor = f"${OPENROUTER_BALANCE_FLOOR:.0f}"
+    return f"Live status: OpenRouter balance {balance} (floor {floor}); {routing}."
+
+
 async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse:
     """Run heartbeat checks in Python instead of relying on the LLM.
 
@@ -2215,16 +2820,26 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
     1. Infrastructure monitoring — tripped tiers, low balance (every cycle)
     2. Task queue awareness — stale task nudges (every 30 min)
     3. LLM-powered thinking — self-directed task suggestions (every 1 hr)
+
+    Everything worth reporting buffers into the hourly digest instead of
+    messaging per event. At most once per HEARTBEAT_DIGEST_INTERVAL the
+    flush sends each item straight to Telegram (one message per item) and
+    returns a short closing summary as this response, which OpenClaw
+    relays — so long results arrive whole instead of clipped to fit the
+    single relayed message.
     """
     from app import brain_db
 
-    lines: list[str] = []
+    record_heartbeat_seen()
+
     tasks_created: list[dict] = []
 
     # ── 1. Tier status ──────────────────────────────────────────
     tripped = [tier["name"] for tier in CONFIG["tiers"] if _circuit_open(tier["name"])]
 
     remaining = await _check_openrouter_balance()
+
+    all_tasks = brain_db.list_tasks()
 
     # ── 2. Check for pending tasks ──────────────────────────────
     # Process one task per cycle — both system-generated and user-created.
@@ -2236,49 +2851,68 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
         label = "ALEX" if source == "user" else "SYSTEM"
         brain_db.claim_task(task["id"])
 
-        # Check if this is a structured marketing scan task
-        scan_result = await _try_marketing_scan(task["description"], brain_db)
-        if scan_result is not None:
-            result = scan_result
+        # Structured interception, in order: self-created status alerts
+        # (closed with live facts, never the LLM), then marketing scans,
+        # then research-shaped tasks (web-capable orchestrator), then the LLM.
+        if _is_status_alert(task["description"]):
+            result = _status_alert_result(task["description"], remaining)
         else:
-            result = await _llm_work_task(task["description"])
+            scan_result = await _try_marketing_scan(task["description"], brain_db)
+            if scan_result is not None:
+                result = scan_result
+            else:
+                research_result = await _try_research_task(task["description"])
+                if research_result is not None:
+                    result = research_result
+                else:
+                    result = await _llm_work_task(task["description"])
 
-        brain_db.complete_task(task["id"], result, "completed")
-        lines.append(f"[{label}] #{task['id']}: {task['description']}")
-        lines.append(f"Result: {result}")
+        if _needs_input(result):
+            # The model asked Alex a question instead of finishing. Close it
+            # as blocked so it leaves the pending queue -- left pending it is
+            # reworked every cycle -- and spend one digest line on it.
+            brain_db.complete_task(task["id"], result, "blocked")
+            _digest_record(_blocked_digest_line(task))
+        else:
+            brain_db.complete_task(task["id"], result, "completed")
+            # One digest item per task; the result gets most of a Telegram
+            # message now that items flush as separate messages. The full
+            # result still lives on the task (!tasks / GET /task/{id}).
+            _digest_record(
+                f"[{label}] #{task['id']}: {task['description']}\n"
+                f"Result: {_clip_result(result, limit=DIGEST_RESULT_LIMIT)}"
+            )
 
-        # Direct Telegram notification
-        await notify(
-            f"[{label}] Task completed: #{task['id']}\n"
-            f"{task['description']}\n\n"
-            f"Result: {result}"
-        )
+        # No direct Telegram notification: the digest line above carries
+        # the completion, at most once per hour.
+
     else:
         # ── PROACTIVE SCAN ──────────────────────────────────────
-        all_tasks = brain_db.list_tasks()
+        # (all_tasks is fetched before the pending branch: the digest
+        # footer also needs it to re-surface blocked questions.)
 
         # Layer 1: Infrastructure — every cycle
         for name in tripped:
             desc = f"Investigate tier recovery: {name}"
-            if not any(
-                t["description"] == desc and t["status"] == "pending" for t in all_tasks
-            ):
+            # 24h dedup regardless of status — pending-only dedup had the
+            # same recreate-after-complete loop as the balance alert.
+            if not _has_recent_task(all_tasks, desc, hours=24):
                 t = brain_db.create_task(desc, priority=2)
                 tasks_created.append(t)
 
-        if remaining is not None and remaining < 5.0:
+        if remaining is not None and remaining < OPENROUTER_BALANCE_FLOOR:
             desc = f"Low balance alert: ${remaining:.2f} remaining"
-            if not any(
-                "Low balance alert" in t["description"] and t["status"] == "pending"
-                for t in all_tasks
-            ):
+            # Any alert in the last 24h counts, completed or not. The old
+            # pending-only dedup re-created the alert every cycle once the
+            # previous one completed, spamming Telegram with duplicates.
+            if not _has_recent_task(all_tasks, "Low balance alert", hours=24):
                 t = brain_db.create_task(desc, priority=1)
                 tasks_created.append(t)
 
         # Layer 2: Stale task awareness — every 30 min
         if _proactive_ready("stale_tasks"):
             _proactive_mark("stale_tasks")
-            stale_cutoff = datetime.now(timezone.utc) - timedelta(hours=4)
+            stale_cutoff = datetime.now(UTC) - timedelta(hours=4)
             stale = [
                 t
                 for t in all_tasks
@@ -2299,22 +2933,42 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
                 tasks_created.append(t)
 
     # ── 3. Build response ───────────────────────────────────────
-    # Only send a visible response when there's something worth reporting.
-    # Empty heartbeat_ok is silent — OpenClaw won't relay it to Telegram.
-    if not lines and not tasks_created:
-        resp = _synthetic_response("")
+    # Created tasks buffer into the digest alongside completions. The
+    # response is non-empty only when the hourly digest is due, so the
+    # 10-minute heartbeat stays silent on Telegram except once per hour
+    # (OpenClaw relays non-empty heartbeat responses, not empty ones).
+    for t in tasks_created:
+        _digest_record(f"Created #{t['id']} [P{t['priority']}] {t['description'][:60]}")
+
+    if _digest_due():
+        messages, text = _digest_take(
+            time.time(),
+            remaining,
+            tripped,
+            waiting=_waiting_on_you_lines(all_tasks),
+        )
+        # Items go straight to Telegram — one message each — before the
+        # response returns, so they land ahead of the relayed summary.
+        # Sequential sends keep the burst in order (header, oldest first).
+        failed = 0
+        for msg in messages:
+            if not await telegram.notify(msg):
+                failed += 1
+        if failed:
+            text += (
+                f"\n{failed} digest message(s) failed to send — "
+                "full results remain in the task queue (GET /task)."
+            )
+        # OpenClaw logs only Telegram *failures*, so a silent digest and a
+        # dropped one look identical downstream. Log the handoff to give the
+        # two logs a correlation point.
+        print(
+            f"[PROXY] digest flushed: {len(messages)} message(s), {failed} failed",
+            flush=True,
+        )
     else:
-        if tasks_created:
-            lines.append(f"Created {len(tasks_created)} task(s):")
-            for t in tasks_created:
-                lines.append(f"  #{t['id']} [P{t['priority']}] {t['description'][:60]}")
-
-        if tripped:
-            lines.append(f"Tiers: {', '.join(tripped)} TRIPPED")
-        if remaining is not None:
-            lines.append(f"Balance: ${remaining:.2f}")
-
-        resp = _synthetic_response("\n".join(lines))
+        text = ""
+    resp = _synthetic_response(text)
 
     if is_stream:
         return _wrap_json_as_sse(resp)
@@ -2354,8 +3008,10 @@ async def _try_single_tier(
     api_key = os.getenv(provider_config["env_key"], "")
 
     if status_msg_id:
-        asyncio.create_task(send_typing())
-        asyncio.create_task(edit_status(status_msg_id, f"\u23f3 {tier['description']}"))
+        asyncio.create_task(telegram.send_typing())
+        asyncio.create_task(
+            telegram.edit_status(status_msg_id, f"\u23f3 {tier['description']}")
+        )
 
     try:
         non_stream_body = {**body, "stream": False}
@@ -2403,7 +3059,8 @@ async def _try_single_tier(
 
             if not first_content.strip():
                 print(
-                    f"[PROXY] empty response from {tier_name} after sanitization — skipping",
+                    f"[PROXY] empty response from {tier_name} after "
+                    f"sanitization — skipping",
                     flush=True,
                 )
                 _record_failure(tier_name)
@@ -2411,7 +3068,8 @@ async def _try_single_tier(
 
             if _is_non_answer(first_content):
                 print(
-                    f"[PROXY] non-answer from {tier_name}: {first_content[:80]!r} — skipping",
+                    f"[PROXY] non-answer from {tier_name}: {first_content[:80]!r} "
+                    f"— skipping",
                     flush=True,
                 )
                 # Don't _record_failure — the provider worked fine, the content
@@ -2431,7 +3089,8 @@ async def _try_single_tier(
             _record_rate_limit(tier_name)
             try:
                 print(
-                    f"[PROXY] 429 on {tier_name} — headers: {dict(resp.headers)} body: {resp.text[:500]}",
+                    f"[PROXY] 429 on {tier_name} — headers: {dict(resp.headers)} "
+                    f"body: {resp.text[:500]}",
                     flush=True,
                 )
             except Exception:
@@ -2460,6 +3119,50 @@ async def _try_single_tier(
 
 
 # ─── Proxy Endpoint ───────────────────────────────────────────────
+
+
+@router.post("/v1/embeddings")
+async def embeddings(
+    request: Request,
+    authorization: str | None = Header(None),
+):
+    """OpenAI-compatible embeddings, proxied to Zhipu (for OpenClaw memory)."""
+    # Auth check — same PROXY_AUTH_TOKEN gate as chat completions
+    if PROXY_AUTH_TOKEN:
+        if not authorization or authorization != f"Bearer {PROXY_AUTH_TOKEN}":
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+    raw_body = await request.json()
+    inputs = raw_body.get("input")
+    if not inputs:
+        raise HTTPException(status_code=400, detail="input is required")
+
+    # Prefer a dedicated embeddings key (for a Z.AI key that has embeddings
+    # access); fall back to the shared chat key.
+    api_key = os.getenv("ZAI_EMBED_API_KEY") or os.getenv("ZAI_API_KEY", "")
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="embeddings provider not configured "
+            "(set ZAI_EMBED_API_KEY or ZAI_API_KEY)",
+        )
+
+    # Force a Zhipu embedding model. OpenAI-named models (sent by OpenClaw's
+    # "auto" probing) are overridden; an explicit "embedding-*" passes through.
+    requested = str(raw_body.get("model") or "")
+    model = requested if requested.startswith("embedding-") else EMBED_MODEL
+
+    try:
+        resp = await _call_embeddings(inputs, model, api_key)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"embeddings upstream error: {exc}")
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=f"embeddings upstream {resp.status_code}: {resp.text[:300]}",
+        )
+    return JSONResponse(content=resp.json())
 
 
 @router.post("/v1/chat/completions")
@@ -2543,6 +3246,14 @@ async def chat_completions(
     if marketing_cmd is not None:
         return await _dispatch_marketing_command(marketing_cmd, is_stream)
 
+    # Intercept !persona / !learn (spec §6 alias) — explicit feedback and
+    # on-demand reflection
+    if msg_lower.startswith(("!persona", "!learn")):
+        prefix = "!persona" if msg_lower.startswith("!persona") else "!learn"
+        args = last_user_msg.strip()[len(prefix) :]
+        resp = await _handle_persona_command(args)
+        return _wrap_json_as_sse(resp) if is_stream else resp
+
     # Strip poisoned assistant messages from conversation history.
     # Uses both static markers (synthetic responses, tool hallucinations)
     # AND the deferral detector — any assistant message that would fail
@@ -2610,8 +3321,8 @@ async def chat_completions(
         print("[PROXY] no tier hint — racing all free tiers", flush=True)
 
     # Show typing indicator and send a transient status message
-    asyncio.create_task(send_typing())
-    status_msg_id = await send_status("\u23f3")
+    asyncio.create_task(telegram.send_typing())
+    status_msg_id = await telegram.send_status("\u23f3")
 
     # Always use non-streaming internally for full sanitization + garbled
     # detection, then re-wrap as SSE if the client requested streaming.
@@ -2621,7 +3332,7 @@ async def chat_completions(
             _handle_non_streaming(body, forced_tier, status_msg_id=status_msg_id),
             timeout=REQUEST_DEADLINE,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning("Request exceeded %ds deadline", REQUEST_DEADLINE)
         result = _synthetic_response(
             "I took too long to respond — the LLM providers might be slow. "
@@ -2630,7 +3341,7 @@ async def chat_completions(
 
     # Remove the status message — OpenClaw delivers the real response
     if status_msg_id:
-        asyncio.create_task(delete_message(status_msg_id))
+        asyncio.create_task(telegram.delete_message(status_msg_id))
 
     if is_stream and isinstance(result, JSONResponse):
         return _wrap_json_as_sse(result)
@@ -2662,15 +3373,24 @@ async def _handle_non_streaming(
             continue
         if provider not in PROVIDER_URLS:
             continue
+        if provider == "openrouter":
+            remaining = await _check_openrouter_balance()
+            # A zero/negative balance blocks every OpenRouter model —
+            # free-tier included — with 402 payment-required errors. Skip
+            # the whole provider so zai-direct carries traffic instead of
+            # every request stalling through failed OpenRouter attempts.
+            if remaining is not None and remaining <= 0:
+                if _should_notify("balance-guard"):
+                    await telegram.notify(
+                        f"*Balance guard* — OpenRouter balance ${remaining:.2f}.\n"
+                        "Routing around OpenRouter until it's topped up."
+                    )
+                continue
         if tier_name == "openrouter-paid" and not forced_tier:
             continue
         if tier_name == "openrouter-paid":
             remaining = await _check_openrouter_balance()
             if remaining is not None and remaining <= OPENROUTER_BALANCE_FLOOR:
-                await notify(
-                    f"*Balance guard* — ${remaining:.2f} remaining"
-                    f"\nSkipping `{tier_name}` to protect free-tier quota"
-                )
                 continue
         available.append(tier)
 
@@ -2730,7 +3450,7 @@ async def _handle_non_streaming(
                 )
                 if status_msg_id:
                     asyncio.create_task(
-                        edit_status(
+                        telegram.edit_status(
                             status_msg_id, f"\u23f3 Rate limited — retrying in {wait}s"
                         )
                     )

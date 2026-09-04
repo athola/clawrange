@@ -9,7 +9,6 @@ import pytest
 import tenant_profile as profile_mod
 from tenant_profile import ProfileError, load_profile, resolve_env
 
-
 # Generator kinds the validator should accept. Passed explicitly so the
 # loader unit tests don't drag in the heavy generators module.
 KNOWN_KINDS = {"pipeline", "crm_digest", "morning_digest", "hot_pulse", "content_idea"}
@@ -67,8 +66,15 @@ def test_load_profile_resolves_env(tmp_path, monkeypatch):
         profile: acme
         connectors:
           - id: c1
-            source: {kind: http_csv, url: "https://x", auth: {kind: bearer, token: "${PORTAL_TOKEN}"}}
-            sink: {kind: crm, object: leads}
+            source:
+              kind: http_csv
+              url: "https://x"
+              auth:
+                kind: bearer
+                token: "${PORTAL_TOKEN}"
+            sink:
+              kind: crm
+              object: leads
         """,
     )
     p = load_profile("acme", profiles_dir=tmp_path, known_generator_kinds=KNOWN_KINDS)
@@ -154,7 +160,12 @@ def test_validate_schedule_undefined_connector_raises(tmp_path):
         profile: acme
         seeds:
           schedules:
-            - {id: s1, name: S1, kind: pipeline, cron: "0 * * * *", kwargs: {connector: ghost}}
+            - id: s1
+              name: S1
+              kind: pipeline
+              cron: "0 * * * *"
+              kwargs:
+                connector: ghost
         connectors:
           - id: real
             source: {kind: http_csv, url: x}
@@ -176,9 +187,21 @@ def test_profile_accessors(tmp_path):
         profile: acme
         seeds:
           projects:
-            - {slug: p1, owner: o, repo: r, topics: [], subreddits: [], search_terms: [], posture: ""}
+            - slug: p1
+              owner: o
+              repo: r
+              topics: []
+              subreddits: []
+              search_terms: []
+              posture: ""
           schedules:
-            - {id: s1, name: S1, kind: crm_digest, cron: "0 8 * * *", kwargs: {queries: [new_leads_count]}}
+            - id: s1
+              name: S1
+              kind: crm_digest
+              cron: "0 8 * * *"
+              kwargs:
+                queries:
+                  - new_leads_count
         connectors:
           - id: c1
             source: {kind: http_csv, url: x}
@@ -204,6 +227,41 @@ def test_module_exposes_known_kind_sets():
     assert "http_csv" in profile_mod.KNOWN_SOURCE_KINDS
     assert "crm" in profile_mod.KNOWN_SINK_KINDS
     assert "sqlite" in profile_mod.KNOWN_ADAPTERS
+
+
+def test_identity_block_validates_and_rejects_unknown_keys():
+    from tenant_profile import Profile, ProfileError, validate
+
+    ok = Profile(
+        name="t",
+        raw={
+            "profile": "t",
+            "assistant": {
+                "name": "Max",
+                "identity": {
+                    "name": "Max",
+                    "creature": "CoS",
+                    "vibe": "sharp",
+                    "emoji": "🎯",
+                },
+            },
+        },
+    )
+    validate(ok)  # should not raise
+    bad = Profile(
+        name="t",
+        raw={
+            "profile": "t",
+            "assistant": {
+                "identity": {"name": "Max", "bogus": "x"},
+            },
+        },
+    )
+    try:
+        validate(bad)
+        assert False, "expected ProfileError"
+    except ProfileError as e:
+        assert "identity" in str(e)
 
 
 # ─── marketing seed equivalence (regression lock, TR-003) ─────────
@@ -233,3 +291,11 @@ def test_marketing_projects_match_golden():
 def test_marketing_schedules_match_golden():
     p = load_profile("marketing", profiles_dir=_real_profiles_dir())
     assert p.schedules == _GOLDEN["schedules"]
+
+
+def test_chief_of_staff_profile_loads_with_identity():
+    from tenant_profile import load_profile
+
+    p = load_profile("chief-of-staff", profiles_dir=_real_profiles_dir())
+    assert p.assistant["identity"]["name"] == "Max"
+    assert p.assistant["identity"]["emoji"] == "🎯"

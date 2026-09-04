@@ -4,8 +4,14 @@ from __future__ import annotations
 
 import pathlib
 
+from persona import (
+    compose_persona,
+    render_all,
+    render_identity,
+    render_persona,
+    write_soul,
+)
 from tenant_profile import Profile, load_profile
-from persona import render_persona, write_soul
 
 
 def _real_profiles_dir():
@@ -88,6 +94,27 @@ def test_marketing_render_contains_john117():
     assert "John-117" in out
 
 
+def test_render_identity_fills_fields_and_defaults_name():
+    p = Profile(
+        name="t",
+        raw={
+            "profile": "t",
+            "assistant": {
+                "name": "Max",
+                "identity": {
+                    "creature": "Chief of Staff",
+                    "vibe": "sharp",
+                    "emoji": "🎯",
+                },
+            },
+        },
+    )
+    out = render_identity(p)
+    assert "**Name:** Max" in out  # defaults to assistant.name
+    assert "**Creature:** Chief of Staff" in out
+    assert "🎯" in out
+
+
 def test_write_soul_round_trips(tmp_path):
     p = Profile(
         "acme",
@@ -99,3 +126,42 @@ def test_write_soul_round_trips(tmp_path):
     dest = tmp_path / "soul.md"
     write_soul(p, dest)
     assert dest.read_text() == render_persona(p)
+
+
+def test_compose_appends_learned_region_and_is_non_destructive():
+    p = Profile(name="t", raw={"profile": "t", "assistant": {"name": "Max"}})
+    learnings = [
+        {
+            "kind": "persona",
+            "target": "Communication",
+            "content": "Lead with the recommendation.",
+        }
+    ]
+    out = compose_persona(p, learnings)
+    assert "## Learned" in out
+    assert "Communication" in out and "Lead with the recommendation." in out
+    # base persona still present
+    assert "Max" in out
+    # no learnings -> no Learned region
+    assert "## Learned" not in compose_persona(p, [])
+
+
+def test_render_all_writes_targets(tmp_path):
+    p = Profile(name="t", raw={"profile": "t", "assistant": {"name": "Max"}})
+    soul = tmp_path / "soul.md"
+    ident = tmp_path / "IDENTITY.md"
+    res = render_all(p, {"soul": str(soul), "identity": str(ident)}, [])
+    assert res == {"soul": True, "identity": True}
+    assert "Max" in soul.read_text() and "Name:** Max" in ident.read_text()
+
+
+def test_render_all_unwritable_target_returns_false(tmp_path):
+    """render_all's no-raise contract: an unwritable target reports False
+    instead of raising, so approve never 500s after committing DB status."""
+
+    p = Profile("x", {"profile": "x", "assistant": {"name": "Max"}})
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    target = blocker / "soul.md"  # parent is a file -> OSError on write
+    result = render_all(p, {"soul": str(target)}, [])
+    assert result == {"soul": False}

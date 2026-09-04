@@ -8,11 +8,12 @@ so collection has no extra dependencies.
 
 from __future__ import annotations
 
+import subprocess
 import sys
+import urllib.error
 from pathlib import Path
 
 import pytest
-
 
 # Ensure scripts/ is importable.
 _SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
@@ -64,8 +65,6 @@ class TestRunTomeResearch:
     """Subprocess wrapper - we mock subprocess.run."""
 
     def test_success_returns_combined_output(self, monkeypatch):
-        import subprocess
-
         class FakeResult:
             returncode = 0
             stdout = "topic findings\n"
@@ -80,8 +79,6 @@ class TestRunTomeResearch:
         assert "topic findings" in out
 
     def test_timeout_returns_124(self, monkeypatch):
-        import subprocess
-
         def raise_timeout(cmd, **kwargs):
             raise subprocess.TimeoutExpired(cmd=cmd, timeout=1)
 
@@ -91,8 +88,6 @@ class TestRunTomeResearch:
         assert "timed out" in out
 
     def test_missing_binary_returns_127(self, monkeypatch):
-        import subprocess
-
         def raise_fnf(cmd, **kwargs):
             raise FileNotFoundError(cmd[0])
 
@@ -216,8 +211,6 @@ class TestProcessOneTask:
 
 class TestRunOnce:
     def test_handles_workflows_unreachable(self, monkeypatch):
-        import urllib.error
-
         def fail(*a, **kw):
             raise urllib.error.URLError("connection refused")
 

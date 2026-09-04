@@ -60,7 +60,7 @@
         "static resume site",
         "resume generator"
       ],
-      "posture": "Lead with: a YAML-driven resume that builds PDF and HTML. Comment with concrete examples; mention only when the post is about resume tooling specifically."
+      "posture": "Lead with: a YAML-driven resume that builds PDF and HTML. Comment with concrete examples. Mention only when the post is about resume tooling specifically."
     },
     {
       "slug": "clawrange",
@@ -93,7 +93,7 @@
         "openrouter telegram",
         "agent orchestration self-hosted"
       ],
-      "posture": "Lead with: a single-host AI ops stack (FastAPI workflows + Claude Code via OpenClaw) for tier-routed LLM access, scheduled marketing scans, and Telegram delivery. Comment with first-hand operational details (single uvicorn worker, APScheduler job persistence, balance-aware tier routing). Mention clawrange only when the post is explicitly about self-hosted Claude tooling or LLM-proxy gateways."
+      "posture": "Lead with: a single-host AI ops stack (FastAPI workflows and Claude Code via OpenClaw) for tier-routed LLM access, scheduled marketing scans, and Telegram delivery. Comment with first-hand operational details (single uvicorn worker, APScheduler job persistence, balance-aware tier routing). Mention clawrange only when the post is explicitly about self-hosted Claude tooling or LLM-proxy gateways."
     },
     {
       "slug": "personal-brand",
@@ -145,6 +145,19 @@
       "kind": "content_idea",
       "cron": "0 9 * * *",
       "kwargs": {}
+    },
+    {
+      "id": "daily-research-pulse",
+      "name": "Daily research freshness pulse via tome bridge",
+      "kind": "research_pulse",
+      "cron": "0 6 * * *",
+      "kwargs": {
+        "topics": [
+          "trade-skill knowledge capture tooling and platforms shipping in 2025: market gaps and positioning for a field-capture Chrome extension (skrills)",
+          "Claude Code plugin and skill discovery in 2025: marketplaces, awesome-lists, and developer-workflow gaps (claude-night-market)",
+          "AI-assisted resume and job-application tooling in 2025: differentiation and unmet needs (simple-resume)"
+        ]
+      }
     }
   ]
 }

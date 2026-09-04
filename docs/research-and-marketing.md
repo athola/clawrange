@@ -38,8 +38,8 @@ ranked, deduplicated, citation-bearing findings.
 | `discourse` | Reddit subreddits | Default subs: ClaudeAI, LocalLLaMA, SideProject. Override with `subreddits`. |
 | `code` | GitHub repos | Default `min_stars=50`. |
 | `discourse_web` (or `web`) | GLM server-side web search | Returns one synthesized summary finding per call. |
-| `academic` | arXiv + Semantic Scholar | Public, no API key. Fans out both in parallel; per-source failures are logged and swallowed. |
-| `triz` | GLM web search with TRIZ prompt | Cross-domain analogical reasoning — finds solutions in adjacent fields with bridge mappings. |
+| `academic` | arXiv and Semantic Scholar | Public, no API key. Fans out both in parallel. Per-source failures are logged and swallowed. |
+| `triz` | GLM web search with TRIZ prompt | Cross-domain analogical reasoning. Finds solutions in adjacent fields with bridge mappings. |
 
 ### Channel readiness check
 
@@ -164,7 +164,7 @@ Setup options:
   or wire it into a systemd user unit / launchd job.
 - **Per-task timeout**: `TOME_BRIDGE_TIMEOUT=600 make tome-bridge`.
 
-The bridge has zero dependencies beyond Python stdlib + the
+The bridge has zero dependencies beyond Python stdlib and the
 `claude` CLI on `$PATH`, so it ships and runs anywhere.
 
 ## Marketing Orchestrator (extended)
@@ -177,14 +177,14 @@ workflows service:
 | `claude-night-market` | Plugin marketplace for Claude Code | ClaudeAI, LocalLLaMA, SideProject |
 | `skrills` | Trade-skill capture chrome extension | Construction, ITCareerQuestions, SideProject |
 | `simple-resume` | YAML → PDF/HTML resume generator | resumes, cscareerquestions, SideProject |
-| `clawrange` | This stack — personal AI ops gateway | ClaudeAI, claudecode, vibecoding, opensourceai, codex, sideprojects, LocalLLaMA, selfhosted |
+| `clawrange` | This stack, personal AI ops gateway | ClaudeAI, claudecode, vibecoding, opensourceai, codex, sideprojects, LocalLLaMA, selfhosted |
 | `personal-brand` | Alex's AI-systems engineer voice | ClaudeAI, LocalLLaMA, MachineLearning, ExperiencedDevs |
 
 ### Generators
 
 | Name | Cron suggestion | What it does |
 |------|-----------------|--------------|
-| `morning_scan` | `0 8 * * *` | Reddit + GitHub scan tasks per project (queue-only) |
+| `morning_scan` | `0 8 * * *` | Reddit and GitHub scan tasks per project (queue-only) |
 | `morning_digest` | `0 8 * * *` (auto-seeded) | Live 24h Reddit scan, Telegram digest of comment-worthy posts grouped by project, plus `[DRAFT]` comment tasks |
 | `weekly_traffic` | `0 8 * * 1` | Stargazer / clone deltas per repo |
 | `awesome_lists_watch` | `0 10 * * 3` | PR-target reminders for awesome-lists |
@@ -192,7 +192,7 @@ workflows service:
 | `content_idea` | `0 9 * * *` | Turns recent research into 1 idea/project |
 | `comment_draft` | (ad-hoc) | Drafts a reply for a specific URL |
 
-#### `morning_digest` — the 8am rundown
+#### `morning_digest`: the 8am rundown
 
 Delivered by `morning_digest_generator` (in `workflows/generators.py`).
 On a fresh boot, `seed_default_projects` registers a `0 8 * * *` schedule
@@ -203,11 +203,11 @@ For each tracked project, the generator searches the union of that
 project's subreddits and the AI-coding extras Alex curated
 (`vibecoding`, `opensourceai`, `claudecode`, `ClaudeAI`, `codex`,
 `sideprojects`) for posts created in the last 24h. Each post is scored
-against the project's topics + search_terms, routed to its best-fit
+against the project's topics and search_terms, routed to its best-fit
 project, deduplicated against `scan_cache` (so tomorrow's run won't
 re-surface today's posts), and rendered as a Markdown digest grouped
 by project. Telegram delivery via `telegram.notify`. Top picks become
-`[DRAFT]` comment-draft tasks for human review — never auto-posted.
+`[DRAFT]` comment-draft tasks for human review, never auto-posted.
 
 Override at runtime with `kwargs` on the schedule:
 - `project_slugs`: limit to specific projects
@@ -215,14 +215,14 @@ Override at runtime with `kwargs` on the schedule:
 - `top_per_project`: cap the digest size (default 4)
 - `queue_drafts`: set false to skip task creation
 
-#### Reddit API access — script-app setup
+#### Reddit API access: script-app setup
 
 The digest works on a fresh deploy without credentials by falling
 back to Reddit's unauthenticated public JSON endpoint. That fallback
 is rate-limited (~30 req/min anonymous) and omits some fields, so
 wire a script-app for production-quality lookups.
 
-**Step 1 — Create the script app**
+**Step 1: Create the script app**
 
 1. Sign in to Reddit as the account whose voice the bot will speak
    in (typically `u/athola`).
@@ -230,22 +230,22 @@ wire a script-app for production-quality lookups.
    **"are you a developer? create an app..."** at the bottom.
 3. Fill in the form:
    - **name**: `clawrange-marketing-bot` (or any identifier you like)
-   - **type**: select **`script`** — this is the only OAuth flow
-     that supports username + password and works for read-only
+   - **type**: select **`script`**. This is the only OAuth flow
+     that supports username and password and works for read-only
      personal use. Do **not** pick `web app` or `installed app`.
    - **description**: optional. e.g. *"Personal marketing-research
      bot. Read-only search across AI-coding subreddits."*
    - **about url**: leave blank or point at your repo.
-   - **redirect uri**: required even for script apps — set it to
+   - **redirect uri**: required even for script apps. Set it to
      `http://localhost:8080` (it isn't used by the script flow but
      Reddit rejects the form if it's empty).
 4. Click **"create app"**. You should land on the app's detail card.
 
-**Step 2 — Pull the credentials**
+**Step 2: Pull the credentials**
 
 On the app card you just created:
-- **client_id**: the short string directly under the app name —
-  it's labelled `personal use script` (~14 characters, base62).
+- **client_id**: the short string directly under the app name. It's
+  labelled `personal use script` (~14 characters, base62).
 - **client_secret**: the longer `secret` field on the same card.
   Click **"edit"** if it's hidden behind a placeholder.
 
@@ -256,7 +256,7 @@ You also need the Reddit account's own credentials:
   per asyncpraw's documented script-app flow. Long-running daemons
   generally disable 2FA on the bot account or use an app-password.
 
-**Step 3 — Wire the credentials**
+**Step 3: Wire the credentials**
 
 Add to `.env` at the repo root (the file is gitignored):
 
@@ -268,20 +268,20 @@ REDDIT_PASSWORD=yourpassword
 REDDIT_USER_AGENT=clawrange-marketing-bot/0.1 (by u/athola)
 ```
 
-The `REDDIT_USER_AGENT` is required by Reddit's API rules — include
+The `REDDIT_USER_AGENT` is required by Reddit's API rules. Include
 your username so they can contact you about misbehaving bots. The
 default value is acceptable but the personalised form is preferred.
 
-**Step 4 — Reload the workflows container**
+**Step 4: Reload the workflows container**
 
 ```bash
 docker compose restart workflows
 ```
 
-The container reads `.env` at start; a restart picks up the new
+The container reads `.env` at start. A restart picks up the new
 values. No image rebuild needed.
 
-**Step 5 — Verify the OAuth path is live**
+**Step 5: Verify the OAuth path is live**
 
 ```bash
 curl -X POST http://localhost:5678/sched/morning_digest/run
@@ -299,26 +299,26 @@ that the Markdown digest landed in Telegram.
 |---------|-------|
 | `401 Unauthorized` from asyncpraw | Wrong client_id/secret, or app type is not `script` |
 | `invalid_grant` | Wrong username or password |
-| Empty results despite valid creds | Account has no Reddit history; new accounts hit shadow filters. Use an account with at least one comment / 1+ karma. |
-| Rate limit warnings (`429`) on public fallback | Expected when creds are missing under heavy fan-out — set creds to upgrade to authenticated rate limits (~60 req/min). |
+| Empty results despite valid creds | Account has no Reddit history. New accounts hit shadow filters. Use an account with at least one comment / 1+ karma. |
+| Rate limit warnings (`429`) on public fallback | Expected when creds are missing under heavy fan-out. Set creds to upgrade to authenticated rate limits (~60 req/min). |
 
 ### Posture
 
 The marketing posture is encoded in each project's `posture` field
 and reinforced in `openclaw/soul.md`. Core rules:
 
-1. **Lurk first, comment later** — be a community member before a
+1. **Lurk first, comment later**: be a community member before a
    marketer.
-2. **Useful comments first** — lead with specifics, code, numbers.
+2. **Useful comments first**: lead with specifics, code, numbers.
 3. **Honest disclaimers beat polish** on r/SideProject and
    r/programming.
-4. **Never auto-post** — every draft lands as a `[DRAFT]` task and
+4. **Never auto-post**: every draft lands as a `[DRAFT]` task and
    Alex sends manually after review.
-5. **HN for depth, Reddit for breadth** — converts ~3x better,
+5. **HN for depth, Reddit for breadth**: converts ~3x better,
    reaches ~1/3 the audience.
-6. **r/SideProject format**: `[Launch] Name — one-liner ≤100ch`
-   + opening + journey + 3-5 features + ending question.
-7. **External article links boost X reach in 2026** —
+6. **r/SideProject format**: `[Launch] Name — one-liner ≤100ch`,
+   opening, journey, 3-5 features, and ending question.
+7. **External article links boost X reach in 2026**:
    Medium/dev.to/Substack/personal blog.
 
 ### Operator workflow

@@ -20,7 +20,6 @@ from research import (
     rank_findings,
 )
 
-
 # ─── Finding model ────────────────────────────────────────────────
 
 
@@ -438,8 +437,9 @@ class TestAcademicChannel:
 
     @pytest.mark.asyncio
     async def test_handles_arxiv_error_gracefully(self, monkeypatch):
-        from research import _fetch_academic
         import httpx
+
+        from research import _fetch_academic
 
         async def fail_get(self, url, **kw):
             raise httpx.HTTPError("network down")
