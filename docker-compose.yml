@@ -51,7 +51,8 @@ services:
       - ./scripts/healthcheck-openclaw.sh:/opt/healthcheck.sh:ro
     environment:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
-      - OPENCLAW_TZ=${TIMEZONE:-America/Chicago}
+      # Timezone is NOT set via env: OpenClaw only reads
+      # agents.defaults.userTimezone in openclaw.json
       - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
       - PROXY_AUTH_TOKEN=${PROXY_AUTH_TOKEN}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
