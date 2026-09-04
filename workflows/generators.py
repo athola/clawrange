@@ -250,9 +250,12 @@ async def content_idea_generator(
         topics = json.loads(project.get("topics", "[]"))
         topic_hint = ", ".join(topics[:3]) if topics else slug
 
+        # Some channels (e.g. TRIZ analogies) carry no URL; cite without
+        # the parens rather than rendering a dangling "()" in the task.
+        citation = f" ({top['url']})" if top.get("url") else ""
         desc = (
             f"Content idea for {slug}: research on '{top['topic']}' "
-            f'surfaced "{top["title"]}" ({top["url"]}). '
+            f'surfaced "{top["title"]}"{citation}. '
             f"Draft three angles - "
             f"(1) technical post tying this to {topic_hint}, "
             f"(2) useful Reddit/HN comment offering specifics, "

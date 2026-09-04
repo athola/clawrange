@@ -2481,6 +2481,52 @@ class TestResearchRouter:
         assert asyncio.run(llm_proxy._try_research_task("Reply to Alex")) is None
 
     @patch("research.orchestrate_research", new_callable=AsyncMock)
+    def test_content_idea_task_not_hijacked_by_research_router(self, mock_orch):
+        """The content-idea template quotes research words ("research on",
+        "surfaced", "Reddit/HN comment") but is a drafting job for the LLM.
+        The orchestrator must not steal it and re-run research."""
+        import asyncio
+
+        import llm_proxy
+
+        desc = (
+            "Content idea for claude-night-market: research on 'trade-skill "
+            'capture\' surfaced "TRIZ analogies" (). Draft three angles - '
+            "(1) technical post, (2) useful Reddit/HN comment, (3) X thread."
+        )
+        result = asyncio.run(llm_proxy._try_research_task(desc))
+        assert result is None
+        mock_orch.assert_not_called()
+
+    @patch("research.orchestrate_research", new_callable=AsyncMock)
+    def test_findings_header_does_not_echo_description(self, mock_orch):
+        """The digest line already shows the task description above the
+        result; echoing it inside the result header just doubles the text
+        and crowds the blocked-detector's 400-char head window."""
+        import asyncio
+
+        import llm_proxy
+
+        mock_orch.return_value = {
+            "findings": [
+                {
+                    "channel": "discourse",
+                    "title": "What chrome extensions do trades use?",
+                    "url": "https://reddit.com/r/trades/x",
+                }
+            ]
+        }
+        result = asyncio.run(
+            llm_proxy._try_research_task(
+                "Search Reddit for live threads on trade-skill knowledge capture"
+            )
+        )
+        assert result is not None
+        assert result.startswith("Research findings (1):")
+        assert "trade-skill knowledge capture" not in result
+        assert "reddit.com/r/trades/x" in result
+
+    @patch("research.orchestrate_research", new_callable=AsyncMock)
     def test_no_findings_reported(self, mock_orch):
         import asyncio
 
@@ -4155,3 +4201,50 @@ class TestDigestTakeWaiting:
     def test_empty_and_no_waiting_stays_silent(self, monkeypatch, tmp_path):
         proxy = self._fresh(monkeypatch, tmp_path)
         assert proxy._digest_take(time.time(), None, []) == ""
+
+    def test_digest_header_pluralizes(self, monkeypatch, tmp_path):
+        proxy = self._fresh(monkeypatch, tmp_path)
+        text = proxy._digest_format(["[SYSTEM] #1: did a thing"], [])
+        assert "1 item this hour" in text
+        assert "item(s)" not in text
+        text = proxy._digest_format(["a", "b"], [])
+        assert "2 items this hour" in text
+
+
+class TestClipResult:
+    def test_short_result_unchanged(self):
+        import llm_proxy
+
+        assert llm_proxy._clip_result("done") == "done"
+
+    def test_long_result_clips_at_sentence_boundary(self):
+        import llm_proxy
+
+        long = "word " * 80 + "Final sentence. " + "word " * 60
+        clipped = llm_proxy._clip_result(long, limit=500)
+        assert len(clipped) <= 500
+        assert clipped.endswith("…")
+        # The last whole sentence inside the budget survives.
+        assert clipped.rstrip("…").endswith("Final sentence.")
+
+    def test_early_sentence_mark_prefers_word_boundary(self):
+        """A lone terminator near the start must not waste the budget."""
+        import llm_proxy
+
+        long = "No. " + "word " * 120
+        clipped = llm_proxy._clip_result(long, limit=500)
+        assert len(clipped) > 100
+        assert clipped.endswith("…")
+        assert "word" in clipped
+
+    def test_no_sentence_mark_falls_back_to_word_boundary(self):
+        import llm_proxy
+
+        long = " ".join(f"w{i}" for i in range(200))
+        clipped = llm_proxy._clip_result(long, limit=500)
+        assert len(clipped) <= 500
+        assert clipped.endswith("…")
+        head = clipped.rstrip("…")
+        # The clipped head is a prefix of the original at a word break.
+        assert long.startswith(head)
+        assert long[len(head) : len(head) + 1] == " "

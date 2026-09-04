@@ -373,6 +373,46 @@ class TestGenerators:
         assert any("reddit.com/r/Construction" in t["description"] for t in idea_tasks)
 
     @pytest.mark.asyncio
+    async def test_content_idea_task_omits_empty_url_parens(self):
+        """
+        GIVEN a recent research finding with no URL (e.g. a TRIZ analogy)
+        WHEN content_idea_generator runs
+        THEN the enqueued task description cites the finding without
+             rendering a dangling empty '()' citation.
+        """
+        from generators import content_idea_generator
+
+        brain_db.upsert_project(
+            "skrills",
+            "athola",
+            "skrills",
+            topics=["chrome-extension"],
+            posture="Lead with: trade skill capture",
+        )
+        session = brain_db.create_research_session(
+            "trade skills chrome extensions", ["triz"]
+        )
+        brain_db.add_research_finding(
+            session_id=session["id"],
+            source="triz",
+            channel="triz",
+            title="TRIZ analogies: capture field know-how",
+            url="",
+            relevance=0.9,
+            summary="cross-domain analogy",
+            metadata={},
+        )
+        brain_db.complete_research_session(session["id"])
+
+        await content_idea_generator(brain_db, project_slugs=["skrills"])
+
+        tasks = brain_db.list_tasks(status="pending")
+        idea_tasks = [t for t in tasks if "content idea" in t["description"].lower()]
+        assert len(idea_tasks) >= 1
+        assert all("()" not in t["description"] for t in idea_tasks)
+        assert any("TRIZ analogies" in t["description"] for t in idea_tasks)
+
+    @pytest.mark.asyncio
     async def test_content_idea_generator_skips_when_no_research(self):
         """No recent sessions -> no tasks emitted."""
         from generators import content_idea_generator

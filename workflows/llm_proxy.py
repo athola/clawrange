@@ -2397,6 +2397,13 @@ async def _try_research_task(description: str) -> str | None:
     ):
         return None
 
+    # Content-idea tasks quote research vocabulary in their template
+    # ("research on ... surfaced ... Reddit/HN comment") but are drafting
+    # jobs for the LLM. Routing them here re-runs research on the whole
+    # description instead of drafting the angles, so hand them back.
+    if description.strip().lower().startswith("content idea for"):
+        return None
+
     # Function-local on purpose (cycle guard): research imports this
     # module at module scope for _llm_call, so a top-level import here
     # would be circular.
@@ -2413,9 +2420,11 @@ async def _try_research_task(description: str) -> str | None:
 
     findings = result.get("findings", [])
     if not findings:
-        return f"Research: no findings for '{description}'."
+        return "Research: no findings."
 
-    lines = [f"Research findings for '{description}' ({len(findings)}):"]
+    # No description echo: the digest line already prints it above the
+    # result, and re-embedding it here crowds _needs_input's head window.
+    lines = [f"Research findings ({len(findings)}):"]
     for i, f in enumerate(findings[:8], 1):
         lines.append(f"{i}. [{f['channel']}] {f['title'][:90]}\n   {f['url']}")
     return "\n".join(lines)
@@ -2662,6 +2671,26 @@ def _digest_take(
     return _digest_format(lines, footer)
 
 
+def _clip_result(text: str, limit: int = 500) -> str:
+    """Shorten a task result for one digest line without cutting mid-word.
+
+    Cuts after the last sentence terminator inside the limit (word boundary
+    as fallback) and marks the cut with an ellipsis; the full result stays
+    on the task (GET /task/{id}).
+    """
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    cut = max(head.rfind("."), head.rfind("!"), head.rfind("?"))
+    if cut < limit // 2:
+        # The last sentence end is too far back to waste the budget on;
+        # a word boundary keeps more of the result.
+        cut = head.rfind(" ")
+    if cut <= 0:
+        return head.rstrip() + "…"
+    return text[: cut + 1].rstrip() + "…"
+
+
 def _digest_format(lines: list[str], footer: list[str]) -> str:
     """Join header, lines and footer within Telegram's length limit.
 
@@ -2671,9 +2700,11 @@ def _digest_format(lines: list[str], footer: list[str]) -> str:
     kept = list(lines)
     while True:
         dropped = len(lines) - len(kept)
-        out = [f"Heartbeat digest ({len(lines)} item(s) this hour):", *kept]
+        item_word = "item" if len(lines) == 1 else "items"
+        out = [f"Heartbeat digest ({len(lines)} {item_word} this hour):", *kept]
         if dropped:
-            out.append(f"… {dropped} more item(s) truncated")
+            more_word = "item" if dropped == 1 else "items"
+            out.append(f"… {dropped} more {more_word} truncated")
         out.extend(footer)
         text = "\n".join(out)
         if len(text) <= TELEGRAM_MAX_CHARS or not kept:
@@ -2779,7 +2810,7 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
             # the task queue (!tasks / GET /task/{id}).
             _digest_record(
                 f"[{label}] #{task['id']}: {task['description']}\n"
-                f"Result: {result[:500]}"
+                f"Result: {_clip_result(result)}"
             )
 
         # No direct Telegram notification: the digest line above carries
