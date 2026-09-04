@@ -108,6 +108,7 @@ services:
       - ./workflows/llm_proxy.py:/app/llm_proxy.py:ro
       - ./workflows/models.json:/app/models.json:ro
       - ./workflows/scheduler.py:/app/scheduler.py:ro
+      - ./workflows/watchdog.py:/app/watchdog.py:ro
       - ./workflows/generators.py:/app/generators.py:ro
       - ./workflows/reddit_search.py:/app/reddit_search.py:ro
       - ./workflows/github_search.py:/app/github_search.py:ro

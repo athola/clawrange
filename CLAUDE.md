@@ -21,6 +21,8 @@ Tailscale and Caddy gateway.
   - `llm_proxy.py`: OpenAI-compatible proxy with tiered routing,
     web-search routing, anti-hallucination guard, balance circuit breaker
   - `scheduler.py`, `generators.py`: APScheduler jobs and generators
+  - `watchdog.py`: heartbeat watchdog — alerts Telegram directly when
+    OpenClaw heartbeats stall during active hours
   - `reddit_search.py`, `github_search.py`: marketing scanners
   - `telegram.py`: Telegram delivery
   - `tenant_profile.py`: declarative profile loader/validator/env-resolver

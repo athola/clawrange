@@ -16,6 +16,7 @@ from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from generators import GENERATORS
+from watchdog import register as register_watchdog
 
 logger = logging.getLogger("clawrange.scheduler")
 
@@ -34,6 +35,10 @@ def init_scheduler(brain_db) -> AsyncIOScheduler | None:
         for sched in schedules:
             if not sched.get("paused"):
                 _register_job(scheduler, sched, brain_db)
+
+        # Heartbeat watchdog: infrastructure, not a tenant schedule, so it
+        # registers directly and survives a wiped schedules table.
+        register_watchdog(scheduler)
 
         scheduler.start()
         logger.info("Scheduler started with %d active jobs", len(schedules))

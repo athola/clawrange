@@ -42,16 +42,24 @@ is due (at most once per hour) — OpenClaw relays non-empty responses to
 Telegram, so the cadence on the phone is one condensed message per
 hour, not one per 10-minute cycle.
 
-**Digest (hourly, only when there is buffered work):**
+**Digest (hourly, only when there is buffered work or open questions):**
 ```
 Heartbeat digest (N item(s) this hour):
 [ALEX|SYSTEM] #<id>: <description>
 Result: <summary>
 Created #<id> [P<n>] <description>
+Waiting on you: #<id> <description>
 Tiers: <tripped> TRIPPED | OpenRouter balance: $X.XX
 ```
 
 Any other cycle responds empty (silent).
+
+**Waiting-on-you lines** re-surface tasks whose result came back
+BLOCKED (a question for Alex) — they stay in the digest footer until a
+later task answers them or they age out (7 days), because the ask-once
+design otherwise goes mute while waiting on the answer. When the digest
+has no other content, it still sends as `Heartbeat digest: nothing new
+this hour.` plus those lines.
 
 **Relay the digest verbatim.** Do not expand it, reformat it, add
 headings, or append recommendations — the digest is already the
@@ -59,6 +67,16 @@ finished message. Telegram rejects a sendMessage body over 4096
 characters with a 400 and the whole delivery is dropped, so an
 elaborated digest can be lost entirely. The proxy caps what it hands
 over at 4096; that budget only holds if the text is passed through.
+
+## Watchdog (scheduler-side, not the heartbeat)
+
+The workflows APScheduler runs a 5-minute watchdog
+(`workflows/watchdog.py`) independent of OpenClaw: the proxy stamps
+every heartbeat arrival, and if none arrive for 15+ minutes during
+active hours (08:00–20:00 local), it messages Telegram directly. A
+wedged OpenClaw is otherwise total silence — the digest only flushes
+when a heartbeat prompt arrives. Re-alerts every 2h while stalled,
+one recovery notice when heartbeats return.
 
 ## Rules
 
