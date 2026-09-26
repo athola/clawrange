@@ -4,8 +4,10 @@ import os
 import tempfile
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from brain import create_brain_router
 from brain_db import BrainDB
 
 
@@ -22,8 +24,6 @@ def brain_db():
 @pytest.fixture
 def client(brain_db):
     """Create a TestClient with the brain router and test DB."""
-    from brain import create_brain_router
-    from fastapi import FastAPI
 
     app = FastAPI()
     router = create_brain_router(brain_db)

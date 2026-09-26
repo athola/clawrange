@@ -10,19 +10,94 @@ connection) and fail at startup.
 import json
 import logging
 import os
+import re
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.jobstores.memory import MemoryJobStore
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+from generators import GENERATORS
+from watchdog import register as register_watchdog
 
 logger = logging.getLogger("clawrange.scheduler")
+
+# Daily reports that must arrive even when workflows was down at fire time.
+# The jobstore is in-memory, so without this a restart spanning 08:00
+# silently drops that day's rundown.
+CATCH_UP_SCHEDULES = {"morning_digest", "homelab_deals"}
+CATCH_UP_WINDOW = timedelta(hours=4)
+CATCH_UP_DELAY = timedelta(seconds=90)  # let Telegram/LLM deps settle
+
+
+def _last_fire(cron: str, now: datetime, tz_name: str) -> datetime | None:
+    """Most recent cron fire at or before `now`, looking back one day."""
+    trigger = CronTrigger(**_parse_cron(cron), timezone=tz_name)
+    prev = None
+    fire = trigger.get_next_fire_time(None, now - timedelta(days=1))
+    while fire is not None and fire <= now:
+        prev = fire
+        fire = trigger.get_next_fire_time(fire, fire + timedelta(seconds=1))
+    return prev
+
+
+def _missed_fire(sched: dict, now: datetime, tz_name: str) -> datetime | None:
+    """Return the fire time a catch-up run should cover, or None.
+
+    Due when the latest fire is within CATCH_UP_WINDOW and either nothing
+    ran since it, or the run that did recorded a failed Telegram delivery.
+    Any other status after the fire counts as handled, so a --reload
+    restart or a crashing generator never re-sends on every boot.
+    """
+    prev = _last_fire(sched["cron"], now, tz_name)
+    if prev is None or now - prev > CATCH_UP_WINDOW:
+        return None
+    last_run = sched.get("last_run")
+    if last_run and datetime.fromisoformat(last_run) >= prev:
+        if not (sched.get("last_status") or "").startswith("FAILED"):
+            return None
+    return prev
+
+
+def _queue_catch_ups(
+    scheduler: AsyncIOScheduler, schedules: list, brain_db, tz_name: str
+) -> None:
+    now = datetime.now(ZoneInfo(tz_name))
+    for sched in schedules:
+        if sched.get("paused") or sched["kind"] not in CATCH_UP_SCHEDULES:
+            continue
+        try:
+            missed = _missed_fire(sched, now, tz_name)
+        except Exception as exc:
+            logger.warning("catch-up check failed for %s: %s", sched["id"], exc)
+            continue
+        if missed is None:
+            continue
+        kwargs = json.loads(sched.get("kwargs") or "{}")
+        kwargs["brain_db"] = brain_db
+        scheduler.add_job(
+            GENERATORS[sched["kind"]],
+            "date",
+            run_date=now + CATCH_UP_DELAY,
+            id=f"catchup_{sched['id']}",
+            kwargs=kwargs,
+            replace_existing=True,
+        )
+        logger.warning(
+            "catch-up: %s missed its %s fire; running at boot",
+            sched["id"],
+            missed.isoformat(),
+        )
 
 
 def init_scheduler(brain_db) -> AsyncIOScheduler | None:
     """Create and configure the scheduler. Returns None on failure."""
     try:
+        tz_name = os.getenv("SCHEDULER_TZ", "America/Chicago")
         scheduler = AsyncIOScheduler(
             jobstores={"default": MemoryJobStore()},
-            timezone=os.getenv("SCHEDULER_TZ", "America/Chicago"),
+            timezone=tz_name,
             job_defaults={"misfire_grace_time": 300, "coalesce": True},
         )
 
@@ -31,6 +106,14 @@ def init_scheduler(brain_db) -> AsyncIOScheduler | None:
         for sched in schedules:
             if not sched.get("paused"):
                 _register_job(scheduler, sched, brain_db)
+        try:
+            _queue_catch_ups(scheduler, schedules, brain_db, tz_name)
+        except Exception as exc:  # never let catch-up take the scheduler down
+            logger.warning("catch-up scan failed: %s", exc)
+
+        # Heartbeat watchdog: infrastructure, not a tenant schedule, so it
+        # registers directly and survives a wiped schedules table.
+        register_watchdog(scheduler)
 
         scheduler.start()
         logger.info("Scheduler started with %d active jobs", len(schedules))
@@ -42,7 +125,6 @@ def init_scheduler(brain_db) -> AsyncIOScheduler | None:
 
 def _register_job(scheduler: AsyncIOScheduler, sched: dict, brain_db) -> None:
     """Register a single schedule as an APScheduler job."""
-    from generators import GENERATORS
 
     kind = sched["kind"]
     if kind not in GENERATORS:
@@ -98,7 +180,6 @@ def _parse_cron(cron_str: str) -> dict:
 
 def _parse_duration(duration_str: str) -> dict:
     """Convert 'every Nh' or 'every Nm' to cron-like interval kwargs."""
-    import re
 
     match = re.match(r"every\s+(\d+)\s*([mhd])", duration_str.lower())
     if not match:
@@ -179,8 +260,6 @@ async def run_schedule_now(
     if not sched:
         raise ValueError(f"Schedule not found: {schedule_id}")
 
-    from generators import GENERATORS
-
     kind = sched["kind"]
     if kind not in GENERATORS:
         raise ValueError(f"Unknown generator kind: {kind}")
@@ -190,12 +269,16 @@ async def run_schedule_now(
 
     try:
         await GENERATORS[kind](**kwargs)
-        now = (
-            __import__("datetime")
-            .datetime.now(__import__("datetime").timezone.utc)
-            .isoformat()
-        )
-        brain_db.update_schedule_status(sched["id"], now, "ok")
+        # Generators that record their own outcome (e.g. morning_digest's
+        # "delivered N/N msgs") keep it; the catch-up check depends on it.
+        after = brain_db.get_schedule(sched["id"]) or {}
+        if after.get("last_run") == sched.get("last_run"):
+            now = (
+                __import__("datetime")
+                .datetime.now(__import__("datetime").timezone.utc)
+                .isoformat()
+            )
+            brain_db.update_schedule_status(sched["id"], now, "ok")
         return {"status": "ok", "schedule_id": sched["id"]}
     except Exception as exc:
         now = (

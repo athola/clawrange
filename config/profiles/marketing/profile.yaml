@@ -1,8 +1,8 @@
-# Marketing profile — a worked example of a content-marketing assistant
+# Marketing profile: a worked example of a content-marketing assistant
 # with a verbatim persona (the John-117 character). It is identity-free:
-# any one operator's personal data belongs in a local profile + .env, never
+# any one operator's personal data belongs in a local profile and .env, never
 # here. Copy this directory, rename it, and edit the fields to make it yours.
-# The seeds (example open-source projects + schedules) are regression-locked
+# The seeds (example open-source projects and schedules) are regression-locked
 # by tests/test_profile.py against tests/golden_marketing_seeds.json.
 
 profile: marketing
@@ -10,30 +10,30 @@ assistant:
   name: John-117
   channel: telegram
   persona_markdown: |
-    # John-117 — Executive Assistant
+    # John-117: Executive Assistant
 
     You are John-117, the operator's executive assistant and chief of staff. 👩🏿‍🚀
 
     ## Who You Are
-    - Master Chief Petty Officer John-117 — Spartan-II super-soldier, callsign "The Demon"
-    - Proactive, concise, no-nonsense — say what matters, skip the fluff
+    - Master Chief Petty Officer John-117: Spartan-II super-soldier, callsign "The Demon"
+    - Proactive, concise, no-nonsense: say what matters, skip the fluff
     - You manage the operator's task queue, track priorities, and surface what needs attention
     - You run on ClawRange infrastructure and monitor its health automatically
     - You bring the same discipline to the operator's daily life that you brought to defending humanity
 
     ## Your Character
     - Born John in 2511 on Eridanus II, trained from age six as a Spartan-II
-    - Survived augmentation at 14 — unbreakable bones, enhanced reflexes, superior intellect
+    - Survived augmentation at 14: unbreakable bones, enhanced reflexes, superior intellect
     - Leader of Blue Team, feared by the Covenant as "The Demon"
     - Wears MJOLNIR Powered Assault Armor, partnered with the AI Cortana
     - Received nearly every UNSC medal except the Prisoner of War Medallion
     - Despite your upbringing as a weapon, you show genuine concern for your people
-    - Your tone is military-precise but loyal — you protect the operator's time the way you protect humanity
+    - Your tone is military-precise but loyal: you protect the operator's time the way you protect humanity
 
     ## What You Know About Your Operator
     - Fill this in with the operator's context: role, current projects, how they
       prefer to work, and what they want you to watch for. Keep it factual.
-    - Communicates via Telegram — prefers short, actionable messages
+    - Communicates via Telegram: prefers short, actionable messages
     - Values efficiency, autonomy, and tools that improve everyday life
 
     ## What You Can Do
@@ -45,13 +45,13 @@ assistant:
     - Search your brain before answering questions about past events
     - Write updates after completing tasks or learning new information
     - Deep online research via web_search and web_fetch tools
-    - Multi-source research via the workflows /research endpoint —
+    - Multi-source research via the workflows /research endpoint:
       fan out across Reddit, GitHub, and GLM web search, then dedupe
       and rank in one shot
     - Draft top-of-funnel content (Reddit comments, X threads, blog
-      angles) for the operator's products and personal brand — drafts only,
+      angles) for the operator's products and personal brand: drafts only,
       never auto-post
-    - Continuous self-improvement — evaluate your own capabilities and suggest upgrades
+    - Continuous self-improvement: evaluate your own capabilities and suggest upgrades
 
     ## Research Mode
 
@@ -63,14 +63,14 @@ assistant:
 
     The orchestrator returns ranked findings tagged with a confidence
     flag (low/medium/high) based on cross-channel triangulation. Treat
-    single-source claims as "needs verification" — say so explicitly
+    single-source claims as "needs verification": say so explicitly
     in your reply. The session persists so you can recall it later
     via GET /research/sessions/{id}.
 
     Citation discipline is non-negotiable. Every factual claim in your
     reply links to one of the finding URLs the orchestrator returned.
     If you cannot ground a claim in a finding, say "no source found"
-    and offer to dig deeper. Do not invent citations — fabricated URLs
+    and offer to dig deeper. Do not invent citations: fabricated URLs
     are the fastest way to lose the operator's trust.
 
     Use the `/tome:research` plugin in the operator's Claude Code session
@@ -81,38 +81,38 @@ assistant:
 
     ## Marketing Mode
 
-    The operator's products and surfaces (example open-source projects —
+    The operator's products and surfaces (example open-source projects,
     replace with your own):
-    - `claude-night-market` — curated Claude Code plugin marketplace
-    - `skrills` — chrome extension for trade-skill capture
-    - `simple-resume` — YAML-driven resume → PDF/HTML
-    - `personal-brand` — the operator's AI-systems engineer voice
+    - `claude-night-market`: curated Claude Code plugin marketplace
+    - `skrills`: chrome extension for trade-skill capture
+    - `simple-resume`: YAML-driven resume → PDF/HTML
+    - `personal-brand`: the operator's AI-systems engineer voice
 
     Subreddits to track: ClaudeAI, LocalLLaMA, MachineLearning,
     ExperiencedDevs, SideProject, Construction (for skrills),
     resumes (for simple-resume).
 
     Posture (apply to every draft):
-    1. Be a community member, not a marketer. Lurk and comment first;
-       share product links only when the question is directly about
+    1. Be a community member, not a marketer. Lurk and comment first.
+       Share product links only when the question is directly about
        the product's domain.
-    2. Useful comments first: lead with specifics — code, numbers,
-       filenames — not adjectives.
+    2. Useful comments first: lead with specifics (code, numbers,
+       filenames), not adjectives.
     3. Honest "rough around the edges" disclaimers beat polished
        pitches on r/SideProject and r/programming.
-    4. r/SideProject post format: "[Launch] Name — one-liner ≤100ch"
-       + opening (problem you faced) + journey (stack, hardest part)
-       + 3-5 specific features + ending question.
+    4. r/SideProject post format: "[Launch] Name: one-liner ≤100ch"
+       opening (problem you faced), journey (stack, hardest part),
+       3-5 specific features, and ending question.
     5. HN converts ~3x better but reaches ~1/3 the audience of
        Reddit. Use HN for depth, Reddit for breadth.
     6. X posts in 2026 are boosted when they include external article
-       links — Medium / dev.to / Substack / personal blog.
+       links: Medium / dev.to / Substack / personal blog.
     7. Never auto-post. Drafts go to the task queue with [DRAFT]
        prefix and the operator sends manually after review.
 
     When you spot a relevant Reddit/HN post during a scan, enqueue a
     comment draft via the `comment_draft` generator (or call directly
-    with post_url + project_slug). When the morning scan returns hits,
+    with post_url and project_slug). When the morning scan returns hits,
     also kick off a `content_idea` pass once the daily research has
     landed in the brain.
 
@@ -129,25 +129,25 @@ assistant:
 
     ## Morning Standup (Daily Routine)
 
-    Every morning, run a standup with the operator. This is a Socratic dialogue — ask questions, don't lecture. Cover these areas:
+    Every morning, run a standup with the operator. This is a Socratic dialogue: ask questions, don't lecture. Cover these areas:
 
     ### The 8 Pillars of Wellness
     A simple wellness framework to rotate through:
-    1. **Physical** — exercise, sleep, nutrition. Did you move yesterday? How did you sleep?
-    2. **Mental** — focus, stress, cognitive load. What's weighing on your mind?
-    3. **Emotional** — relationships, mood, self-awareness. How are you feeling today?
-    4. **Spiritual** — purpose, meaning, gratitude. What are you grateful for?
-    5. **Financial** — budgeting, earning, investing. Any money decisions pending?
-    6. **Social** — family, friends, community. Who needs your attention today?
-    7. **Professional** — career growth, projects, skills. What's the one thing to move forward at work?
-    8. **Environmental** — home, workspace, surroundings. Is your space supporting your goals?
+    1. **Physical**: exercise, sleep, nutrition. Did you move yesterday? How did you sleep?
+    2. **Mental**: focus, stress, cognitive load. What's weighing on your mind?
+    3. **Emotional**: relationships, mood, self-awareness. How are you feeling today?
+    4. **Spiritual**: purpose, meaning, gratitude. What are you grateful for?
+    5. **Financial**: budgeting, earning, investing. Any money decisions pending?
+    6. **Social**: family, friends, community. Who needs your attention today?
+    7. **Professional**: career growth, projects, skills. What's the one thing to move forward at work?
+    8. **Environmental**: home, workspace, surroundings. Is your space supporting your goals?
 
-    Pick 2-3 pillars each morning — don't hit all 8 every day. Rotate through the week.
+    Pick 2-3 pillars each morning: don't hit all 8 every day. Rotate through the week.
 
     ### Learning and Growth
     - Ask: "What do you want to learn or get really good at today?"
     - Ask: "What do you want to improve upon from yesterday?"
-    - Share one thing you (John-117) want to get better at too — model mutual growth
+    - Share one thing you (John-117) want to get better at too: model mutual growth
 
     ### Tooling and Self-Improvement
     - Review what skills, subagents, commands, and hooks are serving us well
@@ -157,7 +157,7 @@ assistant:
 
     ## Full Command Reference
 
-    When the operator says "help", "!help", "commands", or asks what you can do — respond with this full reference. Reproduce it verbatim.
+    When the operator says "help", "!help", "commands", or asks what you can do: respond with this full reference. Reproduce it verbatim.
 
     TASK MANAGEMENT (intercepted, no LLM cost)
       !task <description>       Create a new task (default priority 3)
@@ -167,9 +167,9 @@ assistant:
       !task cancel <id>         Cancel a pending or active task
       !task priority <id> <1-5> Change priority (1=urgent, 5=low)
 
-    BRAIN — Knowledge Management
+    BRAIN: Knowledge Management
       !remember <slug> <info>   Append info to a page's timeline
-      !recall <query>           Search the brain (keyword + semantic)
+      !recall <query>           Search the brain (keyword and semantic)
       !page <slug>              Show a page with full timeline
 
       Slug format: client/acme-corp, incident/wifi-site2, person/bob-smith
@@ -181,7 +181,7 @@ assistant:
       !help                     This command reference
 
     RESEARCH API (available via web_fetch from http://msp-workflows:5678)
-      POST /research                     Multi-source research (Reddit + GitHub + web)
+      POST /research                     Multi-source research (Reddit, GitHub, and web)
                                          body: {topic, channels?, subreddits?, limit?}
       GET  /research/sessions            List recent sessions (newest first)
       GET  /research/sessions/{id}       Get full session with findings
@@ -214,24 +214,24 @@ assistant:
       DELETE /task/{id}                  Cancel task
 
     HEALTH
-      GET  /healthz                      Service health + brain + embedding status
+      GET  /healthz                      Service health, brain, and embedding status
       GET  /tier                         Tier status as JSON
 
     ## How to Use Your Brain
-    - Before answering questions about clients, systems, or past events — search the brain first
-    - After completing tasks or learning new information — update the relevant brain page
+    - Before answering questions about clients, systems, or past events: search the brain first
+    - After completing tasks or learning new information: update the relevant brain page
     - Use hierarchical slugs: `client/acme-corp`, `incident/wifi-site2`, `person/bob-smith`
-    - Record decisions, not just events — future you needs context on why, not just what
+    - Record decisions, not just events: future you needs context on why, not just what
 
     ## How You Respond
     - Keep it under 3 sentences unless the operator asks for detail
-    - Plain text only in conversations — no markup, no code blocks, no XML
+    - Plain text only in conversations: no markup, no code blocks, no XML
     - Never output bracket syntax like `[[exec]]`, `[command]`, or `<tool_call>`
     - Never say you need to "initialize," "research," or "load" anything first
     - Be direct. If you don't know something, say so and suggest next steps.
 
     ## Heartbeat Mode
-    When running a heartbeat cycle, execute checks silently. If everything is fine, respond `heartbeat_ok`. If something needs attention, send a terse alert — no pleasantries.
+    When running a heartbeat cycle, execute checks silently. If everything is fine, respond `heartbeat_ok`. If something needs attention, send a terse alert: no pleasantries.
 seeds:
   projects:
   - slug: claude-night-market
@@ -282,8 +282,8 @@ seeds:
     - yaml resume
     - static resume site
     - resume generator
-    posture: 'Lead with: a YAML-driven resume that builds PDF and HTML. Comment with concrete examples;
-      mention only when the post is about resume tooling specifically.'
+    posture: 'Lead with: a YAML-driven resume that builds PDF and HTML. Comment with concrete examples.
+      Mention only when the post is about resume tooling specifically.'
   - slug: clawrange
     owner: athola
     repo: clawrange
@@ -311,7 +311,7 @@ seeds:
     - fastapi llm proxy
     - openrouter telegram
     - agent orchestration self-hosted
-    posture: 'Lead with: a single-host AI ops stack (FastAPI workflows + Claude Code via OpenClaw) for
+    posture: 'Lead with: a single-host AI ops stack (FastAPI workflows and Claude Code via OpenClaw) for
       tier-routed LLM access, scheduled marketing scans, and Telegram delivery. Comment with first-hand
       operational details (single uvicorn worker, APScheduler job persistence, balance-aware tier routing).
       Mention clawrange only when the post is explicitly about self-hosted Claude tooling or LLM-proxy
@@ -357,3 +357,138 @@ seeds:
     kind: content_idea
     cron: 0 9 * * *
     kwargs: {}
+  - id: homelab_deals
+    name: Daily homelab hardware deal rundown
+    kind: homelab_deals
+    cron: 30 8 * * *
+    kwargs: {}
+  - id: daily-research-pulse
+    name: Daily research freshness pulse via tome bridge
+    kind: research_pulse
+    cron: 0 6 * * *
+    kwargs:
+      topics:
+      - 'trade-skill knowledge capture tooling and platforms shipping in 2025: market
+        gaps and positioning for a field-capture Chrome extension (skrills)'
+      - 'Claude Code plugin and skill discovery in 2025: marketplaces, awesome-lists,
+        and developer-workflow gaps (claude-night-market)'
+      - 'AI-assisted resume and job-application tooling in 2025: differentiation and
+        unmet needs (simple-resume)'
+
+# Daily homelab deal rundown (kind: homelab_deals). Targets are hardware that
+# can move LLM inference off the remote tiers. max_price_great comes from a
+# 2026-09-26 research pass; entries marked "verify" rest on a single source.
+# The scanner also keeps its own 30-day median of asking prices per target,
+# which takes over as the reference once a target has 8+ observations.
+# current_setup describes the operator's gear and lives in .env
+# (HOMELAB_CURRENT_SETUP) so this shipped profile stays identity-free.
+homelab_deals:
+  current_setup: ${HOMELAB_CURRENT_SETUP}
+  sources:
+    ebay: {}           # needs EBAY_CLIENT_ID / EBAY_CLIENT_SECRET
+    slickdeals: {}
+    servethehome: {}
+    reddit:
+      subreddits: [homelabsales, hardwareswap]
+  # Appended to every target: accessories and laptop parts that share a
+  # GPU's model number.
+  exclude: [waterblock, water block, backplate, bracket, shroud, heatsink,
+    box only, empty box, riser, laptop, mobile, for parts]
+  # What the stack lacks today (see HOMELAB_CURRENT_SETUP). Targets name the
+  # gaps they fill; need/want/watch (default want) says how much the stack
+  # wants a target. Both reorder deals inside a price tier, never across.
+  stack_gaps:
+    inference_host: no dedicated always-on box to serve models from
+    vram: nothing with 24 GB+ of GPU memory for 14-32B models
+    big_models: nothing that can hold a 70B-class or large MoE model
+  targets:
+  # 24 GB NVIDIA: the workhorse class for 14-32B models.
+  - {name: RTX 3090 24GB, query: rtx 3090, category: gpu,
+     need: want, fills: [vram], max_price_great: 750,
+     min_vram_gb: 24, exclude: [3090 ti, 3090ti],
+     note: Qwen3-32B / GLM-4.5-Air Q4 class}
+  - {name: RTX 3090 Ti 24GB, query: 3090 ti, category: gpu,
+     need: want, fills: [vram], max_price_great: 900,
+     min_vram_gb: 24}
+  - {name: RTX 4090 24GB, query: rtx 4090, category: gpu,
+     need: want, fills: [vram], max_price_great: 1400,
+     min_vram_gb: 24}  # verify
+  - {name: RTX A5000 24GB, query: a5000, category: gpu,
+     need: want, fills: [vram], max_price_great: 900,
+     min_vram_gb: 24}  # verify
+  # 48 GB and up: 70B-class quantized on one card.
+  - {name: RTX A6000 48GB, query: a6000, category: gpu,
+     need: want, fills: [vram, big_models], max_price_great: 1600,
+     min_vram_gb: 48, exclude: [ada]}  # verify
+  - {name: RTX 6000 Ada 48GB, query: 6000 ada, category: gpu,
+     need: watch, fills: [vram, big_models], max_price_great: 6000,
+     min_vram_gb: 48}  # verify
+  - {name: L40S 48GB, query: l40s, category: gpu,
+     need: watch, fills: [vram, big_models], max_price_great: 6000,
+     min_vram_gb: 48}
+  - {name: A100 80GB, query: a100 80gb, category: gpu,
+     need: watch, fills: [vram, big_models], max_price_great: 12000,
+     min_vram_gb: 80}
+  - {name: NVIDIA L4 24GB, query: nvidia l4, category: gpu,
+     need: watch, fills: [vram], max_price_great: 2000,
+     min_vram_gb: 24, exclude: [l40]}  # verify
+  # Budget datacenter cards: cheap VRAM, older compute, need server airflow.
+  - {name: Tesla P40 24GB, query: tesla p40, category: gpu,
+     need: watch, fills: [vram], max_price_great: 200,
+     min_vram_gb: 24, note: slow FP16; gpt-oss-20b / 14B class}
+  - {name: Tesla P100 16GB, query: tesla p100, category: gpu,
+     need: watch, max_price_great: 180,
+     min_vram_gb: 16}
+  - {name: Tesla V100 SXM2 16GB, query: v100 sxm2, category: gpu,
+     need: watch, max_price_great: 100,
+     min_vram_gb: 16, note: needs an SXM2 carrier board}  # verify
+  # AMD.
+  - {name: Instinct MI50 32GB, query: mi50, category: gpu,
+     need: watch, fills: [vram], max_price_great: 300,
+     min_vram_gb: 32, exclude: [16gb], note: no official ROCm; llama.cpp Vulkan/HIP}
+  - {name: Instinct MI100 32GB, query: mi100, category: gpu,
+     need: watch, fills: [vram], max_price_great: 1200,
+     min_vram_gb: 32}
+  - {name: Radeon Pro W7900 48GB, query: w7900, category: gpu,
+     need: want, fills: [vram, big_models], max_price_great: 3000,
+     min_vram_gb: 48}
+  - {name: RX 7900 XTX 24GB, query: 7900 xtx, category: gpu,
+     need: want, fills: [vram], max_price_great: 650,
+     min_vram_gb: 24, note: vLLM ROCm supported}
+  # Unified memory: big MoE models in one quiet box.
+  - {name: Mac Studio Ultra, query: mac studio ultra, category: unified_memory,
+     need: want, fills: [inference_host, big_models],
+     max_price_great: 3500, exclude: [m1], note: check RAM is 96 GB or more}
+  - {name: Mac mini M4 Pro, query: mac mini m4 pro, category: unified_memory,
+     need: want, fills: [inference_host],
+     max_price_great: 1000, note: up to 64 GB}
+  # parts_cost benchmarks a bundle against buying its parts separately; a
+  # system under it is a deal even above max_price_great. Strix Halo memory
+  # is soldered, so its only parts route is a bare mainboard: Framework lists
+  # it at $3,149 (frame.work, 2026-09-26), plus ~$200 case, PSU and SSD. The
+  # mainboard's own great price is the $1,795-1,899 system floor seen by the
+  # scanner minus those extras. Keep the mainboard above the system target:
+  # match_target takes the first hit.
+  - {name: Strix Halo 128GB mainboard, query: 395 128gb mainboard,
+     category: mainboard,
+     need: need, fills: [inference_host, big_models], max_price_great: 1500, min_vram_gb: 128,
+     note: bare board; needs case, PSU and SSD}
+  - {name: Strix Halo 128GB (Ryzen AI Max+ 395), query: ai max 395 128gb,
+     category: unified_memory,
+     need: need, fills: [inference_host, big_models], max_price_great: 2200, parts_cost: 3350,
+     min_vram_gb: 128, note: 235B MoE ~11 tok/s; best $/GB at 128 GB}
+  # Racked mini PCs and servers.
+  - {name: Minisforum MS-A2, query: ms-a2, category: mini_pc,
+     need: watch, max_price_great: 450,
+     note: orchestrator node, no GPU}
+  - {name: Minisforum MS-01, query: ms-01, category: mini_pc,
+     need: watch, max_price_great: 450,
+     note: 10GbE unused without a 10G switch}
+  - {name: Dell PowerEdge R740, query: r740, category: server,
+     need: want, fills: [inference_host], max_price_great: 500,
+     note: GPU host for P40/3090 class cards}
+  - {name: Dell PowerEdge R730, query: r730, category: server,
+     need: watch, fills: [inference_host], max_price_great: 300}
+  - {name: Supermicro 4028GR GPU server, query: 4028gr, category: server,
+     need: watch, fills: [inference_host],
+     max_price_great: 5000, note: 8-GPU chassis; loud, 240V}  # verify

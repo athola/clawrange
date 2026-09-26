@@ -1,4 +1,4 @@
-# starter — the identity-free default profile shipped with ClawRange.
+# starter: the identity-free default profile shipped with ClawRange.
 #
 # A fresh clone runs on this profile (CLAWRANGE_PROFILE unset -> starter), so
 # the repo never carries anyone's personal data. To build your own assistant,
@@ -11,7 +11,7 @@
 #
 # For a richer worked example see `lead-crm` (a business/CRM assistant) or
 # `marketing` (a content-marketing assistant). ${VAR} tokens resolve from the
-# environment at load time; an unset var resolves to "" and never crashes boot.
+# environment at load time. An unset var resolves to "" and never crashes boot.
 #
 # No persona_markdown: the generic openclaw/soul.template.md is filled from the
 # structured fields below, so you write data, not prose.

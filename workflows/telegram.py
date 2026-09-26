@@ -1,7 +1,9 @@
 """Telegram notification module — sends alerts to a single authorized chat."""
 
+import asyncio
 import logging
 import os
+from collections.abc import Awaitable, Callable
 
 import httpx
 
@@ -10,6 +12,10 @@ logger = logging.getLogger("clawrange.telegram")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+# Telegram rejects a sendMessage body over 4096 chars; stay a little under
+# so the plain-text retry never tips a chunk over the edge.
+MAX_CHARS = 4000
 
 
 async def notify(text: str) -> bool:
@@ -51,6 +57,66 @@ async def notify(text: str) -> bool:
     except httpx.HTTPError as exc:
         logger.error("Telegram request failed: %s", exc)
         return False
+
+
+def split_text(text: str, limit: int = MAX_CHARS) -> list[str]:
+    """Split a long report into sendable chunks.
+
+    Packs whole paragraphs, then whole lines, so a `[title](url)` line is
+    never cut in half. Only a single line longer than `limit` is hard-split,
+    at a word boundary when it has one.
+    """
+    if len(text) <= limit:
+        return [text]
+
+    pieces: list[str] = []
+    for line in text.split("\n"):
+        while len(line) > limit:
+            cut = line.rfind(" ", 0, limit)
+            if cut <= 0:
+                cut = limit
+            pieces.append(line[:cut].rstrip())
+            line = line[cut:].lstrip()
+        pieces.append(line)
+
+    chunks: list[str] = []
+    current = ""
+    for piece in pieces:
+        candidate = f"{current}\n{piece}" if current else piece
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current.strip():
+            chunks.append(current.strip("\n"))
+        current = piece
+    if current.strip():
+        chunks.append(current.strip("\n"))
+    return chunks
+
+
+async def notify_long(
+    text: str,
+    attempts: int = 3,
+    backoff: float = 2.0,
+    _sleep: Callable[[float], Awaitable[None]] | None = None,
+) -> tuple[int, int]:
+    """Send a report of any length as consecutive messages.
+
+    Each chunk is retried with exponential backoff. Returns
+    `(chunks_sent, chunks_total)` so callers can record partial delivery
+    instead of treating it as success.
+    """
+    sleep = _sleep or asyncio.sleep
+    chunks = split_text(text)
+    sent = 0
+    for chunk in chunks:
+        for attempt in range(attempts):
+            if await notify(chunk):
+                sent += 1
+                break
+            if attempt < attempts - 1:
+                await sleep(backoff * (2**attempt))
+    return sent, len(chunks)
 
 
 async def send_typing() -> bool:

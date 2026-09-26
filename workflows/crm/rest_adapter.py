@@ -17,7 +17,7 @@ import logging
 
 import httpx
 
-from .adapter import CRMAdapter
+from .adapter import CRMAdapter, RecordList
 
 logger = logging.getLogger("clawrange.crm.rest")
 
@@ -74,7 +74,7 @@ class RestCRM(CRMAdapter):
         rows = data if isinstance(data, list) else data.get("results", [])
         return rows[:limit]
 
-    def run_template(self, template: dict, params: dict) -> list[dict]:
+    def run_template(self, template: dict, params: dict) -> RecordList:
         raise NotImplementedError(
             "RestCRM.run_template: REST/SaaS CRMs do not execute ad-hoc SQL. "
             "Define a server-side report or saved view in your CRM and map it "

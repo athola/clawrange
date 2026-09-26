@@ -1,8 +1,9 @@
 """Tests for the Telegram notification module."""
 
+from unittest.mock import AsyncMock, patch
+
 import httpx
 import pytest
-from unittest.mock import AsyncMock, patch
 
 import telegram
 
@@ -243,3 +244,76 @@ class TestDeleteMessage:
             patch("telegram.httpx.AsyncClient", return_value=mock_client),
         ):
             assert await telegram.delete_message(42) is False
+
+
+# ─── split_text() / notify_long() ────────────────────────────────
+
+
+class TestSplitText:
+    """GIVEN a report longer than Telegram's 4096-char cap
+    WHEN split_text() chunks it
+    THEN every chunk fits and no Markdown link is cut in half."""
+
+    def test_short_text_is_one_chunk(self):
+        assert telegram.split_text("hello", limit=100) == ["hello"]
+
+    def test_splits_on_paragraph_boundaries(self):
+        paras = [f"para {i} " + "x" * 40 for i in range(10)]
+        chunks = telegram.split_text("\n\n".join(paras), limit=120)
+        assert all(len(c) <= 120 for c in chunks)
+        # Paragraphs are never split mid-way when each fits.
+        rejoined = "\n\n".join(chunks)
+        for p in paras:
+            assert p in rejoined
+
+    def test_never_cuts_inside_a_markdown_link(self):
+        line = "• [A long thread title](https://reddit.com/r/x/comments/abc123)"
+        text = "\n".join([line] * 30)
+        chunks = telegram.split_text(text, limit=200)
+        assert len(chunks) > 1
+        for c in chunks:
+            assert len(c) <= 200
+            for ln in c.splitlines():
+                assert ln == line
+
+    def test_hard_splits_a_single_oversized_line(self):
+        chunks = telegram.split_text("word " * 100, limit=50)
+        assert all(len(c) <= 50 for c in chunks)
+        assert "".join(chunks).replace(" ", "") == ("word" * 100)
+
+
+class TestNotifyLong:
+    """GIVEN a multi-chunk report
+    WHEN notify_long() sends it
+    THEN each chunk is retried on failure and the sent count is reported."""
+
+    @pytest.mark.asyncio
+    async def test_sends_every_chunk(self, monkeypatch):
+        sent: list[str] = []
+
+        async def fake_notify(text):
+            sent.append(text)
+            return True
+
+        monkeypatch.setattr(telegram, "notify", fake_notify)
+        text = "\n\n".join(["y" * 3000, "z" * 3000])
+        ok, total = await telegram.notify_long(text, _sleep=AsyncMock())
+        assert (ok, total) == (2, 2)
+        assert len(sent) == 2
+
+    @pytest.mark.asyncio
+    async def test_retries_a_failed_chunk(self, monkeypatch):
+        results = iter([False, False, True])
+        monkeypatch.setattr(
+            telegram, "notify", AsyncMock(side_effect=lambda _t: next(results))
+        )
+        sleep = AsyncMock()
+        ok, total = await telegram.notify_long("hi", attempts=3, _sleep=sleep)
+        assert (ok, total) == (1, 1)
+        assert sleep.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_reports_zero_when_all_attempts_fail(self, monkeypatch):
+        monkeypatch.setattr(telegram, "notify", AsyncMock(return_value=False))
+        ok, total = await telegram.notify_long("hi", attempts=2, _sleep=AsyncMock())
+        assert (ok, total) == (0, 1)

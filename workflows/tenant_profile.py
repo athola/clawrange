@@ -33,6 +33,10 @@ KNOWN_SINK_KINDS = {"crm"}
 KNOWN_TRANSFORM_KINDS = {"leads_clean", "passthrough"}
 KNOWN_ADAPTERS = {"sqlite", "rest"}
 KNOWN_AUTH_KINDS = {"none", "api_key", "bearer", "basic", "login_form"}
+# Mirrors deal_sources.gather: a typo'd source fails at load, not at 08:30.
+KNOWN_DEAL_SOURCE_KINDS = {"ebay", "slickdeals", "servethehome", "reddit"}
+IDENTITY_FIELDS = {"name", "creature", "vibe", "emoji", "avatar"}
+EMOJI_MAX_LEN = 16
 
 
 class ProfileError(ValueError):
@@ -141,6 +145,10 @@ def validate(
         )
 
     if known_generator_kinds is None:
+        # Function-local on purpose: generators imports tenant_profile at
+        # module level, so a top-level import here would be circular. The
+        # `known_generator_kinds` parameter lets tests inject the registry
+        # without importing generators at all.
         from generators import GENERATORS
 
         known_generator_kinds = set(GENERATORS)
@@ -171,6 +179,21 @@ def validate(
                 f"connector '{c.get('id')}' has unknown sink kind '{sink.get('kind')}'"
             )
 
+    assistant = profile.raw.get("assistant") or {}
+    identity = assistant.get("identity")
+    if identity is not None:
+        if not isinstance(identity, dict):
+            raise ProfileError("assistant.identity must be a mapping")
+        unknown = set(identity) - IDENTITY_FIELDS
+        if unknown:
+            raise ProfileError(
+                f"assistant.identity has unknown keys {sorted(unknown)} "
+                f"(known: {sorted(IDENTITY_FIELDS)})"
+            )
+        emoji = identity.get("emoji", "")
+        if emoji and len(str(emoji)) > EMOJI_MAX_LEN:
+            raise ProfileError("assistant.identity.emoji is too long")
+
     crm = profile.crm
     if crm is not None:
         adapter = crm.get("adapter")
@@ -178,6 +201,8 @@ def validate(
             raise ProfileError(
                 f"crm.adapter '{adapter}' is unknown (known: {sorted(KNOWN_ADAPTERS)})"
             )
+
+    _validate_homelab_deals(profile.raw.get("homelab_deals"))
 
     for s in profile.schedules:
         kind = s.get("kind")
@@ -192,6 +217,52 @@ def validate(
                 f"schedule '{s.get('id')}' references undefined connector "
                 f"'{connector_ref}'"
             )
+
+
+def _validate_homelab_deals(block: dict | None) -> None:
+    if block is None:
+        return
+    for source in block.get("sources") or {}:
+        if source not in KNOWN_DEAL_SOURCE_KINDS:
+            raise ProfileError(
+                f"homelab_deals source '{source}' is unknown "
+                f"(known: {sorted(KNOWN_DEAL_SOURCE_KINDS)})"
+            )
+    gaps = block.get("stack_gaps") or {}
+    names: set[str] = set()
+    for t in block.get("targets") or []:
+        name = t.get("name")
+        if not name or not t.get("query"):
+            raise ProfileError(f"homelab_deals target {t!r} needs name and query")
+        price = t.get("max_price_great")
+        if isinstance(price, bool) or not isinstance(price, int | float) or price <= 0:
+            raise ProfileError(
+                f"homelab_deals target '{name}' max_price_great must be a "
+                f"positive number, got {price!r}"
+            )
+        parts = t.get("parts_cost")
+        if parts is not None and (
+            isinstance(parts, bool) or not isinstance(parts, int | float) or parts <= 0
+        ):
+            raise ProfileError(
+                f"homelab_deals target '{name}' parts_cost must be a "
+                f"positive number, got {parts!r}"
+            )
+        need = t.get("need", "want")
+        if need not in ("need", "want", "watch"):
+            raise ProfileError(
+                f"homelab_deals target '{name}' need must be need, want or "
+                f"watch, got {need!r}"
+            )
+        unknown = [g for g in t.get("fills") or [] if g not in gaps]
+        if unknown:
+            raise ProfileError(
+                f"homelab_deals target '{name}' fills {unknown} not declared "
+                f"in stack_gaps (known: {sorted(gaps)})"
+            )
+        if name in names:
+            raise ProfileError(f"homelab_deals target '{name}' is duplicated")
+        names.add(name)
 
 
 def load_profile(

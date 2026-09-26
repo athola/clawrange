@@ -16,6 +16,7 @@ import pytest  # noqa: E402
 @pytest.fixture()
 def client():
     from fastapi.testclient import TestClient
+
     from app import app
 
     return TestClient(app)
@@ -28,6 +29,7 @@ def _reset_brain_db():
     from app import brain_db
 
     for table in (
+        "persona_learnings",
         "research_findings",
         "research_sessions",
         "tasks",
@@ -51,8 +53,29 @@ def _reset_brain_db():
     try:
         brain_db._conn.execute("DELETE FROM pages_fts")
         brain_db._conn.execute(
-            "INSERT INTO pages_fts(slug, title, compiled) SELECT slug, title, compiled FROM pages"
+            "INSERT INTO pages_fts(slug, title, compiled) "
+            "SELECT slug, title, compiled FROM pages"
         )
     except Exception:
         pass
     brain_db._conn.commit()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_digest_state(tmp_path, monkeypatch):
+    """Keep the heartbeat digest off /data and mid-interval by default.
+
+    In production a missing state file means "due now", so a fresh deploy
+    does not cost a silent hour. Without this fixture every test that runs a
+    heartbeat would flush a digest, and every one would try to write the
+    real /data path. Tests that exercise the digest itself override both.
+    """
+    import time
+
+    monkeypatch.setenv("HEARTBEAT_DIGEST_STATE", str(tmp_path / "digest.json"))
+    import llm_proxy
+
+    monkeypatch.setattr(
+        llm_proxy, "_digest_state", {"lines": [], "last_flush": time.time()}
+    )
+    yield

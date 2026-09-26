@@ -21,7 +21,8 @@ TEMPLATES = [
         "name": "leads_by_status",
         "description": "Lead counts grouped by status.",
         "params": {},
-        "sql": "SELECT status, COUNT(*) AS n FROM leads GROUP BY status ORDER BY n DESC",
+        "sql": "SELECT status, COUNT(*) AS n FROM leads GROUP BY status "
+        "ORDER BY n DESC",
     },
 ]
 

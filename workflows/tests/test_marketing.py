@@ -2,6 +2,7 @@
 generators, scheduler, and marketing command parsing."""
 
 import json
+from datetime import UTC
 
 import pytest
 
@@ -372,6 +373,46 @@ class TestGenerators:
         assert any("reddit.com/r/Construction" in t["description"] for t in idea_tasks)
 
     @pytest.mark.asyncio
+    async def test_content_idea_task_omits_empty_url_parens(self):
+        """
+        GIVEN a recent research finding with no URL (e.g. a TRIZ analogy)
+        WHEN content_idea_generator runs
+        THEN the enqueued task description cites the finding without
+             rendering a dangling empty '()' citation.
+        """
+        from generators import content_idea_generator
+
+        brain_db.upsert_project(
+            "skrills",
+            "athola",
+            "skrills",
+            topics=["chrome-extension"],
+            posture="Lead with: trade skill capture",
+        )
+        session = brain_db.create_research_session(
+            "trade skills chrome extensions", ["triz"]
+        )
+        brain_db.add_research_finding(
+            session_id=session["id"],
+            source="triz",
+            channel="triz",
+            title="TRIZ analogies: capture field know-how",
+            url="",
+            relevance=0.9,
+            summary="cross-domain analogy",
+            metadata={},
+        )
+        brain_db.complete_research_session(session["id"])
+
+        await content_idea_generator(brain_db, project_slugs=["skrills"])
+
+        tasks = brain_db.list_tasks(status="pending")
+        idea_tasks = [t for t in tasks if "content idea" in t["description"].lower()]
+        assert len(idea_tasks) >= 1
+        assert all("()" not in t["description"] for t in idea_tasks)
+        assert any("TRIZ analogies" in t["description"] for t in idea_tasks)
+
+    @pytest.mark.asyncio
     async def test_content_idea_generator_skips_when_no_research(self):
         """No recent sessions -> no tasks emitted."""
         from generators import content_idea_generator
@@ -535,6 +576,115 @@ class TestMorningDigestGenerator:
     """The 8am morning_digest_generator delivers a Telegram rundown
     of comment-worthy Reddit posts in the last 24h, scoped to
     tracked projects, deduplicated against scan_cache."""
+
+    @pytest.fixture(autouse=True)
+    def _no_other_channels(self, monkeypatch):
+        """Keep HN/GitHub/web and the LLM off the network; tests that
+        exercise those channels override these stubs."""
+        from unittest.mock import AsyncMock
+
+        monkeypatch.setattr(
+            "rundown.gather_other_channels", AsyncMock(return_value=([], []))
+        )
+        monkeypatch.setattr("rundown.synthesize", AsyncMock(return_value=None))
+        monkeypatch.setattr("reddit_search.search_all", AsyncMock(return_value=[]))
+
+    def _seed_one_project(self):
+        brain_db.upsert_project(
+            "clawrange",
+            "athola",
+            "clawrange",
+            topics=["llm proxy"],
+            subreddits=["LocalLLaMA"],
+            search_terms=["openclaw"],
+        )
+
+    @pytest.mark.asyncio
+    async def test_morning_digest_always_sends_with_zero_evidence(self, monkeypatch):
+        """An empty morning still produces a report that says why."""
+        from unittest.mock import AsyncMock
+
+        from generators import morning_digest_generator
+
+        self._seed_one_project()
+        monkeypatch.setattr(
+            "reddit_search.search_subreddits", AsyncMock(return_value=[])
+        )
+        monkeypatch.setattr("reddit_search.search_all", AsyncMock(return_value=[]))
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        await morning_digest_generator(brain_db)
+
+        notify_mock.assert_awaited()
+        msg = "\n".join(c.args[0] for c in notify_mock.await_args_list)
+        assert "Daily outreach rundown" in msg
+        assert "No fresh evidence" in msg
+        status = brain_db.get_schedule("morning_digest")
+        if status is not None:
+            assert status["last_status"].startswith("delivered")
+
+    @pytest.mark.asyncio
+    async def test_morning_digest_records_failed_delivery(self, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        from generators import morning_digest_generator
+
+        self._seed_one_project()
+        brain_db.upsert_schedule(
+            "morning_digest", "Morning digest", "morning_digest", "0 8 * * *"
+        )
+        monkeypatch.setattr(
+            "reddit_search.search_subreddits", AsyncMock(return_value=[])
+        )
+        monkeypatch.setattr("reddit_search.search_all", AsyncMock(return_value=[]))
+        monkeypatch.setattr("telegram.notify", AsyncMock(return_value=False))
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+
+        await morning_digest_generator(brain_db)
+
+        status = brain_db.get_schedule("morning_digest")["last_status"]
+        assert status.startswith("FAILED")
+
+    @pytest.mark.asyncio
+    async def test_morning_digest_blends_other_channels_and_synthesis(
+        self, monkeypatch
+    ):
+        from unittest.mock import AsyncMock
+
+        from generators import morning_digest_generator
+        from rundown import Evidence, SourceStatus
+
+        self._seed_one_project()
+        monkeypatch.setattr(
+            "reddit_search.search_subreddits", AsyncMock(return_value=[])
+        )
+        monkeypatch.setattr("reddit_search.search_all", AsyncMock(return_value=[]))
+        hn = Evidence(
+            source="hn",
+            group="Hacker News",
+            project="clawrange",
+            title="Ask HN: self-hosted LLM proxy?",
+            url="https://news.ycombinator.com/item?id=42",
+            facts="HN · 30 pts · 4 comments",
+        )
+        monkeypatch.setattr(
+            "rundown.gather_other_channels",
+            AsyncMock(
+                return_value=([hn], [SourceStatus("Hacker News", True, "1 items")])
+            ),
+        )
+        synth = AsyncMock(return_value="1. Answer the proxy question in [E1].")
+        monkeypatch.setattr("rundown.synthesize", synth)
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        await morning_digest_generator(brain_db)
+
+        msg = "\n".join(c.args[0] for c in notify_mock.await_args_list)
+        assert "[E1](https://news.ycombinator.com/item?id=42)" in msg
+        assert "Hacker News" in msg
+        synth.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_morning_digest_in_registry(self):
@@ -1571,7 +1721,7 @@ class TestHotPulseGenerator:
         (default 15). On throttled fires the function does NOT call
         Reddit or Telegram — just updates schedule status so the
         operator can see the cron is alive."""
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
         from unittest.mock import AsyncMock
 
         import generators
@@ -1596,7 +1746,7 @@ class TestHotPulseGenerator:
         )
 
         # Pretend we delivered 5 minutes ago — within the 15min throttle.
-        recent = datetime.now(timezone.utc) - timedelta(minutes=5)
+        recent = datetime.now(UTC) - timedelta(minutes=5)
         monkeypatch.setattr(generators, "_LAST_HOT_PULSE_DELIVERY_AT", recent)
 
         search_mock = AsyncMock(return_value=[])
@@ -1616,7 +1766,7 @@ class TestHotPulseGenerator:
     async def test_hot_pulse_delivers_after_interval_elapses(self, monkeypatch):
         """After `min_delivery_interval_minutes` has passed since the
         last delivery, the next fire delivers normally."""
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
         from unittest.mock import AsyncMock
 
         import generators
@@ -1633,7 +1783,7 @@ class TestHotPulseGenerator:
         )
 
         # Last delivery 16 minutes ago — past the 15min throttle.
-        stale = datetime.now(timezone.utc) - timedelta(minutes=16)
+        stale = datetime.now(UTC) - timedelta(minutes=16)
         monkeypatch.setattr(generators, "_LAST_HOT_PULSE_DELIVERY_AT", stale)
 
         post = RedditPost(
@@ -1662,7 +1812,7 @@ class TestHotPulseGenerator:
         """An operator can tune the delivery interval at runtime via
         the schedule's kwargs (e.g. min_delivery_interval_minutes=5
         to revert to the old behavior)."""
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
         from unittest.mock import AsyncMock
 
         import generators
@@ -1679,7 +1829,7 @@ class TestHotPulseGenerator:
         )
 
         # 6 minutes ago — past a 5min override but within the 15min default.
-        recent = datetime.now(timezone.utc) - timedelta(minutes=6)
+        recent = datetime.now(UTC) - timedelta(minutes=6)
         monkeypatch.setattr(generators, "_LAST_HOT_PULSE_DELIVERY_AT", recent)
 
         post = RedditPost(
@@ -1711,7 +1861,7 @@ class TestHotPulseGenerator:
         owner. Otherwise the loser project picks it up on the next
         fire that's still within the lookback window (cross-project
         dedup leak)."""
-        from datetime import datetime, timezone
+        from datetime import datetime
         from unittest.mock import AsyncMock
 
         import generators
@@ -1746,7 +1896,7 @@ class TestHotPulseGenerator:
             subreddit="ClaudeAI",
             score=2,
             comments=0,
-            created_utc=datetime.now(timezone.utc).isoformat(),
+            created_utc=datetime.now(UTC).isoformat(),
         )
 
         async def fake_search(*a, **kw):
@@ -1768,24 +1918,24 @@ class TestHotPulseGenerator:
         falls inside the configured local-time window in
         America/Chicago. 07:30 UTC = 01:30 CST (winter, UTC-6) or
         02:30 CDT (summer, UTC-5); both are inside [0, 5)."""
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         from generators import _is_quiet_hours
 
-        winter_utc = datetime(2026, 1, 15, 7, 30, tzinfo=timezone.utc)
-        summer_utc = datetime(2026, 7, 15, 7, 30, tzinfo=timezone.utc)
+        winter_utc = datetime(2026, 1, 15, 7, 30, tzinfo=UTC)
+        summer_utc = datetime(2026, 7, 15, 7, 30, tzinfo=UTC)
         assert _is_quiet_hours(winter_utc, 0, 5, "America/Chicago") is True
         assert _is_quiet_hours(summer_utc, 0, 5, "America/Chicago") is True
 
     def test_is_quiet_hours_outside_window_chicago(self):
         """Returns False at noon UTC, which lands at 06:00 CST /
         07:00 CDT — outside the [0, 5) sleep window."""
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         from generators import _is_quiet_hours
 
-        winter_noon_utc = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
-        summer_noon_utc = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
+        winter_noon_utc = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
+        summer_noon_utc = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
         assert _is_quiet_hours(winter_noon_utc, 0, 5, "America/Chicago") is False
         assert _is_quiet_hours(summer_noon_utc, 0, 5, "America/Chicago") is False
 
@@ -1793,11 +1943,11 @@ class TestHotPulseGenerator:
         """End hour is exclusive: 05:00 CST = 11:00 UTC (winter) is
         already OUT of quiet hours so the */5 fire at 5:00am wakes
         the operator's pulse up immediately."""
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         from generators import _is_quiet_hours
 
-        five_am_cst_utc = datetime(2026, 1, 15, 11, 0, tzinfo=timezone.utc)
+        five_am_cst_utc = datetime(2026, 1, 15, 11, 0, tzinfo=UTC)
         assert _is_quiet_hours(five_am_cst_utc, 0, 5, "America/Chicago") is False
 
     @pytest.mark.asyncio
@@ -1872,7 +2022,7 @@ class TestHotPulseGenerator:
         (5am CST boundary), the next fire must run the normal flow:
         reset the in-quiet-hours flag, call Reddit, and (if posts found)
         deliver to Telegram."""
-        from datetime import datetime, timezone
+        from datetime import datetime
         from unittest.mock import AsyncMock
 
         import generators
@@ -1903,7 +2053,7 @@ class TestHotPulseGenerator:
             url="https://reddit.com/r/ClaudeAI/post_after_sleep",
             score=42,
             comments=5,
-            created_utc=datetime.now(timezone.utc).isoformat(),
+            created_utc=datetime.now(UTC).isoformat(),
         )
 
         async def fake_search(*a, **kw):
@@ -2259,7 +2409,7 @@ class TestRedditAdapter:
         returning an empty list. This keeps the morning_digest useful
         on a fresh deploy before the operator wires script-app creds."""
         import json as _json
-        from datetime import datetime, timezone
+        from datetime import datetime
         from unittest.mock import AsyncMock, patch
 
         import httpx
@@ -2268,7 +2418,7 @@ class TestRedditAdapter:
 
         assert not await is_configured()
 
-        now_ts = datetime.now(timezone.utc).timestamp()
+        now_ts = datetime.now(UTC).timestamp()
         payload = {
             "data": {
                 "children": [
@@ -2348,3 +2498,125 @@ class TestGitHubAdapter:
 
         result = await get_self_traffic("owner", "repo")
         assert result is None
+
+
+class TestCatchUpMissedDaily:
+    """GIVEN workflows was down across the 8am fire
+    WHEN the scheduler boots later that morning
+    THEN the missed morning_digest is queued once, not dropped."""
+
+    TZ = "America/Chicago"
+
+    def _sched(self, last_run=None, last_status=None):
+        return {
+            "id": "morning_digest",
+            "kind": "morning_digest",
+            "cron": "0 8 * * *",
+            "last_run": last_run,
+            "last_status": last_status,
+        }
+
+    def _now(self, hh, mm=0):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        return datetime(2026, 9, 26, hh, mm, tzinfo=ZoneInfo(self.TZ))
+
+    def test_missed_fire_after_restart(self):
+        from scheduler import _missed_fire
+
+        prev = _missed_fire(
+            self._sched("2026-09-25T13:05:00+00:00"), self._now(8, 40), self.TZ
+        )
+        assert prev is not None
+        assert (prev.hour, prev.minute) == (8, 0)
+
+    def test_no_catch_up_when_today_delivered(self):
+        from scheduler import _missed_fire
+
+        sched = self._sched("2026-09-26T13:03:00+00:00", "delivered 2/2 msgs (…)")
+        assert _missed_fire(sched, self._now(9), self.TZ) is None
+        # A manual run's generic "ok" after the fire also counts as handled.
+        sched = self._sched("2026-09-26T13:03:00+00:00", "ok")
+        assert _missed_fire(sched, self._now(9), self.TZ) is None
+
+    def test_catch_up_when_today_failed(self):
+        from scheduler import _missed_fire
+
+        sched = self._sched("2026-09-26T13:03:00+00:00", "FAILED telegram 0/2 msgs")
+        assert _missed_fire(sched, self._now(9), self.TZ) is not None
+
+    def test_no_catch_up_before_fire_time_or_too_late(self):
+        from scheduler import _missed_fire
+
+        sched = self._sched("2026-09-25T13:03:00+00:00", "delivered 1/1 msgs")
+        assert _missed_fire(sched, self._now(7, 30), self.TZ) is None
+        assert _missed_fire(sched, self._now(23), self.TZ) is None
+
+    def test_init_scheduler_queues_catch_up_job(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import scheduler as sched_mod
+
+        fake = MagicMock()
+        fake.get_job.return_value = None
+        monkeypatch.setattr(sched_mod, "AsyncIOScheduler", MagicMock(return_value=fake))
+        monkeypatch.setattr(sched_mod, "register_watchdog", MagicMock())
+        monkeypatch.setattr(sched_mod, "_missed_fire", lambda s, now, tz: object())
+        db = MagicMock()
+        db.list_schedules.return_value = [self._sched()]
+
+        sched_mod.init_scheduler(db)
+
+        ids = [c.kwargs.get("id") for c in fake.add_job.call_args_list]
+        assert "catchup_morning_digest" in ids
+
+
+class TestGitHubIssueSearch:
+    """search_issues must call githubkit's real search method; a wrong
+    name is swallowed as a warning and every search returns []."""
+
+    @pytest.mark.asyncio
+    async def test_calls_async_issues_search(self, monkeypatch):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        import github_search
+
+        item = SimpleNamespace(
+            id=1,
+            number=7,
+            title="Need a plugin marketplace",
+            html_url="https://github.com/o/r/issues/7",
+            state="open",
+            repository_url="https://api.github.com/repos/o/r",
+            labels=[],
+        )
+        search = SimpleNamespace(
+            async_issues_and_pull_requests=AsyncMock(
+                return_value=SimpleNamespace(parsed_data=SimpleNamespace(items=[item]))
+            )
+        )
+        client = SimpleNamespace(rest=SimpleNamespace(search=search))
+        monkeypatch.setattr(github_search, "_get_client", lambda: client)
+
+        issues = await github_search.search_issues("plugin", limit=5)
+
+        assert [i.url for i in issues] == ["https://github.com/o/r/issues/7"]
+
+
+class TestRunNowKeepsGeneratorStatus:
+    @pytest.mark.asyncio
+    async def test_generator_written_status_survives_manual_run(self, monkeypatch):
+        import scheduler as sched_mod
+
+        brain_db.upsert_schedule("rs", "RS", "morning_digest", "0 8 * * *")
+
+        async def gen(brain_db, **kw):
+            brain_db.update_schedule_status(
+                "rs", "2026-09-26T15:00:00+00:00", "delivered 2/2 msgs"
+            )
+
+        monkeypatch.setitem(sched_mod.GENERATORS, "morning_digest", gen)
+        await sched_mod.run_schedule_now(None, brain_db, "rs")
+        assert brain_db.get_schedule("rs")["last_status"] == "delivered 2/2 msgs"

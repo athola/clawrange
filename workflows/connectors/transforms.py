@@ -10,7 +10,7 @@ source already emits CRM-shaped rows.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from .base import Record
 
@@ -18,7 +18,7 @@ logger = logging.getLogger("clawrange.connectors.transforms")
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def passthrough(rows: list[Record], spec: dict) -> list[Record]:

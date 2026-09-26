@@ -139,13 +139,13 @@ def test_health_reports_counts(crm):
 
 # ─── query layer: coercion + time-series (FR-5.1, FR-4.2) ─────────
 
-from datetime import datetime, timedelta, timezone  # noqa: E402
+from datetime import UTC, datetime, timedelta  # noqa: E402
 
 from crm.query import coerce_params, find_template, run_query  # noqa: E402
 
 
 def _iso_days_ago(n):
-    return (datetime.now(timezone.utc) - timedelta(days=n)).isoformat()
+    return (datetime.now(UTC) - timedelta(days=n)).isoformat()
 
 
 NEW_LEADS_COUNT = {
@@ -187,7 +187,7 @@ def test_coerce_duration_binds_since():
     assert "since" in binds
     # 'since' should be ~7 days ago
     since = datetime.fromisoformat(binds["since"])
-    assert 6 < (datetime.now(timezone.utc) - since).days < 8
+    assert 6 < (datetime.now(UTC) - since).days < 8
 
 
 def test_coerce_enum_with_map():

@@ -14,6 +14,7 @@ import logging
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
+from connectors import run_connector
 from crm.query import answer, find_template, run_query
 
 logger = logging.getLogger("clawrange.crm.api")
@@ -77,8 +78,6 @@ def create_crm_router(profile, crm, *, llm=None, http_client=None) -> APIRouter:
 
     @router.post("/crm/sync/{connector_id}")
     def sync_connector(connector_id: str):
-        from connectors import run_connector
-
         spec = profile.connector(connector_id)
         if spec is None:
             raise HTTPException(404, f"unknown connector '{connector_id}'")

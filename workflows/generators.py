@@ -10,12 +10,29 @@ import json
 import logging
 import math
 import statistics
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
+
+import deal_sources
+import deals
+import github_search
+import llm_proxy
+import persona_learning as pl
+import reddit_search
+import rundown
+import telegram
+import tenant_profile
+from connectors import run_connector
+from crm import get_adapter
 
 if TYPE_CHECKING:
     from reddit_search import RedditPost
+
+# NOTE on deferred imports: ``app`` imports this module at module scope, so
+# the ``from app import brain_db`` fallback below must stay function-local
+# (cycle guard).
 
 logger = logging.getLogger("clawrange.generators")
 
@@ -139,7 +156,6 @@ async def awesome_lists_watch_generator(
     brain_db, lists: list[str] | None = None, **kwargs
 ) -> None:
     """Check awesome-lists for tracked projects, enqueue PR tasks when missing."""
-    from github_search import check_awesome_list
 
     projects = brain_db.list_projects()
     target_lists = _AWESOME_LISTS
@@ -152,7 +168,9 @@ async def awesome_lists_watch_generator(
 
     for list_owner, list_repo in target_lists:
         target_urls = [f"github.com/{p['owner']}/{p['repo']}" for p in projects]
-        found = await check_awesome_list(list_owner, list_repo, target_urls)
+        found = await github_search.check_awesome_list(
+            list_owner, list_repo, target_urls
+        )
 
         for project in projects:
             url = f"github.com/{project['owner']}/{project['repo']}"
@@ -235,9 +253,12 @@ async def content_idea_generator(
         topics = json.loads(project.get("topics", "[]"))
         topic_hint = ", ".join(topics[:3]) if topics else slug
 
+        # Some channels (e.g. TRIZ analogies) carry no URL; cite without
+        # the parens rather than rendering a dangling "()" in the task.
+        citation = f" ({top['url']})" if top.get("url") else ""
         desc = (
             f"Content idea for {slug}: research on '{top['topic']}' "
-            f'surfaced "{top["title"]}" ({top["url"]}). '
+            f'surfaced "{top["title"]}"{citation}. '
             f"Draft three angles - "
             f"(1) technical post tying this to {topic_hint}, "
             f"(2) useful Reddit/HN comment offering specifics, "
@@ -306,7 +327,7 @@ async def comment_draft_generator(
 
 
 def _matched_keywords(
-    post: "RedditPost", topics: list[str], terms: list[str]
+    post: RedditPost, topics: list[str], terms: list[str]
 ) -> list[str]:
     """Return up to two project keywords/terms that literally appear
     in the post's title or snippet, search_terms first since they
@@ -322,23 +343,30 @@ def _matched_keywords(
     return matches
 
 
-def _comment_angle(post: "RedditPost") -> str:
-    """One-line 'why we should comment' framing based on engagement.
+def _comment_angle(post: RedditPost) -> str:
+    """One-line 'why we should comment' framing based on engagement."""
+    return rundown.engagement_angle(post.comments)
 
-    The pulse and the digest both surface the post's URL — this is
-    just enough framing for Alex to decide whether to click through.
-    No example replies; he writes his own."""
-    if post.comments == 0:
-        return "fresh thread, no replies yet — first useful answer wins visibility"
-    if post.comments < 5:
-        return f"{post.comments} replies — early, your comment lands near the top"
-    if post.comments < 20:
-        return f"{post.comments} replies — active discussion, still on-topic"
-    return f"{post.comments} replies — late-stage but high reach"
+
+def _pick_facts(
+    post: RedditPost, topics: list[str], terms: list[str], is_bonus: bool
+) -> str:
+    """Engagement plus the reason the post matched, on one line."""
+    matches = _matched_keywords(post, topics, terms)
+    if matches:
+        match_text = "matched " + " + ".join(f'"{m}"' for m in matches)
+    elif is_bonus:
+        match_text = "sub-affinity bonus"
+    else:
+        match_text = "search match"
+    return (
+        f"r/{post.subreddit} · {post.score} pts · "
+        f"{post.comments} comments · {match_text}"
+    )
 
 
 def _render_pick_lines(
-    post: "RedditPost",
+    post: RedditPost,
     topics: list[str],
     terms: list[str],
     is_bonus: bool,
@@ -348,40 +376,34 @@ def _render_pick_lines(
     The link is the literal post.url so it works as a tap target in
     Telegram clients regardless of Markdown rendering quirks."""
     title = post.title if len(post.title) <= 90 else post.title[:87] + "..."
-    matches = _matched_keywords(post, topics, terms)
-    if matches:
-        match_text = "matched " + " + ".join(f'"{m}"' for m in matches)
-    elif is_bonus:
-        match_text = "sub-affinity bonus"
-    else:
-        match_text = "search match"
     star = "★ " if is_bonus else ""
     return [
         f"  • {star}[{title}]({post.url})",
-        f"    r/{post.subreddit} · {post.score} pts · "
-        f"{post.comments} comments · {match_text}",
+        f"    {_pick_facts(post, topics, terms, is_bonus)}",
         f"    Why: {_comment_angle(post)}",
     ]
 
 
-def _score_relevance(post: "RedditPost", topics: list[str], terms: list[str]) -> float:
-    """Keyword-overlap relevance: title + snippet vs project topics/terms.
+def _reddit_evidence(
+    project: dict, post: RedditPost, is_bonus: bool, group: str
+) -> rundown.Evidence:
+    topics = json.loads(project.get("topics", "[]"))
+    terms = json.loads(project.get("search_terms", "[]"))
+    return rundown.Evidence(
+        source="reddit",
+        group=group,
+        project=project["slug"],
+        title=("★ " if is_bonus else "") + post.title,
+        url=post.url,
+        facts=_pick_facts(post, topics, terms, is_bonus),
+        why=_comment_angle(post),
+        score=post.score + post.comments,
+    )
 
-    Topics weight 1.0, search_terms weight 1.5 (terms are higher-signal,
-    they were curated as queries rather than tags). Multi-word phrases
-    count as a single hit when the whole phrase appears.
-    """
-    haystack = (post.title + " " + (post.snippet or "")).lower()
-    score = 0.0
-    for t in topics:
-        t_norm = t.lower().strip()
-        if t_norm and t_norm in haystack:
-            score += 1.0
-    for t in terms:
-        t_norm = t.lower().strip()
-        if t_norm and t_norm in haystack:
-            score += 1.5
-    return score
+
+def _score_relevance(post: RedditPost, topics: list[str], terms: list[str]) -> float:
+    """Keyword-overlap relevance: title + snippet vs project topics/terms."""
+    return rundown.relevance(post.title + " " + (post.snippet or ""), topics, terms)
 
 
 async def morning_digest_generator(
@@ -417,8 +439,6 @@ async def morning_digest_generator(
     queued — the operator reads, taps the direct URL, and writes
     their own replies.
     """
-    from reddit_search import search_subreddits
-    from telegram import notify
 
     projects = brain_db.list_projects()
     if project_slugs:
@@ -448,6 +468,10 @@ async def morning_digest_generator(
         for p in projects
     }
 
+    # One tally across every Reddit call this run, so the report can say
+    # why Reddit came back empty instead of looking like a quiet day.
+    health = reddit_search.SearchHealth()
+
     # Track all post scores per subreddit so we can compute adaptive
     # popularity thresholds (popularity_multiplier × median).
     scores_by_sub: dict[str, list[int]] = {}
@@ -455,7 +479,7 @@ async def morning_digest_generator(
     # Per-post-id best-fit map: rel + tiny sub-affinity bump for tiebreaks
     # so a sub-affinity-only post lands in the project that subscribes to
     # its subreddit, not one that doesn't.
-    best_for_post: dict[str, tuple[dict, "RedditPost", float, bool]] = {}
+    best_for_post: dict[str, tuple[dict, RedditPost, float, bool]] = {}
 
     # Record one search impression per (sub, project) pair this cycle —
     # gives the stats table a denominator for hit-rate analysis.
@@ -475,12 +499,13 @@ async def morning_digest_generator(
 
         for query in queries:
             try:
-                posts = await search_subreddits(
+                posts = await reddit_search.search_subreddits(
                     query,
                     scan_subreddits,
                     since="24h",
                     sort="new",
                     limit_per_sub=15,
+                    health=health,
                 )
             except Exception as exc:
                 logger.warning(
@@ -517,8 +542,8 @@ async def morning_digest_generator(
 
     # Group by project, separate strict (rel > 0) from popular-bonus
     # (rel == 0, sub-affinity, score >= adaptive threshold).
-    strict_by_project: dict[str, list[tuple["RedditPost", float]]] = {}
-    bonus_by_project: dict[str, list[tuple["RedditPost", float]]] = {}
+    strict_by_project: dict[str, list[tuple[RedditPost, float]]] = {}
+    bonus_by_project: dict[str, list[tuple[RedditPost, float]]] = {}
     for project, post, rel, sub_affinity in best_for_post.values():
         slug = project["slug"]
         if rel > 0:
@@ -530,7 +555,7 @@ async def morning_digest_generator(
 
     # Final picks per project: top_per_project strict, then up to
     # popular_bonus_cap bonus picks. is_bonus flag drives the ★ render.
-    picks_by_project: dict[str, list[tuple["RedditPost", bool]]] = {}
+    picks_by_project: dict[str, list[tuple[RedditPost, bool]]] = {}
     for project in projects:
         slug = project["slug"]
         strict = strict_by_project.get(slug, [])
@@ -551,7 +576,7 @@ async def morning_digest_generator(
     # 🆕 section AND recorded as hits in subreddit_stats so they
     # accumulate toward the auto-promote threshold (≥5 hits in 14d).
     emerging_picks_by_project = await _discover_emerging(
-        brain_db, projects, project_sub_sets
+        brain_db, projects, project_sub_sets, health=health
     )
 
     # Auto-promote any non-curated subs that have crossed the threshold
@@ -559,76 +584,59 @@ async def morning_digest_generator(
     # stats row promoted_at, so the next run treats it as curated.
     newly_promoted = _promote_emerging_subreddits(brain_db, projects)
 
-    # Same heartbeat-status update as hot_pulse: ensure the schedule's
-    # last_run reflects cron fires, not just manual /sched/.../run.
+    # Evidence from every channel. Reddit picks keep their tiering; the
+    # other channels degrade independently so one outage never empties
+    # the report.
+    evidence: list[rundown.Evidence] = []
+    for project in projects:
+        slug = project["slug"]
+        for post, is_bonus in picks_by_project.get(slug, []):
+            evidence.append(_reddit_evidence(project, post, is_bonus, "Reddit"))
+        for post in emerging_picks_by_project.get(slug, []):
+            evidence.append(_reddit_evidence(project, post, False, "🆕 Emerging subs"))
+    other, statuses = await rundown.gather_other_channels(projects)
+    evidence = rundown.assign_refs(projects, evidence + other)
+    statuses.insert(0, rundown.reddit_status(health))
+    synthesis = await rundown.synthesize(projects, evidence)
+
+    report = rundown.build_report(
+        projects=projects,
+        evidence=evidence,
+        statuses=statuses,
+        synthesis=synthesis,
+        coverage=_render_subreddit_report(brain_db, projects, newly_promoted),
+        now=datetime.now(UTC),
+    )
+    sent, total = await telegram.notify_long(report)
+
+    # The status row is how "did it arrive?" gets answered later, so it
+    # records delivery, not just that the cron fired.
+    counts = (
+        f"{len(evidence)} items, "
+        f"{sum(len(v) for v in picks_by_project.values())} reddit picks, "
+        f"{len(newly_promoted)} promoted, synthesis {'ok' if synthesis else 'off'}"
+    )
+    status = (
+        f"delivered {sent}/{total} msgs ({counts})"
+        if sent == total
+        else f"FAILED telegram {sent}/{total} msgs ({counts})"
+    )
     try:
         brain_db.update_schedule_status(
-            "morning_digest",
-            datetime.now(timezone.utc).isoformat(),
-            (
-                f"ok ({sum(len(v) for v in picks_by_project.values())} picks, "
-                f"{sum(len(v) for v in emerging_picks_by_project.values())} emerging, "
-                f"{len(newly_promoted)} promoted)"
-            ),
+            "morning_digest", datetime.now(UTC).isoformat(), status
         )
     except Exception as exc:
         logger.warning("morning_digest: could not update schedule status: %s", exc)
 
-    if not picks_by_project and not emerging_picks_by_project and not newly_promoted:
-        logger.info("morning_digest: no fresh comment-worthy posts, skipping notify")
+    if sent < total:
+        logger.warning("morning_digest: %s; not marking seen", status)
         return
 
-    # Compose Markdown digest. Each pick renders as 3 lines:
-    # title-with-link / facts / why-comment. No comment-draft text;
-    # Alex reads, taps, and writes his own replies.
-    lines = ["*Morning digest — Reddit comment candidates (last 24h)*", ""]
-    for project in projects:
-        slug = project["slug"]
-        picks = picks_by_project.get(slug, [])
-        emerging = emerging_picks_by_project.get(slug, [])
-        if not picks and not emerging:
-            continue
-        topics = json.loads(project.get("topics", "[]"))
-        terms = json.loads(project.get("search_terms", "[]"))
-        lines.append(f"*{slug}* ({project['owner']}/{project['repo']})")
-        for post, is_bonus in picks:
-            lines.extend(_render_pick_lines(post, topics, terms, is_bonus))
-        if emerging:
-            lines.append("  🆕 Emerging subs:")
-            for post in emerging:
-                lines.extend(_render_pick_lines(post, topics, terms, is_bonus=False))
-        lines.append("")
-
-    # Stored-subs report paragraph: which subs we search, which yield
-    # hits, and any newly auto-promoted into curated lists.
-    report = _render_subreddit_report(brain_db, projects, newly_promoted)
-    if report:
-        lines.append(report)
-
-    digest = "\n".join(lines).strip()
-    delivered = await notify(digest)
-    if not delivered:
-        logger.warning("morning_digest: telegram delivery failed; not marking seen")
-        return
-
-    # Mark seen + record hits for surfaced posts.
-    # No draft tasks are queued — comment-suggestion was removed at
-    # the operator's request.
     for slug, picks in picks_by_project.items():
         for post, _is_bonus in picks:
             brain_db.mark_seen("reddit_post", post.id, slug)
             brain_db.record_subreddit_hit(post.subreddit, slug)
-    logger.info(
-        "morning_digest: delivered %d posts (%d strict + %d bonus + %d emerging) "
-        "across %d projects, %d newly promoted",
-        sum(len(v) for v in picks_by_project.values())
-        + sum(len(v) for v in emerging_picks_by_project.values()),
-        sum(1 for v in picks_by_project.values() for _, b in v if not b),
-        sum(1 for v in picks_by_project.values() for _, b in v if b),
-        sum(len(v) for v in emerging_picks_by_project.values()),
-        len(picks_by_project) + len(emerging_picks_by_project),
-        len(newly_promoted),
-    )
+    logger.info("morning_digest: %s", status)
 
 
 async def _discover_emerging(
@@ -636,15 +644,15 @@ async def _discover_emerging(
     projects: list[dict],
     project_sub_sets: dict[str, set[str]],
     cap_per_project: int = 2,
-) -> dict[str, list["RedditPost"]]:
+    health: reddit_search.SearchHealth | None = None,
+) -> dict[str, list[RedditPost]]:
     """Search /r/all for each project's first term; return posts in
     non-curated subreddits that pass the project's strict relevance
     filter, capped per project. Records each match as a stat hit so
     sustained emerging subs accumulate toward auto-promotion.
     """
-    from reddit_search import search_all
 
-    out: dict[str, list["RedditPost"]] = {}
+    out: dict[str, list[RedditPost]] = {}
     for project in projects:
         slug = project["slug"]
         terms = json.loads(project.get("search_terms", "[]"))
@@ -653,7 +661,9 @@ async def _discover_emerging(
             continue
         query = (terms or topics)[0]
         try:
-            all_posts = await search_all(query, since="24h", limit=15)
+            all_posts = await reddit_search.search_all(
+                query, since="24h", limit=15, health=health
+            )
         except Exception as exc:
             logger.warning(
                 "morning_digest: discovery search failed for %s/%s: %s",
@@ -664,7 +674,7 @@ async def _discover_emerging(
             continue
 
         curated = project_sub_sets.get(slug, set())
-        emerging: list[tuple["RedditPost", float]] = []
+        emerging: list[tuple[RedditPost, float]] = []
         for post in all_posts:
             sub_lower = post.subreddit.lower()
             if not sub_lower or sub_lower in curated:
@@ -825,10 +835,8 @@ async def hot_pulse_generator(
     (logged as a heartbeat WARNING so the cron is still observable).
     """
     global _LAST_HOT_PULSE_DELIVERY_AT, _HOT_PULSE_IN_QUIET_HOURS
-    from reddit_search import search_subreddits
-    from telegram import notify
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     # Quiet-hours gate: skip Reddit + Telegram entirely when the
     # operator is asleep. Default 00:00-05:00 America/Chicago covers
@@ -923,7 +931,7 @@ async def hot_pulse_generator(
     # (>= 1.0 for keyword hits, 0.5 for Reddit-search-only baseline),
     # and the search query that brought the post back. The query
     # becomes the "category bucket" we group by in the render.
-    best_for_post: dict[str, tuple[dict, "RedditPost", float, str]] = {}
+    best_for_post: dict[str, tuple[dict, RedditPost, float, str]] = {}
 
     for project in projects:
         slug = project["slug"]
@@ -933,7 +941,7 @@ async def hot_pulse_generator(
 
         for query in queries:
             try:
-                posts = await search_subreddits(
+                posts = await reddit_search.search_subreddits(
                     query,
                     scan_subreddits,
                     since=window,
@@ -960,14 +968,14 @@ async def hot_pulse_generator(
     # brought the post). Each project block in the digest renders one
     # subsection per category so the operator sees which area is
     # currently active.
-    by_project_by_category: dict[str, dict[str, list[tuple["RedditPost", float]]]] = {}
+    by_project_by_category: dict[str, dict[str, list[tuple[RedditPost, float]]]] = {}
     for project, post, rel, query in best_for_post.values():
         slug = project["slug"]
         by_project_by_category.setdefault(slug, {}).setdefault(query, []).append(
             (post, rel)
         )
 
-    by_project: dict[str, list[tuple["RedditPost", float]]] = {}
+    by_project: dict[str, list[tuple[RedditPost, float]]] = {}
     for slug, cat_map in by_project_by_category.items():
         for cat_picks in cat_map.values():
             by_project.setdefault(slug, []).extend(cat_picks)
@@ -987,7 +995,7 @@ async def hot_pulse_generator(
     try:
         brain_db.update_schedule_status(
             "hot_pulse",
-            datetime.now(timezone.utc).isoformat(),
+            datetime.now(UTC).isoformat(),
             f"ok ({sum(len(v) for v in by_project.values())} picks)",
         )
     except Exception as exc:
@@ -1042,7 +1050,7 @@ async def hot_pulse_generator(
         lines.append("")
 
     pulse = "\n".join(lines).strip()
-    delivered = await notify(pulse)
+    delivered = await telegram.notify(pulse)
     if not delivered:
         logger.warning("hot_pulse: telegram delivery failed; not marking seen")
         return
@@ -1129,14 +1137,21 @@ def seed_from_profile(brain_db, profile) -> list[dict]:
         else:
             out.append(existing)
     _seed_schedules_from_profile(brain_db, profile)
+
+    # Seed approved persona learnings from the profile's learned.yaml overlay
+    # (the git-portable projection of the brain's approved meta-learnings).
+    try:
+        pl.seed_overlay(brain_db, profile.name, pl.load_overlay(profile.name))
+    except Exception as exc:  # never crash boot on a bad overlay
+        logger.warning("seed_from_profile: learned overlay skipped: %s", exc)
+
     return out
 
 
 def seed_default_schedules(brain_db) -> list[dict]:
     """Seed the active profile's schedules (back-compat entry point)."""
-    from tenant_profile import load_profile
 
-    return _seed_schedules_from_profile(brain_db, load_profile())
+    return _seed_schedules_from_profile(brain_db, tenant_profile.load_profile())
 
 
 def seed_default_projects(brain_db) -> list[dict]:
@@ -1144,9 +1159,8 @@ def seed_default_projects(brain_db) -> list[dict]:
 
     Loads the profile named by CLAWRANGE_PROFILE (default "marketing").
     """
-    from tenant_profile import load_profile
 
-    return seed_from_profile(brain_db, load_profile())
+    return seed_from_profile(brain_db, tenant_profile.load_profile())
 
 
 # ─── CRM generators (lead-crm profile) ───────────────────────────────
@@ -1164,7 +1178,6 @@ def _crm_for(profile, crm):
     if not (profile and profile.crm):
         logger.warning("crm generator: profile has no crm configured; skipping")
         return None
-    from crm import get_adapter
 
     adapter = get_adapter(profile.crm)
     adapter.init()
@@ -1187,12 +1200,10 @@ async def pipeline_generator(
     were written) posts a one-line Telegram summary. Never auto-crashes the
     heartbeat: unknown connectors / fetch errors degrade to a logged status.
     """
-    from connectors import run_connector
-    from tenant_profile import load_profile
 
-    profile = profile or load_profile()
+    profile = profile or tenant_profile.load_profile()
     spec = profile.connector(connector)
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
 
     if spec is None:
         logger.warning("pipeline: connector %r not defined in profile", connector)
@@ -1222,9 +1233,7 @@ async def pipeline_generator(
         )
 
     if counts["written"]:
-        from telegram import notify
-
-        await notify(
+        await telegram.notify(
             f"Lead sync ({connector}): {counts['written']} written "
             f"({counts['fetched']} fetched, {counts['kept']} kept)."
         )
@@ -1249,11 +1258,10 @@ async def crm_digest_generator(
     reported inline rather than raising.
     """
     from crm.query import _format_rows, find_template, run_query
-    from tenant_profile import load_profile
 
-    profile = profile or load_profile()
+    profile = profile or tenant_profile.load_profile()
     queries = queries or []
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
 
     adapter = _crm_for(profile, crm)
     if adapter is None:
@@ -1282,15 +1290,225 @@ async def crm_digest_generator(
             schedule_id, now, f"ok ({len(queries)} queries)"
         )
 
-    from telegram import notify
-
-    await notify(digest)
+    await telegram.notify(digest)
     return digest
+
+
+async def persona_reflect_generator(brain_db, profile_name=None, **kwargs) -> None:
+    """Review recent activity and queue persona-enhancement proposals.
+
+    Routes the reflection prompt through the LLM proxy and posts any
+    suggestion as a [DRAFT] persona proposal. Degrades to a no-op if the
+    proxy is unavailable.
+    """
+
+    profile_name = profile_name or "starter"
+    prompt = (
+        "From recent operator interactions, suggest at most ONE concrete "
+        "persona adjustment (tone/format/priority). Reply with a single "
+        "imperative sentence, or 'none'."
+    )
+    suggestion = await llm_proxy._llm_call(prompt, max_tokens=80)
+    if not suggestion or suggestion.strip().lower().startswith("none"):
+        return
+    if brain_db is None:
+        from app import brain_db as _bd
+
+        brain_db = _bd
+    pl.propose(
+        brain_db,
+        profile_name,
+        "persona",
+        "Reflection",
+        suggestion.strip(),
+        "reflect",
+    )
+
+
+def _hours_since(iso_ts: str | None) -> float:
+    """Hours elapsed since an ISO-8601 timestamp (``inf`` if missing/bad)."""
+    if not iso_ts:
+        return float("inf")
+    try:
+        ts = datetime.fromisoformat(iso_ts)
+    except ValueError:
+        return float("inf")
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - ts).total_seconds() / 3600.0
+
+
+async def research_pulse_generator(
+    brain_db,
+    topics: list[str] | None = None,
+    stale_hours: int = 24,
+    **kwargs,
+) -> None:
+    """Queue a heavy-research task when research has gone stale.
+
+    Research only runs via ``POST /research`` or the tome bridge; the
+    restricted LLM personas have no tool that can issue a POST, so a
+    research task queued for the agent hits a dead end. This generator
+    closes that gap from the scheduler's Python process (no LLM needed):
+    when no research session has run within ``stale_hours`` it enqueues a
+    ``research:tome: <topic>`` task. ``scripts/tome_bridge.py`` already
+    matches that prefix, runs it through the local ``/tome:research``
+    session, and posts results back -- no agent POST capability required.
+
+    Topic selection: an explicit ``topics`` list (from the schedule's
+    kwargs) wins; otherwise the tracked projects' topic hints are used.
+    The first candidate not already queued is chosen, giving basic
+    rotation across a list while never double-queuing the same task.
+    Never auto-posts -- it only enqueues a research task for review.
+    """
+    recent = brain_db.list_research_sessions(limit=1)
+    if recent and _hours_since(recent[0].get("created_at")) < stale_hours:
+        logger.info("research_pulse: research is fresh, skipping")
+        return
+
+    candidates: list[str] = [t.strip() for t in (topics or []) if t and t.strip()]
+    if not candidates:
+        for project in brain_db.list_projects():
+            for topic in json.loads(project.get("topics", "[]")):
+                if topic and topic.strip():
+                    candidates.append(topic.strip())
+    if not candidates:
+        logger.info("research_pulse: no topic configured, skipping")
+        return
+
+    pending = {t["description"] for t in brain_db.list_tasks(status="pending")}
+    for topic in candidates:
+        desc = f"research:tome: {topic}"
+        if desc not in pending:
+            brain_db.create_task(desc, priority=3, source="schedule")
+            logger.info("research_pulse: enqueued '%s'", desc)
+            return
+
+    logger.info("research_pulse: all candidate topics already queued, skipping")
+
+
+INCOME_REVIEW_DESC = "[DRAFT] income: weekly strategy review"
+
+_INCOME_REVIEW_CHECKLIST = (
+    "Cover: balances and P&L vs the two benchmarks ($50 held as USDC; "
+    "$50 all-in BTC on day one), the paper sleeve's 20-week-SMA decision "
+    "and hypothetical result, fees paid this week, and proposed "
+    "adjustments with cited sources (single-source claims flagged). "
+    "Hard rules in docs/income-strategy.md apply; this task is a draft "
+    "for operator approval — never execute trades."
+)
+
+
+async def income_review_generator(brain_db, **kwargs) -> None:
+    """Enqueue the weekly $50-testbed strategy review as a [DRAFT] task.
+
+    Mirrors research_pulse: idempotent (skips while a review is still
+    pending), enqueue-first so a Telegram outage never loses the task,
+    and never acts on its own — the review is a draft the operator
+    approves on Telegram. See docs/income-strategy.md for the protocol.
+    """
+
+    pending = {t["description"] for t in brain_db.list_tasks(status="pending")}
+    if any(d.startswith(INCOME_REVIEW_DESC) for d in pending):
+        logger.info("income_review: review already queued, skipping")
+        return
+
+    brain_db.create_task(
+        f"{INCOME_REVIEW_DESC} — {_INCOME_REVIEW_CHECKLIST}",
+        priority=2,
+        source="schedule",
+    )
+    logger.info("income_review: enqueued weekly review")
+    if not await telegram.notify(
+        "📋 Weekly income review queued — claim the [DRAFT] task to run it."
+    ):
+        logger.warning("income_review: telegram notify failed (task kept)")
+
+
+# ─── Homelab deals ───────────────────────────────────────────────────
+
+
+async def homelab_deals_generator(
+    brain_db, profile_name: str | None = None, **kwargs
+) -> None:
+    """Daily homelab hardware deal rundown, delivered to Telegram.
+
+    Reads targets and sources from the profile's `homelab_deals` block.
+    Every matched, priced listing feeds the price history; deals are judged
+    against history as it stood *before* today's batch, so a flood of
+    listings cannot drag its own reference price. Like the outreach
+    rundown it always sends, and records delivery for the boot catch-up.
+    """
+    block = tenant_profile.load_profile(profile_name).raw.get("homelab_deals") or {}
+    targets = deals.load_targets(block)
+    if not targets:
+        logger.info("homelab_deals: profile has no targets, skipping")
+        return
+
+    listings, statuses = await deal_sources.gather(targets, block.get("sources") or {})
+    history = {t.name: brain_db.deal_price_stats(t.name) for t in targets}
+
+    found: list[deals.Deal] = []
+    misses: list[tuple[deals.Listing, deals.WatchTarget]] = []
+    leads: list[tuple[deals.Listing, deals.WatchTarget]] = []
+    for listing in listings:
+        target = deals.match_target(listing, targets)
+        if target is None:
+            continue
+        key = f"{listing.source}:{listing.listing_id}"
+        total = listing.total
+        if total is None:
+            if not brain_db.is_seen("deal", key):
+                leads.append((listing, target))
+            continue
+        brain_db.record_deal_observation(
+            listing.source, listing.listing_id, target.name, total
+        )
+        deal = deals.classify(listing, target, history[target.name])
+        if deal is None:
+            misses.append((listing, target))
+        elif not brain_db.is_seen("deal", key):
+            found.append(deal)
+    misses.sort(key=lambda lt: (lt[0].total or 0) / lt[1].great_price)
+
+    clean, flagged = deals.order_and_number(found)
+    shown = clean + flagged
+    synthesis = await deals.synthesize(
+        shown, block.get("current_setup", ""), block.get("stack_gaps")
+    )
+    report = deals.render_report(
+        shown, misses, statuses, synthesis, datetime.now(UTC), leads=leads
+    )
+    sent, total_msgs = await telegram.notify_long(report)
+
+    counts = (
+        f"{len(listings)} listings, {len(clean)} deals, {len(flagged)} flagged, "
+        f"{len(leads)} leads, synthesis {'ok' if synthesis else 'off'}"
+    )
+    status = (
+        f"delivered {sent}/{total_msgs} msgs ({counts})"
+        if sent == total_msgs
+        else f"FAILED telegram {sent}/{total_msgs} msgs ({counts})"
+    )
+    try:
+        brain_db.update_schedule_status(
+            "homelab_deals", datetime.now(UTC).isoformat(), status
+        )
+    except Exception as exc:
+        logger.warning("homelab_deals: could not update schedule status: %s", exc)
+    if sent < total_msgs:
+        logger.warning("homelab_deals: %s; not marking seen", status)
+        return
+    for d in shown:
+        brain_db.mark_seen("deal", f"{d.listing.source}:{d.listing.listing_id}")
+    for listing, _t in leads[: deals.MAX_LEADS]:
+        brain_db.mark_seen("deal", f"{listing.source}:{listing.listing_id}")
+    logger.info("homelab_deals: %s", status)
 
 
 # ─── Registry ────────────────────────────────────────────────────────
 
-GENERATORS = {
+GENERATORS: dict[str, Callable[..., Any]] = {
     "morning_scan": morning_scan_generator,
     "morning_digest": morning_digest_generator,
     "hot_pulse": hot_pulse_generator,
@@ -1301,4 +1519,8 @@ GENERATORS = {
     "comment_draft": comment_draft_generator,
     "pipeline": pipeline_generator,
     "crm_digest": crm_digest_generator,
+    "persona_reflect": persona_reflect_generator,
+    "research_pulse": research_pulse_generator,
+    "income_review": income_review_generator,
+    "homelab_deals": homelab_deals_generator,
 }
