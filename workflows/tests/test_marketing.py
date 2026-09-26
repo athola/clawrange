@@ -577,6 +577,115 @@ class TestMorningDigestGenerator:
     of comment-worthy Reddit posts in the last 24h, scoped to
     tracked projects, deduplicated against scan_cache."""
 
+    @pytest.fixture(autouse=True)
+    def _no_other_channels(self, monkeypatch):
+        """Keep HN/GitHub/web and the LLM off the network; tests that
+        exercise those channels override these stubs."""
+        from unittest.mock import AsyncMock
+
+        monkeypatch.setattr(
+            "rundown.gather_other_channels", AsyncMock(return_value=([], []))
+        )
+        monkeypatch.setattr("rundown.synthesize", AsyncMock(return_value=None))
+        monkeypatch.setattr("reddit_search.search_all", AsyncMock(return_value=[]))
+
+    def _seed_one_project(self):
+        brain_db.upsert_project(
+            "clawrange",
+            "athola",
+            "clawrange",
+            topics=["llm proxy"],
+            subreddits=["LocalLLaMA"],
+            search_terms=["openclaw"],
+        )
+
+    @pytest.mark.asyncio
+    async def test_morning_digest_always_sends_with_zero_evidence(self, monkeypatch):
+        """An empty morning still produces a report that says why."""
+        from unittest.mock import AsyncMock
+
+        from generators import morning_digest_generator
+
+        self._seed_one_project()
+        monkeypatch.setattr(
+            "reddit_search.search_subreddits", AsyncMock(return_value=[])
+        )
+        monkeypatch.setattr("reddit_search.search_all", AsyncMock(return_value=[]))
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        await morning_digest_generator(brain_db)
+
+        notify_mock.assert_awaited()
+        msg = "\n".join(c.args[0] for c in notify_mock.await_args_list)
+        assert "Daily outreach rundown" in msg
+        assert "No fresh evidence" in msg
+        status = brain_db.get_schedule("morning_digest")
+        if status is not None:
+            assert status["last_status"].startswith("delivered")
+
+    @pytest.mark.asyncio
+    async def test_morning_digest_records_failed_delivery(self, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        from generators import morning_digest_generator
+
+        self._seed_one_project()
+        brain_db.upsert_schedule(
+            "morning_digest", "Morning digest", "morning_digest", "0 8 * * *"
+        )
+        monkeypatch.setattr(
+            "reddit_search.search_subreddits", AsyncMock(return_value=[])
+        )
+        monkeypatch.setattr("reddit_search.search_all", AsyncMock(return_value=[]))
+        monkeypatch.setattr("telegram.notify", AsyncMock(return_value=False))
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+
+        await morning_digest_generator(brain_db)
+
+        status = brain_db.get_schedule("morning_digest")["last_status"]
+        assert status.startswith("FAILED")
+
+    @pytest.mark.asyncio
+    async def test_morning_digest_blends_other_channels_and_synthesis(
+        self, monkeypatch
+    ):
+        from unittest.mock import AsyncMock
+
+        from generators import morning_digest_generator
+        from rundown import Evidence, SourceStatus
+
+        self._seed_one_project()
+        monkeypatch.setattr(
+            "reddit_search.search_subreddits", AsyncMock(return_value=[])
+        )
+        monkeypatch.setattr("reddit_search.search_all", AsyncMock(return_value=[]))
+        hn = Evidence(
+            source="hn",
+            group="Hacker News",
+            project="clawrange",
+            title="Ask HN: self-hosted LLM proxy?",
+            url="https://news.ycombinator.com/item?id=42",
+            facts="HN · 30 pts · 4 comments",
+        )
+        monkeypatch.setattr(
+            "rundown.gather_other_channels",
+            AsyncMock(
+                return_value=([hn], [SourceStatus("Hacker News", True, "1 items")])
+            ),
+        )
+        synth = AsyncMock(return_value="1. Answer the proxy question in [E1].")
+        monkeypatch.setattr("rundown.synthesize", synth)
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        await morning_digest_generator(brain_db)
+
+        msg = "\n".join(c.args[0] for c in notify_mock.await_args_list)
+        assert "[E1](https://news.ycombinator.com/item?id=42)" in msg
+        assert "Hacker News" in msg
+        synth.assert_awaited_once()
+
     @pytest.mark.asyncio
     async def test_morning_digest_in_registry(self):
         from generators import GENERATORS
@@ -2389,3 +2498,125 @@ class TestGitHubAdapter:
 
         result = await get_self_traffic("owner", "repo")
         assert result is None
+
+
+class TestCatchUpMissedDaily:
+    """GIVEN workflows was down across the 8am fire
+    WHEN the scheduler boots later that morning
+    THEN the missed morning_digest is queued once, not dropped."""
+
+    TZ = "America/Chicago"
+
+    def _sched(self, last_run=None, last_status=None):
+        return {
+            "id": "morning_digest",
+            "kind": "morning_digest",
+            "cron": "0 8 * * *",
+            "last_run": last_run,
+            "last_status": last_status,
+        }
+
+    def _now(self, hh, mm=0):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        return datetime(2026, 9, 26, hh, mm, tzinfo=ZoneInfo(self.TZ))
+
+    def test_missed_fire_after_restart(self):
+        from scheduler import _missed_fire
+
+        prev = _missed_fire(
+            self._sched("2026-09-25T13:05:00+00:00"), self._now(8, 40), self.TZ
+        )
+        assert prev is not None
+        assert (prev.hour, prev.minute) == (8, 0)
+
+    def test_no_catch_up_when_today_delivered(self):
+        from scheduler import _missed_fire
+
+        sched = self._sched("2026-09-26T13:03:00+00:00", "delivered 2/2 msgs (…)")
+        assert _missed_fire(sched, self._now(9), self.TZ) is None
+        # A manual run's generic "ok" after the fire also counts as handled.
+        sched = self._sched("2026-09-26T13:03:00+00:00", "ok")
+        assert _missed_fire(sched, self._now(9), self.TZ) is None
+
+    def test_catch_up_when_today_failed(self):
+        from scheduler import _missed_fire
+
+        sched = self._sched("2026-09-26T13:03:00+00:00", "FAILED telegram 0/2 msgs")
+        assert _missed_fire(sched, self._now(9), self.TZ) is not None
+
+    def test_no_catch_up_before_fire_time_or_too_late(self):
+        from scheduler import _missed_fire
+
+        sched = self._sched("2026-09-25T13:03:00+00:00", "delivered 1/1 msgs")
+        assert _missed_fire(sched, self._now(7, 30), self.TZ) is None
+        assert _missed_fire(sched, self._now(23), self.TZ) is None
+
+    def test_init_scheduler_queues_catch_up_job(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import scheduler as sched_mod
+
+        fake = MagicMock()
+        fake.get_job.return_value = None
+        monkeypatch.setattr(sched_mod, "AsyncIOScheduler", MagicMock(return_value=fake))
+        monkeypatch.setattr(sched_mod, "register_watchdog", MagicMock())
+        monkeypatch.setattr(sched_mod, "_missed_fire", lambda s, now, tz: object())
+        db = MagicMock()
+        db.list_schedules.return_value = [self._sched()]
+
+        sched_mod.init_scheduler(db)
+
+        ids = [c.kwargs.get("id") for c in fake.add_job.call_args_list]
+        assert "catchup_morning_digest" in ids
+
+
+class TestGitHubIssueSearch:
+    """search_issues must call githubkit's real search method; a wrong
+    name is swallowed as a warning and every search returns []."""
+
+    @pytest.mark.asyncio
+    async def test_calls_async_issues_search(self, monkeypatch):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        import github_search
+
+        item = SimpleNamespace(
+            id=1,
+            number=7,
+            title="Need a plugin marketplace",
+            html_url="https://github.com/o/r/issues/7",
+            state="open",
+            repository_url="https://api.github.com/repos/o/r",
+            labels=[],
+        )
+        search = SimpleNamespace(
+            async_issues_and_pull_requests=AsyncMock(
+                return_value=SimpleNamespace(parsed_data=SimpleNamespace(items=[item]))
+            )
+        )
+        client = SimpleNamespace(rest=SimpleNamespace(search=search))
+        monkeypatch.setattr(github_search, "_get_client", lambda: client)
+
+        issues = await github_search.search_issues("plugin", limit=5)
+
+        assert [i.url for i in issues] == ["https://github.com/o/r/issues/7"]
+
+
+class TestRunNowKeepsGeneratorStatus:
+    @pytest.mark.asyncio
+    async def test_generator_written_status_survives_manual_run(self, monkeypatch):
+        import scheduler as sched_mod
+
+        brain_db.upsert_schedule("rs", "RS", "morning_digest", "0 8 * * *")
+
+        async def gen(brain_db, **kw):
+            brain_db.update_schedule_status(
+                "rs", "2026-09-26T15:00:00+00:00", "delivered 2/2 msgs"
+            )
+
+        monkeypatch.setitem(sched_mod.GENERATORS, "morning_digest", gen)
+        await sched_mod.run_schedule_now(None, brain_db, "rs")
+        assert brain_db.get_schedule("rs")["last_status"] == "delivered 2/2 msgs"

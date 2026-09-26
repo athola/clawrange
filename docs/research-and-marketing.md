@@ -185,7 +185,7 @@ workflows service:
 | Name | Cron suggestion | What it does |
 |------|-----------------|--------------|
 | `morning_scan` | `0 8 * * *` | Reddit and GitHub scan tasks per project (queue-only) |
-| `morning_digest` | `0 8 * * *` (auto-seeded) | Live 24h Reddit scan, Telegram digest of comment-worthy posts grouped by project, plus `[DRAFT]` comment tasks |
+| `morning_digest` | `0 8 * * *` (auto-seeded) | Daily outreach rundown: Reddit, Hacker News, GitHub issues and web search, with an LLM read and action items, always delivered to Telegram |
 | `weekly_traffic` | `0 8 * * 1` | Stargazer / clone deltas per repo |
 | `awesome_lists_watch` | `0 10 * * 3` | PR-target reminders for awesome-lists |
 | `custom_scan` | (ad-hoc) | Generic single-topic task emitter |
@@ -199,28 +199,54 @@ On a fresh boot, `seed_default_projects` registers a `0 8 * * *` schedule
 in the `SCHEDULER_TZ` (default `America/Chicago`), so the morning rundown
 fires without manual `/sched add`.
 
-For each tracked project, the generator searches the union of that
-project's subreddits and the AI-coding extras Alex curated
-(`vibecoding`, `opensourceai`, `claudecode`, `ClaudeAI`, `codex`,
-`sideprojects`) for posts created in the last 24h. Each post is scored
-against the project's topics and search_terms, routed to its best-fit
-project, deduplicated against `scan_cache` (so tomorrow's run won't
-re-surface today's posts), and rendered as a Markdown digest grouped
-by project. Telegram delivery via `telegram.notify`. Top picks become
-`[DRAFT]` comment-draft tasks for human review, never auto-posted.
+The report always sends. A morning with no evidence still delivers a
+short report with a source-health line and a **Setup needed** list, so a
+missing message means Telegram failed, not that the scan was quiet.
+
+Sources, each isolated so one outage never empties the report:
+
+- **Reddit**: the union of each project's subreddits and the AI-coding
+  extras, last 24h, scored against topics and search_terms, deduplicated
+  against `scan_cache`, plus the popular-bonus tier (★) and emerging-sub
+  discovery. After 3 consecutive 403/429 responses the run stops calling
+  Reddit and says so in the report.
+- **Hacker News**: keyless Algolia search, last 24h, linked to the HN
+  discussion.
+- **GitHub issues**: open issues on other repos that mention a project's
+  first search term (last 72h). Works keyless; `GITHUB_PAT` lifts the
+  10 req/min limit.
+- **Web search**: the OpenRouter `:online` tier looks for forums,
+  Lobsters, dev.to, newsletters and awesome-lists. Single-source, so
+  these items are labelled "verify before acting".
+
+Every item gets an `E#` ref. One LLM call writes **Today's read and
+action items** over that numbered list. It may cite only `[E#]`; the
+renderer links known refs and strips unknown refs and every raw URL, so
+the model cannot invent a source. Action items say what to do and where,
+not what to write. If synthesis fails, the report falls back to action
+items ranked by engagement. Rendering lives in `workflows/rundown.py`.
+
+Long reports are split on line boundaries into several Telegram messages
+(`telegram.notify_long`), and each chunk is retried with backoff. The
+schedule row records the outcome: `delivered N/N msgs (...)` or
+`FAILED telegram n/N msgs (...)`. Posts are marked seen only after full
+delivery.
+
+If workflows is down at 08:00, the scheduler runs the missed digest at
+boot, as long as the fire was under 4h ago and no later run recorded a
+delivery (`CATCH_UP_SCHEDULES` in `workflows/scheduler.py`).
 
 Override at runtime with `kwargs` on the schedule:
 - `project_slugs`: limit to specific projects
 - `extra_subreddits`: replace the default extras list
-- `top_per_project`: cap the digest size (default 4)
-- `queue_drafts`: set false to skip task creation
+- `top_per_project`: cap Reddit picks per project (default 4)
 
 #### Reddit API access: script-app setup
 
-The digest works on a fresh deploy without credentials by falling
-back to Reddit's unauthenticated public JSON endpoint. That fallback
-is rate-limited (~30 req/min anonymous) and omits some fields, so
-wire a script-app for production-quality lookups.
+Without credentials the digest falls back to Reddit's unauthenticated
+JSON endpoint, which Reddit now answers with 403/429 for most requests.
+In practice Reddit evidence needs a script app. Until one is configured,
+the rundown lists this under **Setup needed** every morning.
 
 **Step 1: Create the script app**
 

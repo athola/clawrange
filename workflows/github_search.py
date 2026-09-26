@@ -124,7 +124,7 @@ async def search_issues(
         return []
 
     try:
-        resp = client.rest.search.search_issues_and_pull_requests(
+        resp = await client.rest.search.async_issues_and_pull_requests(
             q=query, sort="updated", order="desc", per_page=limit
         )
         return [

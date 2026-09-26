@@ -8,6 +8,8 @@ fires before the operator wires script-app credentials.
 
 import logging
 import os
+from collections import Counter
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -36,6 +38,53 @@ async def is_configured() -> bool:
         and creds["username"]
         and creds["password"]
     )
+
+
+# ─── Source health ──────────────────────────────────────────────────
+
+
+@dataclass
+class SearchHealth:
+    """Per-run tally of Reddit request outcomes.
+
+    Callers pass one instance through a run's searches so the report can
+    say *why* it found nothing. After BLOCK_LIMIT consecutive 403/429
+    responses the run stops calling Reddit (`tripped`) instead of spending
+    minutes on requests that will be refused.
+    """
+
+    BLOCK_LIMIT = 3
+
+    mode: str = ""
+    requests: int = 0
+    ok: int = 0
+    skipped: int = 0
+    failures: Counter[str] = field(default_factory=Counter)
+    _block_streak: int = 0
+
+    def record(self, status: int | str) -> None:
+        self.requests += 1
+        if status == 200:
+            self.ok += 1
+            self._block_streak = 0
+            return
+        self.failures[str(status)] += 1
+        if status in (403, 429):
+            self._block_streak += 1
+
+    @property
+    def tripped(self) -> bool:
+        return self._block_streak >= self.BLOCK_LIMIT
+
+    def summary(self) -> str:
+        parts = [f"{self.ok}/{self.requests} requests ok"]
+        if self.failures:
+            parts.append(
+                ", ".join(f"{n}× HTTP {code}" for code, n in self.failures.items())
+            )
+        if self.skipped:
+            parts.append(f"{self.skipped} skipped after repeated blocks")
+        return f"{self.mode or 'reddit'}: " + "; ".join(parts)
 
 
 # ─── Models ──────────────────────────────────────────────────────────
@@ -97,6 +146,7 @@ async def search_subreddits(
     since: str = "7d",
     sort: str = "new",
     limit_per_sub: int = 25,
+    health: SearchHealth | None = None,
 ) -> list[RedditPost]:
     """Search multiple subreddits for posts matching a topic.
 
@@ -107,7 +157,9 @@ async def search_subreddits(
     """
     if not await is_configured():
         logger.info("Reddit OAuth not configured — using public JSON fallback")
-        return await _public_search(topic, subreddits, since, sort, limit_per_sub)
+        return await _public_search(
+            topic, subreddits, since, sort, limit_per_sub, health
+        )
 
     try:
         import asyncpraw
@@ -122,6 +174,8 @@ async def search_subreddits(
 
     seen_ids: set[str] = set()
     results: list[RedditPost] = []
+    if health is not None:
+        health.mode = "oauth"
 
     try:
         reddit = asyncpraw.Reddit(
@@ -164,8 +218,12 @@ async def search_subreddits(
                             snippet=snippet,
                         )
                     )
+                if health is not None:
+                    health.record(200)
             except Exception as exc:
                 logger.warning("Reddit search failed for r/%s: %s", sub_name, exc)
+                if health is not None:
+                    health.record(getattr(exc, "status_code", None) or "error")
                 continue
 
         await reddit.close()
@@ -181,6 +239,7 @@ async def search_all(
     since: str = "24h",
     sort: str = "new",
     limit: int = 25,
+    health: SearchHealth | None = None,
 ) -> list[RedditPost]:
     """Search across all of Reddit (no subreddit restriction).
 
@@ -201,6 +260,11 @@ async def search_all(
 
     seen_ids: set[str] = set()
     results: list[RedditPost] = []
+    if health is not None:
+        health.mode = health.mode or "public"
+        if health.tripped:
+            health.skipped += 1
+            return []
 
     async with httpx.AsyncClient(
         headers={"User-Agent": user_agent},
@@ -216,6 +280,8 @@ async def search_all(
                     "limit": str(limit),
                 },
             )
+            if health is not None:
+                health.record(resp.status_code)
             if resp.status_code != 200:
                 logger.warning(
                     "Reddit all-search '%s' -> HTTP %d", topic, resp.status_code
@@ -224,6 +290,8 @@ async def search_all(
             payload = resp.json()
         except Exception as exc:
             logger.warning("Reddit all-search '%s' failed: %s", topic, exc)
+            if health is not None:
+                health.record("error")
             return []
 
     for child in payload.get("data", {}).get("children", []):
@@ -265,6 +333,7 @@ async def _public_search(
     since: str,
     sort: str,
     limit_per_sub: int,
+    health: SearchHealth | None = None,
 ) -> list[RedditPost]:
     """Unauthenticated read-only fallback via Reddit's public JSON API.
 
@@ -280,12 +349,17 @@ async def _public_search(
 
     seen_ids: set[str] = set()
     results: list[RedditPost] = []
+    if health is not None:
+        health.mode = "public"
 
     async with httpx.AsyncClient(
         headers={"User-Agent": user_agent},
         timeout=15.0,
     ) as client:
         for sub_name in subreddits:
+            if health is not None and health.tripped:
+                health.skipped += 1
+                continue
             url = f"https://www.reddit.com/r/{sub_name}/search.json"
             params = {
                 "q": topic,
@@ -296,6 +370,8 @@ async def _public_search(
             }
             try:
                 resp = await client.get(url, params=params)
+                if health is not None:
+                    health.record(resp.status_code)
                 if resp.status_code != 200:
                     logger.warning(
                         "Reddit public search r/%s '%s' -> HTTP %d",
@@ -307,6 +383,8 @@ async def _public_search(
                 payload = resp.json()
             except Exception as exc:
                 logger.warning("Reddit public search r/%s failed: %s", sub_name, exc)
+                if health is not None:
+                    health.record("error")
                 continue
 
             for child in payload.get("data", {}).get("children", []):

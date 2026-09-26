@@ -279,6 +279,17 @@ class BrainDB:
                 updated_at   TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS deal_observations (
+                source       TEXT NOT NULL,
+                listing_id   TEXT NOT NULL,
+                target       TEXT NOT NULL,
+                price        REAL NOT NULL,
+                observed_at  TEXT NOT NULL,
+                PRIMARY KEY(source, listing_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_deal_obs_target
+                ON deal_observations(target, observed_at);
+
             CREATE TABLE IF NOT EXISTS scan_cache (
                 kind         TEXT NOT NULL,
                 external_id  TEXT NOT NULL,
@@ -1139,6 +1150,38 @@ class BrainDB:
         )
         self._conn.commit()
         return cursor.rowcount > 0
+
+    # ─── Deal price history ─────────────────────────────────────
+
+    def record_deal_observation(
+        self, source: str, listing_id: str, target: str, price: float
+    ) -> None:
+        """Record a matched asking price once per listing (first sighting)."""
+        self._conn.execute(
+            """INSERT OR IGNORE INTO deal_observations
+               (source, listing_id, target, price, observed_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (source, listing_id, target, float(price), _now()),
+        )
+        self._conn.commit()
+
+    def deal_price_stats(self, target: str, days: int = 30):
+        """Median asking price for a target over the window, or None."""
+        from statistics import median
+
+        from deals import PriceStats
+
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+        prices = [
+            r[0]
+            for r in self._conn.execute(
+                "SELECT price FROM deal_observations WHERE target=? AND observed_at>=?",
+                (target, cutoff),
+            ).fetchall()
+        ]
+        if not prices:
+            return None
+        return PriceStats(median=float(median(prices)), samples=len(prices))
 
     # ─── Scan Cache (dedup) ─────────────────────────────────────
 

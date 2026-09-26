@@ -147,6 +147,13 @@
       "kwargs": {}
     },
     {
+      "id": "homelab_deals",
+      "name": "Daily homelab hardware deal rundown",
+      "kind": "homelab_deals",
+      "cron": "30 8 * * *",
+      "kwargs": {}
+    },
+    {
       "id": "daily-research-pulse",
       "name": "Daily research freshness pulse via tome bridge",
       "kind": "research_pulse",

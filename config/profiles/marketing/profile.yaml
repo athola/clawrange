@@ -357,6 +357,11 @@ seeds:
     kind: content_idea
     cron: 0 9 * * *
     kwargs: {}
+  - id: homelab_deals
+    name: Daily homelab hardware deal rundown
+    kind: homelab_deals
+    cron: 30 8 * * *
+    kwargs: {}
   - id: daily-research-pulse
     name: Daily research freshness pulse via tome bridge
     kind: research_pulse
@@ -369,3 +374,121 @@ seeds:
         and developer-workflow gaps (claude-night-market)'
       - 'AI-assisted resume and job-application tooling in 2025: differentiation and
         unmet needs (simple-resume)'
+
+# Daily homelab deal rundown (kind: homelab_deals). Targets are hardware that
+# can move LLM inference off the remote tiers. max_price_great comes from a
+# 2026-09-26 research pass; entries marked "verify" rest on a single source.
+# The scanner also keeps its own 30-day median of asking prices per target,
+# which takes over as the reference once a target has 8+ observations.
+# current_setup describes the operator's gear and lives in .env
+# (HOMELAB_CURRENT_SETUP) so this shipped profile stays identity-free.
+homelab_deals:
+  current_setup: ${HOMELAB_CURRENT_SETUP}
+  sources:
+    ebay: {}           # needs EBAY_CLIENT_ID / EBAY_CLIENT_SECRET
+    slickdeals: {}
+    servethehome: {}
+    reddit:
+      subreddits: [homelabsales, hardwareswap]
+  # Appended to every target: accessories and laptop parts that share a
+  # GPU's model number.
+  exclude: [waterblock, water block, backplate, bracket, shroud, heatsink,
+    box only, empty box, riser, laptop, mobile, for parts]
+  # What the stack lacks today (see HOMELAB_CURRENT_SETUP). Targets name the
+  # gaps they fill; need/want/watch (default want) says how much the stack
+  # wants a target. Both reorder deals inside a price tier, never across.
+  stack_gaps:
+    inference_host: no dedicated always-on box to serve models from
+    vram: nothing with 24 GB+ of GPU memory for 14-32B models
+    big_models: nothing that can hold a 70B-class or large MoE model
+  targets:
+  # 24 GB NVIDIA: the workhorse class for 14-32B models.
+  - {name: RTX 3090 24GB, query: rtx 3090, category: gpu,
+     need: want, fills: [vram], max_price_great: 750,
+     min_vram_gb: 24, exclude: [3090 ti, 3090ti],
+     note: Qwen3-32B / GLM-4.5-Air Q4 class}
+  - {name: RTX 3090 Ti 24GB, query: 3090 ti, category: gpu,
+     need: want, fills: [vram], max_price_great: 900,
+     min_vram_gb: 24}
+  - {name: RTX 4090 24GB, query: rtx 4090, category: gpu,
+     need: want, fills: [vram], max_price_great: 1400,
+     min_vram_gb: 24}  # verify
+  - {name: RTX A5000 24GB, query: a5000, category: gpu,
+     need: want, fills: [vram], max_price_great: 900,
+     min_vram_gb: 24}  # verify
+  # 48 GB and up: 70B-class quantized on one card.
+  - {name: RTX A6000 48GB, query: a6000, category: gpu,
+     need: want, fills: [vram, big_models], max_price_great: 1600,
+     min_vram_gb: 48, exclude: [ada]}  # verify
+  - {name: RTX 6000 Ada 48GB, query: 6000 ada, category: gpu,
+     need: watch, fills: [vram, big_models], max_price_great: 6000,
+     min_vram_gb: 48}  # verify
+  - {name: L40S 48GB, query: l40s, category: gpu,
+     need: watch, fills: [vram, big_models], max_price_great: 6000,
+     min_vram_gb: 48}
+  - {name: A100 80GB, query: a100 80gb, category: gpu,
+     need: watch, fills: [vram, big_models], max_price_great: 12000,
+     min_vram_gb: 80}
+  - {name: NVIDIA L4 24GB, query: nvidia l4, category: gpu,
+     need: watch, fills: [vram], max_price_great: 2000,
+     min_vram_gb: 24, exclude: [l40]}  # verify
+  # Budget datacenter cards: cheap VRAM, older compute, need server airflow.
+  - {name: Tesla P40 24GB, query: tesla p40, category: gpu,
+     need: watch, fills: [vram], max_price_great: 200,
+     min_vram_gb: 24, note: slow FP16; gpt-oss-20b / 14B class}
+  - {name: Tesla P100 16GB, query: tesla p100, category: gpu,
+     need: watch, max_price_great: 180,
+     min_vram_gb: 16}
+  - {name: Tesla V100 SXM2 16GB, query: v100 sxm2, category: gpu,
+     need: watch, max_price_great: 100,
+     min_vram_gb: 16, note: needs an SXM2 carrier board}  # verify
+  # AMD.
+  - {name: Instinct MI50 32GB, query: mi50, category: gpu,
+     need: watch, fills: [vram], max_price_great: 300,
+     min_vram_gb: 32, exclude: [16gb], note: no official ROCm; llama.cpp Vulkan/HIP}
+  - {name: Instinct MI100 32GB, query: mi100, category: gpu,
+     need: watch, fills: [vram], max_price_great: 1200,
+     min_vram_gb: 32}
+  - {name: Radeon Pro W7900 48GB, query: w7900, category: gpu,
+     need: want, fills: [vram, big_models], max_price_great: 3000,
+     min_vram_gb: 48}
+  - {name: RX 7900 XTX 24GB, query: 7900 xtx, category: gpu,
+     need: want, fills: [vram], max_price_great: 650,
+     min_vram_gb: 24, note: vLLM ROCm supported}
+  # Unified memory: big MoE models in one quiet box.
+  - {name: Mac Studio Ultra, query: mac studio ultra, category: unified_memory,
+     need: want, fills: [inference_host, big_models],
+     max_price_great: 3500, exclude: [m1], note: check RAM is 96 GB or more}
+  - {name: Mac mini M4 Pro, query: mac mini m4 pro, category: unified_memory,
+     need: want, fills: [inference_host],
+     max_price_great: 1000, note: up to 64 GB}
+  # parts_cost benchmarks a bundle against buying its parts separately; a
+  # system under it is a deal even above max_price_great. Strix Halo memory
+  # is soldered, so its only parts route is a bare mainboard: Framework lists
+  # it at $3,149 (frame.work, 2026-09-26), plus ~$200 case, PSU and SSD. The
+  # mainboard's own great price is the $1,795-1,899 system floor seen by the
+  # scanner minus those extras. Keep the mainboard above the system target:
+  # match_target takes the first hit.
+  - {name: Strix Halo 128GB mainboard, query: 395 128gb mainboard,
+     category: mainboard,
+     need: need, fills: [inference_host, big_models], max_price_great: 1500, min_vram_gb: 128,
+     note: bare board; needs case, PSU and SSD}
+  - {name: Strix Halo 128GB (Ryzen AI Max+ 395), query: ai max 395 128gb,
+     category: unified_memory,
+     need: need, fills: [inference_host, big_models], max_price_great: 2200, parts_cost: 3350,
+     min_vram_gb: 128, note: 235B MoE ~11 tok/s; best $/GB at 128 GB}
+  # Racked mini PCs and servers.
+  - {name: Minisforum MS-A2, query: ms-a2, category: mini_pc,
+     need: watch, max_price_great: 450,
+     note: orchestrator node, no GPU}
+  - {name: Minisforum MS-01, query: ms-01, category: mini_pc,
+     need: watch, max_price_great: 450,
+     note: 10GbE unused without a 10G switch}
+  - {name: Dell PowerEdge R740, query: r740, category: server,
+     need: want, fills: [inference_host], max_price_great: 500,
+     note: GPU host for P40/3090 class cards}
+  - {name: Dell PowerEdge R730, query: r730, category: server,
+     need: watch, fills: [inference_host], max_price_great: 300}
+  - {name: Supermicro 4028GR GPU server, query: 4028gr, category: server,
+     need: watch, fills: [inference_host],
+     max_price_great: 5000, note: 8-GPU chassis; loud, 240V}  # verify

@@ -299,3 +299,62 @@ def test_chief_of_staff_profile_loads_with_identity():
     p = load_profile("chief-of-staff", profiles_dir=_real_profiles_dir())
     assert p.assistant["identity"]["name"] == "Max"
     assert p.assistant["identity"]["emoji"] == "🎯"
+
+
+# ─── homelab_deals block ─────────────────────────────────────────────
+
+
+def _deals_profile(tmp_path, block: str):
+    _write_profile(
+        tmp_path,
+        "d",
+        "profile: d\nhomelab_deals:\n" + textwrap.indent(textwrap.dedent(block), "  "),
+    )
+    return lambda: load_profile(
+        "d", profiles_dir=tmp_path, known_generator_kinds=KNOWN_KINDS
+    )
+
+
+def test_homelab_deals_valid_block_loads(tmp_path):
+    load = _deals_profile(
+        tmp_path,
+        """
+        sources: {slickdeals: {}, reddit: {subreddits: [homelabsales]}}
+        targets:
+          - {name: RTX 3090, query: rtx 3090, max_price_great: 750}
+        """,
+    )
+    assert load().raw["homelab_deals"]["targets"][0]["name"] == "RTX 3090"
+
+
+def test_homelab_deals_unknown_source_raises(tmp_path):
+    load = _deals_profile(
+        tmp_path,
+        """
+        sources: {craigslist: {}}
+        targets:
+          - {name: RTX 3090, query: rtx 3090, max_price_great: 750}
+        """,
+    )
+    with pytest.raises(ProfileError, match="craigslist"):
+        load()
+
+
+def test_homelab_deals_bad_target_raises(tmp_path):
+    load = _deals_profile(
+        tmp_path,
+        """
+        sources: {slickdeals: {}}
+        targets:
+          - {name: RTX 3090, query: rtx 3090, max_price_great: cheap}
+        """,
+    )
+    with pytest.raises(ProfileError, match="max_price_great"):
+        load()
+
+
+def test_marketing_profile_ships_homelab_deals():
+    p = load_profile("marketing", profiles_dir=_real_profiles_dir())
+    block = p.raw["homelab_deals"]
+    assert len(block["targets"]) >= 20
+    assert set(block["sources"]) <= profile_mod.KNOWN_DEAL_SOURCE_KINDS

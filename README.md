@@ -192,6 +192,8 @@ Scheduled scans are driven by APScheduler with six built-in generators
 registered in `workflows/generators.py`:
 
 - `morning_scan`: daily Reddit and GitHub scan per tracked project
+- `morning_digest`: 8am outreach rundown (Reddit, Hacker News, GitHub
+  issues, web) with cited action items, always delivered to Telegram
 - `weekly_traffic`: weekly traffic snapshot tasks
 - `awesome_lists_watch`: alerts when projects are missing from
   curated awesome-lists
