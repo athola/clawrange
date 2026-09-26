@@ -2964,9 +2964,13 @@ class TestHeartbeatInterceptor:
         sent = [call.args[0] for call in mock_notify.await_args_list]
         assert any("old task from earlier" in text for text in sent)
 
+    @patch(
+        "llm_proxy._current_thinking_subjects",
+        return_value=["Strix Halo 128GB"],
+    )
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
-    def test_heartbeat_llm_thinking(self, mock_notify):
-        """Heartbeat asks the LLM for a task suggestion when due."""
+    def test_heartbeat_llm_thinking(self, mock_notify, _subjects):
+        """The heartbeat asks the LLM for a task suggestion when due."""
         import llm_proxy
 
         # Ensure LLM thinking is ready to fire, stale tasks is not
@@ -2981,7 +2985,8 @@ class TestHeartbeatInterceptor:
                         "message": {
                             "role": "assistant",
                             "content": (
-                                "Review OpenRouter spending trends for the past week"
+                                "Research Reddit threads on Strix Halo 128GB "
+                                "inference speed"
                             ),
                         }
                     }
@@ -3010,13 +3015,94 @@ class TestHeartbeatInterceptor:
             content = r.json()["choices"][0]["message"]["content"]
             assert "this hour" in content
             sent = [call.args[0] for call in mock_notify.await_args_list]
-            assert any("OpenRouter spending" in text for text in sent)
+            assert any("Strix Halo 128GB" in text for text in sent)
 
         from app import brain_db
 
         all_tasks = brain_db.list_tasks()
-        llm_tasks = [t for t in all_tasks if "OpenRouter spending" in t["description"]]
+        llm_tasks = [t for t in all_tasks if "Strix Halo 128GB" in t["description"]]
         assert len(llm_tasks) == 1
+
+    def _think_with(self, suggestion: str) -> list[dict]:
+        """Run one heartbeat whose LLM thinking returns `suggestion`."""
+        import llm_proxy
+        from app import brain_db
+
+        llm_proxy._proactive_state.pop("llm_thinking", None)
+        llm_proxy._proactive_state["stale_tasks"] = time.monotonic()
+        with (
+            patch.dict("os.environ", {"HEARTBEAT_LLM_SUGGEST": "1"}),
+            patch(
+                "llm_proxy._current_thinking_subjects",
+                return_value=TestGroundedThinking.SUBJECTS,
+            ),
+            patch(
+                "llm_proxy._llm_suggest_task",
+                new_callable=AsyncMock,
+                return_value=suggestion,
+            ),
+        ):
+            r = client.post(
+                "/v1/chat/completions",
+                json=self._heartbeat_body(),
+                headers=AUTH_HEADER,
+            )
+        assert r.json()["choices"][0]["message"]["content"] == ""
+        return [t for t in brain_db.list_tasks() if t["description"] == suggestion]
+
+    @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
+    def test_heartbeat_thinking_off_switch(self, _notify, monkeypatch):
+        """HEARTBEAT_LLM_SUGGEST=0 stops self-invented work entirely."""
+        monkeypatch.setenv("HEARTBEAT_LLM_SUGGEST", "0")
+        suggestion = (
+            "Query ClawRange FastAPI workflows documentation and best practices "
+            "to identify optimization patterns"
+        )
+        import llm_proxy
+        from app import brain_db
+
+        llm_proxy._proactive_state.pop("llm_thinking", None)
+        llm_proxy._proactive_state["stale_tasks"] = time.monotonic()
+        with patch(
+            "llm_proxy._llm_suggest_task",
+            new_callable=AsyncMock,
+            return_value=suggestion,
+        ) as sug:
+            client.post(
+                "/v1/chat/completions",
+                json=self._heartbeat_body(),
+                headers=AUTH_HEADER,
+            )
+        sug.assert_not_awaited()
+        assert not [t for t in brain_db.list_tasks() if t["description"] == suggestion]
+
+    @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
+    def test_heartbeat_drops_ungrounded_task(self, _notify):
+        """The real 23d5f755: needs internal docs no worker path can read."""
+        suggestion = TestGroundedThinking.INVENTED[0]
+        assert self._think_with(suggestion) == []
+
+    @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
+    def test_heartbeat_queues_grounded_task(self, _notify):
+        suggestion = TestGroundedThinking.LEGIT[0]
+        assert len(self._think_with(suggestion)) == 1
+
+    @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
+    def test_heartbeat_skips_thinking_without_subjects(self, _notify):
+        import llm_proxy
+
+        llm_proxy._proactive_state.pop("llm_thinking", None)
+        llm_proxy._proactive_state["stale_tasks"] = time.monotonic()
+        with (
+            patch("llm_proxy._current_thinking_subjects", return_value=[]),
+            patch("llm_proxy._llm_suggest_task", new_callable=AsyncMock) as sug,
+        ):
+            client.post(
+                "/v1/chat/completions",
+                json=self._heartbeat_body(),
+                headers=AUTH_HEADER,
+            )
+        sug.assert_not_awaited()
 
     def test_heartbeat_llm_thinking_graceful_failure(self):
         """LLM failure during thinking doesn't break the heartbeat."""
@@ -4117,7 +4203,7 @@ class TestThinkingPromptDoesNotAskAlex:
         import llm_proxy
 
         monkeypatch.setattr(llm_proxy, "_load_soul", lambda: "You are Max.")
-        return llm_proxy._build_thinking_prompt()
+        return llm_proxy._build_thinking_prompt(["skrills"])
 
     def test_prompt_does_not_ask_for_knowledge_building(self, monkeypatch):
         assert "suggest tasks that BUILD knowledge" not in self._prompt(monkeypatch)
@@ -4402,3 +4488,103 @@ class TestClipResult:
         # The clipped head is a prefix of the original at a word break.
         assert long.startswith(head)
         assert long[len(head) : len(head) + 1] == " "
+
+
+class TestGroundedThinking:
+    """Self-invented work is welcome when the worker can do it: research on
+    Reddit/GitHub/web about a subject that exists (a tracked project or a
+    homelab deal target). INVENTED are real system tasks from 2026-09 that
+    needed a CRM, billing data, a calendar or internal docs."""
+
+    SUBJECTS = [
+        "claude-night-market",
+        "skrills",
+        "simple-resume",
+        "clawrange",
+        "Strix Halo 128GB",
+        "RTX 3090 24GB",
+    ]
+    INVENTED = [
+        "Query ClawRange FastAPI workflows documentation and best practices "
+        "to identify optimization patterns that could reduce Alex's task "
+        "queue processing latency and LLM proxy call overhead.",
+        "Query billing records and usage logs to calculate LLM proxy "
+        "cost-per-transaction and identify which client segments",
+        "Query CRM to identify which clients in the active segment haven't "
+        "had contact in 60+ days, then surface their last interaction type",
+        "Query ClawRange infrastructure costs (compute, storage, LLM proxy "
+        "calls) against monthly budget targets",
+        "Create a personal wellness check-in template (weekly cadence: sleep, "
+        "exercise, stress, focus) and schedule it",
+        "Audit ClawRange infrastructure for secret exposure in logs, "
+        "environment variables, and API responses",
+        "Search the web for the top 3 inactive clients from Q3",
+        "I need more context to suggest a meaningful task. What's Alex "
+        "currently working on?",
+    ]
+    LEGIT = [
+        "Research recent Reddit threads on Strix Halo 128GB local inference "
+        "speed with 70B models",
+        "Search GitHub for resume generators similar to simple-resume and "
+        "note features it lacks",
+        "Scan r/ClaudeAI posts asking for plugin marketplaces where "
+        "claude-night-market would be a useful answer",
+    ]
+
+    def test_drops_invented_tasks(self):
+        from llm_proxy import _is_grounded_suggestion
+
+        for text in self.INVENTED:
+            assert not _is_grounded_suggestion(text, self.SUBJECTS), text
+
+    def test_keeps_runnable_research_on_real_subjects(self):
+        from llm_proxy import _is_grounded_suggestion
+
+        for text in self.LEGIT:
+            assert _is_grounded_suggestion(text, self.SUBJECTS), text
+
+    def test_subjects_from_projects_and_deal_targets(self):
+        from llm_proxy import _thinking_subjects
+
+        subjects = _thinking_subjects(
+            [{"slug": "skrills"}, {"slug": "simple-resume"}],
+            {
+                "targets": [
+                    {
+                        "name": "Strix Halo 128GB (Ryzen AI Max+ 395)",
+                        "query": "x",
+                        "max_price_great": 1,
+                    },
+                    {
+                        "name": "RTX 3090 24GB",
+                        "query": "rtx 3090",
+                        "max_price_great": 1,
+                    },
+                ]
+            },
+        )
+        assert subjects == [
+            "skrills",
+            "simple-resume",
+            "Strix Halo 128GB",
+            "RTX 3090 24GB",
+        ]
+
+    def test_subjects_without_deals_block(self):
+        from llm_proxy import _thinking_subjects
+
+        assert _thinking_subjects([{"slug": "skrills"}], None) == ["skrills"]
+
+    def test_prompt_lists_subjects_and_capabilities(self, monkeypatch):
+        import llm_proxy
+
+        monkeypatch.setattr(llm_proxy, "_load_soul", lambda: "You are Max.")
+        prompt = llm_proxy._build_thinking_prompt(
+            self.SUBJECTS, "Stack gaps: vram: nothing with 24 GB+"
+        )
+        for subject in self.SUBJECTS:
+            assert subject in prompt
+        assert "Reddit" in prompt and "GitHub" in prompt
+        assert "Stack gaps: vram" in prompt
+        assert "Focus area" not in prompt
+        assert "client outreach" not in prompt

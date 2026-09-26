@@ -1776,95 +1776,109 @@ def _strip_persona_backstory(soul: str) -> str:
     return "\n".join(out).strip()
 
 
-_TASK_CATEGORIES = [
-    "client outreach or relationship building",
-    "financial review (spending, billing, ROI)",
-    "learning or skill development for Alex",
-    "infrastructure optimization or cost reduction",
-    "documentation or knowledge capture",
-    "personal wellness or family reminder",
-    "business development or lead generation",
-    "tooling improvement or workflow automation",
-    "security audit or compliance check",
-    "research into new technologies or services",
-]
+# Self-invented work is grounded in subjects that exist -- tracked projects
+# and homelab deal targets -- and must be research the worker can run
+# (_try_research_task). Free-form categories ("client outreach", "financial
+# review", "wellness") produced ~90 tasks by 2026-09 that needed a CRM,
+# billing data, a calendar or internal docs, and all dead-ended.
 
-# Track which category was last used to rotate through them.
-_last_category_index = 0
+# Rotates the focus subject so consecutive cycles cover different ground.
+_thinking_focus_index = 0
 
 
-def _build_thinking_prompt() -> str:
-    """Build the LLM thinking prompt with recent task history and category rotation."""
-    global _last_category_index
+def _thinking_subjects(projects: list[dict], deals_block: dict | None) -> list[str]:
+    """Project slugs, then deal target names without their parenthetical."""
+    subjects = [p["slug"] for p in projects if p.get("slug")]
+    for t in (deals_block or {}).get("targets") or []:
+        name = re.sub(r"\s*\(.*?\)", "", t.get("name", "")).strip()
+        if name and name not in subjects:
+            subjects.append(name)
+    return subjects
+
+
+def _deals_block() -> dict | None:
+    from app import app
+
+    profile = getattr(app.state, "profile", None)
+    return profile.raw.get("homelab_deals") if profile else None
+
+
+def _current_thinking_subjects() -> list[str]:
+    from app import brain_db
+
+    try:
+        return _thinking_subjects(brain_db.list_projects(), _deals_block())
+    except Exception:
+        logger.exception("thinking: could not load subjects")
+        return []
+
+
+def _thinking_context() -> str:
+    """Stack gaps from the deals profile, so hardware research has a why."""
+    gaps = (_deals_block() or {}).get("stack_gaps") or {}
+    if not gaps:
+        return ""
+    return "Stack gaps: " + "; ".join(f"{k}: {v}" for k, v in gaps.items())
+
+
+def _squash_words(text: str) -> str:
+    return " " + " ".join(re.sub(r"[^a-z0-9]+", " ", text.lower()).split()) + " "
+
+
+def _is_grounded_suggestion(text: str, subjects: list[str]) -> bool:
+    """Runnable research (the research router would take it) about a subject
+    that exists. Both halves matter: "query the docs" names a real project
+    but no worker can run it; "search the web for inactive clients" is
+    runnable but about nothing real."""
+    if not (_RESEARCH_INTENT.search(text) and _RESEARCH_TARGET.search(text)):
+        return False
+    words = _squash_words(text)
+    return any(_squash_words(s) in words for s in subjects)
+
+
+def _build_thinking_prompt(subjects: list[str], context: str = "") -> str:
+    """Ask for one research task about a listed subject."""
+    global _thinking_focus_index
     soul = _load_soul()
-
-    # Gather recent tasks and brain state for grounding
     recent_descriptions = []
-    brain_summary = "Brain is empty — no entities recorded yet."
     try:
         from app import brain_db
 
-        all_tasks = brain_db.list_tasks()
         cutoff = datetime.now(UTC) - timedelta(hours=24)
-        for t in all_tasks:
-            try:
-                created = datetime.fromisoformat(t["created_at"])
-                if created > cutoff:
-                    recent_descriptions.append(t["description"])
-            except (ValueError, KeyError):
-                continue
-
-        pages = brain_db.list_pages(limit=20)
-        if pages:
-            by_type: dict[str, list[str]] = {}
-            for p in pages:
-                by_type.setdefault(p["page_type"], []).append(p["slug"])
-            parts = [f"{k}: {', '.join(v)}" for k, v in by_type.items()]
-            brain_summary = "Known entities in brain:\n  " + "\n  ".join(parts)
+        for t in brain_db.list_tasks():
+            created = _parse_task_time(t.get("created_at"))
+            if created and created > cutoff:
+                recent_descriptions.append(t["description"])
     except Exception:
         pass
-
     recent_block = ""
     if recent_descriptions:
         recent_list = "\n".join(f"  - {d}" for d in recent_descriptions[-10:])
         recent_block = (
-            f"\n\nTasks already created in the last 24 hours "
-            f"(DO NOT repeat or suggest anything similar):\n"
-            f"{recent_list}\n"
+            "\nTasks already created in the last 24 hours "
+            f"(DO NOT repeat or suggest anything similar):\n{recent_list}\n"
         )
-
-    # Rotate through categories
-    category = _TASK_CATEGORIES[_last_category_index % len(_TASK_CATEGORIES)]
-    _last_category_index += 1
-
-    if soul:
-        return (
-            f"{soul}\n\n"
-            "---\n"
-            f"Focus area for this cycle: **{category}**\n"
-            f"\n{brain_summary}\n"
-            f"{recent_block}\n"
-            "RULES:\n"
-            "- Only reference clients, people, or systems that exist in "
-            "the brain above.\n"
-            "- Never suggest a task that needs information only Alex can "
-            "supply — his clients, priorities, or private history. An empty "
-            "brain is NOT a cue to ask him to fill it: that task comes back "
-            "blocked and the brain stays empty. Suggest work you can finish "
-            "from web search and the system state alone.\n"
-            "- Do NOT invent client names, people, or events.\n"
-            "- Do NOT suggest sending emails or making calls — "
-            "suggest PREPARING drafts or RESEARCHING info.\n"
-            "- Tasks should be completable by an AI with access to web search "
-            "and the brain API.\n\n"
-            "Suggest exactly ONE actionable task. "
-            "Respond with ONLY the task description (one sentence, no explanation, "
-            "no quotes)."
-        )
+    focus = subjects[_thinking_focus_index % len(subjects)]
+    _thinking_focus_index += 1
     return (
-        f"You are Max, an executive assistant. Focus area: {category}. "
-        "Suggest exactly ONE specific, actionable task that an AI can complete. "
-        "Respond with ONLY the task description (one sentence)."
+        (f"{soul}\n\n---\n" if soul else "")
+        + "Suggest ONE task for yourself. The only work you can finish is "
+        "searching Reddit, GitHub, Hacker News, arXiv or the web and "
+        "summarizing what you find. You cannot read internal docs, billing, "
+        "calendars, a CRM or private data.\n\n"
+        "Real subjects (use one, spelled exactly as listed):\n"
+        + "\n".join(f"  - {s}" for s in subjects)
+        + "\n"
+        + (f"{context}\n" if context else "")
+        + f"Prefer this cycle's focus: {focus}\n"
+        + recent_block
+        + "\nRULES:\n"
+        "- Start with Research, Search, Find or Scan, name one subject from "
+        "the list, and name where to look (Reddit, GitHub, web, arXiv).\n"
+        "- Never suggest a task that needs information only Alex can supply "
+        "-- his clients, priorities, or private history.\n"
+        "- Do NOT invent clients, people, events, or subjects not listed.\n\n"
+        "Respond with ONLY the task description (one sentence, no quotes)."
     )
 
 
@@ -2163,9 +2177,9 @@ def _extract_openrouter_citations(annotations: list[dict]) -> str:
     return "\n".join(refs)
 
 
-async def _llm_suggest_task() -> str | None:
+async def _llm_suggest_task(subjects: list[str], context: str = "") -> str | None:
     """Ask the LLM for one proactive task suggestion."""
-    text = await _llm_call(_build_thinking_prompt(), max_tokens=100)
+    text = await _llm_call(_build_thinking_prompt(subjects, context), max_tokens=100)
     if text:
         text = text.strip('"')
         if 10 <= len(text) <= 200 and "\n" not in text:
@@ -2924,10 +2938,22 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
                 t = brain_db.create_task(desc, priority=2)
                 tasks_created.append(t)
 
-        # Layer 3: LLM self-directed thinking — every 1 hr
-        if not tasks_created and _proactive_ready("llm_thinking"):
+        # Layer 3: LLM self-directed thinking, grounded in real subjects.
+        # HEARTBEAT_LLM_SUGGEST=0 turns it off.
+        subjects = (
+            _current_thinking_subjects()
+            if os.environ.get("HEARTBEAT_LLM_SUGGEST", "1") != "0"
+            and not tasks_created
+            and _proactive_ready("llm_thinking")
+            else []
+        )
+        if subjects:
             _proactive_mark("llm_thinking")
-            suggestion = await _llm_suggest_task()
+            suggestion = await _llm_suggest_task(subjects, _thinking_context())
+            if suggestion and not _is_grounded_suggestion(suggestion, subjects):
+                # Prompt rules alone never held this line; drop it in code.
+                print(f"[PROXY] dropped ungrounded task: {suggestion!r}", flush=True)
+                suggestion = None
             if suggestion and not _has_recent_task(all_tasks, suggestion):
                 t = brain_db.create_task(suggestion, priority=3)
                 tasks_created.append(t)
