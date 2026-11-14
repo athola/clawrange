@@ -434,8 +434,8 @@ REDDIT_USER_AGENT=clawrange-marketing-bot/0.1   # default if unset
 # GitHub (PAT with repo + read:org scope)
 GITHUB_PAT=
 
-# Scheduler timezone (default: America/Chicago for Alex's Texas location)
-SCHEDULER_TZ=America/Chicago
+# Operator timezone override (else profile assistant.timezone, else UTC)
+SCHEDULER_TZ=
 ```
 
 All four Reddit vars optional. Adapter gracefully degrades. `GITHUB_PAT` optional. Search degrades to unauthenticated quotas, traffic endpoints disabled.

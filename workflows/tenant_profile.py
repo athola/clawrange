@@ -35,6 +35,7 @@ KNOWN_ADAPTERS = {"sqlite", "rest"}
 KNOWN_AUTH_KINDS = {"none", "api_key", "bearer", "basic", "login_form"}
 # Mirrors deal_sources.gather: a typo'd source fails at load, not at 08:30.
 KNOWN_DEAL_SOURCE_KINDS = {"ebay", "slickdeals", "servethehome", "reddit"}
+KNOWN_OUTREACH_CHANNELS = {"reddit", "hn", "github", "web"}
 IDENTITY_FIELDS = {"name", "creature", "vibe", "emoji", "avatar"}
 EMOJI_MAX_LEN = 16
 
@@ -202,7 +203,16 @@ def validate(
                 f"crm.adapter '{adapter}' is unknown (known: {sorted(KNOWN_ADAPTERS)})"
             )
 
+    _validate_timezone(profile.assistant.get("timezone"))
+    _validate_search_hygiene(profile.assistant.get("search_hygiene"))
+    lists = profile.raw.get("awesome_lists")
+    if lists is not None and not (_is_str_list(lists) and all("/" in x for x in lists)):
+        raise ProfileError("awesome_lists must be a list of owner/repo names")
+    subs = (profile.raw.get("reddit") or {}).get("default_subreddits")
+    if subs is not None and not _is_str_list(subs):
+        raise ProfileError("reddit.default_subreddits must be a list of names")
     _validate_homelab_deals(profile.raw.get("homelab_deals"))
+    _validate_outreach(profile.raw.get("outreach"))
 
     for s in profile.schedules:
         kind = s.get("kind")
@@ -219,9 +229,100 @@ def validate(
             )
 
 
+def _validate_timezone(tz: Any) -> None:
+    if tz in (None, ""):
+        return
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    try:
+        ZoneInfo(str(tz))
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ProfileError(f"assistant.timezone '{tz}' is not a known zone") from exc
+
+
+def _validate_search_hygiene(block: Any) -> None:
+    if block is None:
+        return
+    if not isinstance(block, dict):
+        raise ProfileError("assistant.search_hygiene must be a mapping")
+    for key in ("strip_headings", "blocked_citations"):
+        if not _is_str_list(block.get(key) or []):
+            raise ProfileError(f"assistant.search_hygiene.{key} must be a list")
+    for pattern in block.get("blocked_citations") or []:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ProfileError(
+                f"assistant.search_hygiene.blocked_citations: bad regex {pattern!r}"
+            ) from exc
+
+
+def _is_str_list(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(v, str) for v in value)
+
+
+def _validate_outreach(block: Any) -> None:
+    if block is None:
+        return
+    if not isinstance(block, dict):
+        raise ProfileError("outreach must be a mapping")
+    venues = block.get("venue_actions") or {}
+    if not isinstance(venues, dict) or not all(
+        isinstance(v, str) and v.strip() for v in venues.values()
+    ):
+        raise ProfileError("outreach.venue_actions must map channel -> action text")
+    unknown = set(venues) - KNOWN_OUTREACH_CHANNELS
+    if unknown:
+        raise ProfileError(
+            f"outreach.venue_actions channels {sorted(unknown)} are unknown "
+            f"(known: {sorted(KNOWN_OUTREACH_CHANNELS)})"
+        )
+    if not _is_str_list(block.get("banned_actions") or []):
+        raise ProfileError("outreach.banned_actions must be a list of phrases")
+    for key in ("audience", "web_venues"):
+        if block.get(key) is not None and not isinstance(block[key], str):
+            raise ProfileError(f"outreach.{key} must be text")
+
+
+def _validate_deal_policy(block: dict) -> None:
+    share = block.get("too_good_share")
+    if share is not None and (
+        isinstance(share, bool)
+        or not isinstance(share, int | float)
+        or not 0 < share < 1
+    ):
+        raise ProfileError(
+            f"homelab_deals.too_good_share must be between 0 and 1, got {share!r}"
+        )
+    cap = block.get("max_per_target")
+    if cap is not None and (
+        isinstance(cap, bool) or not isinstance(cap, int) or cap < 1
+    ):
+        raise ProfileError(
+            f"homelab_deals.max_per_target must be a positive integer, got {cap!r}"
+        )
+    flags = block.get("red_flags") or {}
+    if not isinstance(flags, dict) or not all(_is_str_list(v) for v in flags.values()):
+        raise ProfileError("homelab_deals.red_flags must map a label -> [phrases]")
+    for key in ("part_categories", "memory_check_categories"):
+        if block.get(key) is not None and not _is_str_list(block[key]):
+            raise ProfileError(f"homelab_deals.{key} must be a list of categories")
+    advisor = block.get("advisor") or {}
+    if not isinstance(advisor, dict) or not _is_str_list(advisor.get("rules") or []):
+        raise ProfileError("homelab_deals.advisor needs audience text and a rules list")
+    ebay = (block.get("sources") or {}).get("ebay") or {}
+    cats = ebay.get("categories") or {}
+    if not isinstance(cats, dict) or not all(str(v).isdigit() for v in cats.values()):
+        raise ProfileError(
+            "homelab_deals.sources.ebay.categories must map a target category "
+            "to a numeric eBay category id"
+        )
+
+
 def _validate_homelab_deals(block: dict | None) -> None:
     if block is None:
         return
+    _validate_deal_policy(block)
     for source in block.get("sources") or {}:
         if source not in KNOWN_DEAL_SOURCE_KINDS:
             raise ProfileError(
@@ -263,6 +364,75 @@ def _validate_homelab_deals(block: dict | None) -> None:
         if name in names:
             raise ProfileError(f"homelab_deals target '{name}' is duplicated")
         names.add(name)
+
+
+_ACTIVE: dict[str, Any] = {}
+
+
+def active_profile() -> Profile | None:
+    """The running tenant's profile, reloaded when its file changes.
+
+    Hot paths (every heartbeat prompt, every report) read tenant config
+    through this instead of re-parsing YAML. None when no profile loads.
+    """
+    name = os.environ.get("CLAWRANGE_PROFILE") or "starter"
+    path = default_profiles_dir() / name / "profile.yaml"
+    try:
+        stamp = (name, path.stat().st_mtime_ns)
+    except OSError:
+        return None
+    if _ACTIVE.get("stamp") != stamp:
+        try:
+            _ACTIVE.update(stamp=stamp, profile=load_profile(name))
+        except Exception as exc:
+            logger.warning("active_profile: %s failed to load: %s", name, exc)
+            _ACTIVE.update(stamp=stamp, profile=None)
+    return _ACTIVE.get("profile")
+
+
+def operator_name(profile: Profile | None = None) -> str:
+    """How prompts and labels refer to the operator: `assistant.owner.name`,
+    else "the operator". Keeps any one person's name out of core code."""
+    profile = profile or active_profile()
+    owner = (profile.assistant.get("owner") or {}) if profile else {}
+    return str(owner.get("name") or "").strip() or "the operator"
+
+
+def search_hygiene(profile: Profile | None = None) -> dict:
+    """The persona's `assistant.search_hygiene` block: `strip_headings`
+    (persona sections kept out of web-search prompts) and
+    `blocked_citations` (regexes for citation URLs/titles to drop)."""
+    profile = profile or active_profile()
+    return (profile.assistant.get("search_hygiene") or {}) if profile else {}
+
+
+def default_subreddits(profile: Profile | None = None) -> list[str]:
+    """Subreddits for scans that name none: `reddit.default_subreddits`,
+    else the union of the tracked projects' subreddits."""
+    profile = profile or active_profile()
+    if profile is None:
+        return []
+    configured = (profile.raw.get("reddit") or {}).get("default_subreddits")
+    if configured:
+        return [str(s) for s in configured]
+    subs: dict[str, None] = {}
+    for proj in profile.projects:
+        for sub in proj.get("subreddits") or []:
+            subs.setdefault(str(sub), None)
+    return list(subs)
+
+
+def operator_timezone(profile: Profile | None = None) -> str:
+    """The operator's timezone: SCHEDULER_TZ, else the profile's
+    `assistant.timezone`, else UTC. One source for schedules, quiet hours,
+    the heartbeat watchdog and report headers."""
+    env_tz = os.getenv("SCHEDULER_TZ", "").strip()
+    if env_tz:
+        return env_tz
+    profile = profile or active_profile()
+    if profile is None:  # a bad profile must not break a clock
+        return "UTC"
+    return str(profile.assistant.get("timezone") or "UTC")
 
 
 def load_profile(

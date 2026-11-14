@@ -14,6 +14,7 @@ import github_search
 import llm_proxy
 import reddit_search
 import research
+import tenant_profile
 from brain import create_brain_router
 from brain_db import BrainDB
 from crm import get_adapter
@@ -520,7 +521,7 @@ async def scan_reddit(body: dict[str, Any]):
             subreddits = json.loads(project.get("subreddits", "[]"))
 
     if not subreddits:
-        subreddits = ["ClaudeAI", "LocalLLaMA", "SideProject"]
+        subreddits = tenant_profile.default_subreddits()
 
     results = await reddit_search.search_subreddits(
         topic,
@@ -626,7 +627,7 @@ async def run_research(body: ResearchRequest):
     confidence flag based on cross-channel triangulation.
 
     The full session (topic, channels, findings) is persisted in the
-    brain so John-117 can recall earlier research without re-running
+    brain so the assistant can recall earlier research without re-running
     the fanout. The response includes `session_id` for follow-up
     queries against `/research/sessions/{id}`.
     """

@@ -31,7 +31,17 @@ logger = logging.getLogger("clawrange.watchdog")
 # that one slow cycle does not page, short enough to catch a lunchbreak.
 STALL_SECS = float(os.getenv("HEARTBEAT_WATCH_STALL_SECS", "900"))
 REALERT_SECS = float(os.getenv("HEARTBEAT_WATCH_REALERT_SECS", "7200"))
-TZ_NAME = os.getenv("HEARTBEAT_WATCH_TZ", "America/Chicago")
+
+
+def _tz_name() -> str:
+    """HEARTBEAT_WATCH_TZ, else the operator timezone from config."""
+    import tenant_profile
+
+    return os.getenv("HEARTBEAT_WATCH_TZ", "").strip() or (
+        tenant_profile.operator_timezone()
+    )
+
+
 _ACTIVE_START, _ACTIVE_END = (
     int(part) for part in os.getenv("HEARTBEAT_WATCH_ACTIVE", "8-20").split("-")
 )
@@ -47,7 +57,7 @@ def _state_path() -> str:
 
 def in_active_hours(now_dt: datetime) -> bool:
     """True inside the heartbeat gate OpenClaw runs (08:00-20:00 local)."""
-    local = now_dt.astimezone(ZoneInfo(TZ_NAME))
+    local = now_dt.astimezone(ZoneInfo(_tz_name()))
     return _ACTIVE_START <= local.hour < _ACTIVE_END
 
 
@@ -95,7 +105,7 @@ async def check(
     if now_ts is None:
         now_ts = time.time()
     if now_dt is None:
-        now_dt = datetime.now(ZoneInfo(TZ_NAME))
+        now_dt = datetime.now(ZoneInfo(_tz_name()))
     if notify is None:
         from telegram import notify as telegram_notify
 

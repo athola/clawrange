@@ -46,17 +46,8 @@ if [ -z "$OPENROUTER_VAL" ] || echo "$OPENROUTER_VAL" | grep -qi "your-key\|exam
   echo "  Get a key at https://openrouter.ai/settings/keys"
 fi
 
-# Generate n8n encryption key if missing or still placeholder
-N8N_KEY_VAL=$(grep '^N8N_ENCRYPTION_KEY=' .env | cut -d= -f2- || true)
-if [ -z "$N8N_KEY_VAL" ] || echo "$N8N_KEY_VAL" | grep -qi "replace-with"; then
-  KEY=$(openssl rand -hex 32)
-  # Portable sed: use temp file instead of -i (avoids macOS/Linux divergence)
-  sed "s|^N8N_ENCRYPTION_KEY=.*|N8N_ENCRYPTION_KEY=${KEY}|" .env > .env.tmp && mv .env.tmp .env
-  echo "Generated N8N_ENCRYPTION_KEY automatically."
-fi
-
-# ─── Start OpenClaw + n8n ──────────────────────────────────────────
-echo "Starting core stack (OpenClaw + n8n)..."
+# ─── Start OpenClaw + workflows ────────────────────────────────────
+echo "Starting core stack (OpenClaw + workflows)..."
 docker compose up -d
 
 # ─── Optionally start DeerFlow ─────────────────────────────────────
@@ -97,18 +88,18 @@ MAX_TRIES=30
 
 while [ $TRIES -lt $MAX_TRIES ]; do
   OPENCLAW_OK=$(curl -sf --connect-timeout 5 http://localhost:${OPENCLAW_PORT:-3000}/healthz 2>/dev/null && echo "1" || echo "0")
-  N8N_OK=$(curl -sf --connect-timeout 5 http://localhost:${N8N_PORT:-5678}/healthz 2>/dev/null && echo "1" || echo "0")
+  WORKFLOWS_OK=$(curl -sf --connect-timeout 5 http://localhost:${WORKFLOWS_PORT:-5678}/healthz 2>/dev/null && echo "1" || echo "0")
 
   DEERFLOW_OK="1"
   if [ "$WITH_DEERFLOW" = true ]; then
     DEERFLOW_OK=$(curl -sf --connect-timeout 5 http://localhost:${DEERFLOW_PORT:-2026}/api/health 2>/dev/null && echo "1" || echo "0")
   fi
 
-  if [ "$OPENCLAW_OK" = "1" ] && [ "$N8N_OK" = "1" ] && [ "$DEERFLOW_OK" = "1" ]; then
+  if [ "$OPENCLAW_OK" = "1" ] && [ "$WORKFLOWS_OK" = "1" ] && [ "$DEERFLOW_OK" = "1" ]; then
     echo ""
     echo "Stack is healthy!"
     echo "  OpenClaw: http://localhost:${OPENCLAW_PORT:-3000}"
-    echo "  n8n:      http://localhost:${N8N_PORT:-5678}"
+    echo "  Workflows: http://localhost:${WORKFLOWS_PORT:-5678}"
     if [ "$WITH_DEERFLOW" = true ]; then
       echo "  DeerFlow: http://localhost:${DEERFLOW_PORT:-2026}"
     fi

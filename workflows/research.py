@@ -1,7 +1,7 @@
 """Multi-source research orchestrator.
 
 Ports a focused subset of `tome`'s synthesis logic into the
-workflows service so John-117 can call a single endpoint and get
+workflows service so the assistant can call a single endpoint and get
 ranked, deduplicated, citation-bearing findings across Reddit,
 GitHub, and GLM web search. The shape of `Finding`, the dedup
 rules, the authority bonuses, and the triangulation bonus all
@@ -32,6 +32,7 @@ from typing import Any
 import httpx
 
 import llm_proxy
+import tenant_profile
 from github_search import search_repos
 from reddit_search import search_subreddits
 
@@ -335,7 +336,7 @@ def channel_health() -> dict[str, dict[str, Any]]:
 async def _fetch_reddit(topic: str, **kwargs: Any) -> list[Finding]:
     """Wrap reddit_search.search_subreddits and emit Findings."""
 
-    subreddits = kwargs.get("subreddits", ["ClaudeAI", "LocalLLaMA", "SideProject"])
+    subreddits = kwargs.get("subreddits") or tenant_profile.default_subreddits()
     posts = await search_subreddits(
         topic,
         subreddits,

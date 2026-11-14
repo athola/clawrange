@@ -150,13 +150,13 @@ else
     -H "Content-Type: application/json" \
     -d '{
       "input": {
-        "messages": [{"role": "user", "content": "What are the top 3 manufactured home lenders in Texas for FHA loans?"}]
+        "messages": [{"role": "user", "content": "What are three common causes of slow PostgreSQL queries?"}]
       },
       "config": {}
     }' 2>&1) || RESPONSE=""
 
   echo "  Response: $(echo "$RESPONSE" | head -c 200)"
-  if echo "$RESPONSE" | grep -qiE "lender|FHA|Texas|mortgage|manufactured"; then
+  if echo "$RESPONSE" | grep -qiE "postgres|index|query|vacuum|planner"; then
     pass
   else
     fail

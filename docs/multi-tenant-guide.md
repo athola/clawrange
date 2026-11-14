@@ -40,6 +40,10 @@ seeds:
   schedules: [...]       # standing cron jobs (generator + cron + kwargs)
 connectors: [...]        # source -> transform -> sink data pipelines
 crm: {...}               # backend adapter + named query templates
+reddit: {...}            # default and extra subreddits (optional)
+awesome_lists: [...]     # curated lists to check for tracked projects
+outreach: {...}          # outreach rundown policy (optional)
+homelab_deals: {...}     # deal scanner: targets, sources, policy (optional)
 ```
 
 `${VAR}` tokens in any value are resolved from the environment at load time.
@@ -56,6 +60,19 @@ Two ways to define the persona:
   `owner.{name,org,context}`, and `capabilities: [...]`. The generic
   `openclaw/soul.template.md` is filled from these fields. You write data,
   not prose.
+- **Timezone**: `assistant.timezone` (an IANA zone such as
+  `Europe/Berlin`) drives schedules, quiet hours, the heartbeat watchdog
+  and report headers. `SCHEDULER_TZ` in `.env` overrides it; with neither
+  set, everything runs in UTC. An unknown zone fails at load. OpenClaw
+  cannot read the profile, so its `userTimezone` is rendered from
+  `SCHEDULER_TZ` at container start: set it to the same zone.
+- **Operator name**: `assistant.owner.name` is how prompts and task labels
+  refer to the operator ("the operator" when empty). Keep a real name in
+  `.env` and reference it as `${OPERATOR_NAME}`.
+- **Search hygiene** (fictional or branded personas):
+  `assistant.search_hygiene.strip_headings` lists persona sections dropped
+  from web-search prompts, and `blocked_citations` lists regexes for
+  citation URLs/titles to filter, so persona lore never floods research.
 - **Verbatim**: set `assistant.persona_markdown` to a full markdown body and
   it is used as-is (the `marketing` profile does this to preserve John-117
   byte-for-byte).
@@ -226,7 +243,80 @@ and upserts it into the CRM, so `/crm/query` and the `crm_digest` schedule
 work end-to-end without any external service. Point `CRM_DB_PATH` at a host
 path to keep the demo database outside the container.
 
-## 8. Extending
+## 8. Outreach and deal policy
+
+### `reddit` and `awesome_lists`
+
+```yaml
+reddit:
+  default_subreddits: [selfhosted]        # scans that name none
+  digest_extra_subreddits: [homelab]      # added to every digest/pulse
+awesome_lists: [someone/awesome-thing]    # owner/repo, checked weekly
+```
+
+With no `default_subreddits`, scans fall back to the union of the tracked
+projects' own `subreddits`; with neither, nothing is scanned.
+
+Both rundowns keep only generic behaviour in code. Everything about one
+tenant's audience, domain and marketplaces is profile data, validated at
+load so a typo fails at boot rather than at the first cron fire.
+
+### `outreach` (daily outreach rundown)
+
+```yaml
+outreach:
+  audience: a solo maintainer promoting these open-source projects
+  web_venues: forum threads, Lobsters, dev.to   # where web search looks
+  venue_actions:          # override what the operator may do per channel
+    hn: read the thread; comment only on a direct question
+  banned_actions: [newsletter, discount code]   # extra phrases that drop
+                                                # an action item
+```
+
+Channels are `reddit`, `hn`, `github` and `web`. The built-in defaults
+already forbid cross-posting, guest-post pitches, cold outreach and triage
+verbs aimed at issues on repos the operator does not own. Each project is
+described to the model only by the first sentence of its `posture`, so
+write that sentence as what the project is.
+
+### `homelab_deals` (deal scanner)
+
+```yaml
+homelab_deals:
+  title: Homelab deal rundown        # report heading (default "Deal rundown")
+  goal: one line under the heading
+  current_setup: ${MY_SETUP}         # keep personal detail in .env
+  advisor:
+    audience: who the buy read advises, and for what
+    rules: [domain rules the model must apply]
+  too_good_share: 0.5    # under this share of max_price_great: flagged, and
+                         # eBay is not searched below it
+  max_per_target: 2      # listings per target per section; rest -> "+N more"
+  red_flags:             # flag label -> phrases (word-start, any case)
+    "barebone: CPU, RAM or drives not in the price": [barebone, no cpu]
+  part_categories: [gpu, mainboard]   # judged as parts vs. whole systems
+  memory_check_categories: [gpu]      # title may not state less memory
+  exclude: [waterblock, for parts]    # appended to every target
+  sources:
+    ebay:
+      categories: {gpu: 27386}        # target category -> eBay category id
+      marketplace: EBAY_US            # defaults: EBAY_US, USD, US
+      currency: USD
+      delivery_country: US
+    slickdeals: {}
+    reddit: {subreddits: [homelabsales]}
+  stack_gaps: {vram: what is missing}
+  targets:
+  - {name: RTX 3090 24GB, query: rtx 3090, category: gpu,
+     max_price_great: 750, min_vram_gb: 24, fills: [vram]}
+```
+
+Find eBay category ids with the Taxonomy API
+(`get_category_suggestions`). Leave a category unmapped when real listings
+span several eBay categories. The `marketing` profile is a full worked
+example.
+
+## 9. Extending
 
 - **New connector kind**: add a callable in `workflows/connectors/{sources,
   transforms,sinks}.py` and register it in `connectors/__init__.py`. Mirror
@@ -237,7 +327,7 @@ path to keep the demo database outside the container.
 - **Browser scraping** (JS-rendered portals): out of scope for the bundled
   sources. Add a `headless` source kind backed by the chrome tooling.
 
-## 9. Persona & meta-learning
+## 10. Persona & meta-learning
 
 A profile shapes not just *what* the assistant does but *who* it is. The
 `assistant.identity` block renders the agent's `IDENTITY.md`, and an

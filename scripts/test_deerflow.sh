@@ -49,12 +49,12 @@ RESPONSE=$(curl -sf --connect-timeout 5 --max-time 120 -X POST "${BASE}/api/lang
   -H "Content-Type: application/json" \
   -d '{
     "input": {
-      "messages": [{"role": "user", "content": "What are the top 3 manufactured home lenders in Texas for FHA loans?"}]
+      "messages": [{"role": "user", "content": "What are three common causes of slow PostgreSQL queries?"}]
     },
     "config": {}
   }' 2>/dev/null) || RESPONSE=""
 
-if echo "$RESPONSE" | grep -qiE "lender|FHA|Texas|mortgage|manufactured"; then
+if echo "$RESPONSE" | grep -qiE "postgres|index|query|vacuum|planner"; then
   pass "Research request returned relevant results"
   echo "  Response preview: $(echo "$RESPONSE" | head -c 300)"
 else

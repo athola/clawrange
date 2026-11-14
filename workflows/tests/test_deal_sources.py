@@ -146,6 +146,71 @@ class TestEbay:
         assert (item.price, item.shipping, item.seller_feedback) == (640.0, 25.0, 812)
         assert item.source == "eBay"
 
+    @pytest.mark.asyncio
+    async def test_search_is_scoped_to_the_target_category(self, monkeypatch):
+        # 2026-11-14 dry run: unscoped searches for "mi50" and "ms-01"
+        # returned microscope objectives, mechanical seals and toys; the
+        # Graphics/Video Cards and PC Desktops categories cut them out.
+        # The mapping is profile config; unmapped categories stay unscoped.
+        monkeypatch.setenv("EBAY_CLIENT_ID", "id")
+        monkeypatch.setenv("EBAY_CLIENT_SECRET", "secret")
+        seen: list = []
+
+        def handler(request):
+            if request.url.path.endswith("/oauth2/token"):
+                return httpx.Response(200, json={"access_token": "tok"})
+            seen.append(dict(request.url.params))
+            return httpx.Response(200, json={"itemSummaries": []})
+
+        from deals import load_targets
+
+        targets = load_targets(
+            {
+                "sources": {"ebay": {"categories": {"gpu": 27386}}},
+                "targets": [
+                    {
+                        "name": "RTX 3090",
+                        "query": "rtx 3090",
+                        "category": "gpu",
+                        "max_price_great": 750,
+                    },
+                    {
+                        "name": "Mac mini",
+                        "query": "mac mini",
+                        "category": "unified_memory",
+                        "max_price_great": 1000,
+                    },
+                ],
+            }
+        )
+        async with _client(handler) as client:
+            await deal_sources.fetch_ebay(client, targets, pace=0)
+
+        assert seen[0]["category_ids"] == "27386"
+        assert "category_ids" not in seen[1]
+
+    def test_variation_listings_are_skipped(self):
+        # "RTX 3060 3070 3080 3090 ... 24GB" priced at its cheapest variant.
+        item = {
+            "itemId": "v1|377634499876|645905420184",
+            "title": "Dell NVIDIA GeForce RTX 3060 3070 3080 3090 24GB",
+            "price": {"value": "574.00"},
+            "itemGroupType": "SELLER_DEFINED_VARIATIONS",
+        }
+        assert deal_sources._ebay_listing(item) is None
+
+    def test_multi_price_feed_title_has_no_price(self):
+        # Slickdeals 2026-11-14: the first amount ($1,299) was the M2 Max,
+        # but the post matched the Mac Studio Ultra target.
+        title = (
+            "Costco: Apple Mac Studio m2 max $1299, m2 ultra $2499, "
+            "m4 max $1949, m3 ultra $3799"
+        )
+        assert deal_sources._price_from(title, "") is None
+        assert (
+            deal_sources._price_from("RTX 3090 $649.99 + Free Shipping", "") == 649.99
+        )
+
 
 class TestGather:
     @pytest.mark.asyncio

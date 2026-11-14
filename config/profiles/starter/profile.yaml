@@ -22,6 +22,9 @@ assistant:
   name: "Assistant"
   role: "personal operations assistant"
   channel: telegram
+  # IANA zone for schedules, quiet hours and report headers. SCHEDULER_TZ in
+  # .env overrides it.
+  timezone: UTC
   owner:
     name: "Operator"
     org: ""

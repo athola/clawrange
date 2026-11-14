@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import github_search
 import reddit_search
 import telegram
+import tenant_profile
 
 # NOTE on deferred imports: ``app`` imports this module at module scope and
 # ``generators``/``scheduler`` import it transitively, so every use of
@@ -584,7 +585,7 @@ def _is_non_answer(text: str) -> bool:
     return hits >= 3
 
 
-# A task the model cannot finish without Alex comes back as a long, tidy
+# A task the model cannot finish without the operator comes back as a long, tidy
 # markdown essay. _is_non_answer() cannot see it: that one only fires under
 # 300 chars and these run past 1000.
 #
@@ -593,7 +594,7 @@ def _is_non_answer(text: str) -> bool:
 #
 #   "what i need from you"  -> 208 hits, nearly all real deliverables. The
 #       work prompt asks for exactly that ("describe what you prepared and
-#       what Alex needs to do to finish it"), so it is not a blocked signal.
+#       what the operator needs to do to finish it"), so it is not a blocked signal.
 #   header-anchored below   -> 21 hits (2.5%), including both essays that
 #       reached Telegram today.
 #
@@ -614,7 +615,7 @@ _NEEDS_INPUT_SIGNALS = [
 
 
 def _needs_input(text: str) -> bool:
-    """True when a task result declares itself blocked on Alex's input."""
+    """True when a task result declares itself blocked on the operator's input."""
     if not text:
         return False
     head = text[:_NEEDS_INPUT_HEAD]
@@ -622,7 +623,7 @@ def _needs_input(text: str) -> bool:
 
 
 def _blocked_digest_line(task: dict) -> str:
-    """One compact digest line for a task stalled on Alex's input.
+    """One compact digest line for a task stalled on the operator's input.
 
     The full text stays on the task (GET /task/{id}); Telegram gets the
     fact that something stalled and which task it was, not the essay.
@@ -630,7 +631,7 @@ def _blocked_digest_line(task: dict) -> str:
     return f"Blocked #{task['id']}: needs your input — {task['description'][:60]}"
 
 
-# A blocked task asked Alex a question and left the pending queue; dedup
+# A blocked task asked the operator a question and left the pending queue; dedup
 # then stops the LLM re-raising it. Without a re-surface, the ask-once
 # design goes mute while waiting on an answer — indistinguishable on the
 # phone from a dead assistant.
@@ -662,7 +663,7 @@ def _descriptions_overlap(a: dict, b: dict) -> bool:
 def _waiting_on_you_lines(
     all_tasks: list[dict], now: datetime | None = None
 ) -> list[str]:
-    """Digest footer lines for tasks blocked on Alex's input.
+    """Digest footer lines for tasks blocked on the operator's input.
 
     A question drops off when it ages past the window, when a later
     overlapping task completes successfully (the answer landed), or when
@@ -1284,7 +1285,7 @@ async def _handle_scan_command(subcmd: str, args: str) -> str:
                 subreddits = json.loads(project.get("subreddits", "[]"))
 
         if not subreddits:
-            subreddits = ["ClaudeAI", "LocalLLaMA", "SideProject"]
+            subreddits = tenant_profile.default_subreddits()
 
         results: list = await reddit_search.search_subreddits(
             topic, subreddits, since=since, limit_per_sub=10
@@ -1618,7 +1619,7 @@ async def _handle_tasks_list(is_stream: bool) -> JSONResponse | StreamingRespons
         if active:
             lines.append("NOW PROCESSING:")
             for t in active:
-                src = "ALEX" if t.get("source") == "user" else "SYS"
+                src = _operator_label() if t.get("source") == "user" else "SYS"
                 lines.append(
                     f"  [{src}] #{t['id']} [P{t['priority']}] {t['description'][:55]}"
                 )
@@ -1627,7 +1628,7 @@ async def _handle_tasks_list(is_stream: bool) -> JSONResponse | StreamingRespons
         if pending:
             lines.append("QUEUED:")
             for t in pending:
-                src = "ALEX" if t.get("source") == "user" else "SYS"
+                src = _operator_label() if t.get("source") == "user" else "SYS"
                 lines.append(
                     f"  [{src}] #{t['id']} [P{t['priority']}] {t['description'][:55]}"
                 )
@@ -1725,7 +1726,7 @@ _proactive_state: dict[str, float] = {}
 _PROACTIVE_INTERVALS = {
     "stale_tasks": 1800,  # 30 min — nudge about tasks stuck pending
     "llm_thinking": 900,  # 15 min — balance responsiveness vs churn
-    "pending_reminder": 3600,  # 1 hr — remind Alex about P3+ tasks needing review
+    "pending_reminder": 3600,  # 1 hr — remind the operator of P3+ tasks to review
 }
 
 # Path to soul.md inside the container (mounted read-only).
@@ -1740,34 +1741,52 @@ def _load_soul() -> str:
         return ""
 
 
-# Section headers that hold pure character-backstory narrative. When a
-# prompt routes to the OpenRouter `:online` search tier, Exa runs web
-# search on the prompt — these sections contain "John-117 / Master Chief
-# / Spartan-II / Cortana / MJOLNIR / Halo" tokens that pull Halopedia and
-# Master-Chief-Wikipedia citations to the top, polluting research output.
-# Operational sections (Marketing Mode, Research Mode, What You Can Do,
-# etc.) are kept so the model still understands its job.
-_BACKSTORY_HEADINGS = ("## Who You Are", "## Your Character")
+# Persona sections that hold pure character backstory. When a prompt
+# routes to the `:online` search tier, the search runs on the whole prompt,
+# so a fictional persona's names pull lore pages to the top of results and
+# pollute research output. Which sections to strip, and which citations to
+# drop, are persona data: `assistant.search_hygiene` in the profile.
+# Operational sections are kept so the model still understands its job.
+def _backstory_headings() -> tuple[str, ...]:
+    """Persona sections kept out of search-tier prompts, from the profile's
+    `assistant.search_hygiene.strip_headings` (persona text is tenant data)."""
+    hygiene = tenant_profile.search_hygiene()
+    return tuple(h.strip() for h in hygiene.get("strip_headings") or [])
 
 
-def _strip_persona_backstory(soul: str) -> str:
-    """Remove Halo character-backstory sections from soul.md text.
+def _sentence_start(text: str) -> str:
+    """Upper-case only the first letter ("the operator" -> "The operator",
+    "Mary Ann" stays "Mary Ann"); str.capitalize lowercases the rest."""
+    return text[:1].upper() + text[1:]
+
+
+def _operator_label() -> str:
+    """Tag for operator-created tasks in listings: the configured name in
+    capitals, else YOU."""
+    name = tenant_profile.operator_name()
+    return "YOU" if name == "the operator" else name.upper()
+
+
+def _strip_persona_backstory(soul: str, headings: tuple[str, ...] | None = None) -> str:
+    """Remove persona-backstory sections from soul.md text.
 
     A section runs from its `## Heading` line to (but not including) the
     next `## ` heading or end-of-file. Only the sections named in
-    `_BACKSTORY_HEADINGS` get stripped; the rest is returned intact.
+    `headings` (default: the profile's search_hygiene.strip_headings) get
+    stripped; the rest is returned intact.
 
     Empty or whitespace-only input returns "" so callers can use the
     result directly in prompt templates without an extra falsy check.
     """
     if not soul or not soul.strip():
         return ""
+    strip = set(headings if headings is not None else _backstory_headings())
     lines = soul.splitlines()
     out: list[str] = []
     skipping = False
     for line in lines:
         if line.startswith("## "):
-            skipping = line.strip() in _BACKSTORY_HEADINGS
+            skipping = line.strip() in strip
             if skipping:
                 continue
         if skipping:
@@ -1875,8 +1894,9 @@ def _build_thinking_prompt(subjects: list[str], context: str = "") -> str:
         + "\nRULES:\n"
         "- Start with Research, Search, Find or Scan, name one subject from "
         "the list, and name where to look (Reddit, GitHub, web, arXiv).\n"
-        "- Never suggest a task that needs information only Alex can supply "
-        "-- his clients, priorities, or private history.\n"
+        f"- Never suggest a task that needs information only "
+        f"{tenant_profile.operator_name()} can supply "
+        "-- their clients, priorities, or private history.\n"
         "- Do NOT invent clients, people, events, or subjects not listed.\n\n"
         "Respond with ONLY the task description (one sentence, no quotes)."
     )
@@ -2120,30 +2140,22 @@ def _extract_web_citations(tool_calls: list[dict]) -> str:
     return "\n".join(refs)
 
 
-# Citation URL/title patterns that indicate Halo character-backstory
-# pages — Exa returns these when the persona name leaks into search
-# (and as a defense even after _strip_persona_backstory runs). Matched
-# against url + title joined with a space, case-insensitive.
-_PERSONA_CITATION_PATTERN = re.compile(
-    r"halopedia|"
-    r"wiki(?:pedia|/john-117|/master_chief|/spartan-?ii?|/cortana|/mjolnir)|"
-    r"shapes\.ai.*master.chief|"
-    r"halo[\s\-_]?(?:5|infinite|wars|reach)|"
-    r"\bunsc\b|\bspartan-?ii?\b",
-    re.IGNORECASE,
-)
+def _blocked_citation_patterns() -> list[re.Pattern[str]]:
+    """Compiled `assistant.search_hygiene.blocked_citations` regexes."""
+    patterns = tenant_profile.search_hygiene().get("blocked_citations") or []
+    return [re.compile(p, re.IGNORECASE) for p in patterns]
 
 
 def _is_persona_citation(url: str, title: str) -> bool:
-    """Return True when a citation URL/title points at Halo character lore.
+    """Return True when a citation URL/title matches the persona's blocked
+    citation patterns (e.g. lore pages for a fictional persona).
 
-    Belt-and-suspenders for _strip_persona_backstory: even if a future
-    soul.md edit leaks "John-117 / Master Chief" tokens past the
-    stripper, Exa-returned Halopedia results never reach the user's
-    Telegram message.
+    Belt-and-suspenders for _strip_persona_backstory: even if a soul.md
+    edit leaks persona names past the stripper, matching search results
+    never reach the operator's message.
     """
     haystack = f"{url} {title}"
-    return bool(_PERSONA_CITATION_PATTERN.search(haystack))
+    return any(p.search(haystack) for p in _blocked_citation_patterns())
 
 
 def _extract_openrouter_citations(annotations: list[dict]) -> str:
@@ -2154,8 +2166,8 @@ def _extract_openrouter_citations(annotations: list[dict]) -> str:
         message.annotations[].url_citation = {url, title, content, "
         start_index, end_index}
 
-    Halo character-backstory citations (Halopedia, Master Chief Wikipedia,
-    etc.) are filtered out — see _is_persona_citation. Format mirrors
+    Citations matching the persona's blocked patterns are filtered out —
+    see _is_persona_citation. Format mirrors
     _extract_web_citations so Telegram output stays consistent regardless
     of which search backend produced the citations.
     """
@@ -2230,12 +2242,11 @@ async def _build_work_prompt(task_description: str, web_search: bool = False) ->
     """Build a prompt for the LLM to work on a specific task, with live system data.
 
     When `web_search=True`, the prompt routes through OpenRouter `:online`
-    which runs Exa server-side search over the full prompt body. The Halo
-    character backstory in soul.md ("Master Chief", "Spartan-II",
-    "Cortana", "MJOLNIR") pulls Halopedia/Wikipedia character pages to
-    the top of Exa results, polluting the research output. Strip those
-    sections for search-tier routes; non-search routes keep the full
-    persona so John-117 stays in character for direct chat replies.
+    which runs server-side search over the full prompt body. Persona
+    backstory pulls lore pages to the top of results, so the profile's
+    search_hygiene.strip_headings sections are removed for search-tier
+    routes; non-search routes keep the full persona so the assistant stays
+    in character for direct chat replies.
     """
     soul = _load_soul()
     if web_search:
@@ -2264,7 +2275,7 @@ async def _build_work_prompt(task_description: str, web_search: bool = False) ->
             "OUTPUT FORMAT (for Telegram delivery):\n"
             "- Include full URLs to posts/threads you find.\n"
             "- For each result: link, why it's relevant, which project it maps to, "
-            "and a suggested comment Alex can post.\n"
+            f"and a suggested comment {tenant_profile.operator_name()} can post.\n"
             "- Use numbered items, not bullet nesting.\n"
             "- Be specific — real post titles, real subreddits, real URLs.\n"
         )
@@ -2302,7 +2313,8 @@ async def _build_work_prompt(task_description: str, web_search: bool = False) ->
         "- If you have web search, use it to find live data before answering.\n"
         "- If the task requires an action you can't perform (sending email, "
         "making calls), "
-        "describe what you prepared and what Alex needs to do to finish it.\n"
+        f"describe what you prepared and what {tenant_profile.operator_name()} "
+        "needs to do to finish it.\n"
         "- Be honest. 'I found nothing relevant today' is better than fabricating.\n\n"
         f"{format_rules}"
         "Provide the result. Include specific links or references when available."
@@ -2348,7 +2360,8 @@ async def _llm_work_task(description: str) -> str:
         print(f"[PROXY] LLM worked task: {result[:100]!r}", flush=True)
         return result
     return (
-        f"Could not reach LLM to work this task. Alex should handle manually: "
+        f"Could not reach LLM to work this task. "
+        f"{_sentence_start(tenant_profile.operator_name())} should handle manually: "
         f"{description}"
     )
 
@@ -2382,7 +2395,7 @@ project as a relevant tool second
 
 # ─── Research Router ────────────────────────────────────────────────
 # The chat personas have no web tooling (the LLM can only stall or ask
-# Alex to authorize tools it will never have), but the workflow service
+# the operator to authorize tools it will never have), but the workflow service
 # is web-capable: the research orchestrator fans out to Reddit, GitHub,
 # and web search server-side. Research-shaped heartbeat tasks route
 # there and come back with real, citable URLs.
@@ -2468,7 +2481,7 @@ async def _try_marketing_scan(description: str, brain_db) -> str | None:
                 " OR ".join(search_terms[:3]) if search_terms else " ".join(topics[:3])
             )
             results = await reddit_search.search_subreddits(
-                query, subreddits or ["ClaudeAI", "LocalLLaMA", "SideProject"]
+                query, subreddits or tenant_profile.default_subreddits()
             )
 
             if not results:
@@ -2679,7 +2692,7 @@ def _digest_take(
     the actionable footer (open questions, tripped tiers, balance).
 
     A due interval with an empty buffer stays silent — no empty chit-chat —
-    unless unanswered questions are waiting on Alex: that silence is
+    unless unanswered questions are waiting on the operator: that silence is
     indistinguishable from a dead assistant, so the questions surface.
     """
     waiting = waiting or []
@@ -2862,7 +2875,7 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
     if pending:
         task = pending[0]
         source = task.get("source", "system")
-        label = "ALEX" if source == "user" else "SYSTEM"
+        label = _operator_label() if source == "user" else "SYSTEM"
         brain_db.claim_task(task["id"])
 
         # Structured interception, in order: self-created status alerts
@@ -2882,7 +2895,7 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
                     result = await _llm_work_task(task["description"])
 
         if _needs_input(result):
-            # The model asked Alex a question instead of finishing. Close it
+            # The model asked the operator a question instead of finishing. Close it
             # as blocked so it leaves the pending queue -- left pending it is
             # reworked every cycle -- and spend one digest line on it.
             brain_db.complete_task(task["id"], result, "blocked")

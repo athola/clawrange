@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Wipe all data and start fresh.
-# WARNING: This destroys all n8n workflows, DeerFlow output, and Docker volumes.
+# WARNING: This removes the DeerFlow clone and output and prunes project
+# containers. The brain database (data/brain/) is left in place.
 # Usage: ./scripts/reset.sh [--force|-f]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 echo "=== AI MSP Testbed Reset ==="
-echo "This will destroy all persistent data (n8n workflows, volumes, DeerFlow output)."
+echo "This will remove the DeerFlow clone and output and prune project containers."
 
 if [ "${1:-}" = "--force" ] || [ "${1:-}" = "-f" ]; then
   confirm="y"

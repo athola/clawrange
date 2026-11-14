@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Stop the AI MSP Testbed stack.
-# Usage: ./scripts/stop.sh [--all]
+# Usage: ./scripts/stop.sh
+# Data is bind-mounted under data/, so there are no named volumes to remove.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-echo "Stopping core stack (OpenClaw + n8n)..."
+echo "Stopping core stack (OpenClaw + workflows)..."
 docker compose down 2>/dev/null || true
 
 # Stop DeerFlow if running
@@ -14,9 +15,3 @@ if [ -d deer-flow ] && [ -f deer-flow/docker/docker-compose.yaml ]; then
 fi
 
 echo "All services stopped."
-
-if [ "${1:-}" = "--all" ]; then
-  echo "Removing named volumes..."
-  docker volume rm msp-n8n-data 2>/dev/null || true
-  echo "Volumes removed."
-fi

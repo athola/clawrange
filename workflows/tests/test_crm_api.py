@@ -142,3 +142,37 @@ def test_healthz_crm(client):
     assert body["configured"] is True
     assert body["adapter"]["status"] == "ok"
     assert "portal-leads" in body["connectors"]
+
+
+def test_shipped_lead_lookup_matches_phone(tmp_path):
+    """The n8n lead-status webhook matched by name or phone; its replacement,
+    the lead-crm profile's lead_lookup template, must too."""
+    import tenant_profile
+
+    crm = SQLiteCRM(str(tmp_path / "crm.db"))
+    crm.init()
+    crm.upsert(
+        "leads",
+        [
+            {
+                "name": "Ada",
+                "email": "ada@x.com",
+                "phone": "512-555-0101",
+                "status": "new",
+            }
+        ],
+        "email",
+    )
+    profile = tenant_profile.load_profile("lead-crm", env={})
+
+    async def no_llm(prompt):
+        return "{}"
+
+    app = FastAPI()
+    app.include_router(create_crm_router(profile, crm, llm=no_llm))
+    r = TestClient(app).post(
+        "/crm/query/run",
+        json={"template": "lead_lookup", "params": {"q": "555-0101"}},
+    )
+    assert r.status_code == 200
+    assert [row["name"] for row in r.json()["rows"]] == ["Ada"]

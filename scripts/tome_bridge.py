@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """tome_bridge.py - Bridge research:tome tasks to /tome:research.
 
-John-117 (running in OpenClaw) cannot directly invoke the tome
-plugin because tome lives in Alex's Claude Code installation, not
+The assistant (running in OpenClaw) cannot directly invoke the tome
+plugin because tome lives in the operator's Claude Code installation, not
 the workflows container. This script polls the workflows task
 queue, finds tasks tagged for tome, runs `claude /tome:research
 <topic>` locally, and posts the synthesized output back via

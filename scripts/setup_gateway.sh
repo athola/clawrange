@@ -27,7 +27,6 @@ set -euo pipefail
 # Find it on the node with: tailscale ip -4
 NODE_TAILSCALE_IP="${NODE_TAILSCALE_IP:-}"
 OPENCLAW_PORT="${OPENCLAW_PORT:-3000}"
-N8N_PORT="${N8N_PORT:-5678}"
 DEERFLOW_PORT="${DEERFLOW_PORT:-2026}"
 
 # ─── Colors ───────────────────────────────────────────────────────
@@ -194,23 +193,8 @@ YOUR_DOMAIN {
     }
 }
 
-# ─── n8n Dashboard (optional — admin access only) ───────────────
-# Only expose if you need remote workflow editing.
-# Consider restricting to Tailscale IP only for admin access.
-#
-# n8n.YOUR_DOMAIN {
-#     # Restrict to your Tailscale network
-#     @not-tailscale not remote_ip 100.64.0.0/10
-#     respond @not-tailscale 403
-#
-#     reverse_proxy NODE_TAILSCALE_IP_PLACEHOLDER:5678 {
-#         health_uri /healthz
-#         health_interval 30s
-#     }
-# }
-
-# ─── n8n Webhooks (if needed from external services) ────────────
-# Only uncomment if external services need to POST to n8n webhooks.
+# ─── Workflows webhooks (if needed from external services) ──────
+# Only uncomment if external services need to POST to workflows webhooks.
 #
 # webhooks.YOUR_DOMAIN {
 #     # Only allow specific webhook paths

@@ -1,7 +1,9 @@
-# Marketing profile: a worked example of a content-marketing assistant
-# with a verbatim persona (the John-117 character). It is identity-free:
-# any one operator's personal data belongs in a local profile and .env, never
-# here. Copy this directory, rename it, and edit the fields to make it yours.
+# Marketing profile: the maintainer's own worked example of a
+# content-marketing assistant with a verbatim persona (the John-117
+# character). Its seeds are the maintainer's public projects and its
+# timezone is theirs: that is the point of a profile, so none of it lives in
+# code. Secrets and private details (operator name, current setup) stay in
+# .env. To build your own, copy `starter`, not this file.
 # The seeds (example open-source projects and schedules) are regression-locked
 # by tests/test_profile.py against tests/golden_marketing_seeds.json.
 
@@ -9,6 +11,24 @@ profile: marketing
 assistant:
   name: John-117
   channel: telegram
+  # Schedules, quiet hours, the heartbeat watchdog and report headers use
+  # this zone. SCHEDULER_TZ in .env overrides it; unset everywhere -> UTC.
+  timezone: America/Chicago
+  # How prompts refer to the operator ("the operator" when unset). Keep the
+  # real name in .env so this shipped profile stays identity-free.
+  owner:
+    name: ${OPERATOR_NAME}
+  # The verbatim persona is a fictional character, so web-search prompts drop
+  # its backstory sections and lore citations would otherwise flood results.
+  search_hygiene:
+    strip_headings: ["## Who You Are", "## Your Character"]
+    blocked_citations:
+    - halopedia
+    - wiki(?:pedia|/john-117|/master_chief|/spartan-?ii?|/cortana|/mjolnir)
+    - shapes\.ai.*master.chief
+    - halo[\s\-_]?(?:5|infinite|wars|reach)
+    - \bunsc\b
+    - \bspartan-?ii?\b
   persona_markdown: |
     # John-117: Executive Assistant
 
@@ -375,6 +395,25 @@ seeds:
       - 'AI-assisted resume and job-application tooling in 2025: differentiation and
         unmet needs (simple-resume)'
 
+# Curated lists the awesome_lists_watch generator checks for every tracked
+# project ("owner/repo"); a schedule's `lists` kwarg overrides this.
+awesome_lists: [ComposioHQ/awesome-claude-plugins, hesreallyhim/awesome-claude-code]
+
+# Reddit scope beyond each project's own subreddits.
+reddit:
+  # Used when a scan names no subreddits (/scan/reddit, /research, tasks).
+  default_subreddits: [ClaudeAI, LocalLLaMA, SideProject]
+  # Added to every digest and pulse scan: AI-coding communities where
+  # comment-worthy posts about Claude Code, plugins and self-hosted agent
+  # tooling appear.
+  digest_extra_subreddits: [vibecoding, opensourceai, claudecode, ClaudeAI,
+    codex, sideprojects]
+
+# Daily outreach rundown policy (morning_digest). Defaults live in code;
+# these override them for this tenant. See docs/multi-tenant-guide.md.
+outreach:
+  audience: a solo maintainer promoting these open-source projects
+
 # Daily homelab deal rundown (kind: homelab_deals). Targets are hardware that
 # can move LLM inference off the remote tiers. max_price_great comes from a
 # 2026-09-26 research pass; entries marked "verify" rest on a single source.
@@ -383,17 +422,69 @@ seeds:
 # current_setup describes the operator's gear and lives in .env
 # (HOMELAB_CURRENT_SETUP) so this shipped profile stays identity-free.
 homelab_deals:
+  title: Homelab deal rundown
+  goal: hardware that moves inference off remote tiers onto the homelab.
   current_setup: ${HOMELAB_CURRENT_SETUP}
+  # Who the buy read advises and the domain rules it must apply. The
+  # generic rules (cite [D#], one verdict per deal, title over target
+  # name, parts-cost math) live in code; everything here is this stack's.
+  advisor:
+    audience: >-
+      a homelab owner who wants to replace part of their remote LLM
+      inference (OpenRouter free/paid tiers and Z.AI GLM, used for
+      summarization, classification and short tool-using tasks) with
+      open-weight models served locally behind an OpenAI-compatible proxy
+    rules:
+    - For each worthwhile deal, say what class of model it could serve and
+      mark tokens/sec estimates 'needs verification'.
+    - Cover fit with power, noise and networking.
+    - Unified-memory boxes (Strix Halo, Mac) have soldered memory, so their
+      only parts route is a bare mainboard.
+    - A discrete GPU needs a desktop or server with a free PCIe x16 slot,
+      PSU headroom and physical room; it cannot go in a laptop. If the
+      current setup has no such host, say the card needs one and cost it (a
+      host deal by [D#], or an estimate marked 'needs verification').
+  # Under this share of a target's great price a listing is flagged as too
+  # good to be true, and eBay is not asked for anything cheaper. A
+  # 2026-11-14 dry run found ~49 of 54 matches in the 35-50% band were not
+  # the item at all.
+  too_good_share: 0.5
+  # Listings per target per section; the rest become "+N more".
+  max_per_target: 2
+  # Flag label -> phrases (case-insensitive, matched at a word start).
+  red_flags:
+    "barebone: CPU, RAM or drives not in the price": [barebone, system board,
+      0x0ram, 0x0 ram, 0 bay, no cpu, no ram, no memory, no drive, no hdd]
+  part_categories: [gpu, mainboard]   # bought as parts, judged vs. systems
+  memory_check_categories: [gpu]      # title must not state less memory
   sources:
-    ebay: {}           # needs EBAY_CLIENT_ID / EBAY_CLIENT_SECRET
+    ebay:              # needs EBAY_CLIENT_ID / EBAY_CLIENT_SECRET
+      # Target category -> eBay category id (Taxonomy API, 2026-11-14).
+      # Unified-memory and mainboard targets stay unscoped: real listings
+      # span several categories (a real M4 Pro Mac mini sat outside Apple
+      # Desktops).
+      categories: {gpu: 27386, server: 11211, mini_pc: 179}
     slickdeals: {}
     servethehome: {}
     reddit:
       subreddits: [homelabsales, hardwareswap]
   # Appended to every target: accessories and laptop parts that share a
-  # GPU's model number.
+  # GPU's model number, and non-computer items whose product names collide
+  # with it (Sony Alpha cameras share the A5000/A6000 tokens; NVLink
+  # bridges and cooler kits name every card they fit; docks name the Mac
+  # mini; a robot vacuum is the "L40s"). Drive caddies name the server
+  # they fit, and passive Tesla cards sell beside fan ducts and cooling
+  # kits; "caddies" alone stays allowed, since whole servers list them.
+  # Cooling heads, GPU blocks, Mac SSD-upgrade kits and server RAM lots
+  # come from the 2026-11-14 dry run (titles in workflows/tests).
   exclude: [waterblock, water block, backplate, bracket, shroud, heatsink,
-    box only, empty box, riser, laptop, mobile, for parts]
+    box only, empty box, riser, laptop, mobile, for parts, sony, camera,
+    nvlink, bridge, cooler kit, thinkpad, dock, vacuum, drive caddy,
+    hdd caddy, caddy tray, tray caddy, cooling kit, fan kit, fan adapter,
+    fan duct, cooling head, card cooling fan, turbine fan, cooler block,
+    gpu block, tray adapter, adapter board,
+    capacity upgrade, ssd kit, memory ram, hard disk drive, style case,
+    water cooling]
   # What the stack lacks today (see HOMELAB_CURRENT_SETUP). Targets name the
   # gaps they fill; need/want/watch (default want) says how much the stack
   # wants a target. Both reorder deals inside a price tier, never across.
@@ -413,11 +504,12 @@ homelab_deals:
   - {name: RTX 4090 24GB, query: rtx 4090, category: gpu,
      need: want, fills: [vram], max_price_great: 1400,
      min_vram_gb: 24}  # verify
-  - {name: RTX A5000 24GB, query: a5000, category: gpu,
+  - {name: RTX A5000 24GB, query: rtx a5000, category: gpu,
      need: want, fills: [vram], max_price_great: 900,
-     min_vram_gb: 24}  # verify
-  # 48 GB and up: 70B-class quantized on one card.
-  - {name: RTX A6000 48GB, query: a6000, category: gpu,
+     min_vram_gb: 24, exclude: [16gb]}  # verify; 16GB is the laptop module
+  # 48 GB and up: 70B-class quantized on one card. Queries stay brand-
+  # anchored: a bare "a6000" pulls in Sony Alpha camera kits.
+  - {name: RTX A6000 48GB, query: rtx a6000, category: gpu,
      need: want, fills: [vram, big_models], max_price_great: 1600,
      min_vram_gb: 48, exclude: [ada]}  # verify
   - {name: RTX 6000 Ada 48GB, query: 6000 ada, category: gpu,
@@ -438,10 +530,11 @@ homelab_deals:
      min_vram_gb: 24, note: slow FP16; gpt-oss-20b / 14B class}
   - {name: Tesla P100 16GB, query: tesla p100, category: gpu,
      need: watch, max_price_great: 180,
-     min_vram_gb: 16}
+     min_vram_gb: 16, exclude: [adapter, cable, interface card]}
   - {name: Tesla V100 SXM2 16GB, query: v100 sxm2, category: gpu,
      need: watch, max_price_great: 100,
-     min_vram_gb: 16, note: needs an SXM2 carrier board}  # verify
+     min_vram_gb: 16, note: needs an SXM2 carrier board,
+     exclude: [adapter, cable, interface card]}  # verify; SXM2 kits name it
   # AMD.
   - {name: Instinct MI50 32GB, query: mi50, category: gpu,
      need: watch, fills: [vram], max_price_great: 300,

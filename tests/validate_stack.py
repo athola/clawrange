@@ -119,7 +119,7 @@ def check_env_not_committed() -> TestResult:
     return result
 
 
-def check_n8n_workflows() -> TestResult:
+def check_workflow_service() -> TestResult:
     """Validate workflow service has required files and endpoints."""
     result = TestResult("Workflow Service")
     app_path = os.path.join(PROJECT_ROOT, "workflows", "app.py")
@@ -258,7 +258,7 @@ def main():
         check_scripts_executable,
         check_env_example,
         check_env_not_committed,
-        check_n8n_workflows,
+        check_workflow_service,
         check_openclaw_config,
         check_deerflow_data_sovereignty,
         check_soul_template,

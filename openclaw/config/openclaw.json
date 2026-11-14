@@ -10,7 +10,7 @@
 
   "agents": {
     "defaults": {
-      "userTimezone": "America/Chicago",
+      "userTimezone": "${OPENCLAW_TZ}",
       "model": {
         "primary": "clawrange-proxy/default"
       },

@@ -285,6 +285,7 @@ class BrainDB:
                 target       TEXT NOT NULL,
                 price        REAL NOT NULL,
                 observed_at  TEXT NOT NULL,
+                title        TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY(source, listing_id)
             );
             CREATE INDEX IF NOT EXISTS idx_deal_obs_target
@@ -353,6 +354,16 @@ class BrainDB:
                 decided_at  TEXT
             )
         """)
+
+        # Migrate: deal observations keep their title so history can be
+        # re-judged when matching rules change (existing DBs lack it).
+        try:
+            conn.execute("SELECT title FROM deal_observations LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute(
+                "ALTER TABLE deal_observations"
+                " ADD COLUMN title TEXT NOT NULL DEFAULT ''"
+            )
 
         # Migrate: add source column to tasks if missing (existing DBs)
         try:
@@ -1154,19 +1165,31 @@ class BrainDB:
     # ─── Deal price history ─────────────────────────────────────
 
     def record_deal_observation(
-        self, source: str, listing_id: str, target: str, price: float
+        self, source: str, listing_id: str, target: str, price: float, title: str = ""
     ) -> None:
         """Record a matched asking price once per listing (first sighting)."""
         self._conn.execute(
             """INSERT OR IGNORE INTO deal_observations
-               (source, listing_id, target, price, observed_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (source, listing_id, target, float(price), _now()),
+               (source, listing_id, target, price, observed_at, title)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (source, listing_id, target, float(price), _now(), title),
         )
         self._conn.commit()
 
-    def deal_price_stats(self, target: str, days: int = 30):
-        """Median asking price for a target over the window, or None."""
+    def deal_observations(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT source, listing_id, target, price, observed_at, title"
+            " FROM deal_observations"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def deal_price_stats(self, target: str, days: int = 30, floor: float = 0.0):
+        """Median asking price for a target over the window, or None.
+
+        Prices under `floor` are ignored: accessories and scams that once
+        matched a target would otherwise drag its median far below what
+        the real item sells for.
+        """
         from statistics import median
 
         from deals import PriceStats
@@ -1175,8 +1198,9 @@ class BrainDB:
         prices = [
             r[0]
             for r in self._conn.execute(
-                "SELECT price FROM deal_observations WHERE target=? AND observed_at>=?",
-                (target, cutoff),
+                "SELECT price FROM deal_observations"
+                " WHERE target=? AND observed_at>=? AND price>=?",
+                (target, cutoff, floor),
             ).fetchall()
         ]
         if not prices:

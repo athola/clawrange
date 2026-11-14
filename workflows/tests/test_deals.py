@@ -175,7 +175,7 @@ class TestRenderReport:
             synthesis="Buy [D1] today; skip [D9].",
             now=self.NOW,
         )
-        assert "Homelab deal rundown" in report
+        assert "Deal rundown" in report  # generic default title
         assert report.index("Insane deals") < report.index("Great deals")
         assert report.index("Great deals") < report.index("Look twice")
         # Clean deals are numbered first, so the insane one is D1.
@@ -306,7 +306,7 @@ class TestHomelabDealsGenerator:
 
         self._gather(monkeypatch, [])
         await homelab_deals_generator(db)
-        assert "Homelab deal rundown" in "\n".join(self.sent)
+        assert "Deal rundown" in "\n".join(self.sent)
         assert db.get_schedule("homelab_deals")["last_status"].startswith("delivered")
 
     @pytest.mark.asyncio
@@ -481,6 +481,25 @@ class TestPartsBenchmark:
         assert "under ~$3,350 parts cost" in seen["prompt"]
         assert "Prefer part" not in seen["prompt"]
 
+    @pytest.mark.asyncio
+    async def test_synthesis_prompt_treats_title_as_ground_truth(self, monkeypatch):
+        # 2026-10-08 rundown: the buy read said STRONG BUY for D1 even though
+        # the deal line carried "Title: Sony Alpha A6000 ... Digital Camera".
+        # The model must be told the title outranks the target name.
+        import llm_proxy
+
+        seen = {}
+
+        async def fake_call(prompt, max_tokens=0):
+            seen["prompt"] = prompt
+            return "ok"
+
+        monkeypatch.setattr(llm_proxy, "_llm_call", fake_call)
+        deal = self._deal("RTX 3090 FE", 600.0)
+        deals.order_and_number([deal])
+        await deals.synthesize([deal], "")
+        assert "title is what the item actually is" in seen["prompt"]
+
 
 class TestShippedProfileRouting:
     """The live profile must route a bare Strix Halo mainboard to its own
@@ -517,6 +536,41 @@ class TestShippedProfileRouting:
             t for t in targets if t.category == "unified_memory" and "395" in t.query
         )
         assert t.parts_cost is not None and t.parts_cost > 1899
+
+    def test_sony_camera_titles_match_no_target(self, targets):
+        # 2026-10-08 rundown: a Sony Alpha A6000 camera kit was D1, a STRONG
+        # BUY for the RTX A6000 48GB target. Sony Alpha bodies share the
+        # A5000/A6000 model tokens with Nvidia pro GPUs, so bare model-token
+        # queries pull cameras in via eBay search pollution.
+        camera = _listing(
+            "Sony Alpha A6000 24.3MP Digital Camera - Black (Kit with "
+            "16-50mm & 55-210mm Zoom Lens)",
+            price=575.0,
+        )
+        assert deals.match_target(camera, targets) is None
+
+    def test_rtx_a6000_gpu_title_still_matches(self, targets):
+        gpu = _listing("NVIDIA RTX A6000 48GB GDDR6 Workstation GPU", price=575.0)
+        t = deals.match_target(gpu, targets)
+        assert t is not None and t.name == "RTX A6000 48GB"
+
+    def test_accessory_and_laptop_pollution_match_no_target(self, targets):
+        # Titles captured from the 2026-10-31 live run: NVLink bridges,
+        # cooler kits, laptop GPU modules, Mac mini docks and an L40s
+        # robot vacuum all carry a target's model token without being it.
+        pollution = [
+            "New NVLINK BRIDGE 2 SLOT for RTX A100 A800 A6000 A5500 "
+            "A5000 A4500 4090 vv",
+            "EVGA HYBRID Cooler Kit for GeForce RTX 3090/3080 Ti/3080 "
+            "XC3 Graphics Cards",
+            "LENOVO THINKPAD P15 GEN 2 RTX A5000 16GB PCIE 4.0 X16 "
+            "VIDEO CARD 5C51C94209",
+            "GIISSMO Mac mini Dock w/ 8TB M.2 NVMe Enclosure for Mac "
+            "mini M6, M5 Pro, M4 at Amazon",
+            "DREAME L40s Ultra AE Robot Vacuum and Mop Combo, 19,000Pa",
+        ]
+        for title in pollution:
+            assert deals.match_target(_listing(title, price=500.0), targets) is None
 
 
 class TestDesirabilityTags:
@@ -655,3 +709,259 @@ class TestDesirabilityTags:
         await deals.synthesize([d], "", stack_gaps={"vram": "more VRAM for 70B"})
         assert "tags: need, fills vram" in seen["prompt"]
         assert "vram: more VRAM for 70B" in seen["prompt"]
+
+
+from datetime import UTC, datetime  # noqa: E402
+
+
+class TestNovember14DealRundown:
+    """Regressions from the 2026-11-14 deal rundown: a $500 'RTX 4090' was a
+    BUY, drive caddies and cooling kits matched server/GPU targets,
+    barebones servers read as deals, the model put a desktop GPU in a
+    laptop, and the heading printed twice."""
+
+    @pytest.fixture
+    def targets(self):
+        import tenant_profile
+
+        profile = tenant_profile.load_profile("marketing", env={})
+        return deals.load_targets(profile.raw["homelab_deals"])
+
+    def test_half_off_a_great_price_is_too_good_to_be_true(self, targets):
+        rtx4090 = next(t for t in targets if t.name == "RTX 4090 24GB")
+        flags = deals.red_flags(_listing("RTX 4090 24GB", price=500.0), rtx4090)
+        assert any("too good" in f for f in flags)
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "Dell PowerEdge R740, 1x CC, 1x NC, 2x 750w PSU NO CPU, NO RAM, NO HDD",
+            "Dell PowerEdge R740 0 bay,2-HS,0x0ram,0x0,6fans, motherboard,"
+            "I350-ndc-2x1100w",
+            "Supermicro 4028GR-TR 4U Barebone 10 GPU Slots SATA 2x 2000W",
+            "Dell PowerEdge R730, 2 sinks, System Board, 8 trays,H730,Idrac 8 "
+            "Ent, 2x750w Psu",
+        ],
+    )
+    def test_barebones_servers_are_flagged(self, title, targets):
+        # The barebone phrases are profile config (red_flags), not code.
+        r740 = next(t for t in targets if t.name == "Dell PowerEdge R740")
+        flags = deals.red_flags(_listing(title), r740)
+        assert any("barebone" in f for f in flags)
+
+    def test_real_gpu_titles_still_match(self, targets):
+        for title, name in [
+            ("ASUS ROG Strix GeForce RTX 4090 White OC Edition", "RTX 4090 24GB"),
+            ("NVIDIA RTX 3090 24GB EVGA FTW3 for AI", "RTX 3090 24GB"),
+            ("Apple Mac mini M4 Pro 24GB 512GB SSD 12-core", "Mac mini M4 Pro"),
+            (
+                "NVIDIA Tesla P100 SXM2 16GB GPU, Server Accelerator Card",
+                "Tesla P100 16GB",
+            ),
+        ]:
+            t = deals.match_target(_listing(title), targets)
+            assert t is not None and t.name == name, title
+
+    def test_accessories_match_no_target(self, targets):
+        # Real titles from the 2026-11-14 dry run against eBay/Slickdeals.
+        pollution = [
+            '3.5" 2.5" HDD Tray Adapter for Dell 14-16th R440 R640 R740',
+            "NVIDIA Tesla P40 P100 M40 graphics card cooling fan-",
+            "NVIDIA Tesla P40 P100 M40 graphics card cooling turbine fan BFB1012VH",
+            "Water cooling head for NVIDIA Tesla V100 P100 GPU SXM2 US",
+            "Bykski GPU Block For ASRock AMD RX 7900 XTX",
+            "Barrow Liquid Cooling GPU Block for ASUS TUF RTX3090 3080 BS-AST3090-PA2",
+            "CASE for GIGABYTE AORUS RTX 3090 AI Box GV-N3090IXEB-32GD",
+            "NEW 4TB M4PRO SSD For Apple Mac mini M4 Pro 10-layered Expand "
+            "Hard Drive Upgrade",
+            "Orico 10-in-1 Hub Stand for Mac Mini M4/M4 Pro w/ M.2 SSD Slot",
+            "SXM2 To PCIE Adapter Board Supports Nvidia Tesla P100 V100 16GB 32GB",
+            "256GB 8x 32GB PC4-2666 RDIMM Supermicro 4028GR-TRT2 740GP-TNRBT "
+            "Memory RAM",
+            "DELL PRECISION 7760 SERIES NVIDIA RTX A3000 A4000 A5000 6GB "
+            "VIDEO CARD. Lot 3",
+            "Water Panther 18TB 7200 RPM SAS 12Gb/s 3.5-Inch Enterprise Hard "
+            "Disk Drive in 13G Tray Compatible with Dell R730",
+            "Apple Mac mini M4 (2024) - 16GB / 256GB - in Mac Pro Style Case Bundle",
+            "1pcs Tesla V100 SXM2 copper water cooling for V100/P100/SXM2 "
+            "interface card",
+            "External Nvidia Tesla P100 V100 SXM2 PCI-E X16 +SFF-8654 Adapter "
+            "+2 50CM Cable",
+        ]
+        for title in pollution:
+            assert deals.match_target(_listing(title, price=40.0), targets) is None
+
+    def test_server_listing_with_caddies_still_matches(self, targets):
+        t = deals.match_target(
+            _listing("Dell PowerEdge R740 2x Gold 6148 256GB w/ 8 drive caddies"),
+            targets,
+        )
+        assert t is not None and "R740" in t.name
+
+    @pytest.mark.asyncio
+    async def test_prompt_requires_a_pcie_host_for_gpus(self, monkeypatch):
+        import llm_proxy
+
+        seen = {}
+
+        async def fake_call(prompt, max_tokens=0):
+            seen["prompt"] = prompt
+            return "ok"
+
+        monkeypatch.setattr(llm_proxy, "_llm_call", fake_call)
+        deal = deals.classify(_listing("RTX 3090 FE", price=600.0), RTX3090, None)
+        deals.order_and_number([deal])
+        import tenant_profile
+
+        block = tenant_profile.load_profile("marketing", env={}).raw["homelab_deals"]
+        await deals.synthesize([deal], "a laptop", advisor=block["advisor"])
+        p = seen["prompt"]
+        assert "cannot go in a laptop" in p  # a profile rule
+        assert "Cite each deal in one bullet only" in p  # a generic rule
+
+    def test_repeated_buy_read_heading_is_stripped(self):
+        deal = deals.classify(_listing("RTX 3090 FE", price=600.0), RTX3090, None)
+        deals.order_and_number([deal])
+        report = deals.render_report(
+            [deal], [], [], "BUY READ\n\n* BUY [D1]: solid.", datetime.now(UTC)
+        )
+        body = report.split("*Buy read*")[1]
+        assert "BUY READ" not in body
+        assert "BUY [D1]" in body
+
+
+class TestHistoryIgnoresJunk:
+    def test_median_skips_prices_under_the_floor(self, tmp_path):
+        from brain_db import BrainDB
+
+        db = BrainDB(str(tmp_path / "b.db"))
+        db.init_db()
+        for i, price in enumerate([15, 20, 25, 30, 700, 720, 740]):
+            db.record_deal_observation("eBay", str(i), "RTX 3090", price)
+        assert db.deal_price_stats("RTX 3090").median < 100
+        stats = db.deal_price_stats("RTX 3090", floor=300)
+        assert stats.median == 720 and stats.samples == 3
+
+
+class TestOneVerdictPerDeal:
+    """2026-11-14: D6 sat in two SKIP bullets with different reasons. The
+    model is asked for one verdict per deal; code enforces it."""
+
+    def test_repeated_verdict_refs_are_removed(self):
+        text = (
+            "* SKIP D4, D6, D10: barebone R740s, real cost is higher.\n"
+            "* SKIP D2, D6: titles are drive caddies.\n"
+            "* BUY D1: pair with D6 only if you need a host."
+        )
+        out = deals.one_verdict_per_deal(text)
+        assert "SKIP D4, D6, D10:" in out
+        assert "SKIP D2: titles are drive caddies." in out
+        assert "pair with D6" in out  # a body cross-reference is fine
+
+    def test_bullet_left_with_no_refs_is_dropped(self):
+        text = "* BUY D1: good.\n* CONDITIONAL [D1]: also good?\n* SKIP D2: no."
+        out = deals.one_verdict_per_deal(text)
+        assert "CONDITIONAL" not in out
+        assert "SKIP D2: no." in out
+
+    @pytest.mark.asyncio
+    async def test_prompt_asks_for_verdict_heads(self, monkeypatch):
+        import llm_proxy
+
+        seen = {}
+
+        async def fake_call(prompt, max_tokens=0):
+            seen["prompt"] = prompt
+            return "ok"
+
+        monkeypatch.setattr(llm_proxy, "_llm_call", fake_call)
+        deal = deals.classify(_listing("RTX 3090 FE", price=600.0), RTX3090, None)
+        deals.order_and_number([deal])
+        await deals.synthesize([deal], "")
+        assert "BUY, CONDITIONAL or SKIP" in seen["prompt"]
+
+
+class TestPerTargetCap:
+    """2026-11-14 dry run: nine near-identical R730s filled the clean list.
+    The $300 great price is sound (p10 of ~280 populated listings is $298);
+    the bottom of that market is just crowded."""
+
+    R730 = WatchTarget(
+        name="Dell PowerEdge R730", query="r730", category="server", great_price=300.0
+    )
+
+    def test_each_target_keeps_at_most_two_and_reports_the_rest(self):
+        found = [
+            deals.classify(_listing(f"Dell R730 #{i}", price=p), self.R730, None)
+            for i, p in enumerate([200, 190, 210, 220, 180])
+        ] + [deals.classify(_listing("RTX 3090", price=600.0), RTX3090, None)]
+        clean, flagged = deals.order_and_number(found)
+        assert [d.target.name for d in clean].count("Dell PowerEdge R730") == 2
+        assert any(d.target is RTX3090 for d in clean)
+        more = deals.overflow_counts(found, clean + flagged)
+        assert more == {"Dell PowerEdge R730": 3}
+        report = deals.render_report(
+            clean + flagged, [], [], None, datetime.now(UTC), more=more
+        )
+        assert "+3 more Dell PowerEdge R730" in report
+
+
+class TestHistoryPrune:
+    """Observations keep their title so the history can be re-judged when
+    the matching rules improve: a coat recorded as an "L40S" once is a
+    coat forever, and should stop counting toward the L40S median."""
+
+    L40S = WatchTarget(
+        name="L40S 48GB",
+        query="l40s",
+        category="gpu",
+        great_price=6000.0,
+        memory_gb=48,
+        exclude=["jacket", "coat"],
+    )
+
+    @pytest.fixture
+    def db(self, tmp_path):
+        from brain_db import BrainDB
+
+        db = BrainDB(str(tmp_path / "b.db"))
+        db.init_db()
+        return db
+
+    def test_title_is_stored(self, db):
+        db.record_deal_observation("eBay", "1", "RTX 3090", 700, title="RTX 3090 FE")
+        assert db.deal_observations()[0]["title"] == "RTX 3090 FE"
+
+    def test_stale_rows_are_skipped_not_deleted(self, db):
+        rows = [
+            ("1", "L40S 48GB", 5200, "NVIDIA L40S 48GB PCIe"),  # keep
+            ("2", "L40S 48GB", 5500, "Polo Long Coat Khaki L 40S"),  # junk title
+            ("3", "L40S 48GB", 900, ""),  # under the floor
+            ("4", "L40S 48GB", 5400, ""),  # legacy, no title: keep
+            ("5", "Retired target", 100, "anything"),  # target gone
+        ]
+        for lid, target, price, title in rows:
+            db.record_deal_observation("eBay", lid, target, price, title=title)
+        stats = deals.history_stats(db.deal_observations(), [self.L40S])
+        assert stats["L40S 48GB"].samples == 2  # rows 1 and 4
+        assert stats["L40S 48GB"].median == 5300
+        assert len(db.deal_observations()) == 5  # filtered, never deleted
+
+    def test_legacy_db_gains_the_title_column(self, tmp_path):
+        import sqlite3
+
+        from brain_db import BrainDB
+
+        path = str(tmp_path / "old.db")
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "CREATE TABLE deal_observations (source TEXT NOT NULL, listing_id "
+            "TEXT NOT NULL, target TEXT NOT NULL, price REAL NOT NULL, "
+            "observed_at TEXT NOT NULL, PRIMARY KEY(source, listing_id))"
+        )
+        conn.commit()
+        conn.close()
+        db = BrainDB(path)
+        db.init_db()
+        db.record_deal_observation("eBay", "1", "X", 1.0, title="t")
+        assert db.deal_observations()[0]["title"] == "t"

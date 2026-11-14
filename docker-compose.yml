@@ -51,8 +51,10 @@ services:
       - ./scripts/healthcheck-openclaw.sh:/opt/healthcheck.sh:ro
     environment:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
-      # Timezone is NOT set via env: OpenClaw only reads
-      # agents.defaults.userTimezone in openclaw.json
+      # OpenClaw only reads agents.defaults.userTimezone from openclaw.json,
+      # so the startup step below renders it from SCHEDULER_TZ (UTC if
+      # unset). OpenClaw cannot read the tenant profile: keep SCHEDULER_TZ
+      # in .env equal to the profile's assistant.timezone.
       - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
       - PROXY_AUTH_TOKEN=${PROXY_AUTH_TOKEN}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
@@ -66,7 +68,9 @@ services:
       - |
         chown 1000:1000 /home/node/.openclaw /tmp
         if [ ! -f /home/node/.openclaw/openclaw.json ] || grep -q 'PROXY_AUTH_TOKEN' /home/node/.openclaw/openclaw.json; then
-          sed "s|\$${PROXY_AUTH_TOKEN}|${PROXY_AUTH_TOKEN}|g" /opt/openclaw.json.template > /home/node/.openclaw/openclaw.json
+          sed -e "s|\$${PROXY_AUTH_TOKEN}|${PROXY_AUTH_TOKEN}|g" \
+              -e "s|\$${OPENCLAW_TZ}|${SCHEDULER_TZ:-UTC}|g" \
+              /opt/openclaw.json.template > /home/node/.openclaw/openclaw.json
           chown 1000:1000 /home/node/.openclaw/openclaw.json
         fi
         exec runuser -u node -- node --max-old-space-size=1536 dist/index.js gateway --bind lan --port 18789
@@ -160,7 +164,10 @@ services:
       - EBAY_CLIENT_ID=${EBAY_CLIENT_ID:-}
       - EBAY_CLIENT_SECRET=${EBAY_CLIENT_SECRET:-}
       - HOMELAB_CURRENT_SETUP=${HOMELAB_CURRENT_SETUP:-}
-      - SCHEDULER_TZ=${SCHEDULER_TZ:-America/Chicago}
+      # How prompts name the operator (profile assistant.owner.name).
+      - OPERATOR_NAME=${OPERATOR_NAME:-}
+      # Empty -> the profile's assistant.timezone (UTC if unset).
+      - SCHEDULER_TZ=${SCHEDULER_TZ:-}
       # Which tenant profile to load (defaults to the identity-free starter).
       - CLAWRANGE_PROFILE=${CLAWRANGE_PROFILE:-starter}
       # Where the OpenClaw workspace state is mounted (runtime persona render).

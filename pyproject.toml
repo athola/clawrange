@@ -44,7 +44,6 @@ src = ["workflows", "scripts", "tests"]
 exclude = [
     "data",
     ".venv",
-    "n8n",
     "deer-flow",
     "deerflow",
     ".mypy_cache",
@@ -69,7 +68,6 @@ warn_redundant_casts = true
 exclude = [
     "data/",
     "\\.venv/",
-    "n8n/",
     "deer-flow/",
     "deerflow/",
     "\\.mypy_cache/",

@@ -214,3 +214,176 @@ class TestPrecision:
         monkeypatch.setattr(rundown.github_search, "search_issues", search)
         await rundown.fetch_github(PROJECT)
         assert "in:title" in search.await_args.args[0]
+
+
+class TestNovember14Rundown:
+    """Regressions from the 2026-11-14 rundown: third-party issues read as
+    the operator's own, refs rendered as 'E1E2E3', invented project
+    features, and action items with no venue in the evidence."""
+
+    THIRD_PARTY = Evidence(
+        source="github",
+        group="GitHub issues (other repos)",
+        project="clawrange",
+        title="Use a Claude subscription as a provider plugin",
+        url="https://github.com/valdo766hi/pal/issues/76",
+        facts="issue on valdo766hi/pal (not yours) · open #76",
+        ref="E1",
+    )
+
+    def test_adjacent_refs_are_separated(self):
+        ev = [_ev("E1", "https://a.test/1"), _ev("E2", "https://a.test/2")]
+        out = rundown.link_citations("pain points [E1][E2] today", ev)
+        assert "[E1](https://a.test/1), [E2](https://a.test/2)" in out
+
+    @pytest.mark.asyncio
+    async def test_github_issue_on_other_repo_is_labelled_not_yours(self, monkeypatch):
+        issue = type(
+            "Issue",
+            (),
+            {
+                "url": "https://github.com/valdo766hi/pal/issues/76",
+                "title": "Use a Claude subscription as a provider plugin",
+                "number": 76,
+            },
+        )()
+        monkeypatch.setattr(
+            rundown.github_search, "search_issues", AsyncMock(return_value=[issue])
+        )
+        (ev,) = await rundown.fetch_github(PROJECT)
+        assert "valdo766hi/pal (not yours)" in ev.facts
+        assert "other repos" in ev.group
+
+    @pytest.mark.asyncio
+    async def test_prompt_carries_venue_rules_and_grounded_descriptions(
+        self, monkeypatch
+    ):
+        seen = {}
+
+        async def fake_call(prompt, max_tokens=0, **kw):
+            seen["prompt"] = prompt
+            return "ok"
+
+        monkeypatch.setattr(rundown.llm_proxy, "_llm_call", fake_call)
+        project = {**PROJECT, "posture": "Lead with: a single-host AI ops stack."}
+        bare = {**PROJECT, "slug": "bare", "owner": "a", "repo": "bare"}
+        await rundown.synthesize([project, bare], [self.THIRD_PARTY])
+        p = seen["prompt"]
+        assert "about: a single-host AI ops stack." in p
+        assert "no description" in p  # bare project: do not describe it
+        assert "you cannot label" in p  # per-item allowed action
+        assert "1 evidence item" in p  # count-aware hedging
+        assert "cross-post" in p  # off-venue actions named and banned
+
+    def test_off_venue_and_uncited_actions_are_dropped(self):
+        ev = [self.THIRD_PARTY, _ev("E2", "https://news.ycombinator.com/item?id=2")]
+        text = (
+            "TODAY'S READ\n"
+            "1. One item asks about provider plugins [E1].\n"
+            "\n"
+            "ACTION ITEMS\n"
+            "1. Comment on [E1] with the config that worked for you,\n"
+            "   since nobody has replied yet.\n"
+            "2. Tag [E1] with help wanted and cross-post to Discord.\n"
+            "3. Write a dev.to guide on plugin directories.\n"
+            "4. Answer the setup question in the HN thread [E2].\n"
+        )
+        out = rundown.filter_actions(text, ev)
+        assert "Comment on [E1]" in out
+        assert "since nobody has replied yet." in out  # wrapped line kept
+        assert "Tag [E1]" not in out
+        assert "dev.to guide" not in out
+        assert "2. Answer the setup question" in out  # renumbered
+        assert "2 suggested actions dropped" in out
+        assert "1. One item asks" in out  # TODAY'S READ untouched
+
+    def test_little_fits_one_liner_survives(self):
+        text = "ACTION ITEMS\nLittle fits today; nothing worth acting on."
+        assert rundown.filter_actions(text, []) == text
+
+    def test_label_as_plain_verb_is_not_a_triage_action(self):
+        # Live replay 2026-11-14: "align how entries define and label
+        # plugins" is a comment, not triage on someone else's issue.
+        ev = [self.THIRD_PARTY]
+        text = "ACTION ITEMS\n1. Comment on [E1] on how entries label plugins.\n"
+        assert "label plugins" in rundown.filter_actions(text, ev)
+
+    def test_bare_known_refs_are_linked_product_names_are_not(self):
+        ev = [_ev("E1", "https://a.test/1")]
+        out = rundown.link_citations("Comment on E1 about the A6000 and E9", ev)
+        assert "[E1](https://a.test/1)" in out
+        assert "A6000" in out and "[A6000]" not in out
+        assert "E9" in out  # unknown bare token: plain text, not a link
+
+    def test_long_ref_groups_link_every_ref(self):
+        refs = ["E1", "E2", "E3", "E10"]
+        ev = [_ev(r, f"https://a.test/{r}") for r in refs]
+        out = rundown.link_citations("see [E1, E2, E3] and [E1, E2, E3, E10]", ev)
+        for r in refs:
+            assert f"[{r}](https://a.test/{r})" in out
+        assert "\\[" not in out  # no half-escaped bracket left behind
+
+    def test_triage_on_a_bare_ref_is_dropped(self):
+        text = "ACTION ITEMS\n1. Tag E1 with help wanted.\n"
+        assert "Tag E1" not in rundown.filter_actions(text, [self.THIRD_PARTY])
+
+
+class TestCapabilityCheck:
+    """Live replay 2026-11-14 claimed clawrange "handles CLAUDE_CODE_PLUGIN_DIRS
+    discovery". A second pass names unsupported sentences; code deletes
+    them, so the check can only remove text, never add it."""
+
+    PROJECTS = [{**PROJECT, "posture": "Lead with: a single-host AI ops stack."}]
+    DRAFT = (
+        "TODAY'S READ\n"
+        "• One item asks about plugin loading [E1]. clawrange already handles "
+        "plugin directory discovery. This maps to clawrange.\n"
+        "ACTION ITEMS\n"
+        "1. Comment on [E1] with the debug steps that worked for you."
+    )
+
+    @pytest.mark.asyncio
+    async def test_flagged_sentence_is_deleted(self, monkeypatch):
+        seen = {}
+
+        async def fake_call(prompt, max_tokens=0, **kw):
+            seen["prompt"] = prompt
+            return "1"
+
+        monkeypatch.setattr(rundown.llm_proxy, "_llm_call", fake_call)
+        out = await rundown.check_capabilities(self.PROJECTS, self.DRAFT)
+        assert "already handles" not in out
+        assert "One item asks about plugin loading [E1]." in out
+        assert "1. Comment on [E1]" in out
+        # Only sentences naming a project are offered for review.
+        assert "[1] clawrange already handles" in seen["prompt"]
+        assert "a single-host AI ops stack" in seen["prompt"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reply", ["1", "[1]", "[1], [2]", "1 and 2", " 1,2. "])
+    async def test_number_list_formats_are_accepted(self, monkeypatch, reply):
+        # Live replies seen 2026-11-14: "2,3" and "[2], [3]".
+        async def fake_call(prompt, max_tokens=0, **kw):
+            return reply
+
+        monkeypatch.setattr(rundown.llm_proxy, "_llm_call", fake_call)
+        out = await rundown.check_capabilities(self.PROJECTS, self.DRAFT)
+        assert "already handles" not in out
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "reply", ["NONE", "None.", "garbage", "7, 9", None, "Sentence 1 is fine"]
+    )
+    async def test_unusable_reply_keeps_the_draft(self, monkeypatch, reply):
+        async def fake_call(prompt, max_tokens=0, **kw):
+            return reply
+
+        monkeypatch.setattr(rundown.llm_proxy, "_llm_call", fake_call)
+        assert await rundown.check_capabilities(self.PROJECTS, self.DRAFT) == self.DRAFT
+
+    @pytest.mark.asyncio
+    async def test_check_failure_keeps_the_draft(self, monkeypatch):
+        monkeypatch.setattr(
+            rundown.llm_proxy, "_llm_call", AsyncMock(side_effect=RuntimeError)
+        )
+        assert await rundown.check_capabilities(self.PROJECTS, self.DRAFT) == self.DRAFT

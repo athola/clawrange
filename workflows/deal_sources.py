@@ -25,7 +25,7 @@ from urllib.parse import quote_plus
 import httpx
 
 import reddit_search
-from deals import TOO_GOOD_OF_TARGET, Listing, WatchTarget, parse_price
+from deals import Listing, WatchTarget, parse_price
 from reddit_search import SearchHealth
 from rundown import SourceStatus, reddit_status
 
@@ -74,6 +74,10 @@ def _price_from(title: str, body: str) -> float | None:
     Sale posts often list several items with prices in the body, and the
     first amount may belong to a different item than the one we matched.
     """
+    # A title naming several prices ("M2 Max $1299, M2 Ultra $2499") is a
+    # roundup post; its first amount may be another model, so it is a lead.
+    if len({m.group(0).replace(" ", "") for m in _ALL_PRICES_RE.finditer(title)}) > 1:
+        return None
     price = parse_price(title)
     if price is not None:
         return price
@@ -258,6 +262,10 @@ async def _ebay_token(client: httpx.AsyncClient) -> str:
 
 
 def _ebay_listing(item: dict) -> Listing | None:
+    # Multi-variation listings ("RTX 3060 3070 3080 3090") show the cheapest
+    # variant's price, which says nothing about the matched model.
+    if item.get("itemGroupType"):
+        return None
     try:
         price = float(item["price"]["value"])
     except (KeyError, TypeError, ValueError):
@@ -279,42 +287,52 @@ def _ebay_listing(item: dict) -> Listing | None:
     )
 
 
+# eBay search can be scoped to one category per target via the profile's
+# `sources.ebay.categories` (target category -> eBay category id, see the
+# Taxonomy API). Keyword search alone matches toys and seals for
+# model-number queries; unmapped categories stay unscoped.
+
+
 async def fetch_ebay(
     client: httpx.AsyncClient,
     targets: list[WatchTarget],
     pace: float = 1.0,
     _sleep: Sleep | None = None,
+    config: dict | None = None,
 ) -> list[Listing]:
     """Fixed-price and auction listings per target, excluding for-parts.
 
     The price window runs from the too-good-to-be-true floor to 130% of the
     great price, so the history median sees the normal market, not only
-    bargains.
+    bargains. `config` is the profile's `sources.ebay` block: `marketplace`
+    (default EBAY_US), `currency` (USD) and `delivery_country` (US).
     """
+    cfg = config or {}
+    currency = cfg.get("currency") or "USD"
+    country = cfg.get("delivery_country") or "US"
     sleep = _sleep or asyncio.sleep
     token = await _ebay_token(client)
     headers = {
         "Authorization": f"Bearer {token}",
-        "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
+        "X-EBAY-C-MARKETPLACE-ID": cfg.get("marketplace") or "EBAY_US",
     }
     out: list[Listing] = []
     for i, t in enumerate(targets):
         if i and pace:
             await sleep(pace)
-        lo = TOO_GOOD_OF_TARGET * t.great_price
+        lo = t.too_good_floor
         hi = EBAY_PRICE_CEILING * t.great_price
-        resp = await client.get(
-            EBAY_SEARCH_URL,
-            headers=headers,
-            params={
-                "q": t.query,
-                "limit": "50",
-                "filter": (
-                    f"price:[{lo:.0f}..{hi:.0f}],priceCurrency:USD,"
-                    f"conditionIds:{{{EBAY_CONDITIONS}}},deliveryCountry:US"
-                ),
-            },
-        )
+        params = {
+            "q": t.query,
+            "limit": "50",
+            "filter": (
+                f"price:[{lo:.0f}..{hi:.0f}],priceCurrency:{currency},"
+                f"conditionIds:{{{EBAY_CONDITIONS}}},deliveryCountry:{country}"
+            ),
+        }
+        if t.ebay_category:
+            params["category_ids"] = t.ebay_category
+        resp = await client.get(EBAY_SEARCH_URL, headers=headers, params=params)
         if resp.status_code in (401, 403):
             raise NotConfigured(f"eBay search rejected (HTTP {resp.status_code})")
         if resp.status_code != 200:
@@ -356,7 +374,8 @@ async def gather(
                 continue
             fn = globals()[fn_name]
             try:
-                found = await fn(client, targets, pace=pace)
+                kwargs = {"config": sources.get(key) or {}} if key == "ebay" else {}
+                found = await fn(client, targets, pace=pace, **kwargs)
                 listings.extend(found)
                 statuses.append(SourceStatus(name, True, f"{len(found)} listings"))
             except NotConfigured as exc:

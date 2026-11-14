@@ -1,14 +1,17 @@
 """Tests for the LLM proxy with three-tier fallback."""
 
+import asyncio
 import json
 import time
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import httpx
+import pytest
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
+import llm_proxy
 from app import app
 
 client = TestClient(app)
@@ -1282,6 +1285,21 @@ class TestResponseSanitization:
 # ─── Persona Backstory Stripping (search-tier prompt hygiene) ─────
 
 
+@pytest.fixture
+def marketing_persona(monkeypatch):
+    """Run as the marketing tenant: its John-117 persona carries the
+    search_hygiene config, and OPERATOR_NAME names the operator. Persona
+    rules are profile data, so these tests say which profile they test."""
+    import tenant_profile
+
+    monkeypatch.setenv("CLAWRANGE_PROFILE", "marketing")
+    monkeypatch.setenv("OPERATOR_NAME", "Alex")
+    tenant_profile._ACTIVE.clear()
+    yield
+    tenant_profile._ACTIVE.clear()
+
+
+@pytest.mark.usefixtures("marketing_persona")
 class TestPersonaBackstoryStripping:
     """When tasks route to the OpenRouter `:online` search tier, Exa runs
     web search on the full prompt. The Halo character backstory in soul.md
@@ -1346,6 +1364,7 @@ class TestPersonaBackstoryStripping:
 # ─── Work Prompt Persona Routing ──────────────────────────────────
 
 
+@pytest.mark.usefixtures("marketing_persona")
 class TestWorkPromptPersonaRouting:
     """Search-tier work prompts must be clean of Halo character noise.
     Non-search work prompts keep the full persona so John-117 stays in
@@ -1415,6 +1434,7 @@ class TestWorkPromptPersonaRouting:
 # ─── Irrelevant Citation Filtering ────────────────────────────────
 
 
+@pytest.mark.usefixtures("marketing_persona")
 class TestIrrelevantCitationFiltering:
     """Belt-and-suspenders: even if the prompt-stripping fix lets a stray
     Halo token through, the citation-extraction layer drops Halopedia and
@@ -3589,6 +3609,7 @@ class TestLlmWorkTaskRouting:
         assert captured["web_search"] is False
 
     @patch.dict("os.environ", FAKE_ENV)
+    @pytest.mark.usefixtures("marketing_persona")
     def test_empty_llm_response_returns_manual_fallback(self):
         """
         GIVEN _llm_call returns an empty string (all tiers down)
@@ -4208,6 +4229,7 @@ class TestThinkingPromptDoesNotAskAlex:
     def test_prompt_does_not_ask_for_knowledge_building(self, monkeypatch):
         assert "suggest tasks that BUILD knowledge" not in self._prompt(monkeypatch)
 
+    @pytest.mark.usefixtures("marketing_persona")
     def test_prompt_forbids_tasks_needing_alex(self, monkeypatch):
         assert "only Alex can supply" in self._prompt(monkeypatch)
 
@@ -4588,3 +4610,52 @@ class TestGroundedThinking:
         assert "Stack gaps: vram" in prompt
         assert "Focus area" not in prompt
         assert "client outreach" not in prompt
+
+
+class TestGenericOperatorWording:
+    """Without a configured name, prompts never fall back to a real person."""
+
+    @pytest.fixture(autouse=True)
+    def _starter(self, monkeypatch):
+        import tenant_profile
+
+        monkeypatch.delenv("CLAWRANGE_PROFILE", raising=False)
+        monkeypatch.delenv("OPERATOR_NAME", raising=False)
+        tenant_profile._ACTIVE.clear()
+        yield
+        tenant_profile._ACTIVE.clear()
+
+    def test_fallback_names_the_operator_generically(self):
+        async def fake_call(prompt, max_tokens, web_search=False):
+            return ""
+
+        async def fake_prompt(desc, web_search=False):
+            return "PROMPT"
+
+        with (
+            patch.object(llm_proxy, "_llm_call", side_effect=fake_call),
+            patch.object(llm_proxy, "_build_work_prompt", side_effect=fake_prompt),
+        ):
+            result = asyncio.run(llm_proxy._llm_work_task("Send weekly invoice"))
+        # The starter profile's placeholder owner.name is "Operator".
+        assert "Operator should handle manually" in result
+        assert "Alex" not in result
+
+    def test_no_persona_hygiene_without_config(self):
+        soul = "## Who You Are\nlore\n## What You Can Do\njob"
+        assert llm_proxy._strip_persona_backstory(soul) == soul
+        assert not llm_proxy._is_persona_citation("https://halopedia.test", "x")
+        assert llm_proxy._operator_label() == "OPERATOR"
+
+    def test_profile_without_owner_says_the_operator(self):
+        import tenant_profile
+
+        profile = tenant_profile.Profile(name="x", raw={"assistant": {}})
+        assert tenant_profile.operator_name(profile) == "the operator"
+
+
+def test_sentence_start_keeps_multi_word_names():
+    # str.capitalize would turn "Mary Ann" into "Mary ann".
+    assert llm_proxy._sentence_start("Mary Ann") == "Mary Ann"
+    assert llm_proxy._sentence_start("the operator") == "The operator"
+    assert llm_proxy._sentence_start("") == ""

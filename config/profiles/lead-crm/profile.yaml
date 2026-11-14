@@ -117,7 +117,7 @@ crm:
         SELECT strftime(:fmt, created_at) AS bucket, COUNT(*) AS n
         FROM leads WHERE created_at >= :since GROUP BY bucket ORDER BY bucket
     - name: lead_lookup
-      description: "Find leads matching a name or email fragment."
+      description: "Find leads matching a name, email or phone fragment."
       params:
         q: {type: string}
-      sql: "SELECT * FROM leads WHERE email LIKE :like OR name LIKE :like LIMIT 10"
+      sql: "SELECT * FROM leads WHERE email LIKE :like OR name LIKE :like OR phone LIKE :like LIMIT 10"

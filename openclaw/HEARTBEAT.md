@@ -47,7 +47,7 @@ summary that this heartbeat response carries and OpenClaw relays.
 **Direct item messages (sent by the proxy, arrive first):**
 ```
 Heartbeat digest (N item(s) this hour):
-[ALEX|SYSTEM] #<id>: <description>
+[<OPERATOR>|SYSTEM] #<id>: <description>
 Result: <summary>
 Created #<id> [P<n>] <description>
 ```
@@ -62,7 +62,7 @@ Tiers: <tripped> TRIPPED | OpenRouter balance: $X.XX
 Any other cycle responds empty (silent).
 
 **Waiting-on-you lines** re-surface tasks whose result came back
-BLOCKED (a question for Alex) — they stay in the summary footer until a
+BLOCKED (a question for the operator) — they stay in the summary footer until a
 later task answers them or they age out (7 days), because the ask-once
 design otherwise goes mute while waiting on the answer. When the digest
 has no other content, the response is still `Heartbeat digest: nothing
@@ -93,4 +93,4 @@ one recovery notice when heartbeats return.
 - Deduplication: don't recreate an alert/investigation task if a
   similar one exists from the last 24 hours regardless of status —
   completed alerts count, or they would be recreated every cycle
-- Infrastructure monitoring only. Alex creates his own work tasks via `!task`
+- Infrastructure monitoring only. The operator creates their own work tasks via `!task`

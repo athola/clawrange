@@ -196,7 +196,8 @@ workflows service:
 
 Delivered by `morning_digest_generator` (in `workflows/generators.py`).
 On a fresh boot, `seed_default_projects` registers a `0 8 * * *` schedule
-in the `SCHEDULER_TZ` (default `America/Chicago`), so the morning rundown
+in the operator timezone (`SCHEDULER_TZ`, else the profile's
+`assistant.timezone`, else UTC), so the morning rundown
 fires without manual `/sched add`.
 
 The report always sends. A morning with no evidence still delivers a

@@ -47,6 +47,35 @@ class TestSearchHealth:
         assert len(calls) == SearchHealth.BLOCK_LIMIT
 
     @pytest.mark.asyncio
+    async def test_feed_fallback_trips_on_refused_feeds_too(self, monkeypatch):
+        calls: list[str] = []
+
+        def handler(request):
+            calls.append(str(request.url))
+            return httpx.Response(403)
+
+        _patch_transport(monkeypatch, handler)
+
+        async def no_sleep(_s):
+            return None
+
+        monkeypatch.setattr(reddit_search, "_sleep", no_sleep)
+        health = SearchHealth()
+        subs = [f"sub{i}" for i in range(10)]
+        posts = await reddit_search.search_subreddits(
+            "claude", subs, since="24h", health=health, feed_fallback=True
+        )
+
+        # One refused JSON search switches the run to feeds; BLOCK_LIMIT
+        # refused feeds then trip it, and the remaining subs are skipped.
+        assert posts == []
+        assert health.mode == "rss"
+        assert health.failures == {"403": 1 + SearchHealth.BLOCK_LIMIT}
+        assert health.tripped
+        assert health.skipped == 10 - SearchHealth.BLOCK_LIMIT
+        assert len(calls) == 1 + SearchHealth.BLOCK_LIMIT
+
+    @pytest.mark.asyncio
     async def test_success_resets_block_streak(self, monkeypatch):
         statuses = iter([429, 200, 429, 200])
 

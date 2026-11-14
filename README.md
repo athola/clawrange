@@ -34,6 +34,26 @@ make health         # confirm both services answer /healthz
 make test           # run the validation suite
 ```
 
+To see one real end-to-end run (scheduler, LLM proxy and Telegram), fire
+a seeded job now instead of waiting for its cron. A fresh clone runs the
+identity-free `starter` profile, which seeds no jobs; list what your
+profile seeds, then run one (the `marketing` example seeds
+`morning_digest` and `homelab_deals`):
+
+```bash
+curl -s localhost:5678/sched                              # seeded jobs
+curl -s -X POST localhost:5678/sched/<id>/run             # run one now
+curl -s localhost:5678/tier                               # tier and balance
+```
+
+Everything tenant-specific (timezone, tracked projects, outreach policy,
+deal targets and marketplaces) is profile YAML, never code: see
+[docs/multi-tenant-guide.md](docs/multi-tenant-guide.md).
+
+Each rundown always sends, so an empty Telegram means delivery failed, not
+that nothing matched. The report's `Setup needed` block names any missing
+credential (Reddit script app, GitHub PAT, eBay keyset).
+
 For Tailscale-secured deployment (cloud gateway and onsite node), see
 [docs/DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md). For specs covering
 the marketing orchestrator and brain database, see

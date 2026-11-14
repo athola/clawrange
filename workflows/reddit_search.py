@@ -3,14 +3,22 @@
 Preferred path: Reddit's official API via asyncpraw (script-app OAuth
 flow). When credentials are missing, falls back to Reddit's
 unauthenticated read-only JSON endpoint so the morning_digest still
-fires before the operator wires script-app credentials.
+fires before the operator wires script-app credentials. When Reddit
+refuses that too (HTTP 403 for keyless JSON from many hosts), each
+subreddit's Atom feed is read once per run and topics are matched
+locally; feeds carry no score or comment counts.
 """
 
+import asyncio
+import html
 import logging
 import os
+import re
+import xml.etree.ElementTree as ET  # noqa: S405 - DTDs refused before parsing
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import httpx
 from pydantic import BaseModel
@@ -56,6 +64,10 @@ class SearchHealth:
     BLOCK_LIMIT = 3
 
     mode: str = ""
+    # Set once keyless JSON is refused: the rest of the run reads feeds,
+    # cached here per subreddit so each feed costs one request per run.
+    feed_mode: bool = False
+    feeds: dict[str, list[Any]] = field(default_factory=dict)
     requests: int = 0
     ok: int = 0
     skipped: int = 0
@@ -99,6 +111,118 @@ class RedditPost(BaseModel):
     comments: int
     created_utc: str
     snippet: str | None = None
+    # False for feed posts: score/comments are unknown, not zero.
+    engagement_known: bool = True
+
+
+# ─── Atom feed fallback ─────────────────────────────────────────────
+
+FEED_URL = "https://www.reddit.com/r/{sub}/new/.rss?limit=100"
+# Reddit serves feeds to browser-like agents it refuses JSON to.
+# REDDIT_FEED_USER_AGENT overrides it.
+FEED_USER_AGENT = (
+    os.getenv("REDDIT_FEED_USER_AGENT", "").strip()
+    or "Mozilla/5.0 (compatible; clawrange/0.1)"
+)
+FEED_PACE_S = 6.0
+_ATOM = {"a": "http://www.w3.org/2005/Atom"}
+_sleep = asyncio.sleep  # patched in tests
+
+
+def parse_feed_posts(xml_text: str, cutoff: datetime) -> list[RedditPost]:
+    """Atom entries newer than `cutoff`, as posts with unknown engagement.
+
+    Feeds are untrusted: any DOCTYPE/ENTITY declaration is refused, which
+    rules out entity-expansion attacks without an extra dependency.
+    """
+    if re.search(r"<!(DOCTYPE|ENTITY)", xml_text, re.IGNORECASE):
+        logger.warning("Reddit feed declares a DTD; refusing to parse")
+        return []
+    try:
+        root = ET.fromstring(xml_text)  # noqa: S314 - DTDs refused above
+    except ET.ParseError as exc:
+        logger.warning("Reddit feed unparseable: %s", exc)
+        return []
+    out: list[RedditPost] = []
+    for entry in root.iter(f"{{{_ATOM['a']}}}entry"):
+        raw_id = (entry.findtext("a:id", namespaces=_ATOM) or "").strip()
+        when = entry.findtext("a:published", namespaces=_ATOM) or entry.findtext(
+            "a:updated", namespaces=_ATOM
+        )
+        try:
+            created = datetime.fromisoformat((when or "").strip())
+        except ValueError:
+            continue
+        if not raw_id or created < cutoff:
+            continue
+        link = entry.find("a:link", _ATOM)
+        category = entry.find("a:category", _ATOM)
+        text = html.unescape(entry.findtext("a:content", namespaces=_ATOM) or "")
+        body = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text)).strip()
+        out.append(
+            RedditPost(
+                id=raw_id.removeprefix("t3_"),
+                url=link.get("href", "") if link is not None else "",
+                title=(entry.findtext("a:title", namespaces=_ATOM) or "").strip(),
+                subreddit=category.get("term", "") if category is not None else "",
+                score=0,
+                comments=0,
+                created_utc=created.astimezone(UTC).isoformat(),
+                snippet=(body[:200] + "...") if len(body) > 200 else (body or None),
+                engagement_known=False,
+            )
+        )
+    return out
+
+
+def _topic_matches(post: RedditPost, topic: str) -> bool:
+    words = [w for w in topic.lower().split() if len(w) > 2]
+    haystack = f"{post.title} {post.snippet or ''}".lower()
+    return bool(words) and all(w in haystack for w in words)
+
+
+async def _feed_search(
+    client: httpx.AsyncClient,
+    sub_name: str,
+    topic: str,
+    cutoff: datetime,
+    health: "SearchHealth",
+) -> list[RedditPost]:
+    """Posts in one subreddit's feed that match the topic (cached per run)."""
+    key = sub_name.lower()
+    if key not in health.feeds:
+        if health.tripped:
+            health.skipped += 1
+            return []
+        if health.feeds:
+            await _sleep(FEED_PACE_S)
+        posts: list[RedditPost] = []
+        try:
+            for attempt in range(2):  # one retry after backing off a 429
+                resp = await client.get(
+                    FEED_URL.format(sub=sub_name),
+                    headers={"User-Agent": FEED_USER_AGENT},
+                )
+                health.record(resp.status_code)
+                if resp.status_code != 429 or attempt:
+                    break
+                await _sleep(FEED_PACE_S * 2)
+            if resp.status_code == 200:
+                # Cache the whole feed; each call applies its own window.
+                posts = parse_feed_posts(resp.text, datetime.min.replace(tzinfo=UTC))
+            else:
+                logger.warning(
+                    "Reddit feed r/%s -> HTTP %d", sub_name, resp.status_code
+                )
+        except Exception as exc:
+            logger.warning("Reddit feed r/%s failed: %s", sub_name, exc)
+            health.record("error")
+        health.feeds[key] = posts
+    return [
+        p
+        for p in health.feeds[key]
+        if datetime.fromisoformat(p.created_utc) >= cutoff and _topic_matches(p, topic)
+    ]
 
 
 # ─── Time Filter Parsing ────────────────────────────────────────────
@@ -147,8 +271,14 @@ async def search_subreddits(
     sort: str = "new",
     limit_per_sub: int = 25,
     health: SearchHealth | None = None,
+    feed_fallback: bool = False,
 ) -> list[RedditPost]:
     """Search multiple subreddits for posts matching a topic.
+
+    `feed_fallback` lets a keyless run switch to subreddit Atom feeds when
+    search JSON is refused. Opt-in, and only useful with one `health`
+    shared across a run's searches: the feed cache and pacing live there,
+    so a caller without one would re-probe and re-fetch on every call.
 
     Returns deduplicated results sorted by score descending. Uses the
     OAuth script-app flow when REDDIT_CLIENT_ID/SECRET/USERNAME/PASSWORD
@@ -158,7 +288,7 @@ async def search_subreddits(
     if not await is_configured():
         logger.info("Reddit OAuth not configured — using public JSON fallback")
         return await _public_search(
-            topic, subreddits, since, sort, limit_per_sub, health
+            topic, subreddits, since, sort, limit_per_sub, health, feed_fallback
         )
 
     try:
@@ -262,7 +392,9 @@ async def search_all(
     results: list[RedditPost] = []
     if health is not None:
         health.mode = health.mode or "public"
-        if health.tripped:
+        # Feed mode has no all-of-Reddit equivalent short of one request
+        # per topic, which the anonymous rate limit cannot afford.
+        if health.tripped or health.feed_mode:
             health.skipped += 1
             return []
 
@@ -334,6 +466,7 @@ async def _public_search(
     sort: str,
     limit_per_sub: int,
     health: SearchHealth | None = None,
+    feed_fallback: bool = False,
 ) -> list[RedditPost]:
     """Unauthenticated read-only fallback via Reddit's public JSON API.
 
@@ -349,7 +482,8 @@ async def _public_search(
 
     seen_ids: set[str] = set()
     results: list[RedditPost] = []
-    if health is not None:
+    health = health if health is not None else SearchHealth()
+    if not health.feed_mode:
         health.mode = "public"
 
     async with httpx.AsyncClient(
@@ -357,7 +491,13 @@ async def _public_search(
         timeout=15.0,
     ) as client:
         for sub_name in subreddits:
-            if health is not None and health.tripped:
+            if health.feed_mode:
+                for post in await _feed_search(client, sub_name, topic, cutoff, health):
+                    if post.id not in seen_ids:
+                        seen_ids.add(post.id)
+                        results.append(post)
+                continue
+            if health.tripped:
                 health.skipped += 1
                 continue
             url = f"https://www.reddit.com/r/{sub_name}/search.json"
@@ -370,8 +510,20 @@ async def _public_search(
             }
             try:
                 resp = await client.get(url, params=params)
-                if health is not None:
-                    health.record(resp.status_code)
+                health.record(resp.status_code)
+                if resp.status_code == 403 and feed_fallback:
+                    # Keyless JSON refused: switch the run to feeds and
+                    # stop probing JSON, which only feeds the block streak.
+                    logger.info("Reddit JSON refused; switching to feeds")
+                    health.feed_mode, health.mode = True, "rss"
+                    health._block_streak = 0
+                    for post in await _feed_search(
+                        client, sub_name, topic, cutoff, health
+                    ):
+                        if post.id not in seen_ids:
+                            seen_ids.add(post.id)
+                            results.append(post)
+                    continue
                 if resp.status_code != 200:
                     logger.warning(
                         "Reddit public search r/%s '%s' -> HTTP %d",
@@ -383,8 +535,7 @@ async def _public_search(
                 payload = resp.json()
             except Exception as exc:
                 logger.warning("Reddit public search r/%s failed: %s", sub_name, exc)
-                if health is not None:
-                    health.record("error")
+                health.record("error")
                 continue
 
             for child in payload.get("data", {}).get("children", []):

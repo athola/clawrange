@@ -17,6 +17,15 @@ import pytest
 
 import watchdog
 
+
+@pytest.fixture(autouse=True)
+def _operator_in_chicago(monkeypatch):
+    """These cases are written in Chicago local time; the operator timezone
+    is config (SCHEDULER_TZ / assistant.timezone), so pin it here."""
+    monkeypatch.setenv("SCHEDULER_TZ", "America/Chicago")
+    monkeypatch.delenv("HEARTBEAT_WATCH_TZ", raising=False)
+
+
 CHICAGO = ZoneInfo("America/Chicago")
 
 

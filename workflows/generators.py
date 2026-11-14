@@ -78,18 +78,13 @@ def _is_quiet_hours(
     return hour >= start_hour or hour < end_hour
 
 
-# Subreddits to include in every morning digest scan, even when no
-# tracked project subscribes to them directly. Sourced from Alex's
-# brief: AI-coding communities where comment-worthy posts about
-# Claude Code, plugins, and self-hosted agent tooling appear.
-MORNING_DIGEST_EXTRA_SUBREDDITS = (
-    "vibecoding",
-    "opensourceai",
-    "claudecode",
-    "ClaudeAI",
-    "codex",
-    "sideprojects",
-)
+def digest_extra_subreddits() -> list[str]:
+    """Subreddits added to every digest/pulse scan even when no tracked
+    project subscribes to them: the profile's
+    `reddit.digest_extra_subreddits` (tenant data, empty by default)."""
+    profile = tenant_profile.active_profile()
+    reddit = (profile.raw.get("reddit") or {}) if profile else {}
+    return [str(s) for s in reddit.get("digest_extra_subreddits") or []]
 
 
 async def morning_scan_generator(
@@ -146,10 +141,28 @@ async def weekly_traffic_generator(
         logger.info("weekly_traffic: enqueued task for %s", slug)
 
 
-_AWESOME_LISTS = [
-    ("ComposioHQ", "awesome-claude-plugins"),
-    ("hesreallyhim", "awesome-claude-code"),
-]
+def _awesome_lists(lists: list[str] | None) -> list[tuple[str, str]]:
+    """ "owner/repo" lists to watch: the profile's `awesome_lists` (tenant
+    data; none by default). A schedule's `lists` kwarg overrides it with
+    owner/repo entries, or narrows it by bare repo name."""
+    profile = tenant_profile.active_profile()
+    configured = [
+        str(x) for x in ((profile.raw.get("awesome_lists") or []) if profile else [])
+    ]
+    if lists:
+        full = [x for x in lists if "/" in x]
+        names = {x for x in lists if "/" not in x}
+        lists = full + [x for x in configured if x.partition("/")[2] in names]
+    else:
+        lists = configured
+    out = []
+    for entry in lists:
+        owner, _, repo = str(entry).partition("/")
+        if owner and repo:
+            out.append((owner, repo))
+        else:
+            logger.warning("awesome_lists_watch: %r is not owner/repo", entry)
+    return out
 
 
 async def awesome_lists_watch_generator(
@@ -158,13 +171,9 @@ async def awesome_lists_watch_generator(
     """Check awesome-lists for tracked projects, enqueue PR tasks when missing."""
 
     projects = brain_db.list_projects()
-    target_lists = _AWESOME_LISTS
-    if lists:
-        target_lists = [
-            (lo, lr)
-            for lo, lr in _AWESOME_LISTS
-            if f"{lo}/{lr}" in lists or lr in lists
-        ]
+    target_lists = _awesome_lists(lists)
+    if not target_lists:
+        logger.info("awesome_lists_watch: no lists configured, skipping")
 
     for list_owner, list_repo in target_lists:
         target_urls = [f"github.com/{p['owner']}/{p['repo']}" for p in projects]
@@ -216,13 +225,13 @@ async def content_idea_generator(
     the brain and, for each tracked project, enqueues a single
     content-idea task with the strongest finding from that pool.
 
-    The generated task is intended to be picked up by John-117 (or
-    Alex) and elaborated into one of:
+    The generated task is intended to be picked up by the assistant (or
+    the operator) and elaborated into one of:
     - a technical blog post (lead),
     - a Reddit comment (engage),
     - or an X thread (broadcast).
 
-    The generator never auto-posts. It only proposes; Alex approves.
+    The generator never auto-posts. It only proposes; the operator approves.
     """
     projects = brain_db.list_projects()
     if project_slugs:
@@ -291,8 +300,8 @@ async def comment_draft_generator(
     - post_url: Reddit/HN/blog URL the draft is responding to.
     - post_summary: optional one-line summary of what OP asked.
     - project_slug: optional project whose posture should color
-      the draft (e.g. mention claude-night-market when the post
-      is about plugin discovery).
+      the draft (e.g. mention a plugin-marketplace project when the
+      post is about plugin discovery).
 
     Emits a single task tagged 'comment_draft' for human review.
     """
@@ -319,7 +328,8 @@ async def comment_draft_generator(
         f"[DRAFT] Comment draft for {project_name} on {post_url}.{summary_clause} "
         f"Write a useful 3-5 sentence reply that leads with concrete advice and "
         f"only mentions the product if directly relevant. Honest, specific, no "
-        f"hype. Never auto-post - this draft is for Alex to review and send "
+        f"hype. Never auto-post - this draft is for "
+        f"{tenant_profile.operator_name()} to review and send "
         f"manually.{posture_clause}"
     )
     brain_db.create_task(desc, priority=2, source="schedule")
@@ -345,6 +355,8 @@ def _matched_keywords(
 
 def _comment_angle(post: RedditPost) -> str:
     """One-line 'why we should comment' framing based on engagement."""
+    if not post.engagement_known:
+        return "engagement unknown (feed fallback) — open it to judge"
     return rundown.engagement_angle(post.comments)
 
 
@@ -359,6 +371,8 @@ def _pick_facts(
         match_text = "sub-affinity bonus"
     else:
         match_text = "search match"
+    if not post.engagement_known:
+        return f"r/{post.subreddit} · engagement unknown · {match_text}"
     return (
         f"r/{post.subreddit} · {post.score} pts · "
         f"{post.comments} comments · {match_text}"
@@ -406,6 +420,15 @@ def _score_relevance(post: RedditPost, topics: list[str], terms: list[str]) -> f
     return rundown.relevance(post.title + " " + (post.snippet or ""), topics, terms)
 
 
+def _outreach_policy(profile_name: str | None = None) -> dict:
+    """The profile's optional `outreach` block; {} when absent or broken."""
+    try:
+        return tenant_profile.load_profile(profile_name).raw.get("outreach") or {}
+    except Exception as exc:
+        logger.warning("morning_digest: outreach policy unavailable: %s", exc)
+        return {}
+
+
 async def morning_digest_generator(
     brain_db,
     project_slugs: list[str] | None = None,
@@ -451,7 +474,7 @@ async def morning_digest_generator(
     extras = (
         list(extra_subreddits)
         if extra_subreddits is not None
-        else list(MORNING_DIGEST_EXTRA_SUBREDDITS)
+        else digest_extra_subreddits()
     )
 
     # Union of every project's subreddit list plus the user's extras.
@@ -506,6 +529,9 @@ async def morning_digest_generator(
                     sort="new",
                     limit_per_sub=15,
                     health=health,
+                    # One health spans the run, so feeds are fetched once
+                    # per subreddit and paced when JSON is refused.
+                    feed_fallback=True,
                 )
             except Exception as exc:
                 logger.warning(
@@ -514,7 +540,12 @@ async def morning_digest_generator(
                 continue
 
             for post in posts:
-                scores_by_sub.setdefault(post.subreddit.lower(), []).append(post.score)
+                # Feed posts have no score; a median of zeros would make
+                # every one of them a "popular" bonus pick.
+                if post.engagement_known:
+                    scores_by_sub.setdefault(post.subreddit.lower(), []).append(
+                        post.score
+                    )
                 if brain_db.is_seen("reddit_post", post.id, slug):
                     continue
                 rel = _score_relevance(post, topics, terms)
@@ -524,8 +555,9 @@ async def morning_digest_generator(
                 if rel <= 0 and not sub_affinity:
                     continue
                 # Routing priority: rel dominates, sub-affinity is a small
-                # tiebreak so e.g. an r/Construction post lands at skrills
-                # rather than at clawrange when both have rel == 0.
+                # tiebreak so e.g. an r/Construction post lands at the
+                # project subscribed to r/Construction, not at another one
+                # with the same rel == 0.
                 priority = rel + (0.1 if sub_affinity else 0)
                 prior = best_for_post.get(post.id)
                 prior_priority = prior[2] + (0.1 if prior[3] else 0) if prior else -1.0
@@ -594,10 +626,11 @@ async def morning_digest_generator(
             evidence.append(_reddit_evidence(project, post, is_bonus, "Reddit"))
         for post in emerging_picks_by_project.get(slug, []):
             evidence.append(_reddit_evidence(project, post, False, "🆕 Emerging subs"))
-    other, statuses = await rundown.gather_other_channels(projects)
+    policy = _outreach_policy(kwargs.get("profile_name"))
+    other, statuses = await rundown.gather_other_channels(projects, policy)
     evidence = rundown.assign_refs(projects, evidence + other)
     statuses.insert(0, rundown.reddit_status(health))
-    synthesis = await rundown.synthesize(projects, evidence)
+    synthesis = await rundown.synthesize(projects, evidence, policy)
 
     report = rundown.build_report(
         projects=projects,
@@ -606,6 +639,7 @@ async def morning_digest_generator(
         synthesis=synthesis,
         coverage=_render_subreddit_report(brain_db, projects, newly_promoted),
         now=datetime.now(UTC),
+        policy=policy,
     )
     sent, total = await telegram.notify_long(report)
 
@@ -743,7 +777,7 @@ def _render_subreddit_report(
     for p in projects:
         for s in json.loads(p.get("subreddits", "[]")):
             all_subs.add(s.lower())
-    for s in MORNING_DIGEST_EXTRA_SUBREDDITS:
+    for s in digest_extra_subreddits():
         all_subs.add(s.lower())
 
     # Top yields across all projects (limit 5)
@@ -791,7 +825,7 @@ async def hot_pulse_generator(
     min_delivery_interval_minutes: int = 15,
     quiet_hours_start: int = 0,
     quiet_hours_end: int = 5,
-    quiet_hours_tz: str = "America/Chicago",
+    quiet_hours_tz: str | None = None,
     **kwargs,
 ) -> None:
     """Reddit pulse for brand-new comment candidates.
@@ -839,13 +873,15 @@ async def hot_pulse_generator(
     now = datetime.now(UTC)
 
     # Quiet-hours gate: skip Reddit + Telegram entirely when the
-    # operator is asleep. Default 00:00-05:00 America/Chicago covers
-    # the operator's CST/CDT sleep window. Status row is written
+    # operator is asleep: default 00:00-05:00 in the operator timezone
+    # (assistant.timezone / SCHEDULER_TZ) unless the schedule passes
+    # quiet_hours_tz. Status row is written
     # exactly once on the boundary fire entering quiet hours; later
     # fires inside the window are silent to avoid 60 status writes
     # per night. On the first non-quiet fire after the window the
     # flag clears and the normal flow resumes (and naturally rewrites
     # last_status with "ok"/"throttled" as part of delivery).
+    quiet_hours_tz = quiet_hours_tz or tenant_profile.operator_timezone()
     in_quiet = _is_quiet_hours(now, quiet_hours_start, quiet_hours_end, quiet_hours_tz)
     if in_quiet:
         if not _HOT_PULSE_IN_QUIET_HOURS:
@@ -906,7 +942,7 @@ async def hot_pulse_generator(
     extras = (
         list(extra_subreddits)
         if extra_subreddits is not None
-        else list(MORNING_DIGEST_EXTRA_SUBREDDITS)
+        else digest_extra_subreddits()
     )
     sub_set: set[str] = set(extras)
     for p in projects:
@@ -1446,7 +1482,8 @@ async def homelab_deals_generator(
         return
 
     listings, statuses = await deal_sources.gather(targets, block.get("sources") or {})
-    history = {t.name: brain_db.deal_price_stats(t.name) for t in targets}
+    # Medians skip observations today's rules reject (see history_stats).
+    history = deals.history_stats(brain_db.deal_observations(), targets)
 
     found: list[deals.Deal] = []
     misses: list[tuple[deals.Listing, deals.WatchTarget]] = []
@@ -1462,7 +1499,7 @@ async def homelab_deals_generator(
                 leads.append((listing, target))
             continue
         brain_db.record_deal_observation(
-            listing.source, listing.listing_id, target.name, total
+            listing.source, listing.listing_id, target.name, total, title=listing.title
         )
         deal = deals.classify(listing, target, history[target.name])
         if deal is None:
@@ -1471,13 +1508,26 @@ async def homelab_deals_generator(
             found.append(deal)
     misses.sort(key=lambda lt: (lt[0].total or 0) / lt[1].great_price)
 
-    clean, flagged = deals.order_and_number(found)
+    clean, flagged = deals.order_and_number(
+        found, block.get("max_per_target") or deals.MAX_PER_TARGET
+    )
     shown = clean + flagged
     synthesis = await deals.synthesize(
-        shown, block.get("current_setup", ""), block.get("stack_gaps")
+        shown,
+        block.get("current_setup", ""),
+        block.get("stack_gaps"),
+        block.get("advisor"),
     )
     report = deals.render_report(
-        shown, misses, statuses, synthesis, datetime.now(UTC), leads=leads
+        shown,
+        misses,
+        statuses,
+        synthesis,
+        datetime.now(UTC),
+        leads=leads,
+        more=deals.overflow_counts(found, shown),
+        goal=block.get("goal", ""),
+        title=block.get("title") or "Deal rundown",
     )
     sent, total_msgs = await telegram.notify_long(report)
 

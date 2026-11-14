@@ -394,7 +394,7 @@ class TestCheckScriptsExecutable:
         assert result.passed is True
 
 
-# ─── check_n8n_workflows (now checks workflow service) ───────────
+# ─── check_workflow_service ───────────
 
 
 class TestCheckN8nWorkflows:
@@ -409,7 +409,7 @@ class TestCheckN8nWorkflows:
             '"/webhook/test"\n"/healthz"\n"/brain"\n"/task"\n"/tier"\n'
         )
         (wf_dir / "Dockerfile").write_text("FROM python:3.12-slim\n")
-        result = validate_stack.check_n8n_workflows()
+        result = validate_stack.check_workflow_service()
         assert result.passed is True
 
     def test_fail_with_missing_endpoint(self, project_tree):
@@ -419,7 +419,7 @@ class TestCheckN8nWorkflows:
         wf_dir.mkdir(parents=True, exist_ok=True)
         (wf_dir / "app.py").write_text('"/webhook/test"\n"/healthz"\n')
         (wf_dir / "Dockerfile").write_text("FROM python:3.12-slim\n")
-        result = validate_stack.check_n8n_workflows()
+        result = validate_stack.check_workflow_service()
         assert result.passed is False
         assert "brain" in result.message
 
@@ -429,7 +429,7 @@ class TestCheckN8nWorkflows:
         wf_dir = project_tree / "workflows"
         wf_dir.mkdir(parents=True, exist_ok=True)
         (wf_dir / "Dockerfile").write_text("FROM python:3.12-slim\n")
-        result = validate_stack.check_n8n_workflows()
+        result = validate_stack.check_workflow_service()
         assert result.passed is False
         assert "app.py" in result.message
 
@@ -441,7 +441,7 @@ class TestCheckN8nWorkflows:
         (wf_dir / "app.py").write_text(
             '"/webhook/test"\n"/healthz"\n"/brain"\n"/task"\n"/tier"\n'
         )
-        result = validate_stack.check_n8n_workflows()
+        result = validate_stack.check_workflow_service()
         assert result.passed is False
         assert "Dockerfile" in result.message
 

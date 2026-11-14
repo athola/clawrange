@@ -9,7 +9,6 @@ connection) and fail at startup.
 
 import json
 import logging
-import os
 import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -94,7 +93,9 @@ def _queue_catch_ups(
 def init_scheduler(brain_db) -> AsyncIOScheduler | None:
     """Create and configure the scheduler. Returns None on failure."""
     try:
-        tz_name = os.getenv("SCHEDULER_TZ", "America/Chicago")
+        import tenant_profile
+
+        tz_name = tenant_profile.operator_timezone()
         scheduler = AsyncIOScheduler(
             jobstores={"default": MemoryJobStore()},
             timezone=tz_name,
