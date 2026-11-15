@@ -11,6 +11,7 @@ import pytest
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
+import digest
 import llm_proxy
 import research_router
 import telegram
@@ -69,8 +70,8 @@ def _reset_state():
 
     llm_proxy._circuit_state.clear()
     llm_proxy._notification_last_sent.clear()
-    llm_proxy._digest_state["lines"] = []
-    llm_proxy._digest_state["last_flush"] = time.time()
+    digest._digest_state["lines"] = []
+    digest._digest_state["last_flush"] = time.time()
 
 
 # ─── Provider mock helpers ────────────────────────────────────────
@@ -2759,8 +2760,8 @@ class TestHeartbeatInterceptor:
         # An hour later the digest delivers the buffered completion: the
         # item goes straight to Telegram and the relayed response is the
         # closing summary.
-        llm_proxy._digest_state["last_flush"] = (
-            _time.time() - llm_proxy.HEARTBEAT_DIGEST_INTERVAL - 1
+        digest._digest_state["last_flush"] = (
+            _time.time() - digest.HEARTBEAT_DIGEST_INTERVAL - 1
         )
         r = client.post(
             "/v1/chat/completions",
@@ -2809,8 +2810,8 @@ class TestHeartbeatInterceptor:
             )
             assert r.status_code == 200
 
-        llm_proxy._digest_state["last_flush"] = (
-            _time.time() - llm_proxy.HEARTBEAT_DIGEST_INTERVAL - 1
+        digest._digest_state["last_flush"] = (
+            _time.time() - digest.HEARTBEAT_DIGEST_INTERVAL - 1
         )
         client.post(
             "/v1/chat/completions",
@@ -2984,8 +2985,8 @@ class TestHeartbeatInterceptor:
         assert statuses[old_task["id"]] == "completed"
 
         # ...and the completion surfaces in the next hourly digest
-        llm_proxy._digest_state["last_flush"] = (
-            time.time() - llm_proxy.HEARTBEAT_DIGEST_INTERVAL - 1
+        digest._digest_state["last_flush"] = (
+            time.time() - digest.HEARTBEAT_DIGEST_INTERVAL - 1
         )
         r = client.post(
             "/v1/chat/completions",
@@ -3038,8 +3039,8 @@ class TestHeartbeatInterceptor:
             assert content == ""  # created tasks buffer into the digest
 
             # Once the digest hour elapses the suggestion is delivered
-            llm_proxy._digest_state["last_flush"] = (
-                time.time() - llm_proxy.HEARTBEAT_DIGEST_INTERVAL - 1
+            digest._digest_state["last_flush"] = (
+                time.time() - digest.HEARTBEAT_DIGEST_INTERVAL - 1
             )
             r = client.post(
                 "/v1/chat/completions",
@@ -3959,14 +3960,10 @@ class TestDigestPersistence:
     """
 
     def _fresh(self, monkeypatch, tmp_path):
-        import llm_proxy
-
         state_file = tmp_path / "digest.json"
         monkeypatch.setenv("HEARTBEAT_DIGEST_STATE", str(state_file))
-        monkeypatch.setattr(
-            llm_proxy, "_digest_state", {"lines": [], "last_flush": None}
-        )
-        return llm_proxy, state_file
+        monkeypatch.setattr(digest, "_digest_state", {"lines": [], "last_flush": None})
+        return digest, state_file
 
     def test_buffered_lines_survive_restart(self, monkeypatch, tmp_path):
         proxy, state_file = self._fresh(monkeypatch, tmp_path)
@@ -4033,13 +4030,9 @@ class TestDigestMultiMessageFlush:
     """
 
     def _fresh(self, monkeypatch, tmp_path):
-        import llm_proxy
-
         monkeypatch.setenv("HEARTBEAT_DIGEST_STATE", str(tmp_path / "digest.json"))
-        monkeypatch.setattr(
-            llm_proxy, "_digest_state", {"lines": [], "last_flush": None}
-        )
-        return llm_proxy
+        monkeypatch.setattr(digest, "_digest_state", {"lines": [], "last_flush": None})
+        return digest
 
     def test_one_message_per_item_with_header_on_first(self, monkeypatch, tmp_path):
         proxy = self._fresh(monkeypatch, tmp_path)
@@ -4402,14 +4395,10 @@ class TestDigestTakeWaiting:
     questions — that is exactly the silence that looked like breakage."""
 
     def _fresh(self, monkeypatch, tmp_path):
-        import llm_proxy
-
         state_file = tmp_path / "digest.json"
         monkeypatch.setenv("HEARTBEAT_DIGEST_STATE", str(state_file))
-        monkeypatch.setattr(
-            llm_proxy, "_digest_state", {"lines": [], "last_flush": None}
-        )
-        return llm_proxy
+        monkeypatch.setattr(digest, "_digest_state", {"lines": [], "last_flush": None})
+        return digest
 
     def test_waiting_only_makes_digest_nonempty(self, monkeypatch, tmp_path):
         proxy = self._fresh(monkeypatch, tmp_path)
@@ -4446,15 +4435,13 @@ class TestDigestTakeWaiting:
 
 class TestClipResult:
     def test_short_result_unchanged(self):
-        import llm_proxy
 
-        assert llm_proxy._clip_result("done") == "done"
+        assert digest._clip_result("done") == "done"
 
     def test_long_result_clips_at_sentence_boundary(self):
-        import llm_proxy
 
         long = "word " * 80 + "Final sentence. " + "word " * 60
-        clipped = llm_proxy._clip_result(long, limit=500)
+        clipped = digest._clip_result(long, limit=500)
         assert len(clipped) <= 500
         assert clipped.endswith("…")
         # The last whole sentence inside the budget survives.
@@ -4462,19 +4449,17 @@ class TestClipResult:
 
     def test_early_sentence_mark_prefers_word_boundary(self):
         """A lone terminator near the start must not waste the budget."""
-        import llm_proxy
 
         long = "No. " + "word " * 120
-        clipped = llm_proxy._clip_result(long, limit=500)
+        clipped = digest._clip_result(long, limit=500)
         assert len(clipped) > 100
         assert clipped.endswith("…")
         assert "word" in clipped
 
     def test_no_sentence_mark_falls_back_to_word_boundary(self):
-        import llm_proxy
 
         long = " ".join(f"w{i}" for i in range(200))
-        clipped = llm_proxy._clip_result(long, limit=500)
+        clipped = digest._clip_result(long, limit=500)
         assert len(clipped) <= 500
         assert clipped.endswith("…")
         head = clipped.rstrip("…")
@@ -5069,8 +5054,8 @@ class TestDigestNotLostOnFailure:
         brain_db._conn.commit()
         for key in ("stale_tasks", "llm_thinking", "pending_reminder"):
             llm_proxy._proactive_state[key] = time.monotonic()
-        llm_proxy._digest_state["last_flush"] = (
-            time.time() - llm_proxy.HEARTBEAT_DIGEST_INTERVAL - 1
+        digest._digest_state["last_flush"] = (
+            time.time() - digest.HEARTBEAT_DIGEST_INTERVAL - 1
         )
 
     def _beat(self):
@@ -5081,24 +5066,24 @@ class TestDigestNotLostOnFailure:
         )
 
     def test_failed_send_rebuffers_line(self):
-        llm_proxy._digest_record("[SYSTEM] #1: important")
+        digest._digest_record("[SYSTEM] #1: important")
         with patch("telegram.notify", AsyncMock(return_value=False)):
             assert self._beat().status_code == 200
-        assert llm_proxy._digest_state["lines"] == ["[SYSTEM] #1: important"]
+        assert digest._digest_state["lines"] == ["[SYSTEM] #1: important"]
 
     def test_successful_send_clears_buffer(self):
-        llm_proxy._digest_record("[SYSTEM] #1: important")
+        digest._digest_record("[SYSTEM] #1: important")
         with patch("telegram.notify", AsyncMock(return_value=True)):
             self._beat()
-        assert llm_proxy._digest_state["lines"] == []
+        assert digest._digest_state["lines"] == []
 
     def test_overflow_items_carry_over(self):
         for i in range(30):
-            llm_proxy._digest_record(f"[SYSTEM] #{i}: item")
+            digest._digest_record(f"[SYSTEM] #{i}: item")
         with patch("telegram.notify", AsyncMock(return_value=True)):
             self._beat()
-        assert len(llm_proxy._digest_state["lines"]) == 11
-        assert llm_proxy._digest_state["lines"][0] == "[SYSTEM] #19: item"
+        assert len(digest._digest_state["lines"]) == 11
+        assert digest._digest_state["lines"][0] == "[SYSTEM] #19: item"
 
 
 class TestRequestValidation:
@@ -5179,7 +5164,7 @@ class TestTierHintBoundary:
 
 class TestDigestContinuationPrefix:
     def test_exactly_one_prefix_per_continuation(self):
-        messages = _plan_messages(llm_proxy, ["[SYSTEM] #1: " + "x" * 9000])
+        messages = _plan_messages(digest, ["[SYSTEM] #1: " + "x" * 9000])
         assert len(messages) >= 3
         assert not messages[0].startswith("…")
         for m in messages[1:]:

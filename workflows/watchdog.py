@@ -6,7 +6,7 @@ is total silence on the phone, indistinguishable from a quiet hour.
 This job runs inside the workflows scheduler, independent of OpenClaw,
 and turns that silence into an alert.
 
-The proxy stamps every heartbeat arrival (llm_proxy.record_heartbeat_seen
+The proxy stamps every heartbeat arrival (digest.record_heartbeat_seen
 -> HEARTBEAT_SEEN_PATH). This module reads the stamp and compares it
 against the heartbeat cadence OpenClaw is configured for (every 10m,
 active hours 08:00-20:00 in agents.defaults.userTimezone).

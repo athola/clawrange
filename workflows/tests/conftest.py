@@ -128,9 +128,9 @@ def _isolate_digest_state(tmp_path, monkeypatch):
     import time
 
     monkeypatch.setenv("HEARTBEAT_DIGEST_STATE", str(tmp_path / "digest.json"))
-    import llm_proxy
+    import digest
 
     monkeypatch.setattr(
-        llm_proxy, "_digest_state", {"lines": [], "last_flush": time.time()}
+        digest, "_digest_state", {"lines": [], "last_flush": time.time()}
     )
     yield
