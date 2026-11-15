@@ -381,6 +381,17 @@ class TestCheckScriptsExecutable:
         assert result.passed is False
         assert "stop.sh" in result.message
 
+    def test_sourced_library_without_shebang_is_exempt(self, project_tree):
+        """GIVEN a .sh file with no shebang (a library meant to be sourced)
+        THEN it needn't be executable."""
+        scripts_dir = project_tree / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        lib = scripts_dir / "workflows_auth.sh"
+        lib.write_text("# shellcheck shell=bash\nWF_AUTH_HEADER=x\n")
+        lib.chmod(0o644)
+        result = validate_stack.check_scripts_executable()
+        assert result.passed is True
+
     def test_ignores_non_sh_files(self, project_tree):
         """GIVEN scripts/ contains a non-.sh file without execute permission
         THEN the check should still pass (only .sh files matter)."""

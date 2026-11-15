@@ -61,13 +61,20 @@ def check_required_files() -> TestResult:
 
 
 def check_scripts_executable() -> TestResult:
-    """Verify shell scripts have execute permission."""
+    """Verify shell scripts have execute permission.
+
+    A .sh file without a shebang is a library meant to be sourced
+    (e.g. workflows_auth.sh), so it is exempt.
+    """
     result = TestResult("Script Permissions")
     scripts_dir = os.path.join(PROJECT_ROOT, "scripts")
     not_exec = []
     for f in os.listdir(scripts_dir):
         if f.endswith(".sh"):
             path = os.path.join(scripts_dir, f)
+            with open(path, "rb") as fh:
+                if fh.read(2) != b"#!":
+                    continue
             if not os.access(path, os.X_OK):
                 not_exec.append(f)
     if not_exec:
