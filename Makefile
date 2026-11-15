@@ -97,7 +97,7 @@ persona: ## Render soul.md + identity.md from a profile's identity + learned ove
 from persona import render_all; from tenant_profile import load_profile; \
 import persona_learning as pl; \
 name=sys.argv[1]; p=load_profile(name); \
-r=render_all(p, {'soul':'openclaw/soul.md','identity':'openclaw/identity.md'}, pl.load_overlay(name)); \
+r=render_all(p, {'soul':'openclaw/soul.md','identity':'openclaw/identity.md','ops_soul':'openclaw/soul-ops.md'}, pl.load_overlay(name)); \
 print('rendered ->', {k:('ok' if v else 'failed') for k,v in r.items()})" "$(PROFILE)"
 
 persona-demo: ## Offline walkthrough of the persona meta-learning loop (PROFILE=<name>)

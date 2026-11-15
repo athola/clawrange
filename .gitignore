@@ -9,6 +9,8 @@
 # profile + openclaw/identity.template.md.
 openclaw/soul.md
 openclaw/identity.md
+# The ops agent persona, rendered from openclaw/soul-ops.template.md.
+openclaw/soul-ops.md
 
 # Operator-private profiles. The shipped examples (starter, lead-crm, marketing)
 # are committed; copy one to a new name for your own identity and it stays local.

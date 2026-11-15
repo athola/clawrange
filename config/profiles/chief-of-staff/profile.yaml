@@ -20,10 +20,19 @@ assistant:
     vibe: "Sharp, direct, calm under pressure. White House CoS energy."
     emoji: "🎯"
     avatar: ""
+  # The heartbeat ops agent (OpenClaw agent id; its workspace is
+  # workspace-<agent>). It gets openclaw/soul-ops.template.md, never the main
+  # persona.
+  ops:
+    agent: max-ops
+    name: "Max Ops"
   owner:
     # Keep the real name in .env (OPERATOR_NAME); empty -> "the operator".
     name: ${OPERATOR_NAME}
-    org: ""
+    # Organization and location also live in .env (OPERATOR_ORG,
+    # OPERATOR_LOCATION) so this shipped profile names no one.
+    org: ${OPERATOR_ORG}
+    location: ${OPERATOR_LOCATION}
     context: >-
       Operator running a personal AI ops stack. Wants signal over noise and
       decisions surfaced fast.

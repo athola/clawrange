@@ -49,7 +49,6 @@ services:
       # NOT mounted: it is a human-readable render artifact only; the agent
       # reads IDENTITY.md from its workspace under data/openclaw-state.
       - ./openclaw/soul.md:/home/node/.openclaw/soul.md:ro
-      - ./openclaw/soul-ops.md:/home/node/.openclaw/soul-ops.md:ro
       - ./openclaw/HEARTBEAT.md:/home/node/.openclaw/HEARTBEAT.md:ro
       - ./openclaw/config/openclaw.json:/opt/openclaw.json.template:ro
       - ./openclaw/render-config.js:/opt/render-config.js:ro
@@ -153,6 +152,8 @@ services:
       - HOMELAB_CURRENT_SETUP=${HOMELAB_CURRENT_SETUP:-}
       # How prompts name the operator (profile assistant.owner.name).
       - OPERATOR_NAME=${OPERATOR_NAME:-}
+      - OPERATOR_ORG=${OPERATOR_ORG:-}
+      - OPERATOR_LOCATION=${OPERATOR_LOCATION:-}
       # Empty -> the profile's assistant.timezone (UTC if unset).
       - SCHEDULER_TZ=${SCHEDULER_TZ:-}
       # Which tenant profile to load (defaults to the identity-free starter).

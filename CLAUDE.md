@@ -12,8 +12,11 @@ Tailscale and Caddy gateway.
 
 - `docker-compose.yml`: OpenClaw and workflows orchestration
 - `docker-compose.prod.yml`: production overrides (Tailscale binding)
-- `openclaw/`: assistant config: `soul.md` (persona), `soul-ops.md`
-  (ops mode), `HEARTBEAT.md` (10-minute heartbeat instructions),
+- `openclaw/`: assistant config: `soul.md` (persona) and `soul-ops.md`
+  (ops agent), both rendered and gitignored (`make persona PROFILE=<name>`;
+  ops comes from `soul-ops.template.md` plus the profile's `assistant.ops`
+  block, with org and location in `.env`), `HEARTBEAT.md` (10-minute
+  heartbeat instructions),
   `config/openclaw.json` (tool routing)
 - `workflows/`: FastAPI service:
   - `app.py`: FastAPI entrypoint and route registration

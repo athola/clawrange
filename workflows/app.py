@@ -170,8 +170,19 @@ def _persona_render_targets(profile):
         )
     except OSError:
         workspaces = []
-    targets["workspace_soul"] = [os.path.join(w, "SOUL.md") for w in workspaces]
-    targets["workspace_identity"] = [os.path.join(w, "IDENTITY.md") for w in workspaces]
+    # The ops agent (assistant.ops.agent) gets the ops persona, never the
+    # main one; every other workspace gets the main persona.
+    ops = ((profile.assistant if profile else {}) or {}).get("ops") or {}
+    ops_ws = os.path.join(state, f"workspace-{ops['agent']}") if ops else None
+    main = [w for w in workspaces if w != ops_ws]
+    targets["workspace_soul"] = [os.path.join(w, "SOUL.md") for w in main]
+    targets["workspace_identity"] = [os.path.join(w, "IDENTITY.md") for w in main]
+    if ops_ws:
+        if os.path.isdir(repo_openclaw):
+            targets["ops_soul"] = os.path.join(repo_openclaw, "soul-ops.md")
+        targets["ops_workspace_soul"] = (
+            [os.path.join(ops_ws, "SOUL.md")] if ops_ws in workspaces else []
+        )
     return targets
 
 

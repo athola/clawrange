@@ -39,6 +39,9 @@ KNOWN_AUTH_KINDS = {"none", "api_key", "bearer", "basic", "login_form"}
 KNOWN_DEAL_SOURCE_KINDS = {"ebay", "slickdeals", "servethehome", "reddit"}
 KNOWN_OUTREACH_CHANNELS = {"reddit", "hn", "github", "web"}
 IDENTITY_FIELDS = {"name", "creature", "vibe", "emoji", "avatar"}
+OPS_FIELDS = {"agent", "name"}
+# OpenClaw agent ids name workspace directories (workspace-<id>).
+_AGENT_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
 EMOJI_MAX_LEN = 16
 
 
@@ -200,6 +203,8 @@ def validate(
         if emoji and len(str(emoji)) > EMOJI_MAX_LEN:
             raise ProfileError("assistant.identity.emoji is too long")
 
+    _validate_ops(assistant.get("ops"))
+
     crm = profile.crm
     if crm is not None:
         adapter = crm.get("adapter")
@@ -249,6 +254,27 @@ def _validate_timezone(tz: Any) -> None:
         ZoneInfo(str(tz))
     except (ZoneInfoNotFoundError, ValueError) as exc:
         raise ProfileError(f"assistant.timezone '{tz}' is not a known zone") from exc
+
+
+def _validate_ops(block: Any) -> None:
+    """``assistant.ops``: the ops agent's id (its OpenClaw workspace is
+    ``workspace-<agent>``) and an optional display name."""
+    if block is None:
+        return
+    if not isinstance(block, dict):
+        raise ProfileError("assistant.ops must be a mapping")
+    unknown = set(block) - OPS_FIELDS
+    if unknown:
+        raise ProfileError(
+            f"assistant.ops has unknown keys {sorted(unknown)} "
+            f"(known: {sorted(OPS_FIELDS)})"
+        )
+    agent = block.get("agent")
+    if not isinstance(agent, str) or not _AGENT_ID_RE.fullmatch(agent):
+        raise ProfileError(
+            "assistant.ops.agent must be an OpenClaw agent id "
+            "(lowercase letters, digits, '-' or '_')"
+        )
 
 
 def _validate_search_hygiene(block: Any) -> None:

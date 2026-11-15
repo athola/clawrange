@@ -32,6 +32,9 @@ _TEMPLATE_PATH = (
     Path(__file__).resolve().parent.parent / "openclaw" / "soul.template.md"
 )
 
+_OPS_TEMPLATE_PATH = (
+    Path(__file__).resolve().parent.parent / "openclaw" / "soul-ops.template.md"
+)
 _IDENTITY_TEMPLATE_PATH = (
     Path(__file__).resolve().parent.parent / "openclaw" / "identity.template.md"
 )
@@ -110,6 +113,35 @@ def render_identity(profile: Profile) -> str:
     return template.rstrip("\n") + "\n"
 
 
+def render_ops_persona(profile: Profile) -> str | None:
+    """Render the ops agent's SOUL from ``assistant.ops`` and the owner block.
+
+    Returns None when the profile defines no ops agent. The organization and
+    location come from ``owner.org`` / ``owner.location`` (usually ``${VAR}``
+    tokens resolved from .env), so no tracked file names an operator.
+    """
+    a = profile.assistant
+    ops = a.get("ops")
+    if not ops:
+        return None
+    owner = a.get("owner") or {}
+    name = a.get("name", "Assistant")
+    ops_name = ops.get("name") or f"{name} Ops"
+    org, location = owner.get("org"), owner.get("location")
+    clause = f" for **{org}**" if org else ""
+    if org and location:
+        clause += f" in {location}"
+    subs = {
+        "{{ops_title}}": f"{ops_name}: {org} Internal Agent" if org else ops_name,
+        "{{name}}": name,
+        "{{org_clause}}": clause,
+    }
+    text = _OPS_TEMPLATE_PATH.read_text()
+    for token, value in subs.items():
+        text = text.replace(token, value)
+    return text.rstrip("\n") + "\n"
+
+
 def write_soul(profile: Profile, path: str | Path) -> Path:
     """Render the persona and write it to ``path`` (default OpenClaw soul)."""
     dest = Path(path)
@@ -180,4 +212,10 @@ def render_all(profile: Profile, targets: dict, learnings: list) -> dict:
         results[f"ws_soul:{wp}"] = _atomic_write(Path(wp), soul)
     for wp in targets.get("workspace_identity", []):
         results[f"ws_identity:{wp}"] = _atomic_write(Path(wp), ident)
+    ops = render_ops_persona(profile)
+    if ops is not None:
+        if targets.get("ops_soul"):
+            results["ops_soul"] = _atomic_write(Path(targets["ops_soul"]), ops)
+        for wp in targets.get("ops_workspace_soul", []):
+            results[f"ws_ops_soul:{wp}"] = _atomic_write(Path(wp), ops)
     return results

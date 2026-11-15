@@ -134,7 +134,7 @@ Caddy walkthrough. Key shifts vs. the local testbed:
 | **Docker images** | `:latest` tags | Pin to specific versions (e.g. `ghcr.io/openclaw/openclaw:2026.3.24`) |
 | **Network** | Docker bridge on localhost | Tailscale VPN mesh between Droplet and ThinkCentre |
 | **Domain/SSL** | http://localhost | Real domain with Let's Encrypt SSL via Caddy |
-| **soul.md** | Default John-117 persona | Same, optionally swap `soul-ops.md` for ops mode |
+| **soul.md** | Default John-117 persona | Same; the ops agent's persona renders from `soul-ops.template.md` |
 | **Workflows** | Hot-reload bind mounts | Image-baked code, single uvicorn worker |
 | **Brain DB** | `data/brain/brain.db` (bind mount) | Persistent volume with backup strategy |
 | **Secrets** | `.env` file | Docker secrets or sealed env |
@@ -152,8 +152,9 @@ Caddy walkthrough. Key shifts vs. the local testbed:
 
 The default persona is wired for the operator. To repoint the stack:
 
-1. Replace `openclaw/soul.md` with the new operator's persona and
-   `openclaw/soul-ops.md` with their ops-mode instructions. Keep
+1. Point a profile at the new operator (persona, `assistant.ops` for the
+   heartbeat agent) and set `OPERATOR_NAME`, `OPERATOR_ORG` and
+   `OPERATOR_LOCATION` in `.env`, then `make persona PROFILE=<name>`. Keep
    responses tight. Telegram is the main channel.
 2. Reseed the marketing orchestrator: `POST /projects` with the new
    slugs/repos, then `POST /sched` for any cron jobs that should run.

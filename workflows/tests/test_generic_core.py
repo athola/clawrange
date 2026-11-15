@@ -56,7 +56,7 @@ TENANT_TOKENS = [
 # Shipped non-Python surfaces OpenClaw, Docker and operators read.
 TEXT_SURFACES = [
     "openclaw/HEARTBEAT.md",
-    "openclaw/soul-ops.md",
+    "openclaw/soul-ops.template.md",
     "openclaw/soul.template.md",
     "openclaw/identity.template.md",
     "openclaw/config/openclaw.json",
