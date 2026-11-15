@@ -1133,10 +1133,9 @@ async def hot_pulse_generator(
 # Seeds (tracked projects + baseline schedules) now live in the active
 # tenant profile (config/profiles/<name>/profile.yaml), not in code. The
 # marketing profile reproduces the original hardcoded set exactly
-# (regression-locked by tests/test_profile.py). seed_default_projects /
-# seed_default_schedules keep their names as the public entry points so
-# existing callers (app lifespan, tests) are unchanged; they load the
-# active profile (CLAWRANGE_PROFILE, default "marketing") and seed from it.
+# (regression-locked by tests/test_profile.py). seed_from_profile is the
+# entry point; the app lifespan passes the active profile
+# (CLAWRANGE_PROFILE, default "marketing").
 
 
 def _seed_schedules_from_profile(brain_db, profile) -> list[dict]:
@@ -1198,21 +1197,6 @@ def seed_from_profile(brain_db, profile) -> list[dict]:
         logger.warning("seed_from_profile: learned overlay skipped: %s", exc)
 
     return out
-
-
-def seed_default_schedules(brain_db) -> list[dict]:
-    """Seed the active profile's schedules (back-compat entry point)."""
-
-    return _seed_schedules_from_profile(brain_db, tenant_profile.load_profile())
-
-
-def seed_default_projects(brain_db) -> list[dict]:
-    """Seed the active profile's projects + schedules (back-compat entry point).
-
-    Loads the profile named by CLAWRANGE_PROFILE (default "marketing").
-    """
-
-    return seed_from_profile(brain_db, tenant_profile.load_profile())
 
 
 # ─── CRM generators (lead-crm profile) ───────────────────────────────

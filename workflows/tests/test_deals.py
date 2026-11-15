@@ -957,25 +957,6 @@ class TestHistoryPrune:
         assert stats["L40S 48GB"].median == 5300
         assert len(db.deal_observations()) == 5  # filtered, never deleted
 
-    def test_legacy_db_gains_the_title_column(self, tmp_path):
-        import sqlite3
-
-        from brain_db import BrainDB
-
-        path = str(tmp_path / "old.db")
-        conn = sqlite3.connect(path)
-        conn.execute(
-            "CREATE TABLE deal_observations (source TEXT NOT NULL, listing_id "
-            "TEXT NOT NULL, target TEXT NOT NULL, price REAL NOT NULL, "
-            "observed_at TEXT NOT NULL, PRIMARY KEY(source, listing_id))"
-        )
-        conn.commit()
-        conn.close()
-        db = BrainDB(path)
-        db.init_db()
-        db.record_deal_observation("eBay", "1", "X", 1.0, title="t")
-        assert db.deal_observations()[0]["title"] == "t"
-
 
 class TestSynthesizeFailureIsLogged:
     @pytest.mark.asyncio

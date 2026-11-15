@@ -480,27 +480,29 @@ class TestGenerators:
 
         assert "comment_draft" in GENERATORS
 
-    def test_seed_default_schedules_creates_daily_content_idea(self):
+    def test_schedule_seed_creates_daily_content_idea(self):
         """
-        GIVEN seed_default_schedules has been called
+        GIVEN the schedule seed has been called
         WHEN we list schedules
         THEN at minimum the daily-content-idea schedule exists with a
              cron string that fires at a morning hour.
         """
-        from generators import seed_default_schedules
+        from generators import _seed_schedules_from_profile
+        from tenant_profile import load_profile
 
-        seed_default_schedules(brain_db)
+        _seed_schedules_from_profile(brain_db, load_profile())
         scheds = {s["id"]: s for s in brain_db.list_schedules()}
         assert "daily-content-idea" in scheds
         sched = scheds["daily-content-idea"]
         assert sched["kind"] == "content_idea"
         assert sched["cron"].split()[1] in {"7", "8", "9", "10"}
 
-    def test_seed_default_schedules_idempotent(self):
+    def test_schedule_seed_idempotent(self):
         """Calling twice does not duplicate, and preserves user edits."""
-        from generators import seed_default_schedules
+        from generators import _seed_schedules_from_profile
+        from tenant_profile import load_profile
 
-        seed_default_schedules(brain_db)
+        _seed_schedules_from_profile(brain_db, load_profile())
         first = brain_db.list_schedules()
         sched = brain_db.get_schedule("daily-content-idea")
         brain_db.upsert_schedule(
@@ -509,7 +511,7 @@ class TestGenerators:
             sched["kind"],
             "*/30 * * * *",
         )
-        seed_default_schedules(brain_db)
+        _seed_schedules_from_profile(brain_db, load_profile())
         second = brain_db.list_schedules()
         assert len(first) == len(second)
         edited = brain_db.get_schedule("daily-content-idea")
@@ -517,13 +519,14 @@ class TestGenerators:
 
     def test_personal_brand_project_seed_exists(self):
         """
-        GIVEN seed_default_projects has been called
+        GIVEN seed_from_profile has been called
         WHEN we look up 'personal-brand'
         THEN it exists with athola owner and AI-systems posture.
         """
-        from generators import seed_default_projects
+        from generators import seed_from_profile
+        from tenant_profile import load_profile
 
-        seed_default_projects(brain_db)
+        seed_from_profile(brain_db, load_profile())
         pb = brain_db.get_project("personal-brand")
         assert pb is not None
         assert pb["owner"] == "athola"
@@ -534,14 +537,15 @@ class TestGenerators:
 
     def test_clawrange_project_seed_exists(self):
         """
-        GIVEN seed_default_projects has been called
+        GIVEN seed_from_profile has been called
         WHEN we look up 'clawrange'
         THEN athola/clawrange exists with subreddits covering the
              AI-coding communities (vibecoding/claudecode/codex).
         """
-        from generators import seed_default_projects
+        from generators import seed_from_profile
+        from tenant_profile import load_profile
 
-        seed_default_projects(brain_db)
+        seed_from_profile(brain_db, load_profile())
         cr = brain_db.get_project("clawrange")
         assert cr is not None
         assert cr["owner"] == "athola"
@@ -1222,13 +1226,14 @@ class TestMorningDigestGenerator:
         assert "Tracking" in msg
 
     def test_morning_digest_schedule_registered_after_seed(self):
-        """seed_default_projects must register a 0 8 * * * schedule
+        """seed_from_profile must register a 0 8 * * * schedule
         for the morning_digest generator (idempotently)."""
-        from generators import seed_default_projects
+        from generators import seed_from_profile
+        from tenant_profile import load_profile
 
-        seed_default_projects(brain_db)
+        seed_from_profile(brain_db, load_profile())
         # Calling twice must not duplicate
-        seed_default_projects(brain_db)
+        seed_from_profile(brain_db, load_profile())
 
         sched = brain_db.get_schedule("morning_digest")
         assert sched is not None
@@ -1702,12 +1707,13 @@ class TestHotPulseGenerator:
         assert "ao1" in msg
 
     def test_hot_pulse_schedule_registered_after_seed(self):
-        """seed_default_projects must register a */5 * * * * schedule
+        """seed_from_profile must register a */5 * * * * schedule
         for the hot_pulse generator (idempotently)."""
-        from generators import seed_default_projects
+        from generators import seed_from_profile
+        from tenant_profile import load_profile
 
-        seed_default_projects(brain_db)
-        seed_default_projects(brain_db)
+        seed_from_profile(brain_db, load_profile())
+        seed_from_profile(brain_db, load_profile())
 
         sched = brain_db.get_schedule("hot_pulse")
         assert sched is not None
@@ -1736,7 +1742,7 @@ class TestHotPulseGenerator:
             search_terms=["agent orchestration"],
         )
         # Schedule row must exist for update_schedule_status to land —
-        # in production seed_default_projects creates this on startup.
+        # in production seed_from_profile creates this on startup.
         brain_db.upsert_schedule(
             "hot_pulse",
             "5-min Reddit hot-pulse",

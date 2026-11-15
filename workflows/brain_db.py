@@ -411,36 +411,6 @@ class BrainDB:
             )
         """)
 
-        # Migrate: deal observations keep their title so history can be
-        # re-judged when matching rules change (existing DBs lack it).
-        try:
-            conn.execute("SELECT title FROM deal_observations LIMIT 1")
-        except sqlite3.OperationalError:
-            conn.execute(
-                "ALTER TABLE deal_observations"
-                " ADD COLUMN title TEXT NOT NULL DEFAULT ''"
-            )
-
-        # Migrate: add source column to tasks if missing (existing DBs)
-        try:
-            conn.execute("SELECT source FROM tasks LIMIT 1")
-        except sqlite3.OperationalError:
-            conn.execute("ALTER TABLE tasks ADD COLUMN source TEXT DEFAULT 'system'")
-
-        # Legacy single-model vector table: never populated (nothing called
-        # store_embedding). Per-model tables replace it; drop it only if empty.
-        if self._has_vec:
-            legacy = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE name='chunk_embeddings'"
-            ).fetchone()
-            if (
-                legacy
-                and not conn.execute(
-                    "SELECT 1 FROM chunk_embeddings LIMIT 1"
-                ).fetchone()
-            ):
-                conn.execute("DROP TABLE chunk_embeddings")
-
         conn.commit()
 
     # ─── Internal helpers ────────────────────────────────────────
