@@ -25,7 +25,9 @@ import tenant_profile
 # ─── Heartbeat Interceptor ───────────────────────────────────────
 
 
-_HEARTBEAT_MARKER = "read heartbeat.md"
+# Start of the heartbeat prompt pinned in openclaw/config/openclaw.json
+# (agents.entries.*.heartbeat.prompt); OpenClaw sends it verbatim.
+_HEARTBEAT_MARKER = "clawrange heartbeat:"
 
 
 # How often each proactive check can fire (seconds).

@@ -168,22 +168,40 @@ _SEARCH_Q = re.compile(r"brain/search\?q=([^\"&\s\\]+)")
 
 
 def harvest_queries(root: str) -> list[str]:
-    """Real /brain/search queries found in OpenClaw session files, in order."""
+    """Real /brain/search queries in OpenClaw transcripts, in order.
+
+    Reads ``transcript_events`` from each per-agent ``openclaw-agent.sqlite``
+    under ``root``. zstd-compressed events are skipped: the stdlib cannot
+    decode them before Python 3.14.
+    """
     found: dict[str, None] = {}
     for dirpath, _dirs, files in os.walk(root):
         for name in sorted(files):
-            if not name.endswith((".json", ".jsonl")):
+            if not name.endswith(".sqlite"):
                 continue
-            try:
-                with open(os.path.join(dirpath, name), errors="replace") as f:
-                    text = f.read()
-            except OSError:
-                continue
-            for raw in _SEARCH_Q.findall(text):
+            for raw in _SEARCH_Q.findall(_transcript_text(os.path.join(dirpath, name))):
                 q = " ".join(urllib.parse.unquote_plus(raw).split())
                 if q and q != "...":
                     found.setdefault(q, None)
     return list(found)
+
+
+def _transcript_text(path: str) -> str:
+    """Uncompressed transcript events of an OpenClaw agent DB, or ''."""
+    try:
+        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return ""
+    try:
+        rows = db.execute(
+            "SELECT event_json FROM transcript_events "
+            "WHERE event_json IS NOT NULL ORDER BY session_id, seq"
+        ).fetchall()
+    except sqlite3.Error:  # not an agent DB (locks, quarantine, ...)
+        return ""
+    finally:
+        db.close()
+    return "\n".join(r[0] for r in rows)
 
 
 def merge_candidates(path: str, queries: Iterable[str]) -> int:

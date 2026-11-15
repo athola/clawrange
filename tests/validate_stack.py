@@ -167,7 +167,7 @@ def check_openclaw_config() -> TestResult:
         result.fail_(str(e))
         return result
     errors = []
-    # v2026.3+ schema: gateway, agents.defaults.model required
+    # v2026.8+ schema: gateway, agents.defaults.model required
     if "gateway" not in data:
         errors.append("missing 'gateway' section")
     else:

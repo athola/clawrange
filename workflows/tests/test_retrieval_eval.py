@@ -4,6 +4,7 @@ the CI regression gate against the committed fixture baseline."""
 import json
 import math
 import os
+import sqlite3
 
 import pytest
 
@@ -278,14 +279,27 @@ class TestRealBrain:
             }
         ]
 
-    def test_harvest_finds_url_encoded_queries_in_sessions(self, tmp_path):
-        agent = tmp_path / "max" / "sessions"
-        agent.mkdir(parents=True)
-        (agent / "s.jsonl").write_text(
-            '{"url": "http://x:5678/brain/search?q=lead+conversion&mode=hybrid"}\n'
-            '{"url": "http://x/brain/search?q=who%20pays%3F"}\n'
-            '{"url": "http://x/brain/search?q=lead+conversion"}\n'
+    def test_harvest_reads_agent_transcript_sqlite(self, tmp_path):
+        db_dir = tmp_path / "max-ops" / "agent"
+        db_dir.mkdir(parents=True)
+        db = sqlite3.connect(db_dir / "openclaw-agent.sqlite")
+        db.execute(
+            "CREATE TABLE transcript_events (session_id TEXT, seq INTEGER, "
+            "event_json TEXT, event_zstd BLOB)"
         )
+        for seq, url in enumerate(
+            [
+                "http://x:5678/brain/search?q=lead+conversion&mode=hybrid",
+                "http://x/brain/search?q=who%20pays%3F",
+                "http://x/brain/search?q=lead+conversion",
+            ]
+        ):
+            db.execute(
+                "INSERT INTO transcript_events VALUES (?, ?, ?, NULL)",
+                ("s", seq, json.dumps({"url": url})),
+            )
+        db.commit()
+        db.close()
         assert rev.harvest_queries(str(tmp_path)) == ["lead conversion", "who pays?"]
 
     def test_merge_adds_unlabelled_cases_once(self, tmp_path):

@@ -131,7 +131,7 @@ Caddy walkthrough. Key shifts vs. the local testbed:
 
 | Aspect | Testbed (Local) | Production |
 |--------|----------------|------------|
-| **Docker images** | `:latest` tags | Pin to specific versions (e.g. `ghcr.io/openclaw/openclaw:2026.3.24`) |
+| **Docker images** | `:latest` tags | Pin to specific versions (e.g. `ghcr.io/openclaw/openclaw:2026.11.3`) |
 | **Network** | Docker bridge on localhost | Tailscale VPN mesh between Droplet and ThinkCentre |
 | **Domain/SSL** | http://localhost | Real domain with Let's Encrypt SSL via Caddy |
 | **soul.md** | Default John-117 persona | Same; the ops agent's persona renders from `soul-ops.template.md` |
@@ -158,8 +158,10 @@ The default persona is wired for the operator. To repoint the stack:
    responses tight. Telegram is the main channel.
 2. Reseed the marketing orchestrator: `POST /projects` with the new
    slugs/repos, then `POST /sched` for any cron jobs that should run.
-3. Update `openclaw/HEARTBEAT.md` if the heartbeat cadence or task
-   priorities differ.
+3. Update `openclaw/HEARTBEAT.md` if the task priorities differ (it is
+   reloaded into the heartbeat monitor scratch on the next OpenClaw start)
+   and `agents.entries.max-ops.heartbeat` in `openclaw/config/openclaw.json`
+   for the cadence.
 4. Re-run `make test` to confirm health, completion, and webhook
    canary still pass.
 

@@ -7,7 +7,6 @@
       "mode": "token"
     }
   },
-
   "agents": {
     "defaults": {
       "userTimezone": "${OPENCLAW_TZ}",
@@ -15,27 +14,59 @@
         "primary": "clawrange-proxy/default"
       },
       "models": {
-        "clawrange-proxy/default": { "alias": "proxy" }
+        "clawrange-proxy/default": {
+          "alias": "proxy"
+        }
       },
       "sandbox": {
         "mode": "off"
+      },
+      "heartbeat": {
+        "every": "0m"
+      },
+      "modelPolicy": {
+        "allow": [
+          "clawrange-proxy/default"
+        ]
       }
     },
-    "list": [
-      {
-        "id": "max",
+    "ownership": "explicit",
+    "entries": {
+      "max": {
         "tools": {
-          "allow": ["web_search", "web_fetch", "memory_search", "memory_get",
-                    "message", "tts"],
-          "deny": ["exec", "process", "read", "write", "edit", "apply_patch",
-                   "image", "browser", "canvas", "nodes", "cron", "gateway",
-                   "subagents", "session_status", "sessions_list",
-                   "sessions_history", "sessions_send", "sessions_spawn",
-                   "sessions_yield"]
-        }
+          "allow": [
+            "web_search",
+            "web_fetch",
+            "memory_search",
+            "memory_get",
+            "message",
+            "tts"
+          ],
+          "deny": [
+            "exec",
+            "process",
+            "read",
+            "write",
+            "edit",
+            "apply_patch",
+            "view_image",
+            "browser",
+            "canvas",
+            "nodes",
+            "cron",
+            "gateway",
+            "subagents",
+            "session_status",
+            "sessions_list",
+            "sessions_history",
+            "sessions_send",
+            "sessions_spawn",
+            "sessions_yield"
+          ]
+        },
+        "workspace": "/home/node/.openclaw/workspace"
       },
-      {
-        "id": "max-ops",
+      "max-ops": {
         "sandbox": {
           "mode": "off",
           "workspaceAccess": "ro"
@@ -44,23 +75,59 @@
           "every": "10m",
           "target": "telegram",
           "to": "${TELEGRAM_CHAT_ID}",
-          "activeHours": { "start": "08:00", "end": "20:00" },
+          "activeHours": {
+            "start": "08:00",
+            "end": "20:00"
+          },
           "isolatedSession": true,
-          "lightContext": false
+          "lightContext": false,
+          "prompt": "ClawRange heartbeat: run the scheduled checks in the monitor scratch. Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK."
         },
         "tools": {
-          "allow": ["read", "web_fetch", "web_search", "cron",
-                    "session_status", "memory_search", "memory_get"],
-          "deny": ["exec", "process", "write", "edit", "apply_patch",
-                   "image", "image_generate", "browser", "canvas", "nodes",
-                   "gateway", "subagents", "code_execution", "message",
-                   "x_search", "sessions_spawn", "sessions_send",
-                   "sessions_yield"]
-        }
+          "allow": [
+            "read",
+            "web_fetch",
+            "web_search",
+            "cron",
+            "session_status",
+            "memory_search",
+            "memory_get"
+          ],
+          "deny": [
+            "exec",
+            "process",
+            "write",
+            "edit",
+            "apply_patch",
+            "view_image",
+            "image_generate",
+            "browser",
+            "canvas",
+            "nodes",
+            "gateway",
+            "subagents",
+            "code_execution",
+            "message",
+            "x_search",
+            "sessions_spawn",
+            "sessions_send",
+            "sessions_yield"
+          ]
+        },
+        "workspace": "/home/node/.openclaw/workspace-max-ops"
       }
-    ]
+    }
   },
-
+  "bindings": [
+    {
+      "agentId": "max",
+      "comment": "Telegram DMs go to Max",
+      "match": {
+        "channel": "telegram",
+        "accountId": "*"
+      }
+    }
+  ],
   "models": {
     "mode": "merge",
     "providers": {
@@ -74,8 +141,15 @@
             "name": "ClawRange LLM Proxy (auto-tier)",
             "api": "openai-completions",
             "reasoning": false,
-            "input": ["text"],
-            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "input": [
+              "text"
+            ],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
             "contextWindow": 65536,
             "maxTokens": 4096
           }
@@ -83,32 +157,68 @@
       }
     }
   },
-
   "channels": {
     "telegram": {
       "enabled": true,
       "botToken": "${TELEGRAM_BOT_TOKEN}",
       "dmPolicy": "allowlist",
-      "allowFrom": ["${TELEGRAM_CHAT_ID}"],
+      "allowFrom": [
+        "${TELEGRAM_CHAT_ID}"
+      ],
       "groupPolicy": "disabled",
-      "streaming": "off"
+      "streaming": {
+        "mode": "off"
+      }
     }
   },
-
   "tools": {
     "sandbox": {
       "tools": {
-        "deny": ["exec", "process", "write", "edit", "apply_patch",
-                 "browser", "canvas", "nodes", "gateway",
-                 "sessions_spawn", "sessions_send", "sessions_yield",
-                 "subagents"]
+        "deny": [
+          "exec",
+          "process",
+          "write",
+          "edit",
+          "apply_patch",
+          "browser",
+          "canvas",
+          "nodes",
+          "gateway",
+          "sessions_spawn",
+          "sessions_send",
+          "sessions_yield",
+          "subagents"
+        ]
       }
     },
     "elevated": {
       "enabled": false
     }
   },
-
+  "memory": {
+    "search": {
+      "provider": "none",
+      "rememberAcrossConversations": false
+    }
+  },
+  "skills": {
+    "workshop": {
+      "autonomous": {
+        "mode": "off"
+      }
+    }
+  },
+  "plugins": {
+    "entries": {
+      "memory-core": {
+        "config": {
+          "dreaming": {
+            "enabled": false
+          }
+        }
+      }
+    }
+  },
   "logging": {
     "level": "info"
   }

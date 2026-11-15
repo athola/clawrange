@@ -221,7 +221,7 @@ Your personal devices can still reach everything as the tailnet owner.
 - [ ] `OPENROUTER_API_KEY` set in `.env`; balance is read live from the
   OpenRouter credits API (`/api/v1/credits`)
 - [ ] Pin Docker images to specific versions before production
-  (e.g. `ghcr.io/openclaw/openclaw:2026.3.24`)
+  (e.g. `ghcr.io/openclaw/openclaw:2026.11.3`)
 - [ ] Workflows runs single uvicorn worker (default: do not raise)
 - [ ] Brain DB at `data/brain/brain.db` is included in your backup plan
 

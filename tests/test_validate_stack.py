@@ -243,7 +243,7 @@ class TestCheckOpenclawConfig:
     """Tests for OpenClaw config validation."""
 
     def test_pass_with_valid_config(self, project_tree):
-        """GIVEN a valid openclaw.json with v2026.3 schema
+        """GIVEN a valid openclaw.json with v2026.8+ schema
         THEN the check should pass."""
         config_dir = project_tree / "openclaw" / "config"
         config_dir.mkdir(parents=True, exist_ok=True)

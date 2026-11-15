@@ -25,6 +25,7 @@
 
 set -e
 
-wget -q -O /dev/null --timeout=5 http://127.0.0.1:18789/healthz || exit 1
+# curl, not wget: OpenClaw 2026.8+ images no longer ship wget.
+curl -sf -o /dev/null --max-time 5 http://127.0.0.1:18789/healthz || exit 1
 
 exit 0

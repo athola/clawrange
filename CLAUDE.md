@@ -15,9 +15,13 @@ Tailscale and Caddy gateway.
 - `openclaw/`: assistant config: `soul.md` (persona) and `soul-ops.md`
   (ops agent), both rendered and gitignored (`make persona PROFILE=<name>`;
   ops comes from `soul-ops.template.md` plus the profile's `assistant.ops`
-  block, with org and location in `.env`), `HEARTBEAT.md` (10-minute
-  heartbeat instructions),
-  `config/openclaw.json` (tool routing)
+  block, with org and location in `.env`), `HEARTBEAT.md` (max-ops
+  heartbeat checklist; OpenClaw 2026.8+ reads it from a monitor scratch,
+  which `sync-heartbeat.sh` reloads on every container start),
+  `config/openclaw.json` (rendered over the live config on start by
+  `render-config.js`: agents, Telegram binding, tool policy; pins the
+  heartbeat prompt the proxy intercepts and keeps dreaming, self-learning
+  and cross-conversation recall off)
 - `workflows/`: FastAPI service:
   - `app.py`: FastAPI entrypoint and route registration
   - `auth.py`: app-wide bearer auth (`PROXY_AUTH_TOKEN`), fails closed;

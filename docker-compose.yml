@@ -16,8 +16,10 @@ services:
   #   - ./data/openclaw-tmp/   (ephemeral logs, locks)
   # Host reads allowed via :ro mounts. No writes outside ~/clawrange.
   openclaw:
-    image: ghcr.io/openclaw/openclaw:2026.3.24
+    image: ghcr.io/openclaw/openclaw:2026.11.3
     container_name: msp-openclaw
+    # Reaps the backgrounded sync-heartbeat.sh once node is PID 1.
+    init: true
     read_only: true
     # Loopback plus the docker0 gateway only, never 0.0.0.0: under WSL
     # mirrored networking a wildcard bind is reachable from the LAN.
@@ -49,7 +51,10 @@ services:
       # NOT mounted: it is a human-readable render artifact only; the agent
       # reads IDENTITY.md from its workspace under data/openclaw-state.
       - ./openclaw/soul.md:/home/node/.openclaw/soul.md:ro
-      - ./openclaw/HEARTBEAT.md:/home/node/.openclaw/HEARTBEAT.md:ro
+      # 2026.8+ no longer reads HEARTBEAT.md: sync-heartbeat.sh loads it into
+      # each heartbeat's monitor scratch once the gateway is up.
+      - ./openclaw/HEARTBEAT.md:/opt/HEARTBEAT.md:ro
+      - ./openclaw/sync-heartbeat.sh:/opt/sync-heartbeat.sh:ro
       - ./openclaw/config/openclaw.json:/opt/openclaw.json.template:ro
       - ./openclaw/render-config.js:/opt/render-config.js:ro
       # Host home — read-only access for agent file reads
@@ -67,6 +72,8 @@ services:
       - OPENCLAW_TZ=${SCHEDULER_TZ:-UTC}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      # The rootfs is read-only; 2026.8+ stages SQLite snapshots in the cache dir.
+      - XDG_CACHE_HOME=/tmp/.cache
     user: "0:0"
     security_opt:
       - no-new-privileges:true
@@ -80,6 +87,7 @@ services:
         # openclaw/render-config.js.
         node /opt/render-config.js /opt/openclaw.json.template /home/node/.openclaw/openclaw.json
         chown 1000:1000 /home/node/.openclaw/openclaw.json
+        sh /opt/sync-heartbeat.sh /opt/HEARTBEAT.md &
         exec runuser -u node -- node --max-old-space-size=1536 dist/index.js gateway --bind lan --port 18789
     restart: unless-stopped
     healthcheck:
