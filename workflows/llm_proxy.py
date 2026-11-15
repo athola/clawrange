@@ -757,23 +757,19 @@ def _detect_tier_hint(messages: list[dict]) -> str | None:
     incidental mentions of provider names in conversation context never
     trigger routing.
     """
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            text = msg.get("content", "")
-            if isinstance(text, list):
-                text = " ".join(b.get("text", "") for b in text if isinstance(b, dict))
-            # Strip sender metadata blocks to avoid false matches
-            text = re.sub(
-                r"sender \(untrusted metadata\):.*?```.*?```",
-                "",
-                text,
-                flags=re.DOTALL,
-            )
-            text_lower = text.lower()
-            for keyword, tier in TIER_HINTS.items():
-                if re.search(rf"(?<!\S)!{re.escape(keyword)}\b", text_lower):
-                    return tier
-            break
+    for text in _user_texts(messages):
+        # Strip sender metadata blocks to avoid false matches
+        text = re.sub(
+            r"sender \(untrusted metadata\):.*?```.*?```",
+            "",
+            text,
+            flags=re.DOTALL,
+        )
+        text_lower = text.lower()
+        for keyword, tier in TIER_HINTS.items():
+            if re.search(rf"(?<!\S)!{re.escape(keyword)}\b", text_lower):
+                return tier
+        break
     return None
 
 
@@ -856,20 +852,42 @@ _OPENCLAW_META_RE = re.compile(
 )
 
 
-def _get_last_user_message(messages: list[dict]) -> str:
-    """Extract the text of the last user message, stripping OpenClaw metadata."""
+# OpenClaw 2026.8+ appends a separate user message carrying runtime context
+# (temporal context, interrupted inputs) after the real one, and prefixes
+# the real text with a "[Sun 2026-11-15 22:21 UTC] " envelope.
+_RUNTIME_CONTEXT_PREFIX = "openclaw runtime context:"
+_TIMESTAMP_ENVELOPE_RE = re.compile(
+    r"^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d{4}-\d{2}-\d{2} \d{2}:\d{2}"
+    r"(?::\d{2})? [A-Za-z0-9_+/:-]+\]\s*"
+)
+# First turn of a fresh session: "\n\nRuntime: agent=max | session=... | ...".
+_RUNTIME_LINE_RE = re.compile(r"\n\s*runtime: agent=[^\n]*\s*$", re.IGNORECASE)
+
+
+def _user_texts(messages: list[dict]):
+    """Raw user message texts, newest first, minus OpenClaw runtime context."""
     for msg in reversed(messages):
-        if msg.get("role") == "user":
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                content = " ".join(
-                    b.get("text", "") for b in content if isinstance(b, dict)
-                )
-            if not isinstance(content, str):
-                return ""
-            # Strip OpenClaw conversation metadata prefix
-            content = _OPENCLAW_META_RE.sub("", content)
-            return content.strip()
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            content = " ".join(
+                b.get("text", "") for b in content if isinstance(b, dict)
+            )
+        if not isinstance(content, str):
+            yield ""
+            continue
+        if content.lstrip().lower().startswith(_RUNTIME_CONTEXT_PREFIX):
+            continue
+        yield content
+
+
+def _get_last_user_message(messages: list[dict]) -> str:
+    """Text of the last real user message, stripped of OpenClaw envelopes."""
+    for content in _user_texts(messages):
+        content = _OPENCLAW_META_RE.sub("", content)
+        content = _RUNTIME_LINE_RE.sub("", content.strip())
+        return _TIMESTAMP_ENVELOPE_RE.sub("", content).strip()
     return ""
 
 

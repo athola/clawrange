@@ -1867,6 +1867,61 @@ class TestDetectTierHint:
 class TestGetLastUserMessage:
     """Unit tests for _get_last_user_message() with edge cases."""
 
+    # OpenClaw 2026.8+ appends a runtime-context user message after the real
+    # one and prefixes the text with a timestamp envelope (captured shapes).
+    RUNTIME_CONTEXT = (
+        "OpenClaw runtime context:\n## Interrupted inputs\nnone in the latest "
+        "retained-input page\n\n## Temporal Context\nCurrent date: 2026-11-15"
+        "\nTime zone: UTC\nEnd OpenClaw runtime context."
+    )
+
+    def test_skips_trailing_openclaw_runtime_context(self):
+        from llm_proxy import _get_last_user_message
+
+        msgs = [
+            {"role": "user", "content": "!help"},
+            {"role": "user", "content": self.RUNTIME_CONTEXT},
+        ]
+        assert _get_last_user_message(msgs) == "!help"
+
+    def test_strips_timestamp_envelope(self):
+        from llm_proxy import _get_last_user_message
+
+        msgs = [{"role": "user", "content": "[Sun 2026-11-15 22:21 UTC] !help"}]
+        assert _get_last_user_message(msgs) == "!help"
+
+    def test_heartbeat_prompt_survives_runtime_context(self):
+        import heartbeat
+        from llm_proxy import _get_last_user_message
+
+        msgs = [
+            {"role": "user", "content": "ClawRange heartbeat: run the checks. ..."},
+            {"role": "user", "content": self.RUNTIME_CONTEXT},
+        ]
+        assert heartbeat._is_heartbeat(_get_last_user_message(msgs))
+
+    def test_strips_first_turn_runtime_line(self):
+        # The first turn of a fresh session carries a runtime summary line.
+        from llm_proxy import _get_last_user_message
+
+        msgs = [
+            {
+                "role": "user",
+                "content": "!tasks\n\nRuntime: agent=max | session=agent:max:main"
+                " | host=abc | os=linux | node=v24.22.1",
+            }
+        ]
+        assert _get_last_user_message(msgs) == "!tasks"
+
+    def test_tier_hint_ignores_runtime_context(self):
+        from llm_proxy import _detect_tier_hint
+
+        msgs = [
+            {"role": "user", "content": "!paid summarise this"},
+            {"role": "user", "content": self.RUNTIME_CONTEXT},
+        ]
+        assert _detect_tier_hint(msgs) == "openrouter-paid"
+
     def test_simple_text(self):
         from llm_proxy import _get_last_user_message
 
@@ -2643,8 +2698,8 @@ class TestResearchRouter:
                 {
                     "role": "user",
                     "content": (
-                        "read heartbeat.md if it exists (workspace context). "
-                        "follow it strictly. do not infer or repeat old tasks "
+                        "clawrange heartbeat: run the scheduled checks in the "
+                        "monitor scratch. do not infer or repeat old tasks "
                         "from prior chats. if nothing needs attention, reply "
                         "with exactly: heartbeat_ok"
                     ),
@@ -2676,8 +2731,8 @@ class TestHeartbeatInterceptor:
                 {
                     "role": "user",
                     "content": (
-                        "read heartbeat.md if it exists (workspace context). "
-                        "follow it strictly. do not infer or repeat old tasks "
+                        "clawrange heartbeat: run the scheduled checks in the "
+                        "monitor scratch. do not infer or repeat old tasks "
                         "from prior chats. if nothing needs attention, reply "
                         "heartbeat_ok."
                     ),
