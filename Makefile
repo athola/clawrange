@@ -8,6 +8,10 @@
 
 .DEFAULT_GOAL := help
 
+# make does not read .env. Recipes that resolve profile ${VAR}s or call the
+# bearer-protected API source it first (values are never echoed).
+LOAD_ENV = if [ -f .env ]; then set -a; . ./.env; set +a; fi
+
 # ─── Stack Lifecycle ──────────────────────────────────────────────
 
 .PHONY: start start-full stop stop-clean restart reset
@@ -36,7 +40,7 @@ PROD_COMPOSE := -f docker-compose.yml -f docker-compose.prod.yml
 
 start-prod: ## Start core stack bound to Tailscale + localhost only
 	@docker compose $(PROD_COMPOSE) up -d --build
-	@if [ -f .env ]; then set -a; . ./.env; set +a; fi; \
+	@$(LOAD_ENV); \
 	echo "Services bound to 127.0.0.1 + $${TAILSCALE_IP:-<TAILSCALE_IP unset>} (Tailscale)"
 
 start-prod-full: ## Start full stack (prod mode) including DeerFlow
@@ -46,7 +50,7 @@ start-prod-full: ## Start full stack (prod mode) including DeerFlow
 stop-prod: ## Stop production stack
 	@docker compose $(PROD_COMPOSE) down
 
-reset: ## Wipe all data and start fresh (interactive confirmation)
+reset: ## Stop, drop containers and the DeerFlow clone; keeps data/ (asks first)
 	@./scripts/reset.sh
 
 # ─── Testing ──────────────────────────────────────────────────────
@@ -75,7 +79,7 @@ test-research: ## Smoke test the /research endpoint with a live topic
 
 # The task queue API requires a bearer token: export PROXY_AUTH_TOKEN from
 # .env (never printed) and refuse to run without it.
-TOME_BRIDGE_ENV = if [ -f .env ]; then set -a; . ./.env; set +a; fi; \
+TOME_BRIDGE_ENV = $(LOAD_ENV); \
 	if [ -z "$${PROXY_AUTH_TOKEN:-}" ]; then \
 		echo "PROXY_AUTH_TOKEN is empty: set it in .env (the task queue API requires it)." >&2; \
 		exit 1; \
@@ -89,12 +93,12 @@ tome-bridge-watch: ## Watch task queue for research:tome tasks
 
 persona-export: ## Export approved persona learnings to learned.yaml (PROFILE=<name>)
 	@test -n "$(PROFILE)" || { echo "usage: make persona-export PROFILE=<name>"; exit 1; }
-	@uv run python workflows/scripts/persona_export.py "$(PROFILE)"
+	@$(LOAD_ENV); uv run python workflows/scripts/persona_export.py "$(PROFILE)"
 
 # PROFILE is passed as argv, never interpolated into the Python source.
 persona: ## Render soul.md + identity.md from a profile's identity + learned overlay (PROFILE=<name>)
 	@test -n "$(PROFILE)" || { echo "usage: make persona PROFILE=<name>"; exit 1; }
-	@uv run python -c "import sys; sys.path.insert(0,'workflows'); \
+	@$(LOAD_ENV); uv run python -c "import sys; sys.path.insert(0,'workflows'); \
 from persona import render_all; from tenant_profile import load_profile; \
 import persona_learning as pl; \
 name=sys.argv[1]; p=load_profile(name); \
@@ -111,19 +115,19 @@ retrieval-eval: ## Compare search configs on the fixture golden set (offline)
 	@cd workflows && uv run python retrieval_eval.py
 
 retrieval-eval-refresh: ## Embed fixture cache misses via OpenRouter, then compare
-	@if [ -f .env ]; then set -a; . ./.env; set +a; fi; \
+	@$(LOAD_ENV); \
 	cd workflows && uv run python retrieval_eval.py --refresh --check-truncation
 
 retrieval-harvest: ## Add John's real brain searches to data/retrieval/golden.json (unlabelled)
 	@cd workflows && uv run python retrieval_eval.py --brain ../data/brain/brain.db --harvest
 
 retrieval-eval-brain: ## Compare search configs on the real brain with your labelled queries
-	@if [ -f .env ]; then set -a; . ./.env; set +a; fi; \
+	@$(LOAD_ENV); \
 	cd workflows && uv run python retrieval_eval.py --brain ../data/brain/brain.db --refresh
 
 validate: ## Validate config files and project structure
 	@uv run python tests/validate_stack.py
-	@uv run pytest tests/test_validate_stack.py -q
+	@uv run pytest tests/ -q
 
 # ─── Tenant Profiles (multi-tenant template) ──────────────────────
 
@@ -131,7 +135,7 @@ validate: ## Validate config files and project structure
 
 profile: ## Render openclaw/soul.md from a profile + set it in .env (PROFILE=<name>)
 	@test -n "$(PROFILE)" || { echo "usage: make profile PROFILE=<name>"; exit 1; }
-	@uv run python -c "import sys; sys.path.insert(0,'workflows'); \
+	@$(LOAD_ENV); uv run python -c "import sys; sys.path.insert(0,'workflows'); \
 from persona import write_soul; from tenant_profile import load_profile; \
 p=write_soul(load_profile(sys.argv[1]), 'openclaw/soul.md'); \
 print('rendered persona ->', p)" "$(PROFILE)"
