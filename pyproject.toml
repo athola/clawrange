@@ -3,19 +3,21 @@ name = "clawrange"
 version = "0.1.0"
 description = "ClawRange: personal AI ops stack (OpenClaw assistant + FastAPI workflows service)"
 requires-python = ">=3.12"
-# Runtime dependencies are mirrored in workflows/requirements.txt, which is the
-# install source for the (read-only, bind-mount-driven) Docker image. Keep the
-# two in sync; a future follow-up can derive requirements.txt via `uv export`.
+# workflows/requirements.txt (the Docker image's install source) is generated
+# from uv.lock by the uv-export pre-commit hook; never edit it by hand.
 dependencies = [
-    "fastapi==0.115.12",
-    "uvicorn[standard]==0.34.2",
+    "fastapi==0.163.1",
+    "uvicorn[standard]==0.54.0",
     "httpx==0.28.1",
     "sqlite-vec==0.1.9",
-    "apscheduler>=3.10.4,<4",
-    "asyncpraw>=7.8",
-    "githubkit>=0.11",
-    "pytimeparse>=1.1",
-    "pyyaml==6.0.1",
+    "apscheduler>=3.11.3,<4",
+    "asyncpraw>=8.0.3",
+    "githubkit>=0.17.1",
+    # githubkit deprecated its httpx transport; httpx2 is the supported one.
+    "httpx2>=2.16.0",
+    "hishel[async,httpx2]>=1.4.0",
+    "pytimeparse>=1.1.10",
+    "pyyaml==6.0.3",
 ]
 
 [dependency-groups]
@@ -26,10 +28,12 @@ dev = [
     "mypy",
     "pytest",
     "pre-commit",
-    "pytest-asyncio>=1.4.0",
+    "pytest-asyncio>=1.5.0",
 ]
 
 [tool.uv]
+# The lock file format follows the uv version; keep everyone on one.
+required-version = ">=0.13.8"
 # ClawRange is a collection of scripts run inside Docker, not an importable
 # distribution. Tell uv not to build/install the project root.
 package = false
@@ -41,6 +45,8 @@ target-version = "py312"
 src = ["workflows", "scripts", "tests"]
 exclude = [
     "data",
+    # Code blocks in docs are illustrative; ruff 0.17 would reformat them.
+    "docs",
     ".venv",
     "deer-flow",
     "deerflow",
