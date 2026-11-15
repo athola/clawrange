@@ -155,6 +155,28 @@ def _connect(db_path: str) -> tuple[sqlite3.Connection, bool]:
     return conn, has_vec
 
 
+def rrf_fuse(
+    rankings: list[list[str]],
+    k: int = 60,
+    weights: list[float] | None = None,
+) -> list[tuple[str, float]]:
+    """Reciprocal Rank Fusion: score(slug) = sum_i weight_i / (k + rank_i).
+
+    Ranks are 0-based. Ties keep first-seen order (rankings are walked in
+    order and the sort is stable). Shared by search_hybrid and the
+    retrieval eval, so both rank identically.
+    """
+    if weights is None:
+        weights = [1.0] * len(rankings)
+    if len(weights) != len(rankings):
+        raise ValueError("one weight per ranking")
+    scores: dict[str, float] = {}
+    for ranking, weight in zip(rankings, weights, strict=True):
+        for rank, slug in enumerate(ranking):
+            scores[slug] = scores.get(slug, 0.0) + weight / (k + rank)
+    return sorted(scores.items(), key=lambda item: item[1], reverse=True)
+
+
 def project_list(project: dict[str, Any] | None, key: str) -> list[str]:
     """Decode a project's JSON-list column (topics, subreddits, search_terms).
 
@@ -177,6 +199,10 @@ def project_list(project: dict[str, Any] | None, key: str) -> list[str]:
 class BrainDB:
     def __init__(self, db_path: str = "/data/brain.db"):
         self._db_path = db_path
+        # Chunking knobs (the retrieval eval varies them; production uses
+        # the defaults). Changing them re-chunks pages on their next upsert.
+        self.chunk_max_words = 300
+        self.chunk_overlap_words = 50
         # Ensure parent directory exists
         parent = os.path.dirname(db_path)
         if parent:
@@ -530,7 +556,7 @@ class BrainDB:
             if page["compiled"]
             else page["title"]
         )
-        chunks = _chunk_text(text)
+        chunks = _chunk_text(text, self.chunk_max_words, self.chunk_overlap_words)
 
         if not chunks:
             self._conn.execute(
@@ -729,14 +755,25 @@ class BrainDB:
 
     # ─── FTS5 Keyword Search ─────────────────────────────────────
 
-    def search_keyword(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
+    def search_keyword(
+        self, query: str, limit: int = 10, match: str = "all"
+    ) -> list[dict[str, Any]]:
+        """BM25 keyword search over whole pages.
+
+        ``match="all"`` requires every word (FTS5's implicit AND);
+        ``match="any"`` ORs them, so a question still finds a page that
+        shares only some of its words, ranked by BM25.
+        """
+        if match not in ("all", "any"):
+            raise ValueError(f"match must be 'all' or 'any', not {match!r}")
         # Treat user input as plain words: quote each token so FTS5 operators
         # and stray quotes/parens can't raise a syntax error (a 500).
         tokens = [t.replace('"', '""') for t in query.split()]
         tokens = [t for t in tokens if t.strip('"')]
         if not tokens:
             return []
-        query = " ".join(f'"{t}"' for t in tokens)
+        joiner = " OR " if match == "any" else " "
+        query = joiner.join(f'"{t}"' for t in tokens)
         limit = max(1, min(int(limit), MAX_SEARCH_LIMIT))
         rows = self._conn.execute(
             """
@@ -759,19 +796,29 @@ class BrainDB:
         query_vector: list[float] | None = None,
         limit: int = 10,
         k: int = 60,
+        kw_weight: float = 1.0,
+        vec_weight: float = 1.0,
+        depth: int | None = None,
+        kw_match: str | None = None,
     ) -> list[dict[str, Any]]:
         """Hybrid search combining keyword (FTS5) + vector (sqlite-vec) with RRF.
 
-        Reciprocal Rank Fusion: score = Σ 1/(k + rank_i)
-        Falls back to keyword-only if vector is unavailable or query_vector is None.
+        ``depth`` is how many pages each retriever contributes before fusion
+        (default ``2 * limit``); the weights scale each retriever's RRF
+        share. ``kw_match`` is passed to search_keyword; by default it is
+        "all" when a query vector is available and "any" when it is not,
+        because AND-matching alone misses most natural-language questions
+        (retrieval eval: hit@1 0.21 vs 0.79 on the fixture set). Falls back to
+        keyword-only if vector is unavailable or query_vector is None.
         """
-        # Keyword results
-        kw_results = self.search_keyword(query, limit=limit * 2)
+        depth = depth or limit * 2
+        use_vec = bool(query_vector) and self._vec_table is not None
+        match = kw_match or ("all" if use_vec else "any")
+        kw_results = self.search_keyword(query, limit=depth, match=match)
 
-        # Vector results (if available)
         vec_results = []
-        if query_vector and self._vec_table is not None:
-            vec_results = self.search_vector(query_vector, limit=limit * 2)
+        if use_vec and query_vector:
+            vec_results = self.search_vector(query_vector, limit=depth)
 
         # If only one source, compute RRF scores from single ranking
         if not vec_results:
@@ -786,41 +833,39 @@ class BrainDB:
                 r["score"] = round(1.0 / (k + rank), 6)
             return vec_results[:limit]
 
-        # RRF fusion
-        rrf_scores: dict[str, float] = {}
         slug_data: dict[str, dict[str, Any]] = {}
-
-        for rank, r in enumerate(kw_results):
-            slug = r["slug"]
-            rrf_scores[slug] = rrf_scores.get(slug, 0) + 1.0 / (k + rank)
-            if slug not in slug_data:
-                slug_data[slug] = {
-                    "slug": slug,
+        for r in kw_results:
+            slug_data.setdefault(
+                r["slug"],
+                {
+                    "slug": r["slug"],
                     "title": r["title"],
                     "page_type": r["page_type"],
                     "snippet": r.get("snippet", r.get("compiled", "")[:200]),
-                }
-
-        for rank, r in enumerate(vec_results):
-            slug = r["slug"]
-            rrf_scores[slug] = rrf_scores.get(slug, 0) + 1.0 / (k + rank)
-            if slug not in slug_data:
-                slug_data[slug] = {
-                    "slug": slug,
+                },
+            )
+        for r in vec_results:
+            slug_data.setdefault(
+                r["slug"],
+                {
+                    "slug": r["slug"],
                     "title": r["title"],
                     "page_type": r["page_type"],
                     "snippet": r.get("snippet", ""),
-                }
+                },
+            )
 
-        # Sort by fused score
-        sorted_slugs = sorted(rrf_scores, key=lambda s: rrf_scores[s], reverse=True)
+        fused = rrf_fuse(
+            [[r["slug"] for r in kw_results], [r["slug"] for r in vec_results]],
+            k=k,
+            weights=[kw_weight, vec_weight],
+        )
         results = []
-        for slug in sorted_slugs[:limit]:
+        for slug, score in fused[:limit]:
             entry = slug_data[slug]
-            entry["score"] = round(rrf_scores[slug], 6)
+            entry["score"] = round(score, 6)
             entry["match_type"] = "hybrid"
             results.append(entry)
-
         return results
 
     # ─── Links (Knowledge Graph) ─────────────────────────────────

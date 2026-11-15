@@ -9,6 +9,8 @@ from brain_db import (
     BrainDB,
     LinkType,
     PageType,
+    _chunk_text,
+    rrf_fuse,
 )
 
 
@@ -829,3 +831,102 @@ class TestSubredditSearchBatch:
         monkeypatch.setattr(db, "_conn", Spy())
         db.record_subreddit_searches([(f"s{i}", "p", False) for i in range(20)])
         assert len(commits) == 1
+
+
+class TestRRFFuse:
+    """Fusion is a pure function so the retrieval eval and search_hybrid
+    rank with exactly the same code."""
+
+    def test_equal_weights_sum_reciprocal_ranks(self):
+        fused = dict(rrf_fuse([["a", "b"], ["b", "c"]], k=60))
+        assert fused["b"] == pytest.approx(1 / 61 + 1 / 60)
+        assert fused["a"] == pytest.approx(1 / 60)
+
+    def test_order_is_by_fused_score(self):
+        assert [s for s, _ in rrf_fuse([["a", "b"], ["b", "c"]])] == ["b", "a", "c"]
+
+    def test_ties_keep_first_seen_order(self):
+        assert [s for s, _ in rrf_fuse([["a"], ["c"]])] == ["a", "c"]
+
+    def test_weight_shifts_the_winner(self):
+        rankings = [["kw_top", "shared"], ["vec_top", "shared"]]
+        top_kw = rrf_fuse(rankings, k=1, weights=[3.0, 1.0])[0][0]
+        top_vec = rrf_fuse(rankings, k=1, weights=[1.0, 3.0])[0][0]
+        assert (top_kw, top_vec) == ("kw_top", "vec_top")
+
+    def test_weights_length_must_match(self):
+        with pytest.raises(ValueError):
+            rrf_fuse([["a"], ["b"]], weights=[1.0])
+
+
+class TestHybridTuning:
+    def test_keyword_weight_reorders_hybrid(self, db):
+        db.use_vector_table("vec_test_4", 4)
+        db.upsert_page("n/kw", "Alpha", PageType.NOTE, "zebra stripes")
+        db.upsert_page("n/vec", "Beta", PageType.NOTE, "unrelated words")
+        vec_chunk = db.get_chunks("n/vec")[0]["id"]
+        kw_chunk = db.get_chunks("n/kw")[0]["id"]
+        db.store_embeddings([(vec_chunk, [1, 0, 0, 0]), (kw_chunk, [0, 1, 0, 0])])
+        # n/kw is in both rankings (vector rank 1), so a small k lets the
+        # top rank dominate and the weights decide the winner.
+        q = [1.0, 0.0, 0.0, 0.0]
+        favour_kw = db.search_hybrid("zebra", q, k=1, kw_weight=3.0, vec_weight=1.0)
+        favour_vec = db.search_hybrid("zebra", q, k=1, kw_weight=1.0, vec_weight=3.0)
+        assert favour_kw[0]["slug"] == "n/kw"
+        assert favour_vec[0]["slug"] == "n/vec"
+
+    def test_chunk_size_is_configurable(self, db):
+        db.chunk_max_words = 20
+        db.chunk_overlap_words = 0
+        body = "\n\n".join(f"Paragraph {i} " + "word " * 15 for i in range(4))
+        db.upsert_page("n/long", "Long", PageType.NOTE, body)
+        assert len(db.get_chunks("n/long")) == len(
+            _chunk_text("Long\n\n" + body, 20, 0)
+        )
+        assert len(db.get_chunks("n/long")) > 1
+
+
+class TestKeywordMatchMode:
+    """FTS5 joins quoted tokens with AND, so a natural-language question
+    misses any page lacking one of its words. match="any" ORs the terms and
+    lets BM25 rank pages by how many (and how rare) terms they share."""
+
+    def test_all_mode_requires_every_word(self, db):
+        db.upsert_page("n/a", "Launch", PageType.NOTE, "post Show HN on a weekday")
+        assert db.search_keyword("Show HN timing") == []
+
+    def test_any_mode_matches_partial_overlap(self, db):
+        db.upsert_page("n/a", "Launch", PageType.NOTE, "post Show HN on a weekday")
+        hits = db.search_keyword("Show HN timing", match="any")
+        assert [h["slug"] for h in hits] == ["n/a"]
+
+    def test_any_mode_ranks_more_shared_terms_first(self, db):
+        db.upsert_page("n/one", "One", PageType.NOTE, "zebra")
+        db.upsert_page("n/two", "Two", PageType.NOTE, "zebra stripes savanna")
+        hits = db.search_keyword("zebra stripes savanna", match="any")
+        assert hits[0]["slug"] == "n/two"
+
+    def test_unknown_mode_rejected(self, db):
+        with pytest.raises(ValueError):
+            db.search_keyword("x", match="some")
+
+    def test_hybrid_passes_match_mode(self, db):
+        db.upsert_page("n/a", "Launch", PageType.NOTE, "post Show HN on a weekday")
+        hits = db.search_hybrid("Show HN timing", kw_match="any")
+        assert [h["slug"] for h in hits] == ["n/a"]
+
+    def test_hybrid_without_vector_falls_back_to_any_terms(self, db):
+        """With no query vector (embedding outage, no key) hybrid is keyword
+        only; AND-matching there found the right page for 21% of the eval's
+        questions, any-term matching for 79%."""
+        db.upsert_page("n/a", "Launch", PageType.NOTE, "post Show HN on a weekday")
+        hits = db.search_hybrid("Show HN timing")
+        assert [h["slug"] for h in hits] == ["n/a"]
+
+    def test_hybrid_with_vector_keeps_all_terms_by_default(self, db):
+        db.use_vector_table("vec_test_4", 4)
+        db.upsert_page("n/a", "Launch", PageType.NOTE, "post Show HN on a weekday")
+        db.store_embeddings([(db.get_chunks("n/a")[0]["id"], [0, 1, 0, 0])])
+        hits = db.search_hybrid("Show HN timing", [0.0, 1.0, 0.0, 0.0])
+        # keyword side (AND) is empty, so the vector side alone answers
+        assert [h["match_type"] for h in hits] == ["vector"]
