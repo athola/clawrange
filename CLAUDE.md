@@ -18,7 +18,8 @@ Tailscale and Caddy gateway.
 - `workflows/`: FastAPI service:
   - `app.py`: FastAPI entrypoint and route registration
   - `auth.py`: app-wide bearer auth (`PROXY_AUTH_TOKEN`), fails closed;
-    only `/healthz*`, `GET /tier`, `GET /sched[/{id}]` are public
+    only `/healthz` (+ `/research`, `/crm`, `/persona`), `GET /tier`,
+    `GET /sched[/{id}]` are public
   - `rundown.py`, `deals.py`, `deal_sources.py`: daily outreach and
     homelab deal rundowns
   - `brain.py`, `brain_db.py`: persistent knowledge store and task queue
@@ -106,8 +107,10 @@ make py-lint          # uv run ruff check .
 ## API Endpoints
 
 Every route requires `Authorization: Bearer $PROXY_AUTH_TOKEN` except
-`/healthz*`, `GET /tier`, `GET /sched` and `GET /sched/{id}` (polled by
-the homepage dashboard). An unset token fails closed (401).
+`GET /healthz`, `/healthz/{research,crm,persona}`, `GET /tier`, `GET /sched`
+and `GET /sched/{id}` (polled by the homepage dashboard). Anonymous `/sched`
+reads omit `kwargs` and reduce `last_status` to `ok`/`failed`. An unset
+token fails closed (401).
 
 **Health and tiers**
 - `GET  /healthz` (port 3000): OpenClaw health

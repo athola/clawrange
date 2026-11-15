@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # Sourced (not executed) by scripts that call protected workflows routes.
-# Every workflows route except GET /healthz*, /tier and /sched* requires
+# Every workflows route except the GET health, /tier and /sched reads requires
 # `Authorization: Bearer $PROXY_AUTH_TOKEN`. The header is written to a
 # 0600 temp file and passed as `curl -H @"$WF_AUTH_HEADER"`, so the token never
 # appears on a command line (ps) or in script output.

@@ -18,7 +18,9 @@ from fastapi import HTTPException, Request
 # (method, path regex) pairs reachable without a token. Keep this list
 # read-only and free of anything that reveals brain, task or CRM contents.
 _PUBLIC: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("GET", re.compile(r"^/healthz(/[^/]+)?$")),
+    # Exact health paths: a new /healthz/* route stays private until it is
+    # reviewed and added here.
+    ("GET", re.compile(r"^/healthz(/(research|crm|persona))?$")),
     ("GET", re.compile(r"^/tier$")),
     ("GET", re.compile(r"^/sched$")),
     ("GET", re.compile(r"^/sched/[^/]+$")),
@@ -57,11 +59,19 @@ def bearer_ok(authorization: str | None, expected: str) -> bool:
     return hmac.compare_digest(token.encode(), expected.encode())
 
 
+def is_authenticated(request: Request) -> bool:
+    """True when the request carries the valid bearer token.
+
+    Public routes use this to return a reduced view to anonymous callers.
+    """
+    import llm_proxy  # local: llm_proxy imports app-level modules lazily
+
+    return bearer_ok(request.headers.get("authorization"), llm_proxy.PROXY_AUTH_TOKEN)
+
+
 async def require_token(request: Request) -> None:
     """App-wide dependency: 401 unless the route is public or the token matches."""
     if is_public(request.method, request.url.path):
         return
-    import llm_proxy  # local: llm_proxy imports app-level modules lazily
-
-    if not bearer_ok(request.headers.get("authorization"), llm_proxy.PROXY_AUTH_TOKEN):
+    if not is_authenticated(request):
         raise HTTPException(status_code=401, detail="Unauthorized")

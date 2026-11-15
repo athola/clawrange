@@ -142,3 +142,56 @@ class TestStartupWarning:
         with caplog.at_level("ERROR", logger="clawrange.auth"):
             assert auth.warn_if_unset("tok") is False
         assert caplog.text == ""
+
+
+@patch("llm_proxy.PROXY_AUTH_TOKEN", "s3cret")
+class TestPublicScheduleView:
+    """The dashboard polls GET /sched without a token. It gets the shape it
+    needs (id, name, kind, cron, paused, next fire, ok/failed) but never a
+    schedule's kwargs or the raw status text, which can carry queries and
+    error detail. Authenticated callers still see full rows."""
+
+    @pytest.fixture(autouse=True)
+    def _sched(self):
+        from app import brain_db
+
+        brain_db.upsert_schedule(
+            "pub_view",
+            "pub view",
+            "reddit_scan",
+            "0 9 * * *",
+            {"query": "private search terms"},
+        )
+        brain_db.update_schedule_status(
+            "pub_view", "2026-11-15T09:00:00", "FAILED telegram 1/3 msgs (x)"
+        )
+
+    def _row(self, body):
+        return next(s for s in body["schedules"] if s["id"] == "pub_view")
+
+    def test_list_without_token_hides_kwargs(self, real_auth):
+        row = self._row(real_auth.get("/sched").json())
+        assert "kwargs" not in row
+        assert row["last_status"] == "failed"
+        assert row["cron"] == "0 9 * * *"
+
+    def test_get_without_token_hides_kwargs(self, real_auth):
+        row = real_auth.get("/sched/pub_view").json()
+        assert "kwargs" not in row
+        assert row["last_status"] == "failed"
+
+    def test_list_with_token_keeps_full_row(self, real_auth):
+        row = self._row(real_auth.get("/sched", headers=GOOD).json())
+        assert "private search terms" in str(row["kwargs"])
+        assert row["last_status"].startswith("FAILED telegram")
+
+
+class TestHealthzAllowlistIsExact:
+    @pytest.mark.parametrize(
+        "path", ["/healthz", "/healthz/research", "/healthz/crm", "/healthz/persona"]
+    )
+    def test_known_health_routes_public(self, path):
+        assert auth.is_public("GET", path)
+
+    def test_unknown_health_subroute_not_public(self):
+        assert not auth.is_public("GET", "/healthz/anything-new")

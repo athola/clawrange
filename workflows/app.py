@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
 import auth
@@ -419,8 +419,23 @@ class SchedulePatch(BaseModel):
     paused: bool | None = None
 
 
+def _schedule_view(sched: dict[str, Any], full: bool) -> dict[str, Any]:
+    """Anonymous callers (the dashboard) get no kwargs and only ok/failed.
+
+    kwargs can hold search queries and project slugs, and the raw status
+    text can hold error detail; neither belongs on a public route.
+    """
+    if full:
+        return sched
+    view = {k: v for k, v in sched.items() if k != "kwargs"}
+    status = sched.get("last_status")
+    if status:
+        view["last_status"] = "failed" if "FAILED" in status else "ok"
+    return view
+
+
 @app.get("/sched")
-def list_schedules():
+def list_schedules(request: Request):
     scheds = brain_db.list_schedules()
     jobs = (
         list_scheduled_jobs(app.state.scheduler)
@@ -431,11 +446,15 @@ def list_schedules():
     for s in scheds:
         j = job_map.get(s["id"])
         s["next_fire_time"] = j["next_fire_time"] if j else None
-    return {"schedules": scheds, "total": len(scheds)}
+    full = auth.is_authenticated(request)
+    return {
+        "schedules": [_schedule_view(s, full) for s in scheds],
+        "total": len(scheds),
+    }
 
 
 @app.get("/sched/{schedule_id}")
-def get_schedule(schedule_id: str):
+def get_schedule(schedule_id: str, request: Request):
     sched = brain_db.get_schedule(schedule_id)
     if not sched:
         raise HTTPException(status_code=404, detail="Schedule not found")
@@ -447,7 +466,7 @@ def get_schedule(schedule_id: str):
     job_map = {j["id"].replace("marketing_", ""): j for j in jobs}
     j = job_map.get(sched["id"])
     sched["next_fire_time"] = j["next_fire_time"] if j else None
-    return sched
+    return _schedule_view(sched, auth.is_authenticated(request))
 
 
 @app.post("/sched")
