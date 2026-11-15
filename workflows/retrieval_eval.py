@@ -19,7 +19,6 @@ search methods, so the eval scores the code that serves queries, not a copy.
 from __future__ import annotations
 
 import argparse
-import base64
 import dataclasses
 import hashlib
 import json
@@ -150,7 +149,9 @@ class VectorCache:
     """Vectors keyed by sha256(model, dim, text), stored as float16.
 
     float16 halves the fixture size; the rounding error (~1e-3) is far
-    below the gaps between ranked cosine scores in practice.
+    below the gaps between ranked cosine scores in practice. Values are
+    lowercase hex, not base64: base64 text can spell an AWS-style key id
+    ("AKIA" + uppercase) and trip CI's secret scan.
     """
 
     def __init__(self, path: str, model: str, dim: int):
@@ -164,11 +165,11 @@ class VectorCache:
         if len(vector) != self.dim:
             raise ValueError(f"expected {self.dim} dims, got {len(vector)}")
         packed = struct.pack(f"<{self.dim}e", *vector)
-        self._vectors[self.key(text)] = base64.b64encode(packed).decode()
+        self._vectors[self.key(text)] = packed.hex()
 
     def get(self, text: str) -> list[float]:
         try:
-            packed = base64.b64decode(self._vectors[self.key(text)])
+            packed = bytes.fromhex(self._vectors[self.key(text)])
         except KeyError:
             raise CacheMiss(text[:80]) from None
         return list(struct.unpack(f"<{self.dim}e", packed))

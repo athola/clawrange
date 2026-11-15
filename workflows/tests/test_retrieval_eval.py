@@ -71,6 +71,20 @@ class TestVectorCache:
         assert again.model == "m" and again.dim == 4
         assert again.get("hello") == pytest.approx([0.5, -0.25, 0.125, 1.0])
 
+    def test_stored_vectors_are_lowercase_hex(self, tmp_path):
+        """base64 once produced 'AKIA' + uppercase, tripping CI's AWS-key
+        scan; lowercase hex can never match a secret pattern."""
+        path = tmp_path / "v.json"
+        cache = rev.VectorCache(str(path), model="m", dim=4)
+        cache.put("t", [0.5, -0.25, 0.125, 1.0])
+        cache.save()
+        stored = json.loads(path.read_text())["vectors"]
+        assert all(set(v) <= set("0123456789abcdef") for v in stored.values())
+
+    def test_committed_fixture_cache_is_hex(self):
+        stored = json.load(open(os.path.join(FIXTURES, "vectors.json")))["vectors"]
+        assert all(set(v) <= set("0123456789abcdef") for v in stored.values())
+
     def test_keys_depend_on_model(self, tmp_path):
         a = rev.VectorCache(str(tmp_path / "a.json"), model="m1", dim=4)
         b = rev.VectorCache(str(tmp_path / "b.json"), model="m2", dim=4)
