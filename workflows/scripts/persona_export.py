@@ -10,6 +10,7 @@ Usage:
 """
 
 import sys
+from itertools import takewhile
 from pathlib import Path
 
 # Allow running from the repo root: make the workflows package importable.
@@ -24,7 +25,15 @@ from tenant_profile import default_profiles_dir  # noqa: E402
 name = sys.argv[1] if len(sys.argv) > 1 else "starter"
 db = BrainDB("data/brain/brain.db")
 db.init_db()
-overlay = {"learned": pl.export_overlay(db, name)}
 dest = default_profiles_dir() / name / "learned.yaml"
-dest.write_text(yaml.safe_dump(overlay, allow_unicode=True, sort_keys=False))
+existing = pl.load_overlay(name)
+overlay = {"learned": pl.export_overlay(db, name, existing=existing)}
+if overlay["learned"] == existing:
+    # Nothing new: leave the hand-formatted file (or its absence) alone.
+    print(f"{dest} unchanged ({len(existing)} learnings)")
+    sys.exit(0)
+# Keep the leading comment block: yaml.safe_dump would otherwise drop it.
+old = dest.read_text().splitlines(keepends=True) if dest.exists() else []
+header = "".join(takewhile(lambda ln: ln.startswith("#") or not ln.strip(), old))
+dest.write_text(header + yaml.safe_dump(overlay, allow_unicode=True, sort_keys=False))
 print(f"wrote {dest} ({len(overlay['learned'])} learnings)")

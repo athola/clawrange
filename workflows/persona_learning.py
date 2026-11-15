@@ -85,18 +85,37 @@ def reject(brain_db, profile_name, learning_id, render_fn=None):
     return out
 
 
-def export_overlay(brain_db, profile_name):
-    rows = brain_db.list_learnings(profile=profile_name, status="approved")
-    return [
-        {
-            "kind": r["kind"],
-            "target": r["target"],
-            "content": r["content"],
-            "source": r["source"],
-            "approved_at": r["decided_at"],
-        }
-        for r in rows
-    ]
+def export_overlay(brain_db, profile_name, existing=None):
+    """Project the brain's approved learnings onto the overlay list.
+
+    ``existing`` is the current learned.yaml list. Entries the brain has
+    never seen are kept (the brain may serve another profile, or be fresh).
+    An entry is dropped only when the brain rejected it and holds no
+    approved copy; a pending re-proposal does not remove it. New approvals
+    are appended in the brain's order.
+    """
+    rows = brain_db.list_learnings(profile=profile_name)
+    statuses: dict[tuple, set] = {}
+    for r in rows:
+        statuses.setdefault((r["target"], r["content"]), set()).add(r["status"])
+    out = []
+    for item in existing or []:
+        seen = statuses.get((item.get("target"), item.get("content")), set())
+        if "rejected" not in seen or "approved" in seen:
+            out.append(item)
+    kept = {(e.get("target"), e.get("content")) for e in out}
+    for r in rows:
+        if r["status"] == "approved" and (r["target"], r["content"]) not in kept:
+            out.append(
+                {
+                    "kind": r["kind"],
+                    "target": r["target"],
+                    "content": r["content"],
+                    "source": r["source"],
+                    "approved_at": r["decided_at"],
+                }
+            )
+    return out
 
 
 def scan_signals(brain_db, profile_name):

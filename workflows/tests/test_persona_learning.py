@@ -240,3 +240,44 @@ def test_approve_reports_render_results(db):
     )
     assert out["status"] == "approved"
     assert out["render"] == {"soul": True, "ws": False}
+
+
+SEEDED = {
+    "kind": "persona",
+    "target": "Communication",
+    "content": "Lead with the recommendation.",
+    "source": "feedback",
+    "approved_at": "2026-06-26T00:00:00+00:00",
+}
+
+
+def test_export_keeps_overlay_entries_the_brain_never_saw(db):
+    # A brain that serves a different profile has no rows for this one;
+    # exporting must not wipe the git-tracked overlay.
+    assert pl.export_overlay(db, "cos", existing=[SEEDED]) == [SEEDED]
+
+
+def test_export_adds_new_approvals_after_existing(db):
+    row = pl.propose(db, "cos", "persona", "Tone", "Be terse.", "feedback")
+    pl.approve(db, "cos", row["id"], render_fn=lambda lrn: None)
+    out = pl.export_overlay(db, "cos", existing=[SEEDED])
+    assert [e["content"] for e in out] == [SEEDED["content"], "Be terse."]
+
+
+def test_export_drops_learnings_the_brain_rejected(db):
+    pl.seed_overlay(db, "cos", [SEEDED])
+    (row,) = db.list_learnings(profile="cos", status="approved")
+    pl.reject(db, "cos", row["id"], render_fn=lambda lrn: None)
+    assert pl.export_overlay(db, "cos", existing=[SEEDED]) == []
+
+
+def test_export_does_not_duplicate_seeded_entries(db):
+    pl.seed_overlay(db, "cos", [SEEDED])
+    out = pl.export_overlay(db, "cos", existing=[SEEDED])
+    assert [e["content"] for e in out] == [SEEDED["content"]]
+
+
+def test_export_keeps_overlay_entry_with_only_a_pending_duplicate(db):
+    # Re-proposing an approved overlay learning must not drop it before review.
+    pl.propose(db, "cos", "persona", SEEDED["target"], SEEDED["content"], "feedback")
+    assert pl.export_overlay(db, "cos", existing=[SEEDED]) == [SEEDED]
