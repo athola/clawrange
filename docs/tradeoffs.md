@@ -6,6 +6,7 @@ Decisions, the alternatives weighed, and what was given up. Newest first.
 
 | ID | Phase | Status | Decision |
 |----|-------|--------|----------|
+| TR-005 | execute | proposed | Keyword fallback ORs terms; hybrid with vectors unchanged until the eval shows a win |
 | TR-004 | execute | proposed | Keep per-file dev mounts; directory mount blocked by the nested soul.md bind |
 | TR-003 | plan | proposed | Regression-lock marketing seeds (RED equivalence test) before deleting constants |
 | TR-002 | specify | proposed | Minimal CRMAdapter interface and templated-SQL only (no LLM raw SQL) |
@@ -22,6 +23,41 @@ Decisions, the alternatives weighed, and what was given up. Newest first.
 - **Options weighed**: ...
 - **Negative consequences**: ...
 -->
+
+## TR-005: Measure retrieval offline before tuning it
+
+- **Phase**: execute
+- **Status**: proposed
+- **Decision (Y-statement)**: In the context of brain search quality, facing
+  levers that the literature says help (RRF k and weights, contextual
+  headers, chunk size, Matryoshka truncation), we decided to **gate changes on
+  an offline eval** (`workflows/retrieval_eval.py`) and adopt only what clears
+  a paired bootstrap, to achieve tuning backed by evidence, accepting that the
+  fixture corpus is synthetic and small.
+- **Evidence** (30 pages, 72 queries, `make retrieval-eval`):
+  - Production hybrid scores hit@1 0.833 and MRR@10 0.900. hit@3 is 0.986,
+    at the ceiling, so hit@1 and MRR carry the signal.
+  - Keyword search ANDs every word, so it found the right page first for
+    0.208 of questions. ORing the terms raised that to 0.792 (Δhit@1 +0.583,
+    95% CI [+0.458, +0.708]). **Adopted** for hybrid's no-vector path only.
+  - With vectors, no fused variant beat production: RRF k 10 to 100, keyword
+    weight 0.5 or 2, depth 40, title headers and any-term fusion all have
+    CIs spanning zero.
+  - dim-512 is worse (ΔMRR -0.030, CI [-0.065, -0.002]); keep 1536.
+    Offline truncation matches native 512 and 1024 vectors (cosine 1.0000).
+  - chunk-150 is the most promising lever (deep-question hit@1 0.56 to 0.75,
+    ΔMRR +0.022, CI [-0.016, +0.060]) but is not yet significant.
+- **Options weighed**:
+  - Adopt the research defaults directly: unmeasured on our data. Rejected.
+  - LLM-generated golden queries: cheap at scale, but literature reports
+    lexical-overlap and length bias. Hand-written, tagged queries for now.
+  - Rerank via OpenRouter `/api/v1/rerank`: costs per query and needs the
+    network; left for a live-only run.
+- **Negative consequences**: The fixture is not real usage; a lever that
+  wins here still needs a live check. Changing the chunking or header recipe
+  in production would also need the recipe in the vector table's name, or
+  old and new vectors would mix.
+- **Reversibility**: HIGH. One default in `search_hybrid`.
 
 ## TR-004: Keep per-file dev mounts until the soul.md bind moves out of /app
 

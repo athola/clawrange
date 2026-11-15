@@ -26,6 +26,10 @@ Tailscale and Caddy gateway.
   - `embeddings.py`: OpenRouter embeddings (`EMBED_MODEL`/`EMBED_DIM`), one
     sqlite-vec table per model, 10-minute backfill job; hybrid search embeds
     the query and falls back to keyword-only
+  - `retrieval_eval.py`: offline search eval (hit@k, MRR, nDCG, paired
+    bootstrap) over a fixture corpus and golden set with cached vectors in
+    `tests/fixtures/retrieval/`; the pre-push pytest run gates production
+    and the no-vector fallback against `baseline.json`
   - `llm_proxy.py`: OpenAI-compatible proxy with tiered routing,
     web-search routing, anti-hallucination guard, balance circuit breaker
   - `scheduler.py`, `generators.py`: APScheduler jobs and generators
@@ -93,6 +97,7 @@ make start-full       # include DeerFlow
 make start-prod       # bind to 127.0.0.1 and Tailscale IP only
 make test             # run validation suite
 make test-unit        # uv run pytest workflows/tests/
+make retrieval-eval   # compare search configs offline (fixture golden set)
 make health           # quick curl health checks
 make logs             # tail docker logs
 

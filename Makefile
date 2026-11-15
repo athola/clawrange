@@ -51,7 +51,8 @@ reset: ## Wipe all data and start fresh (interactive confirmation)
 # ─── Testing ──────────────────────────────────────────────────────
 
 .PHONY: test test-openclaw test-workflows test-deerflow test-ollama test-research \
-	test-unit validate tome-bridge tome-bridge-watch
+	test-unit validate tome-bridge tome-bridge-watch \
+	retrieval-eval retrieval-eval-refresh
 
 test: ## Run full validation suite (6 tests)
 	@./scripts/test_all.sh
@@ -104,6 +105,13 @@ persona-demo: ## Offline walkthrough of the persona meta-learning loop (PROFILE=
 
 test-unit: ## Run Python unit tests (no containers needed)
 	@uv run pytest workflows/tests/ -v
+
+retrieval-eval: ## Compare search configs on the fixture golden set (offline)
+	@cd workflows && uv run python retrieval_eval.py
+
+retrieval-eval-refresh: ## Embed fixture cache misses via OpenRouter, then compare
+	@if [ -f .env ]; then set -a; . ./.env; set +a; fi; \
+	cd workflows && uv run python retrieval_eval.py --refresh --check-truncation
 
 validate: ## Validate config files and project structure
 	@uv run python tests/validate_stack.py
