@@ -61,6 +61,20 @@ def _reset_proxy_globals(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _bypass_api_auth():
+    """Skip the app-wide bearer check so route tests needn't send a token.
+
+    test_auth.py removes this override to exercise the real check.
+    """
+    import auth
+    from app import app
+
+    app.dependency_overrides[auth.require_token] = lambda: None
+    yield
+    app.dependency_overrides.pop(auth.require_token, None)
+
+
+@pytest.fixture(autouse=True)
 def _reset_brain_db():
     """Clear all tables between tests for isolation."""
     yield

@@ -22,6 +22,7 @@ Usage:
 
 Env:
   WORKFLOWS_BASE       defaults to http://localhost:5678
+  PROXY_AUTH_TOKEN     bearer token for the workflows API (required)
   CLAUDE_BIN           defaults to 'claude' on $PATH
   TOME_BRIDGE_TIMEOUT  per-task timeout in seconds (default 1800)
 
@@ -50,6 +51,13 @@ DEFAULT_BASE = os.environ.get("WORKFLOWS_BASE", "http://localhost:5678")
 DEFAULT_CLAUDE = os.environ.get("CLAUDE_BIN", "claude")
 DEFAULT_TIMEOUT = int(os.environ.get("TOME_BRIDGE_TIMEOUT", "1800"))
 
+# Tools the bridged Claude session may never use. The topic comes from the
+# workflows task queue, so treat it as untrusted prompt text: research needs
+# search, fetch and read, never shell or file writes.
+DENIED_TOOLS = ("Bash", "Edit", "Write", "MultiEdit", "NotebookEdit")
+MAX_TOPIC_CHARS = 300
+_UNSAFE_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
 _TOME_PATTERNS = (
     re.compile(r"^research:tome:\s*(?P<topic>.+)$", re.IGNORECASE),
     re.compile(r"^\[research:tome\]\s*(?P<topic>.+)$", re.IGNORECASE),
@@ -73,15 +81,27 @@ def extract_topic(description: str) -> str | None:
     return None
 
 
+def topic_problem(topic: str) -> str | None:
+    """Why ``topic`` is unsafe to hand to Claude, or None when it is fine."""
+    if len(topic) > MAX_TOPIC_CHARS:
+        return f"longer than {MAX_TOPIC_CHARS} characters"
+    if _UNSAFE_CHARS.search(topic):
+        return "contains control characters"
+    return None
+
+
 def http_json(method: str, url: str, payload: dict | None = None) -> dict:
-    """Minimal stdlib JSON HTTP helper (avoids httpx dependency)."""
+    """Minimal stdlib JSON HTTP helper (avoids httpx dependency).
+
+    Sends ``Authorization: Bearer $PROXY_AUTH_TOKEN``: the workflows API
+    rejects unauthenticated task-queue calls.
+    """
     data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method=method,
-        headers={"Content-Type": "application/json"},
-    )
+    headers = {"Content-Type": "application/json"}
+    token = os.environ.get("PROXY_AUTH_TOKEN", "")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     with urllib.request.urlopen(req, timeout=15) as resp:
         body = resp.read().decode()
     return json.loads(body) if body else {}
@@ -108,7 +128,15 @@ def run_tome_research(claude_bin: str, topic: str, timeout: int) -> tuple[int, s
 
     Returns (returncode, combined_stdout_stderr).
     """
-    cmd = [claude_bin, "--print", f"/tome:research {topic}"]
+    # The prompt must precede --disallowedTools: that flag is variadic and
+    # would otherwise swallow the prompt as one more tool name.
+    cmd = [
+        claude_bin,
+        "--print",
+        f"/tome:research {topic}",
+        "--disallowedTools",
+        *DENIED_TOOLS,
+    ]
     try:
         result = subprocess.run(
             cmd,
@@ -146,6 +174,17 @@ def process_one_task(
         claim_task(base, task_id)
     except urllib.error.HTTPError as exc:
         logger.warning("tome bridge: claim failed for %s: %s", task_id, exc)
+        return True
+
+    problem = topic_problem(topic)
+    if problem is not None:
+        logger.warning("tome bridge: task %s topic rejected: %s", task_id, problem)
+        try:
+            complete_task(
+                base, task_id, f"tome bridge: topic rejected ({problem})", "failed"
+            )
+        except urllib.error.HTTPError as exc:
+            logger.error("tome bridge: complete_task failed for %s: %s", task_id, exc)
         return True
 
     rc, output = run_tome_research(claude_bin, topic, timeout)

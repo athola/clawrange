@@ -7,9 +7,10 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
 
+import auth
 import github_search
 import llm_proxy
 import reddit_search
@@ -116,6 +117,7 @@ def init_profile(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    auth.warn_if_unset(llm_proxy.PROXY_AUTH_TOKEN)
     init_profile(app, brain_db)
     scheduler = init_scheduler(brain_db)
     app.state.scheduler = scheduler
@@ -124,7 +126,13 @@ async def lifespan(app: FastAPI):
         scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="ClawRange Workflows", version="3.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="ClawRange Workflows",
+    version="3.0.0",
+    lifespan=lifespan,
+    # Bearer auth on every route except the read-only allowlist in auth.py.
+    dependencies=[Depends(auth.require_token)],
+)
 app.include_router(llm_router)
 app.include_router(create_brain_router(brain_db), prefix="/brain")
 

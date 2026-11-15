@@ -20,6 +20,7 @@ import httpx
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+import auth
 import github_search
 import reddit_search
 import telegram
@@ -3167,9 +3168,8 @@ async def embeddings(
 ):
     """OpenAI-compatible embeddings, proxied to Zhipu (for OpenClaw memory)."""
     # Auth check — same PROXY_AUTH_TOKEN gate as chat completions
-    if PROXY_AUTH_TOKEN:
-        if not authorization or authorization != f"Bearer {PROXY_AUTH_TOKEN}":
-            raise HTTPException(status_code=401, detail="Unauthorized")
+    if not auth.bearer_ok(authorization, PROXY_AUTH_TOKEN):
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
     raw_body = await request.json()
     inputs = raw_body.get("input")
@@ -3209,10 +3209,8 @@ async def chat_completions(
     request: Request,
     authorization: str | None = Header(None),
 ):
-    # Auth check — if PROXY_AUTH_TOKEN is set, require it
-    if PROXY_AUTH_TOKEN:
-        if not authorization or authorization != f"Bearer {PROXY_AUTH_TOKEN}":
-            raise HTTPException(status_code=401, detail="Unauthorized")
+    if not auth.bearer_ok(authorization, PROXY_AUTH_TOKEN):
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
     raw_body = await request.json()
     messages = raw_body.get("messages", [])

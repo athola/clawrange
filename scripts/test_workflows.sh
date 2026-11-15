@@ -12,6 +12,11 @@ fi
 
 PORT="${WORKFLOWS_PORT:-5678}"
 BASE="http://localhost:${PORT}"
+
+# Protected workflows routes need the bearer token (see workflows_auth.sh).
+# shellcheck source=scripts/workflows_auth.sh
+. ./scripts/workflows_auth.sh
+workflows_auth_init || exit 1
 PASS=0
 FAIL=0
 
@@ -35,6 +40,7 @@ fi
 echo ""
 echo "Test 2: Test webhook roundtrip"
 RESPONSE=$(curl -sf --connect-timeout 5 --max-time 15 -X POST "${BASE}/webhook-test/test" \
+  -H @"$WF_AUTH_HEADER" \
   -H "Content-Type: application/json" \
   -d '{"message": "ping", "source": "test-script"}' 2>/dev/null) || RESPONSE=""
 
@@ -59,6 +65,7 @@ if [ "$CRM_HEALTH" != "200" ]; then
   skip "active profile defines no crm (GET /healthz/crm -> ${CRM_HEALTH})"
 else
   RESPONSE=$(curl -sf --connect-timeout 5 --max-time 15 -X POST "${BASE}/crm/query/run" \
+    -H @"$WF_AUTH_HEADER" \
     -H "Content-Type: application/json" \
     -d '{"template": "lead_lookup", "params": {"q": "@"}}' 2>/dev/null) || RESPONSE=""
   if echo "$RESPONSE" | grep -q '"rows"'; then
@@ -75,6 +82,7 @@ if [ "$CRM_HEALTH" != "200" ]; then
   skip "active profile defines no crm (GET /healthz/crm -> ${CRM_HEALTH})"
 else
   RESPONSE=$(curl -sf --connect-timeout 5 --max-time 15 -X POST "${BASE}/crm/query/run" \
+    -H @"$WF_AUTH_HEADER" \
     -H "Content-Type: application/json" \
     -d '{"template": "new_leads_count", "params": {}}' 2>/dev/null) || RESPONSE=""
   if echo "$RESPONSE" | grep -q '"rows"'; then

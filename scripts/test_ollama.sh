@@ -57,7 +57,7 @@ fi
 # Step 4: Send test prompt and measure speed
 echo ""
 echo "Running inference test..."
-PROMPT="You are a helpful AI assistant for a manufactured home dealer. A customer asks: What financing options do you offer? Respond in 2 sentences."
+PROMPT="${OLLAMA_TEST_PROMPT:-You are a helpful assistant for a small business. A customer asks: What are your opening hours? Respond in 2 sentences.}"
 
 # Portable timing: use date +%s (seconds). macOS does not support %N.
 START_TIME=$(date +%s)

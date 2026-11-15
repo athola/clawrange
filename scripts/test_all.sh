@@ -15,6 +15,11 @@ OPENCLAW_PORT="${OPENCLAW_PORT:-3000}"
 WORKFLOWS_PORT="${WORKFLOWS_PORT:-5678}"
 DEERFLOW_PORT="${DEERFLOW_PORT:-2026}"
 
+# Protected workflows routes need the bearer token (see workflows_auth.sh).
+# shellcheck source=scripts/workflows_auth.sh
+. ./scripts/workflows_auth.sh
+workflows_auth_init || exit 1
+
 # POSIX-compatible results tracking (no arrays)
 RESULTS=""
 PASSED=0
@@ -35,7 +40,7 @@ echo "Test 1 — Stack Health"
 
 T1_OK=true
 
-printf "  OpenClaw (localhost:${OPENCLAW_PORT}): "
+printf "  OpenClaw (localhost:%s): " "${OPENCLAW_PORT}"
 if curl -sf --connect-timeout 5 --max-time 10 "http://localhost:${OPENCLAW_PORT}/healthz" >/dev/null 2>&1; then
   echo "UP"
 else
@@ -43,7 +48,7 @@ else
   T1_OK=false
 fi
 
-printf "  Workflows (localhost:${WORKFLOWS_PORT}): "
+printf "  Workflows (localhost:%s): " "${WORKFLOWS_PORT}"
 if curl -sf --connect-timeout 5 --max-time 10 "http://localhost:${WORKFLOWS_PORT}/healthz" >/dev/null 2>&1; then
   echo "UP"
 else
@@ -51,7 +56,7 @@ else
   T1_OK=false
 fi
 
-printf "  DeerFlow (localhost:${DEERFLOW_PORT}): "
+printf "  DeerFlow (localhost:%s): " "${DEERFLOW_PORT}"
 if curl -sf --connect-timeout 5 --max-time 10 "http://localhost:${DEERFLOW_PORT}/api/health" >/dev/null 2>&1; then
   echo "UP"
 else
@@ -84,6 +89,7 @@ echo ""
 # ─── Test 3: Webhook Roundtrip ─────────────────────────────────────
 echo "Test 3 — Webhook Roundtrip"
 RESPONSE=$(curl -sf --connect-timeout 5 --max-time 15 -X POST "http://localhost:${WORKFLOWS_PORT}/webhook-test/test" \
+  -H @"$WF_AUTH_HEADER" \
   -H "Content-Type: application/json" \
   -d '{"message": "ping", "source": "openclaw-test"}' 2>/dev/null) || RESPONSE=""
 
@@ -102,6 +108,7 @@ echo ""
 echo "Test 4 — Task Queue Lifecycle"
 TASK_DESC="stack-validation probe $(date +%s)"
 CREATE_RESPONSE=$(curl -sf --connect-timeout 5 --max-time 15 -X POST "http://localhost:${WORKFLOWS_PORT}/task" \
+  -H @"$WF_AUTH_HEADER" \
   -H "Content-Type: application/json" \
   -d "{\"description\": \"${TASK_DESC}\", \"priority\": 5}" 2>/dev/null) || CREATE_RESPONSE=""
 
@@ -112,9 +119,9 @@ if [ -z "$TASK_ID" ]; then
   fail
   echo "  POST /task did not return an id. Check: docker compose logs workflows"
 else
-  GET_RESPONSE=$(curl -sf --connect-timeout 5 --max-time 10 "http://localhost:${WORKFLOWS_PORT}/task/${TASK_ID}" 2>/dev/null) || GET_RESPONSE=""
+  GET_RESPONSE=$(curl -sf --connect-timeout 5 --max-time 10 -H @"$WF_AUTH_HEADER" "http://localhost:${WORKFLOWS_PORT}/task/${TASK_ID}" 2>/dev/null) || GET_RESPONSE=""
   echo "  Read response: $(echo "$GET_RESPONSE" | head -c 160)"
-  curl -sf --connect-timeout 5 --max-time 10 -X DELETE "http://localhost:${WORKFLOWS_PORT}/task/${TASK_ID}" >/dev/null 2>&1 || true
+  curl -sf --connect-timeout 5 --max-time 10 -X DELETE -H @"$WF_AUTH_HEADER" "http://localhost:${WORKFLOWS_PORT}/task/${TASK_ID}" >/dev/null 2>&1 || true
   if echo "$GET_RESPONSE" | grep -qF "$TASK_DESC"; then
     pass
   else

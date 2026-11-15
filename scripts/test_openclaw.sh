@@ -41,22 +41,35 @@ else
 fi
 
 # Test 3: Send a test message via agent CLI
+# Agent id must exist in openclaw/config/openclaw.json (max, max-ops).
+# OPENCLAW_TEST_PROMPT / OPENCLAW_TEST_EXPECT override the generic probe.
 echo ""
 echo "Test 3: Send test message"
-RESPONSE=$(docker exec msp-openclaw runuser -u node -- openclaw agent --agent main \
-  -m "What financing options does Longview Home Center offer?" --json 2>/dev/null) || RESPONSE=""
+AGENT_ID="${OPENCLAW_TEST_AGENT:-max}"
+PROMPT="${OPENCLAW_TEST_PROMPT:-Respond with exactly one word: PONG}"
+EXPECT="${OPENCLAW_TEST_EXPECT:-PONG}"
+ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/clawrange.XXXXXX")
+trap 'rm -f "$ERR_FILE"' EXIT
+AGENT_RC=0
+RESPONSE=$(docker exec msp-openclaw runuser -u node -- openclaw agent --agent "$AGENT_ID" \
+  -m "$PROMPT" --json 2>"$ERR_FILE") || AGENT_RC=$?
 
 AGENT_TEXT=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('result',{}).get('payloads',[{}])[0].get('text',''))" 2>/dev/null) || AGENT_TEXT=""
 
-if echo "$AGENT_TEXT" | grep -qiE "FHA|VA|conventional|in-house|financing"; then
-  pass "Got relevant financing response"
+if echo "$AGENT_TEXT" | grep -qiE "$EXPECT"; then
+  pass "Got expected response (${EXPECT})"
   echo "  Response: $(echo "$AGENT_TEXT" | head -c 200)"
 elif echo "$AGENT_TEXT" | grep -qi "billing\|credits\|balance\|insufficient"; then
   pass "Agent works (OpenRouter balance empty)"
   echo "  Top up at: https://openrouter.ai/settings/credits"
 else
-  fail "Response did not mention financing options"
+  fail "Response did not match: ${EXPECT}"
   echo "  Response: $(echo "$AGENT_TEXT" | head -c 300)"
+  if [ "$AGENT_RC" -ne 0 ] || [ -s "$ERR_FILE" ]; then
+    echo "  openclaw agent exit code: ${AGENT_RC}"
+    echo "  stderr:"
+    head -c 1000 "$ERR_FILE" | sed 's/^/    /'
+  fi
   echo "  Note: This may fail if OPENROUTER_API_KEY is not set."
 fi
 

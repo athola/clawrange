@@ -614,6 +614,7 @@ class TestBalanceGuard:
 # ─── Tier Command Interception ───────────────────────────────────
 
 
+@patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
 class TestTierCommand:
     """Verify /tier command interception returns synthetic response."""
 
@@ -680,6 +681,7 @@ class TestTierCommand:
         assert "Tier Status" not in content
 
 
+@patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
 class TestHelpCommand:
     """Verify !help command returns full command reference."""
 
