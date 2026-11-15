@@ -108,17 +108,22 @@ with open(src) as f:
 with open(dst, "w") as f:
     f.write(text.replace("$OPENROUTER_API_KEY", os.environ["OPENROUTER_API_KEY"]))
 PY
+    # deploy.sh passes this file to compose as --env-file. BIND_HOST stays
+    # loopback: never 0.0.0.0 (LAN-reachable under WSL mirrored networking).
     cat > deer-flow/.env <<EOF
 OPENAI_API_KEY=${OPENROUTER_VAL}
 OPENAI_API_BASE=https://openrouter.ai/api/v1
 PORT=${DEERFLOW_PORT:-2026}
+BIND_HOST=127.0.0.1
 EOF
     chmod 600 deer-flow/config.yaml deer-flow/.env
   )
 
-  echo "Starting DeerFlow..."
-  # Run DeerFlow compose in a subshell to avoid cd side effects
-  (cd deer-flow && COMPOSE_FILE=docker/docker-compose.yaml docker compose up -d)
+  echo "Starting DeerFlow (upstream scripts/deploy.sh: build + start)..."
+  # Upstream's deploy script sets DEER_FLOW_HOME, the config paths and the
+  # generated auth secrets its compose file needs; raw `docker compose up`
+  # fails with "invalid spec: :/app/backend/config.yaml:ro".
+  (cd deer-flow && ./scripts/deploy.sh)
 
   # Connect DeerFlow containers to msp-network if not already
   for container in $(docker ps --filter "name=deer-flow" --format '{{.Names}}' 2>/dev/null); do
@@ -138,7 +143,7 @@ while [ $TRIES -lt $MAX_TRIES ]; do
 
   DEERFLOW_OK="1"
   if [ "$WITH_DEERFLOW" = true ]; then
-    DEERFLOW_OK=$(curl -sf --connect-timeout 5 --max-time 10 "http://localhost:${DEERFLOW_PORT:-2026}/api/health" >/dev/null 2>&1 && echo "1" || echo "0")
+    DEERFLOW_OK=$(curl -sf --connect-timeout 5 --max-time 10 "http://localhost:${DEERFLOW_PORT:-2026}/health" >/dev/null 2>&1 && echo "1" || echo "0")
   fi
 
   if [ "$OPENCLAW_OK" = "1" ] && [ "$WORKFLOWS_OK" = "1" ] && [ "$DEERFLOW_OK" = "1" ]; then

@@ -57,7 +57,7 @@ else
 fi
 
 printf "  DeerFlow (localhost:%s): " "${DEERFLOW_PORT}"
-if curl -sf --connect-timeout 5 --max-time 10 "http://localhost:${DEERFLOW_PORT}/api/health" >/dev/null 2>&1; then
+if curl -sf --connect-timeout 5 --max-time 10 "http://localhost:${DEERFLOW_PORT}/health" >/dev/null 2>&1; then
   echo "UP"
 else
   echo "DOWN (optional)"
@@ -148,12 +148,26 @@ fi
 echo ""
 
 # ─── Test 6: DeerFlow Research ──────────────────────────────────────
+# DeerFlow's gateway rejects anonymous /api calls. Upstream deploy.sh writes an
+# internal service token into the clone; send it via curl -K on stdin so the
+# token never appears in argv (ps). POSTs also need the CSRF double-submit
+# pair: the same random value as cookie and header.
+DF_TOKEN_FILE="deer-flow/backend/.deer-flow/.internal-auth-token"
+df_curl() {
+  if [ -r "$DF_TOKEN_FILE" ]; then
+    df_csrf=$(openssl rand -hex 16)
+    printf 'header = "X-DeerFlow-Internal-Token: %s"\nheader = "X-CSRF-Token: %s"\ncookie = "csrf_token=%s"\n' \
+      "$(cat "$DF_TOKEN_FILE")" "$df_csrf" "$df_csrf" | curl -K - "$@"
+  else
+    curl "$@"
+  fi
+}
 echo "Test 6 — DeerFlow Research (optional)"
-if ! curl -sf --connect-timeout 5 --max-time 10 "http://localhost:${DEERFLOW_PORT}/api/health" >/dev/null 2>&1; then
+if ! curl -sf --connect-timeout 5 --max-time 10 "http://localhost:${DEERFLOW_PORT}/health" >/dev/null 2>&1; then
   echo "  DeerFlow is not running. Skipping."
   skip
 else
-  RESPONSE=$(curl -sf --connect-timeout 5 --max-time 120 -X POST "http://localhost:${DEERFLOW_PORT}/api/langgraph/runs" \
+  RESPONSE=$(df_curl -sf --connect-timeout 5 --max-time 120 -X POST "http://localhost:${DEERFLOW_PORT}/api/langgraph/runs/wait" \
     -H "Content-Type: application/json" \
     -d '{
       "input": {

@@ -156,7 +156,7 @@ seed-demo: ## Load the lead-crm demo leads into the CRM for an offline demo
 ps: ## Show running containers
 	@docker compose ps 2>/dev/null; \
 	if [ -f deer-flow/docker/docker-compose.yaml ]; then \
-		(cd deer-flow 2>/dev/null && COMPOSE_FILE=docker/docker-compose.yaml docker compose ps 2>/dev/null) || true; \
+		docker ps -a --filter label=com.docker.compose.project=deer-flow; \
 	fi
 
 logs: ## Tail logs from all services
@@ -174,7 +174,7 @@ health: ## Quick health check (no test logic, just curl)
 	@[ -f .env ] && set -a && . ./.env && set +a || true; \
 	printf "Workflows: "; curl -sf --connect-timeout 5 http://localhost:$${WORKFLOWS_PORT:-5678}/healthz && echo " OK" || echo "DOWN"
 	@[ -f .env ] && set -a && . ./.env && set +a || true; \
-	printf "DeerFlow:  "; curl -sf --connect-timeout 5 http://localhost:$${DEERFLOW_PORT:-2026}/api/health && echo " OK" || echo "DOWN (optional)"
+	printf "DeerFlow:  "; curl -sf --connect-timeout 5 http://localhost:$${DEERFLOW_PORT:-2026}/health && echo " OK" || echo "DOWN (optional)"
 
 # ─── Linting ─────────────────────────────────────────────────────
 

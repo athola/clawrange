@@ -21,6 +21,7 @@ data/
 
 # DeerFlow cloned repo
 deer-flow/
+deer-flow.tmp/
 
 
 # Ollama models

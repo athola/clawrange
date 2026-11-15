@@ -27,7 +27,13 @@ fi
 # Remove DeerFlow clone
 if [ -d deer-flow ]; then
   echo "Removing DeerFlow clone..."
-  rm -rf deer-flow
+  if ! rm -rf deer-flow 2>/dev/null; then
+    # DeerFlow's containers write root-owned runtime data under
+    # backend/.deer-flow; delete that as root in a throwaway container.
+    docker run --rm -v "$PWD/deer-flow/backend:/backend" alpine:3.20 \
+      rm -rf /backend/.deer-flow
+    rm -rf deer-flow
+  fi
 fi
 
 # Remove DeerFlow output

@@ -41,7 +41,13 @@ compose_down
 # Stop DeerFlow if running
 if [ -d deer-flow ] && [ -f deer-flow/docker/docker-compose.yaml ]; then
   echo "Stopping DeerFlow..."
-  (cd deer-flow && export COMPOSE_FILE=docker/docker-compose.yaml && compose_down)
+  # Upstream deploy.sh started it and exports the paths its compose file
+  # interpolates; a bare `docker compose down` fails with "invalid spec".
+  (cd deer-flow && ./scripts/deploy.sh down) || true
+  if [ "$REMOVE_ALL" = true ]; then
+    docker volume ls -q --filter label=com.docker.compose.project=deer-flow \
+      | xargs -r docker volume rm >/dev/null 2>&1 || true
+  fi
 fi
 
 echo "All services stopped."
