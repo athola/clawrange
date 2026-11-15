@@ -265,6 +265,14 @@ def channel_health() -> dict[str, dict[str, Any]]:
     if not web_configured:
         report["discourse_web"]["reason"] = "ZAI_API_KEY or OPENROUTER_API_KEY not set"
 
+    # academic: public arXiv + Semantic Scholar APIs, no key needed.
+    report["academic"] = {"source": "arxiv+semantic_scholar", "configured": True}
+
+    # triz: an LLM call through the proxy, so the same key as discourse_web.
+    report["triz"] = {"source": "glm-web", "configured": web_configured}
+    if not web_configured:
+        report["triz"]["reason"] = "ZAI_API_KEY or OPENROUTER_API_KEY not set"
+
     return report
 
 

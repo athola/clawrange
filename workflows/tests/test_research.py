@@ -490,6 +490,22 @@ class TestChannelHealth:
             assert "configured" in info
             assert "source" in info
 
+    def test_reports_every_dispatchable_channel(self):
+        # /research accepts academic and triz too; a report that omits
+        # them leaves an empty result from those channels undiagnosable.
+        import research
+
+        assert set(research.channel_health()) == set(research._CHANNEL_FETCHER_NAMES)
+
+    def test_triz_shares_the_llm_key_requirement(self, monkeypatch):
+        monkeypatch.delenv("ZAI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        from research import channel_health
+
+        triz = channel_health()["triz"]
+        assert triz["configured"] is False
+        assert "OPENROUTER_API_KEY" in triz["reason"]
+
     def test_unconfigured_channel_includes_reason(self, monkeypatch):
         # Force github 'not configured' branch. No importlib.reload: it
         # would leak the emptied GITHUB_PAT constant into later tests;
