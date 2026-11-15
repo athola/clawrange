@@ -57,7 +57,8 @@ reset: ## Stop, drop containers and the DeerFlow clone; keeps data/ (asks first)
 
 .PHONY: test test-openclaw test-workflows test-deerflow test-ollama test-research \
 	test-unit validate tome-bridge tome-bridge-watch \
-	retrieval-eval retrieval-eval-refresh retrieval-harvest retrieval-eval-brain
+	retrieval-eval retrieval-eval-refresh retrieval-harvest retrieval-eval-brain \
+	models-check
 
 test: ## Run full validation suite (6 tests)
 	@./scripts/test_all.sh
@@ -124,6 +125,9 @@ retrieval-harvest: ## Add John's real brain searches to data/retrieval/golden.js
 retrieval-eval-brain: ## Compare search configs on the real brain with your labelled queries
 	@$(LOAD_ENV); \
 	cd workflows && uv run python retrieval_eval.py --brain ../data/brain/brain.db --refresh
+
+models-check: ## Check configured OpenRouter model ids against the live catalog
+	@uv run python scripts/check_models.py
 
 validate: ## Validate config files and project structure
 	@uv run python tests/validate_stack.py
