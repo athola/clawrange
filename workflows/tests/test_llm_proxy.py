@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 import digest
+import heartbeat
 import llm_proxy
 import research_router
 import telegram
@@ -1327,7 +1328,7 @@ class TestPersonaBackstoryStripping:
     Mode, What You Can Do) stay so the model still understands its job."""
 
     def test_strips_who_you_are_section(self):
-        from llm_proxy import _strip_persona_backstory
+        from heartbeat import _strip_persona_backstory
 
         soul = (
             "You are John-117, Alex's executive assistant.\n\n"
@@ -1345,7 +1346,7 @@ class TestPersonaBackstoryStripping:
         assert "Manage the task queue" in stripped
 
     def test_strips_your_character_section(self):
-        from llm_proxy import _strip_persona_backstory
+        from heartbeat import _strip_persona_backstory
 
         soul = (
             "## Your Character\n"
@@ -1366,14 +1367,14 @@ class TestPersonaBackstoryStripping:
         mentions of John-117 in operational instructions (e.g.
         'You [John-117] manage the task queue') are unavoidable but rare
         enough that Exa won't pivot to Halopedia for them."""
-        from llm_proxy import _strip_persona_backstory
+        from heartbeat import _strip_persona_backstory
 
         soul = "## Marketing Mode\nJohn-117 drafts comments for Alex's products.\n"
         stripped = _strip_persona_backstory(soul)
         assert "Marketing Mode" in stripped
 
     def test_empty_soul_returns_empty(self):
-        from llm_proxy import _strip_persona_backstory
+        from heartbeat import _strip_persona_backstory
 
         assert _strip_persona_backstory("") == ""
         assert _strip_persona_backstory("   ") == ""
@@ -1400,11 +1401,11 @@ class TestWorkPromptPersonaRouting:
     )
 
     @patch.dict("os.environ", FAKE_ENV)
-    @patch("llm_proxy._load_soul")
+    @patch("heartbeat._load_soul")
     def test_search_prompt_omits_halo_character_tokens(self, mock_soul):
         import asyncio
 
-        from llm_proxy import _build_work_prompt
+        from heartbeat import _build_work_prompt
 
         mock_soul.return_value = self._FAKE_SOUL
         prompt = asyncio.run(
@@ -1428,14 +1429,14 @@ class TestWorkPromptPersonaRouting:
             )
 
     @patch.dict("os.environ", FAKE_ENV)
-    @patch("llm_proxy._load_soul")
+    @patch("heartbeat._load_soul")
     def test_non_search_prompt_keeps_full_persona(self, mock_soul):
         """Regression guard: direct chat (no web search) still needs the
         full John-117 character for in-character replies. The strip only
         applies to search-tier routes."""
         import asyncio
 
-        from llm_proxy import _build_work_prompt
+        from heartbeat import _build_work_prompt
 
         mock_soul.return_value = self._FAKE_SOUL
         prompt = asyncio.run(
@@ -2823,7 +2824,7 @@ class TestHeartbeatInterceptor:
         assert any("PAST-OLD-CLIP" in text for text in sent)
         assert all(len(text) <= telegram.MAX_CHARS for text in sent)
 
-    @patch("llm_proxy._llm_suggest_task", new_callable=AsyncMock, return_value=None)
+    @patch("heartbeat._llm_suggest_task", new_callable=AsyncMock, return_value=None)
     @patch("llm_proxy._check_openrouter_balance", new_callable=AsyncMock)
     def test_low_balance_alert_not_recreated_after_completion(
         self, mock_balance, _mock_suggest
@@ -3000,7 +3001,7 @@ class TestHeartbeatInterceptor:
         assert any("old task from earlier" in text for text in sent)
 
     @patch(
-        "llm_proxy._current_thinking_subjects",
+        "heartbeat._current_thinking_subjects",
         return_value=["Strix Halo 128GB"],
     )
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
@@ -3068,11 +3069,11 @@ class TestHeartbeatInterceptor:
         with (
             patch.dict("os.environ", {"HEARTBEAT_LLM_SUGGEST": "1"}),
             patch(
-                "llm_proxy._current_thinking_subjects",
+                "heartbeat._current_thinking_subjects",
                 return_value=TestGroundedThinking.SUBJECTS,
             ),
             patch(
-                "llm_proxy._llm_suggest_task",
+                "heartbeat._llm_suggest_task",
                 new_callable=AsyncMock,
                 return_value=suggestion,
             ),
@@ -3099,7 +3100,7 @@ class TestHeartbeatInterceptor:
         llm_proxy._proactive_state.pop("llm_thinking", None)
         llm_proxy._proactive_state["stale_tasks"] = time.monotonic()
         with patch(
-            "llm_proxy._llm_suggest_task",
+            "heartbeat._llm_suggest_task",
             new_callable=AsyncMock,
             return_value=suggestion,
         ) as sug:
@@ -3129,8 +3130,8 @@ class TestHeartbeatInterceptor:
         llm_proxy._proactive_state.pop("llm_thinking", None)
         llm_proxy._proactive_state["stale_tasks"] = time.monotonic()
         with (
-            patch("llm_proxy._current_thinking_subjects", return_value=[]),
-            patch("llm_proxy._llm_suggest_task", new_callable=AsyncMock) as sug,
+            patch("heartbeat._current_thinking_subjects", return_value=[]),
+            patch("heartbeat._llm_suggest_task", new_callable=AsyncMock) as sug,
         ):
             client.post(
                 "/v1/chat/completions",
@@ -3224,7 +3225,7 @@ class TestSemanticDedup:
 
     def test_semantic_dedup_catches_rephrased_tasks(self):
         """Two differently worded tier-review tasks should be flagged as duplicates."""
-        from llm_proxy import _has_recent_task
+        from heartbeat import _has_recent_task
 
         queue = [
             {
@@ -3243,7 +3244,7 @@ class TestSemanticDedup:
 
     def test_semantic_dedup_allows_different_tasks(self):
         """Genuinely different tasks should not be flagged as duplicates."""
-        from llm_proxy import _has_recent_task
+        from heartbeat import _has_recent_task
 
         queue = [
             {
@@ -3261,7 +3262,7 @@ class TestSemanticDedup:
 
     def test_semantic_dedup_ignores_expired_tasks(self):
         """Tasks older than the cutoff should not block new ones."""
-        from llm_proxy import _has_recent_task
+        from heartbeat import _has_recent_task
 
         old_time = (
             datetime.now(UTC) - __import__("datetime").timedelta(hours=25)
@@ -3282,7 +3283,7 @@ class TestSemanticDedup:
 
     def test_llm_thinking_interval_is_fifteen_minutes(self):
         """Verify LLM thinking interval is 900s (15 min), not 300s."""
-        from llm_proxy import _PROACTIVE_INTERVALS
+        from heartbeat import _PROACTIVE_INTERVALS
 
         assert _PROACTIVE_INTERVALS["llm_thinking"] == 900
 
@@ -3505,7 +3506,7 @@ class TestTaskNeedsWeb:
         WHEN _task_needs_web is called
         THEN it returns True so the work runner enables GLM web search.
         """
-        from llm_proxy import _task_needs_web
+        from heartbeat import _task_needs_web
 
         for desc in (
             "Find recent reddit posts about MSP pricing",
@@ -3522,7 +3523,7 @@ class TestTaskNeedsWeb:
         WHEN _task_needs_web is called
         THEN it returns False so the LLM answers from training data.
         """
-        from llm_proxy import _task_needs_web
+        from heartbeat import _task_needs_web
 
         for desc in (
             "Summarize today's standup notes",
@@ -3535,7 +3536,7 @@ class TestTaskNeedsWeb:
     def test_match_is_case_insensitive(self):
         """Keyword detection lowercases the input — REDDIT and Reddit must both
         match."""
-        from llm_proxy import _task_needs_web
+        from heartbeat import _task_needs_web
 
         assert _task_needs_web("Scan REDDIT for promo opportunities") is True
         assert _task_needs_web("scan reddit for promo opportunities") is True
@@ -3545,7 +3546,7 @@ class TestTaskNeedsWeb:
         Lock the canonical keyword set. If a keyword is removed, this fails so
         the change becomes a conscious decision rather than silent drift.
         """
-        from llm_proxy import _WEB_SEARCH_KEYWORDS
+        from heartbeat import _WEB_SEARCH_KEYWORDS
 
         # Anchors that must remain — adding new keywords is fine, deletions need
         # an explicit human review since downstream tasks rely on them.
@@ -3582,10 +3583,10 @@ class TestLlmWorkTaskRouting:
 
         with (
             patch.object(llm_proxy, "_llm_call", side_effect=fake_call),
-            patch.object(llm_proxy, "_build_work_prompt", side_effect=fake_prompt),
+            patch.object(heartbeat, "_build_work_prompt", side_effect=fake_prompt),
         ):
             result = asyncio.run(
-                llm_proxy._llm_work_task("Scan reddit for MSP pain points")
+                heartbeat._llm_work_task("Scan reddit for MSP pain points")
             )
 
         assert result == "ok"
@@ -3615,9 +3616,9 @@ class TestLlmWorkTaskRouting:
 
         with (
             patch.object(llm_proxy, "_llm_call", side_effect=fake_call),
-            patch.object(llm_proxy, "_build_work_prompt", side_effect=fake_prompt),
+            patch.object(heartbeat, "_build_work_prompt", side_effect=fake_prompt),
         ):
-            result = asyncio.run(llm_proxy._llm_work_task("Summarize standup notes"))
+            result = asyncio.run(heartbeat._llm_work_task("Summarize standup notes"))
 
         assert result == "summary"
         assert captured["max_tokens"] == 500
@@ -3644,9 +3645,9 @@ class TestLlmWorkTaskRouting:
 
         with (
             patch.object(llm_proxy, "_llm_call", side_effect=fake_call),
-            patch.object(llm_proxy, "_build_work_prompt", side_effect=fake_prompt),
+            patch.object(heartbeat, "_build_work_prompt", side_effect=fake_prompt),
         ):
-            result = asyncio.run(llm_proxy._llm_work_task("Send weekly invoice"))
+            result = asyncio.run(heartbeat._llm_work_task("Send weekly invoice"))
 
         assert "Could not reach LLM" in result
         assert "Alex should handle manually" in result
@@ -3667,18 +3668,16 @@ class TestBuildWorkPromptFormatting:
         """
         import asyncio
 
-        import llm_proxy
-
         with (
-            patch.object(llm_proxy, "_load_soul", return_value=""),
+            patch.object(heartbeat, "_load_soul", return_value=""),
             patch.object(
-                llm_proxy,
+                heartbeat,
                 "_gather_system_state",
                 new=AsyncMock(return_value="STATE"),
             ),
         ):
             prompt = asyncio.run(
-                llm_proxy._build_work_prompt("Find reddit threads", web_search=True)
+                heartbeat._build_work_prompt("Find reddit threads", web_search=True)
             )
 
         assert "OUTPUT FORMAT (for Telegram delivery):" in prompt
@@ -3696,18 +3695,16 @@ class TestBuildWorkPromptFormatting:
         """
         import asyncio
 
-        import llm_proxy
-
         with (
-            patch.object(llm_proxy, "_load_soul", return_value=""),
+            patch.object(heartbeat, "_load_soul", return_value=""),
             patch.object(
-                llm_proxy,
+                heartbeat,
                 "_gather_system_state",
                 new=AsyncMock(return_value="STATE"),
             ),
         ):
             prompt = asyncio.run(
-                llm_proxy._build_work_prompt("Summarize standup", web_search=False)
+                heartbeat._build_work_prompt("Summarize standup", web_search=False)
             )
 
         assert "OUTPUT FORMAT (for Telegram delivery):" not in prompt
@@ -3722,19 +3719,17 @@ class TestBuildWorkPromptFormatting:
         """
         import asyncio
 
-        import llm_proxy
-
         with (
-            patch.object(llm_proxy, "_load_soul", return_value=""),
+            patch.object(heartbeat, "_load_soul", return_value=""),
             patch.object(
-                llm_proxy,
+                heartbeat,
                 "_gather_system_state",
                 new=AsyncMock(return_value="STATE"),
             ),
         ):
             for flag in (True, False):
                 prompt = asyncio.run(
-                    llm_proxy._build_work_prompt("any task", web_search=flag)
+                    heartbeat._build_work_prompt("any task", web_search=flag)
                 )
                 assert "Do NOT invent URLs" in prompt, f"missing for web={flag}"
 
@@ -4185,10 +4180,9 @@ class TestThinkingPromptDoesNotAskAlex:
         # _load_soul() reads /app/soul.md, absent under test -- without a soul
         # _build_thinking_prompt falls back to a short branch that carries
         # neither rule, so the assertions would pass vacuously.
-        import llm_proxy
 
-        monkeypatch.setattr(llm_proxy, "_load_soul", lambda: "You are Max.")
-        return llm_proxy._build_thinking_prompt(["skrills"])
+        monkeypatch.setattr(heartbeat, "_load_soul", lambda: "You are Max.")
+        return heartbeat._build_thinking_prompt(["skrills"])
 
     def test_prompt_does_not_ask_for_knowledge_building(self, monkeypatch):
         assert "suggest tasks that BUILD knowledge" not in self._prompt(monkeypatch)
@@ -4510,19 +4504,19 @@ class TestGroundedThinking:
     ]
 
     def test_drops_invented_tasks(self):
-        from llm_proxy import _is_grounded_suggestion
+        from heartbeat import _is_grounded_suggestion
 
         for text in self.INVENTED:
             assert not _is_grounded_suggestion(text, self.SUBJECTS), text
 
     def test_keeps_runnable_research_on_real_subjects(self):
-        from llm_proxy import _is_grounded_suggestion
+        from heartbeat import _is_grounded_suggestion
 
         for text in self.LEGIT:
             assert _is_grounded_suggestion(text, self.SUBJECTS), text
 
     def test_subjects_from_projects_and_deal_targets(self):
-        from llm_proxy import _thinking_subjects
+        from heartbeat import _thinking_subjects
 
         subjects = _thinking_subjects(
             [{"slug": "skrills"}, {"slug": "simple-resume"}],
@@ -4549,15 +4543,14 @@ class TestGroundedThinking:
         ]
 
     def test_subjects_without_deals_block(self):
-        from llm_proxy import _thinking_subjects
+        from heartbeat import _thinking_subjects
 
         assert _thinking_subjects([{"slug": "skrills"}], None) == ["skrills"]
 
     def test_prompt_lists_subjects_and_capabilities(self, monkeypatch):
-        import llm_proxy
 
-        monkeypatch.setattr(llm_proxy, "_load_soul", lambda: "You are Max.")
-        prompt = llm_proxy._build_thinking_prompt(
+        monkeypatch.setattr(heartbeat, "_load_soul", lambda: "You are Max.")
+        prompt = heartbeat._build_thinking_prompt(
             self.SUBJECTS, "Stack gaps: vram: nothing with 24 GB+"
         )
         for subject in self.SUBJECTS:
@@ -4590,18 +4583,18 @@ class TestGenericOperatorWording:
 
         with (
             patch.object(llm_proxy, "_llm_call", side_effect=fake_call),
-            patch.object(llm_proxy, "_build_work_prompt", side_effect=fake_prompt),
+            patch.object(heartbeat, "_build_work_prompt", side_effect=fake_prompt),
         ):
-            result = asyncio.run(llm_proxy._llm_work_task("Send weekly invoice"))
+            result = asyncio.run(heartbeat._llm_work_task("Send weekly invoice"))
         # The starter profile's placeholder owner.name is "Operator".
         assert "Operator should handle manually" in result
         assert "Alex" not in result
 
     def test_no_persona_hygiene_without_config(self):
         soul = "## Who You Are\nlore\n## What You Can Do\njob"
-        assert llm_proxy._strip_persona_backstory(soul) == soul
+        assert heartbeat._strip_persona_backstory(soul) == soul
         assert not llm_proxy._is_persona_citation("https://halopedia.test", "x")
-        assert llm_proxy._operator_label() == "OPERATOR"
+        assert heartbeat._operator_label() == "OPERATOR"
 
     def test_profile_without_owner_says_the_operator(self):
         import tenant_profile
@@ -4612,9 +4605,9 @@ class TestGenericOperatorWording:
 
 def test_sentence_start_keeps_multi_word_names():
     # str.capitalize would turn "Mary Ann" into "Mary ann".
-    assert llm_proxy._sentence_start("Mary Ann") == "Mary Ann"
-    assert llm_proxy._sentence_start("the operator") == "The operator"
-    assert llm_proxy._sentence_start("") == ""
+    assert heartbeat._sentence_start("Mary Ann") == "Mary Ann"
+    assert heartbeat._sentence_start("the operator") == "The operator"
+    assert heartbeat._sentence_start("") == ""
 
 
 class TestLoadSoulPrefersRenderedWorkspace:
@@ -4623,21 +4616,19 @@ class TestLoadSoulPrefersRenderedWorkspace:
     heartbeat prompts. Prefer the rendered workspace copy when present."""
 
     def test_workspace_soul_wins(self, tmp_path, monkeypatch):
-        import llm_proxy
 
         (tmp_path / "workspace").mkdir()
         (tmp_path / "workspace" / "SOUL.md").write_text("rendered soul\n")
         monkeypatch.setenv("OPENCLAW_STATE_DIR", str(tmp_path))
-        assert llm_proxy._load_soul() == "rendered soul"
+        assert heartbeat._load_soul() == "rendered soul"
 
     def test_falls_back_to_bundled_soul(self, tmp_path, monkeypatch):
-        import llm_proxy
 
         bundled = tmp_path / "soul.md"
         bundled.write_text("bundled soul\n")
         monkeypatch.setenv("OPENCLAW_STATE_DIR", str(tmp_path / "missing"))
-        monkeypatch.setattr(llm_proxy, "_SOUL_MD_PATH", bundled)
-        assert llm_proxy._load_soul() == "bundled soul"
+        monkeypatch.setattr(heartbeat, "_SOUL_MD_PATH", bundled)
+        assert heartbeat._load_soul() == "bundled soul"
 
 
 class TestNextHeartbeatTask:
@@ -4647,7 +4638,6 @@ class TestNextHeartbeatTask:
     before their real consumer ever saw them."""
 
     def test_skips_tome_and_draft_tasks(self):
-        import llm_proxy
 
         pending = [
             {"id": "a", "description": "research:tome: agent platforms"},
@@ -4657,20 +4647,18 @@ class TestNextHeartbeatTask:
             {"id": "e", "description": "[DRAFT] income: weekly strategy review"},
             {"id": "f", "description": "check disk usage"},
         ]
-        assert llm_proxy._next_heartbeat_task(pending)["id"] == "f"
+        assert heartbeat._next_heartbeat_task(pending)["id"] == "f"
 
     def test_comment_drafts_stay_heartbeat_owned(self):
         """Comment-draft tasks instruct the LLM worker to write the reply."""
-        import llm_proxy
 
         pending = [{"id": "a", "description": "[DRAFT] Comment draft for x on y."}]
-        assert llm_proxy._next_heartbeat_task(pending)["id"] == "a"
+        assert heartbeat._next_heartbeat_task(pending)["id"] == "a"
 
     def test_none_when_only_foreign_tasks(self):
-        import llm_proxy
 
         pending = [{"id": "a", "description": "[DRAFT] income: weekly review"}]
-        assert llm_proxy._next_heartbeat_task(pending) is None
+        assert heartbeat._next_heartbeat_task(pending) is None
 
 
 @patch.dict("os.environ", FAKE_ENV)
@@ -4878,7 +4866,7 @@ class TestHeartbeatRobustness:
 
         t = brain_db.create_task("Test task for heartbeat")
         with patch(
-            "llm_proxy._llm_work_task", AsyncMock(side_effect=RuntimeError("boom"))
+            "heartbeat._llm_work_task", AsyncMock(side_effect=RuntimeError("boom"))
         ):
             r = self._beat()
         assert r.status_code == 200
@@ -4894,7 +4882,7 @@ class TestHeartbeatRobustness:
         work = AsyncMock(return_value="done")
         with (
             patch.object(brain_db, "claim_task", side_effect=ValueError("claimed")),
-            patch("llm_proxy._llm_work_task", work),
+            patch("heartbeat._llm_work_task", work),
         ):
             r = self._beat()
         assert r.status_code == 200
@@ -4909,7 +4897,7 @@ class TestHeartbeatRobustness:
         work = AsyncMock(return_value="done")
         with (
             patch.object(brain_db, "claim_task", return_value=None),
-            patch("llm_proxy._llm_work_task", work),
+            patch("heartbeat._llm_work_task", work),
         ):
             assert self._beat().status_code == 200
         work.assert_not_called()
@@ -4920,7 +4908,7 @@ class TestHeartbeatRobustness:
 
         brain_db.create_task("Test task for heartbeat")
         with (
-            patch("llm_proxy._llm_work_task", AsyncMock(return_value="ok")),
+            patch("heartbeat._llm_work_task", AsyncMock(return_value="ok")),
             patch.object(brain_db, "complete_task", side_effect=ValueError("gone")),
         ):
             assert self._beat().status_code == 200
@@ -4935,7 +4923,7 @@ class TestHeartbeatRobustness:
         async def hang(_desc):
             await asyncio.sleep(10)
 
-        with patch("llm_proxy._llm_work_task", hang):
+        with patch("heartbeat._llm_work_task", hang):
             r = self._beat()
         assert r.status_code == 200
         assert brain_db.get_task(t["id"])["status"] == "failed"
@@ -5181,15 +5169,13 @@ class TestLowUptimeClock:
     def _fake_time(self, monkeypatch):
         from types import SimpleNamespace
 
-        monkeypatch.setattr(
-            llm_proxy,
-            "time",
-            SimpleNamespace(monotonic=lambda: 5.0, time=time.time),
-        )
+        fake = SimpleNamespace(monotonic=lambda: 5.0, time=time.time)
+        monkeypatch.setattr(llm_proxy, "time", fake)
+        monkeypatch.setattr(heartbeat, "time", fake)
 
     def test_proactive_due_on_fresh_host(self, monkeypatch):
         self._fake_time(monkeypatch)
-        assert llm_proxy._proactive_ready("never_ran") is True
+        assert heartbeat._proactive_ready("never_ran") is True
 
     def test_notification_not_debounced_on_fresh_host(self, monkeypatch):
         self._fake_time(monkeypatch)
