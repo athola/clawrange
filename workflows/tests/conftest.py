@@ -106,9 +106,11 @@ def _reset_brain_db():
     try:
         for table in _resettable_tables(conn):
             conn.execute(f"DELETE FROM {table}")
-        if brain_db._has_vec:
-            conn.execute("DELETE FROM chunk_embeddings")
-        conn.execute("DELETE FROM pages_fts")
+        # Virtual tables: pages_fts plus one sqlite-vec table per model.
+        for (vtable,) in conn.execute(
+            "SELECT name FROM pragma_table_list WHERE type='virtual' AND schema='main'"
+        ).fetchall():
+            conn.execute(f"DELETE FROM {vtable}")
         conn.commit()
     finally:
         conn.execute("PRAGMA foreign_keys=ON")

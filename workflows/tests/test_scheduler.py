@@ -183,3 +183,32 @@ class TestCatchUpFlag:
 
         monkeypatch.setattr(tenant_profile, "active_profile", lambda: None)
         assert sch.catch_up_ids() == set()
+
+
+class TestMaintenanceJobs:
+    """scan_cache had a pruning method nothing ever called, so the dedup
+    table grew without bound. It now runs as a daily internal job."""
+
+    def test_register_maintenance_adds_daily_prune(self, db):
+        s = AsyncIOScheduler(timezone="UTC")
+        sch.register_maintenance(s, db)
+        job = s.get_job("maintenance_prune_scan_cache")
+        assert job is not None
+        assert "cron" in str(job.trigger)
+
+    def test_prune_job_removes_old_rows(self, db):
+        db.mark_seen("reddit_post", "old", "p")
+        db._conn.execute("UPDATE scan_cache SET seen_at = '2000-01-01T00:00:00+00:00'")
+        db.mark_seen("reddit_post", "new", "p")
+        sch.prune_scan_cache_job(db)
+        assert not db.is_seen("reddit_post", "old", "p")
+        assert db.is_seen("reddit_post", "new", "p")
+
+
+class TestEmbeddingBackfillJob:
+    def test_registered_every_ten_minutes(self, db):
+        s = AsyncIOScheduler(timezone="UTC")
+        sch.register_maintenance(s, db)
+        job = s.get_job("maintenance_embed_backfill")
+        assert job is not None and "interval" in str(job.trigger)
+        assert job.trigger.interval.total_seconds() == 600

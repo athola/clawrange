@@ -15,13 +15,16 @@ Tailscale and Caddy gateway.
 - `openclaw/`: assistant config: `soul.md` (persona), `soul-ops.md`
   (ops mode), `HEARTBEAT.md` (10-minute heartbeat instructions),
   `config/openclaw.json` (tool routing)
-- `workflows/`: FastAPI service replacing n8n:
+- `workflows/`: FastAPI service:
   - `app.py`: FastAPI entrypoint and route registration
   - `auth.py`: app-wide bearer auth (`PROXY_AUTH_TOKEN`), fails closed;
     only `/healthz*`, `GET /tier`, `GET /sched[/{id}]` are public
   - `rundown.py`, `deals.py`, `deal_sources.py`: daily outreach and
     homelab deal rundowns
   - `brain.py`, `brain_db.py`: persistent knowledge store and task queue
+  - `embeddings.py`: OpenRouter embeddings (`EMBED_MODEL`/`EMBED_DIM`), one
+    sqlite-vec table per model, 10-minute backfill job; hybrid search embeds
+    the query and falls back to keyword-only
   - `llm_proxy.py`: OpenAI-compatible proxy with tiered routing,
     web-search routing, anti-hallucination guard, balance circuit breaker
   - `scheduler.py`, `generators.py`: APScheduler jobs and generators
@@ -49,7 +52,9 @@ Tailscale and Caddy gateway.
 - `deerflow/`: DeerFlow research agent config (optional, OpenRouter)
 - `scripts/`: POSIX shell scripts for lifecycle and testing
 - `tests/`: Python validation suite (`validate_stack.py`)
-- `docs/`: project brief, specification, testbed and deployment guides
+- `docs/`: testbed and deployment guides, the multi-tenant and
+  research/marketing operator guides, `tradeoffs.md` (decision journal);
+  finished plans and specs live in `docs/archive/`
 
 ## Key Conventions
 
@@ -71,7 +76,7 @@ Tailscale and Caddy gateway.
 - Dev compose bind-mounts `./workflows` and runs `uvicorn --reload`; prod
   (`make start-prod`) runs the baked image without reload, so code changes
   need a rebuild.
-- Workflows runs on port 5678 (replaces the n8n port).
+- Workflows runs on port 5678.
 - DeerFlow runs via its own docker-compose (multi-service), connected to
   `msp-network`.
 - Single uvicorn worker is a hard requirement: APScheduler 3.x (pinned

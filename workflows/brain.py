@@ -9,8 +9,10 @@ Starlette's path converter will greedily consume the sub-path segment.
 """
 
 from fastapi import APIRouter, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
+import embeddings
 from brain_db import BrainDB, LinkType, PageType
 
 # ─── Request/Response Models ──────────────────────────────────────
@@ -47,31 +49,34 @@ def create_brain_router(db: BrainDB) -> APIRouter:
 
     # Search (no slug conflict)
     @router.get("/search")
-    def search(q: str = "", mode: str = "hybrid", limit: int = 10):
+    async def search(q: str = "", mode: str = "hybrid", limit: int = 10):
         if not q.strip():
             return {"results": [], "query": q, "mode": mode, "total": 0}
-
-        if mode == "keyword":
-            results = db.search_keyword(q, limit)
-            for r in results:
-                r["match_type"] = "keyword"
-        elif mode == "vector":
-            if not db.has_embeddings():
-                raise HTTPException(
-                    503, "Vector search unavailable — no embedding engine"
-                )
-            # Vector-only requires embeddings to be pre-generated;
-            # callers must supply query_vector via the internal API.
-            # For HTTP, fall back to hybrid which handles missing vectors gracefully.
-            results = db.search_hybrid(q, query_vector=None, limit=limit)
-        elif mode == "hybrid":
-            # Hybrid search: keyword + vector via RRF.
-            # Without a query_vector, falls back to keyword-only automatically.
-            results = db.search_hybrid(q, query_vector=None, limit=limit)
-        else:
+        if mode not in ("keyword", "vector", "hybrid"):
             raise HTTPException(
                 400, f"Invalid search mode: {mode}. Use keyword, vector, or hybrid"
             )
+
+        if mode == "keyword":
+            results = await run_in_threadpool(db.search_keyword, q, limit)
+            for r in results:
+                r["match_type"] = "keyword"
+        else:
+            # Embed the query with the configured model: the same model whose
+            # table search_vector reads, so the vectors are comparable.
+            vector = None
+            if db.has_embeddings():
+                vectors = await embeddings.embed_texts([q])
+                vector = vectors[0] if vectors else None
+            if mode == "vector":
+                if vector is None:
+                    raise HTTPException(
+                        503, "Vector search unavailable (no embeddings yet)"
+                    )
+                results = await run_in_threadpool(db.search_vector, vector, limit)
+            else:
+                # Keyword + vector via RRF; keyword-only when no vector.
+                results = await run_in_threadpool(db.search_hybrid, q, vector, limit)
 
         return {
             "results": results,

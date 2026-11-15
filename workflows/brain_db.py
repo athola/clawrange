@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import sqlite3
+import struct
 import threading
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -127,7 +128,6 @@ def _chunk_text(text: str, max_words: int = 300, overlap_words: int = 50) -> lis
     return result
 
 
-EMBEDDING_DIM = 1536  # text-embedding-3-small
 MAX_SEARCH_LIMIT = 100
 
 
@@ -186,6 +186,7 @@ class BrainDB:
         # Every public method holds this lock (see _serialize_methods below)
         # so one thread's commit() can't commit another's half-done write.
         self._lock = threading.RLock()
+        self._vec_table: str | None = None  # set by use_vector_table()
 
     def init_db(self) -> None:
         conn = self._conn
@@ -400,28 +401,23 @@ class BrainDB:
         except sqlite3.OperationalError:
             conn.execute("ALTER TABLE tasks ADD COLUMN source TEXT DEFAULT 'system'")
 
-        # sqlite-vec virtual table for embeddings (optional)
+        # Legacy single-model vector table: never populated (nothing called
+        # store_embedding). Per-model tables replace it; drop it only if empty.
         if self._has_vec:
-            conn.execute(f"""
-                CREATE VIRTUAL TABLE IF NOT EXISTS chunk_embeddings
-                    USING vec0(chunk_id INTEGER PRIMARY KEY, vector float[{
-                EMBEDDING_DIM
-            }])
-            """)
+            legacy = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='chunk_embeddings'"
+            ).fetchone()
+            if (
+                legacy
+                and not conn.execute(
+                    "SELECT 1 FROM chunk_embeddings LIMIT 1"
+                ).fetchone()
+            ):
+                conn.execute("DROP TABLE chunk_embeddings")
 
         conn.commit()
 
     # ─── Internal helpers ────────────────────────────────────────
-
-    def _fetch_tables(self) -> set[str]:
-        rows = self._conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()
-        fts = self._conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='view' OR "
-            "(type='table' AND name LIKE '%fts%')"
-        ).fetchall()
-        return {r["name"] for r in rows} | {r["name"] for r in fts}
 
     def _row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         return dict(row)
@@ -591,22 +587,68 @@ class BrainDB:
 
     # ─── Embeddings (sqlite-vec) ─────────────────────────────────
 
-    def store_embedding(self, chunk_id: int, vector: list[float]) -> bool:
-        """Store a vector embedding for a content chunk.
+    # ─── Embeddings (one sqlite-vec table per model) ─────────────
 
-        Returns False if vec unavailable.
+    def use_vector_table(self, table: str, dim: int) -> bool:
+        """Point vector storage and search at ``table`` (created if missing).
+
+        Each embedding model+dimension has its own table, because vectors
+        from different models aren't comparable. Returns False when
+        sqlite-vec is unavailable (keyword search still works).
         """
-        if not self._has_vec:
+        if not self._has_vec or not re.fullmatch(r"vec_[a-z0-9_]+", table):
+            self._vec_table = None
             return False
-        import struct
-
-        blob = struct.pack(f"{len(vector)}f", *vector)
         self._conn.execute(
-            "INSERT OR REPLACE INTO chunk_embeddings (chunk_id, vector) VALUES (?, ?)",
-            (chunk_id, blob),
+            f"CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vec0("
+            f"chunk_id INTEGER PRIMARY KEY, vector float[{int(dim)}] "
+            "distance_metric=cosine)"
         )
         self._conn.commit()
+        self._vec_table = table
         return True
+
+    def store_embeddings(self, rows: list[tuple[int, list[float]]]) -> int:
+        """Store (chunk_id, vector) pairs in the active table, one commit."""
+        if self._vec_table is None or not rows:
+            return 0
+        self._conn.executemany(
+            f"INSERT OR REPLACE INTO {self._vec_table} (chunk_id, vector) "
+            "VALUES (?, ?)",
+            [(cid, struct.pack(f"{len(v)}f", *v)) for cid, v in rows],
+        )
+        self._conn.commit()
+        return len(rows)
+
+    def missing_embeddings(self, limit: int = 256) -> list[dict[str, Any]]:
+        """Chunks with no vector in the active table (id, content)."""
+        if self._vec_table is None:
+            return []
+        rows = self._conn.execute(
+            f"SELECT cc.id, cc.content FROM content_chunks cc "
+            f"WHERE cc.id NOT IN (SELECT chunk_id FROM {self._vec_table}) "
+            "ORDER BY cc.id LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
+    def prune_orphan_embeddings(self) -> int:
+        """Drop vectors whose chunk no longer exists (re-chunked pages)."""
+        if self._vec_table is None:
+            return 0
+        cur = self._conn.execute(
+            f"DELETE FROM {self._vec_table} "
+            "WHERE chunk_id NOT IN (SELECT id FROM content_chunks)"
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    def embedding_count(self) -> int:
+        if self._vec_table is None:
+            return 0
+        return self._conn.execute(f"SELECT COUNT(*) FROM {self._vec_table}").fetchone()[
+            0
+        ]
 
     def search_vector(
         self, query_vector: list[float], limit: int = 10
@@ -615,17 +657,15 @@ class BrainDB:
 
         Returns page-level results with the best matching chunk snippet.
         """
-        if not self._has_vec:
+        if self._vec_table is None:
             return []
-        import struct
-
         blob = struct.pack(f"{len(query_vector)}f", *query_vector)
         rows = self._conn.execute(
-            """
+            f"""
             SELECT ce.chunk_id, ce.distance,
                    cc.page_slug, cc.content, cc.chunk_index,
                    p.title, p.page_type
-            FROM chunk_embeddings ce
+            FROM {self._vec_table} ce
             JOIN content_chunks cc ON cc.id = ce.chunk_id
             JOIN pages p ON p.slug = cc.page_slug
             WHERE ce.vector MATCH ?
@@ -649,7 +689,7 @@ class BrainDB:
                     "title": row["title"],
                     "page_type": row["page_type"],
                     "snippet": row["content"][:200],
-                    "score": 1.0 - row["distance"],  # Convert distance to similarity
+                    "score": 1.0 - row["distance"],  # cosine distance -> similarity
                     "match_type": "vector",
                 }
             )
@@ -659,8 +699,8 @@ class BrainDB:
         return results
 
     def has_embeddings(self) -> bool:
-        """Check if vector search is available."""
-        return self._has_vec
+        """True when the active model's table holds vectors to search."""
+        return self.embedding_count() > 0
 
     # ─── Timeline ────────────────────────────────────────────────
 
@@ -730,7 +770,7 @@ class BrainDB:
 
         # Vector results (if available)
         vec_results = []
-        if query_vector and self._has_vec:
+        if query_vector and self._vec_table is not None:
             vec_results = self.search_vector(query_vector, limit=limit * 2)
 
         # If only one source, compute RRF scores from single ranking

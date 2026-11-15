@@ -101,7 +101,6 @@ services:
 
   # ─── Workflows: Webhook + CRM Service ─────────────────────────────
   # Handles webhooks, lead lookups, morning briefings.
-  # Replaces n8n with testable Python endpoints.
   # API at http://localhost:5678
   #
   # SANDBOX: Read-only container. No host mounts. Network-only service.
@@ -135,6 +134,9 @@ services:
     environment:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - ZAI_API_KEY=${ZAI_API_KEY}
+      # Embedding model for brain search and OpenClaw memory (OpenRouter).
+      - EMBED_MODEL=${EMBED_MODEL:-openai/text-embedding-3-small}
+      - EMBED_DIM=${EMBED_DIM:-1536}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
       - PROXY_AUTH_TOKEN=${PROXY_AUTH_TOKEN}

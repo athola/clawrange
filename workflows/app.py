@@ -11,6 +11,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 import auth
+import embeddings
 import github_search
 import llm_proxy
 import reddit_search
@@ -56,6 +57,9 @@ logger = logging.getLogger("clawrange.app")
 _db_path = os.environ.get("BRAIN_DB_PATH", "/data/brain.db")
 brain_db = BrainDB(_db_path)
 brain_db.init_db()
+# Vectors live in one table per embedding model (see embeddings.py).
+_embed_cfg = embeddings.config()
+brain_db.use_vector_table(_embed_cfg.table, _embed_cfg.dim)
 
 # ─── Scheduler Setup ─────────────────────────────────────────────
 
@@ -288,6 +292,8 @@ def healthz():
             "db": "ok" if total_pages >= 0 else "error",
             "pages": total_pages,
             "embeddings": brain_db.has_embeddings(),
+            "embedding_model": _embed_cfg.model,
+            "vectors": brain_db.embedding_count(),
         },
     }
 

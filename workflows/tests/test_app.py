@@ -2,6 +2,7 @@
 
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -407,3 +408,20 @@ class TestTaskInputBounds:
     def test_rejects_empty_description(self):
         r = client.post("/task", json={"description": "   "})
         assert r.status_code == 422
+
+
+class TestEmbeddingWiring:
+    def test_startup_uses_configured_model_table(self):
+        import embeddings
+        from app import brain_db
+
+        if not brain_db._has_vec:
+            pytest.skip("sqlite-vec unavailable")
+        assert brain_db._vec_table == embeddings.config().table
+
+    def test_healthz_reports_embedding_model(self):
+        import embeddings
+
+        data = client.get("/healthz").json()["brain"]
+        assert data["embedding_model"] == embeddings.config().model
+        assert data["vectors"] == 0

@@ -3831,91 +3831,48 @@ FAKE_EMBED_RESPONSE = {
 @patch.dict("os.environ", FAKE_ENV)
 @patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
 class TestEmbeddings:
-    """The /v1/embeddings route proxies to Zhipu so OpenClaw memory has a
-    convention-clean embeddings backend (everything still goes through the
-    proxy; no direct provider keys in the agents)."""
+    """/v1/embeddings serves OpenClaw memory through OpenRouter (a GLM Coding
+    Plan Z.AI key cannot embed: error 1211). The configured model is always
+    used, so every stored vector is comparable."""
 
     def test_rejects_missing_auth(self):
         r = client.post("/v1/embeddings", json=EMBED_BODY)
         assert r.status_code == 401
 
     def test_missing_input_returns_400(self):
-        r = client.post(
-            "/v1/embeddings", json={"model": "embedding-3"}, headers=AUTH_HEADER
-        )
+        r = client.post("/v1/embeddings", json={"model": "x"}, headers=AUTH_HEADER)
         assert r.status_code == 400
 
-    @patch("llm_proxy._call_embeddings", new_callable=AsyncMock)
-    def test_returns_embeddings_via_zai(self, mock_call):
-        mock_call.return_value = _mock_response(200, FAKE_EMBED_RESPONSE)
+    @patch("embeddings.request", new_callable=AsyncMock)
+    def test_returns_embeddings_via_openrouter(self, mock_req):
+        mock_req.return_value = _mock_response(200, FAKE_EMBED_RESPONSE)
         r = client.post("/v1/embeddings", json=EMBED_BODY, headers=AUTH_HEADER)
         assert r.status_code == 200
-        data = r.json()
-        assert data["data"][0]["embedding"] == [0.1, 0.2, 0.3]
-        # Unknown (OpenAI-named) model is overridden to the Zhipu default,
-        # and the call is authed with ZAI_API_KEY.
-        called = mock_call.call_args
-        assert (
-            called.kwargs.get("model", called.args[1] if len(called.args) > 1 else None)
-            == "embedding-3"
-        )
-        assert (
-            called.kwargs.get(
-                "api_key", called.args[2] if len(called.args) > 2 else None
-            )
-            == "test-key"
-        )
+        assert r.json()["data"][0]["embedding"] == [0.1, 0.2, 0.3]
+        inputs, cfg = mock_req.call_args.args
+        # Whatever model the caller names, the configured one is used, keyed
+        # with OPENROUTER_API_KEY.
+        assert cfg.model == "openai/text-embedding-3-small"
+        assert cfg.api_key == "test-key"
+        assert inputs == [EMBED_BODY["input"]] or inputs == EMBED_BODY["input"]
 
-    @patch("llm_proxy._call_embeddings", new_callable=AsyncMock)
-    def test_honors_explicit_zhipu_model(self, mock_call):
-        mock_call.return_value = _mock_response(200, FAKE_EMBED_RESPONSE)
-        r = client.post(
-            "/v1/embeddings",
-            json={"input": "x", "model": "embedding-2"},
-            headers=AUTH_HEADER,
-        )
-        assert r.status_code == 200
-        called = mock_call.call_args
-        passed_model = called.kwargs.get(
-            "model", called.args[1] if len(called.args) > 1 else None
-        )
-        assert passed_model == "embedding-2"
-
-    @patch("llm_proxy._call_embeddings", new_callable=AsyncMock)
-    def test_prefers_dedicated_embed_key(self, mock_call):
-        """A dedicated ZAI_EMBED_API_KEY (for a key with embeddings access)
-        takes precedence over the chat ZAI_API_KEY."""
-        mock_call.return_value = _mock_response(200, FAKE_EMBED_RESPONSE)
-        with patch.dict(
-            "os.environ", {"ZAI_EMBED_API_KEY": "embed-key-789"}, clear=False
-        ):
-            r = client.post("/v1/embeddings", json=EMBED_BODY, headers=AUTH_HEADER)
-        assert r.status_code == 200
-        called = mock_call.call_args
-        passed_key = called.kwargs.get(
-            "api_key", called.args[2] if len(called.args) > 2 else None
-        )
-        assert passed_key == "embed-key-789"
-
-    def test_missing_zai_key_returns_503(self):
-        with patch.dict(
-            "os.environ", {"ZAI_API_KEY": "", "ZAI_EMBED_API_KEY": ""}, clear=False
-        ):
+    def test_missing_key_returns_503(self):
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": ""}, clear=False):
             r = client.post("/v1/embeddings", json=EMBED_BODY, headers=AUTH_HEADER)
         assert r.status_code == 503
 
-    @patch("llm_proxy._call_embeddings", new_callable=AsyncMock)
-    def test_upstream_non_200_maps_to_same_status(self, mock_call):
+    @patch("embeddings.request", new_callable=AsyncMock)
+    def test_upstream_non_200_maps_to_same_status(self, mock_req):
         """Upstream errors must surface as errors, never as HTTP 200 bodies
         that OpenClaw memory would ingest as embeddings."""
-        mock_call.return_value = _mock_response(429, {"error": "rate limited"})
+        mock_req.return_value = _mock_response(429, {"error": "rate limited"})
         r = client.post("/v1/embeddings", json=EMBED_BODY, headers=AUTH_HEADER)
         assert r.status_code == 429
         assert "429" in r.json()["detail"]
 
-    @patch("llm_proxy._call_embeddings", new_callable=AsyncMock)
-    def test_upstream_transport_error_is_502(self, mock_call):
-        mock_call.side_effect = httpx.ConnectError("boom")
+    @patch("embeddings.request", new_callable=AsyncMock)
+    def test_upstream_transport_error_is_502(self, mock_req):
+        mock_req.side_effect = httpx.ConnectError("boom")
         r = client.post("/v1/embeddings", json=EMBED_BODY, headers=AUTH_HEADER)
         assert r.status_code == 502
 

@@ -28,7 +28,10 @@ def db():
 class TestSchemaInit:
     def test_creates_all_tables(self, db):
         """All required tables exist after init."""
-        tables = db._fetch_tables()
+        tables = {
+            r["name"]
+            for r in db._conn.execute("SELECT name FROM sqlite_master").fetchall()
+        }
         expected = {
             "pages",
             "timeline",
@@ -70,12 +73,12 @@ class TestPageCRUD:
             slug="client/acme-corp",
             title="Acme Corp",
             page_type=PageType.CLIENT,
-            compiled="Main contact: Bob Smith. 3 sites in Longview.",
+            compiled="Main contact: Pat Doe. 3 sites in Springfield.",
         )
         assert page["slug"] == "client/acme-corp"
         assert page["title"] == "Acme Corp"
         assert page["page_type"] == "client"
-        assert page["compiled"] == "Main contact: Bob Smith. 3 sites in Longview."
+        assert page["compiled"] == "Main contact: Pat Doe. 3 sites in Springfield."
         assert page["content_hash"]
         assert page["created_at"]
         assert page["updated_at"]
@@ -277,11 +280,16 @@ class TestChunkTextFunction:
 
 class TestEmbeddings:
     def test_has_embeddings(self, db):
-        """sqlite-vec should be available in test environment."""
+        """True once the active model's table holds vectors."""
+        assert db.use_vector_table("vec_test_1536", 1536) is True
+        assert db.has_embeddings() is False
+        db.upsert_page("note/v", "V", PageType.NOTE, "body")
+        db.store_embeddings([(db.get_chunks("note/v")[0]["id"], [0.1] * 1536)])
         assert db.has_embeddings() is True
 
     def test_store_and_search_vector(self, db):
         """Store embedding for a chunk, then find it via vector search."""
+        db.use_vector_table("vec_test_1536", 1536)
         db.upsert_page("note/vec", "Vector Test", PageType.NOTE, "searchable content")
         chunks = db.get_chunks("note/vec")
         assert len(chunks) >= 1
@@ -289,7 +297,7 @@ class TestEmbeddings:
 
         # Store a synthetic embedding (1536 dims)
         vector = [0.1] * 1536
-        assert db.store_embedding(chunk_id, vector) is True
+        assert db.store_embeddings([(chunk_id, vector)]) == 1
 
         # Search with the same vector — should find our page
         results = db.search_vector(vector, limit=5)
@@ -299,6 +307,7 @@ class TestEmbeddings:
 
     def test_vector_search_returns_best_per_page(self, db):
         """Dedup: only best matching chunk per page returned."""
+        db.use_vector_table("vec_test_1536", 1536)
         db.upsert_page(
             "note/multi",
             "Multi Chunk",
@@ -310,7 +319,7 @@ class TestEmbeddings:
         # Embed both chunks with slightly different vectors
         for i, chunk in enumerate(chunks):
             vec = [0.1 + i * 0.01] * 1536
-            db.store_embedding(chunk["id"], vec)
+            db.store_embeddings([(chunk["id"], vec)])
 
         results = db.search_vector([0.1] * 1536, limit=10)
         slugs = [r["slug"] for r in results]
@@ -329,6 +338,7 @@ class TestHybridSearch:
 
     def test_hybrid_with_vector_merges_results(self, db):
         """With both keyword and vector results, RRF fuses them."""
+        db.use_vector_table("vec_test_1536", 1536)
         # Page that matches keyword
         db.upsert_page(
             "inc/wifi", "WiFi Outage", PageType.INCIDENT, "WiFi down at site"
@@ -341,7 +351,7 @@ class TestHybridSearch:
         # Embed the network page
         chunks = db.get_chunks("inc/net")
         if chunks:
-            db.store_embedding(chunks[0]["id"], [0.5] * 1536)
+            db.store_embeddings([(chunks[0]["id"], [0.5] * 1536)])
 
         # Search with a vector that matches the network page
         results = db.search_hybrid("WiFi", query_vector=[0.5] * 1536)
@@ -760,3 +770,62 @@ class TestKeywordSearchInput:
             db.upsert_page(f"p{i}", f"T{i}", "concept", "common word")
         assert len(db.search_keyword("common", limit=10_000)) == 5
         assert len(db.search_keyword("common", limit=0)) == 1
+
+
+class TestProjectList:
+    """Project list columns are JSON TEXT; one malformed row used to raise in
+    the middle of a generator run (34 open-coded json.loads call sites)."""
+
+    def test_decodes_json_text(self):
+        from brain_db import project_list
+
+        assert project_list({"topics": '["a", "b"]'}, "topics") == ["a", "b"]
+
+    def test_missing_or_none(self):
+        from brain_db import project_list
+
+        assert project_list({}, "topics") == []
+        assert project_list(None, "topics") == []
+        assert project_list({"topics": None}, "topics") == []
+
+    def test_malformed_json_is_empty_not_a_crash(self):
+        from brain_db import project_list
+
+        assert project_list({"slug": "x", "topics": "[oops"}, "topics") == []
+        assert project_list({"topics": '{"a": 1}'}, "topics") == []
+
+    def test_already_a_list(self):
+        from brain_db import project_list
+
+        assert project_list({"topics": ["a"]}, "topics") == ["a"]
+
+
+class TestSubredditSearchBatch:
+    def test_batch_matches_individual_calls(self, db):
+        rows = [
+            ("ClaudeAI", "p", True),
+            ("python", "p", False),
+            ("ClaudeAI", "p", True),
+        ]
+        db.record_subreddit_searches(rows)
+        stats = {
+            r["subreddit"]: (r["impressions"], r["is_curated"])
+            for r in db._conn.execute("SELECT * FROM subreddit_stats").fetchall()
+        }
+        assert stats == {"claudeai": (2, 1), "python": (1, 0)}
+
+    def test_batch_commits_once(self, db, monkeypatch):
+        commits = []
+        real = db._conn
+
+        class Spy:
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            def commit(self):
+                commits.append(1)
+                real.commit()
+
+        monkeypatch.setattr(db, "_conn", Spy())
+        db.record_subreddit_searches([(f"s{i}", "p", False) for i in range(20)])
+        assert len(commits) == 1

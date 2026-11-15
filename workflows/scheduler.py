@@ -103,6 +103,45 @@ def _queue_catch_ups(
         )
 
 
+SCAN_CACHE_MAX_AGE_DAYS = 14
+
+
+def prune_scan_cache_job(brain_db) -> None:
+    """Drop dedup rows older than SCAN_CACHE_MAX_AGE_DAYS."""
+    removed = brain_db.prune_scan_cache(SCAN_CACHE_MAX_AGE_DAYS)
+    logger.info("maintenance: pruned %d scan_cache rows", removed)
+
+
+async def embed_backfill_job(brain_db) -> None:
+    """Embed brain chunks that lack a vector for the configured model."""
+    import embeddings
+
+    result = await embeddings.backfill(brain_db)
+    if result.get("stored") or result.get("failed"):
+        logger.info("maintenance: embedding backfill %s", result)
+
+
+def register_maintenance(scheduler, brain_db) -> None:
+    """Internal housekeeping jobs (not tenant schedules)."""
+    scheduler.add_job(
+        prune_scan_cache_job,
+        "cron",
+        hour=4,
+        minute=15,
+        id="maintenance_prune_scan_cache",
+        kwargs={"brain_db": brain_db},
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        embed_backfill_job,
+        "interval",
+        minutes=10,
+        id="maintenance_embed_backfill",
+        kwargs={"brain_db": brain_db},
+        replace_existing=True,
+    )
+
+
 def init_scheduler(brain_db) -> AsyncIOScheduler | None:
     """Create and configure the scheduler. Returns None on failure."""
     try:
@@ -128,6 +167,7 @@ def init_scheduler(brain_db) -> AsyncIOScheduler | None:
         # Heartbeat watchdog: infrastructure, not a tenant schedule, so it
         # registers directly and survives a wiped schedules table.
         register_watchdog(scheduler)
+        register_maintenance(scheduler, brain_db)
 
         scheduler.start()
         logger.info("Scheduler started with %d active jobs", len(schedules))

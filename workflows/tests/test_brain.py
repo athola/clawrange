@@ -592,3 +592,62 @@ class TestEmbeddingStatus:
         assert r.status_code == 200
         assert "tags" in r.json()
         assert "test" in r.json()["tags"]
+
+
+class TestSemanticSearch:
+    """Hybrid/vector search embed the query with the configured model and
+    read only that model's vector table; keyword search covers the gaps."""
+
+    @pytest.fixture
+    def vec_client(self, brain_db, monkeypatch):
+        if not brain_db._has_vec:
+            pytest.skip("sqlite-vec unavailable")
+        import embeddings
+
+        brain_db.use_vector_table("vec_test_4", 4)
+        monkeypatch.setattr(
+            embeddings,
+            "config",
+            lambda env=None: embeddings.EmbedConfig("u", "m", 4, "k"),
+        )
+        brain_db.upsert_page("net/wifi", "WiFi", "concept", "wireless access points")
+        brain_db.upsert_page("pets/cat", "Cat", "concept", "a small furry animal")
+        cat = [c for c in brain_db.missing_embeddings(10) if "furry" in c["content"]][0]
+        brain_db.store_embeddings([(cat["id"], [1.0, 0, 0, 0])])
+        app = FastAPI()
+        app.include_router(create_brain_router(brain_db), prefix="/brain")
+        return TestClient(app)
+
+    def test_hybrid_finds_semantic_match_without_keyword_overlap(
+        self, vec_client, monkeypatch
+    ):
+        import embeddings
+
+        async def fake(texts, cfg=None, batch=96):
+            return [[1.0, 0, 0, 0] for _ in texts]
+
+        monkeypatch.setattr(embeddings, "embed_texts", fake)
+        r = vec_client.get("/brain/search?q=kitten&mode=hybrid")
+        assert [x["slug"] for x in r.json()["results"]] == ["pets/cat"]
+
+    def test_hybrid_falls_back_to_keyword_when_embedding_fails(
+        self, vec_client, monkeypatch
+    ):
+        import embeddings
+
+        async def fail(texts, cfg=None, batch=96):
+            return None
+
+        monkeypatch.setattr(embeddings, "embed_texts", fail)
+        r = vec_client.get("/brain/search?q=wireless&mode=hybrid")
+        assert r.status_code == 200
+        assert [x["slug"] for x in r.json()["results"]] == ["net/wifi"]
+
+    def test_vector_mode_unavailable_is_503(self, vec_client, monkeypatch):
+        import embeddings
+
+        async def fail(texts, cfg=None, batch=96):
+            return None
+
+        monkeypatch.setattr(embeddings, "embed_texts", fail)
+        assert vec_client.get("/brain/search?q=kitten&mode=vector").status_code == 503

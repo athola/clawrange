@@ -21,6 +21,7 @@ from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import auth
+import embeddings
 import github_search
 import reddit_search
 import telegram
@@ -688,41 +689,6 @@ async def _call_provider(
                 "Content-Type": "application/json",
             },
             json=payload,
-        )
-
-
-# ─── Embeddings (Zhipu-backed) ─────────────────────────────────────
-#
-# OpenClaw's memory search needs an embeddings provider. Per project
-# convention every model call routes through this proxy (never a direct
-# provider key in the agent), so we expose an OpenAI-compatible
-# /v1/embeddings endpoint backed by Zhipu's embedding model — reusing the
-# ZAI_API_KEY already configured for chat. Point OpenClaw memory at the
-# clawrange-proxy provider with model "embedding-3".
-
-ZAI_EMBEDDINGS_URL = os.getenv(
-    "ZAI_EMBED_URL", "https://open.bigmodel.cn/api/paas/v4/embeddings"
-)
-EMBED_MODEL = os.getenv("ZAI_EMBED_MODEL", "embedding-3")
-
-
-async def _call_embeddings(
-    inputs: str | list[str], model: str, api_key: str
-) -> httpx.Response:
-    """POST an embeddings request to Zhipu. Returns the raw response.
-
-    Zhipu's v4 embeddings API is OpenAI-compatible in both request
-    (``{model, input}``) and response (``{object: "list", data: [...]}``)
-    shape, so the body passes through unchanged.
-    """
-    async with httpx.AsyncClient(timeout=PROVIDER_TIMEOUT) as client:
-        return await client.post(
-            ZAI_EMBEDDINGS_URL,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={"model": model, "input": inputs},
         )
 
 
@@ -3293,11 +3259,15 @@ async def _json_object(request: Request) -> dict:
 
 
 @router.post("/v1/embeddings")
-async def embeddings(
+async def create_embeddings(
     request: Request,
     authorization: str | None = Header(None),
 ):
-    """OpenAI-compatible embeddings, proxied to Zhipu (for OpenClaw memory)."""
+    """OpenAI-compatible embeddings for OpenClaw memory, via OpenRouter.
+
+    Always uses the configured model (embeddings.config) so every vector
+    OpenClaw stores is comparable; a GLM Coding Plan Z.AI key can't embed.
+    """
     # Auth check — same PROXY_AUTH_TOKEN gate as chat completions
     if not auth.bearer_ok(authorization, PROXY_AUTH_TOKEN):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -3307,23 +3277,15 @@ async def embeddings(
     if not inputs:
         raise HTTPException(status_code=400, detail="input is required")
 
-    # Prefer a dedicated embeddings key (for a Z.AI key that has embeddings
-    # access); fall back to the shared chat key.
-    api_key = os.getenv("ZAI_EMBED_API_KEY") or os.getenv("ZAI_API_KEY", "")
-    if not api_key:
+    cfg = embeddings.config()
+    if not cfg.api_key:
         raise HTTPException(
             status_code=503,
-            detail="embeddings provider not configured "
-            "(set ZAI_EMBED_API_KEY or ZAI_API_KEY)",
+            detail="embeddings provider not configured (set OPENROUTER_API_KEY)",
         )
-
-    # Force a Zhipu embedding model. OpenAI-named models (sent by OpenClaw's
-    # "auto" probing) are overridden; an explicit "embedding-*" passes through.
-    requested = str(raw_body.get("model") or "")
-    model = requested if requested.startswith("embedding-") else EMBED_MODEL
-
+    batch = inputs if isinstance(inputs, list) else [inputs]
     try:
-        resp = await _call_embeddings(inputs, model, api_key)
+        resp = await embeddings.request(batch, cfg)
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"embeddings upstream error: {exc}")
 
