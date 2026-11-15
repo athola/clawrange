@@ -11,17 +11,17 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: ShellCheck
-        uses: ludeeus/action-shellcheck@master
+        uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38  # 2.0.0
         with:
           scandir: scripts
           severity: warning
 
       - name: Validate YAML
         run: |
-          pip install --quiet yamllint
+          pip install --quiet yamllint==1.38.0
           yamllint -d relaxed docker-compose.yml deerflow/config.yaml
 
       - name: Validate JSON
@@ -47,19 +47,37 @@ jobs:
           echo "OK: No secrets detected"
 
   python-tests:
-    name: Python validation suite
+    name: Python lint, types and tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: actions/setup-python@v5
+      # uv installs the Python and the exact tool and runtime versions from
+      # uv.lock, so CI runs what pre-push and the Docker image run.
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
         with:
+          version: "0.13.8"
           python-version: "3.12"
+          enable-cache: true
+
+      - name: Sync locked environment
+        run: uv sync --locked
+
+      - name: requirements.txt matches uv.lock
+        run: |
+          uv export --no-dev --no-emit-project --format requirements-txt -o workflows/requirements.txt -q
+          git diff --exit-code workflows/requirements.txt
+
+      - name: Ruff
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Mypy
+        run: uv run mypy workflows scripts tests
 
       - name: Run validation suite
-        run: python3 tests/validate_stack.py
+        run: uv run python tests/validate_stack.py
 
-      - name: Run unit tests
-        run: |
-          pip install --quiet pytest
-          python3 -m pytest tests/test_validate_stack.py -v
+      - name: Run test suite
+        run: uv run pytest -q -rf
