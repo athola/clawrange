@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 import llm_proxy
+import research_router
 import telegram
 from app import app
 
@@ -2483,8 +2484,6 @@ class TestResearchRouter:
     def test_research_task_runs_orchestrator(self, mock_orch):
         import asyncio
 
-        import llm_proxy
-
         mock_orch.return_value = {
             "findings": [
                 {
@@ -2497,7 +2496,7 @@ class TestResearchRouter:
             ]
         }
         result = asyncio.run(
-            llm_proxy._try_research_task(
+            research_router._try_research_task(
                 "Search Reddit for live threads on trade-skill knowledge capture"
             )
         )
@@ -2513,10 +2512,11 @@ class TestResearchRouter:
     def test_non_research_task_returns_none(self):
         import asyncio
 
-        import llm_proxy
-
-        assert asyncio.run(llm_proxy._try_research_task("Check z.ai pricing")) is None
-        assert asyncio.run(llm_proxy._try_research_task("Reply to Alex")) is None
+        assert (
+            asyncio.run(research_router._try_research_task("Check z.ai pricing"))
+            is None
+        )
+        assert asyncio.run(research_router._try_research_task("Reply to Alex")) is None
 
     @patch("research.orchestrate_research", new_callable=AsyncMock)
     def test_content_idea_task_not_hijacked_by_research_router(self, mock_orch):
@@ -2525,14 +2525,12 @@ class TestResearchRouter:
         The orchestrator must not steal it and re-run research."""
         import asyncio
 
-        import llm_proxy
-
         desc = (
             "Content idea for claude-night-market: research on 'trade-skill "
             'capture\' surfaced "TRIZ analogies" (). Draft three angles - '
             "(1) technical post, (2) useful Reddit/HN comment, (3) X thread."
         )
-        result = asyncio.run(llm_proxy._try_research_task(desc))
+        result = asyncio.run(research_router._try_research_task(desc))
         assert result is None
         mock_orch.assert_not_called()
 
@@ -2542,8 +2540,6 @@ class TestResearchRouter:
         result; echoing it inside the result header just doubles the text
         and crowds the blocked-detector's 400-char head window."""
         import asyncio
-
-        import llm_proxy
 
         mock_orch.return_value = {
             "findings": [
@@ -2555,7 +2551,7 @@ class TestResearchRouter:
             ]
         }
         result = asyncio.run(
-            llm_proxy._try_research_task(
+            research_router._try_research_task(
                 "Search Reddit for live threads on trade-skill knowledge capture"
             )
         )
@@ -2568,11 +2564,11 @@ class TestResearchRouter:
     def test_no_findings_reported(self, mock_orch):
         import asyncio
 
-        import llm_proxy
-
         mock_orch.return_value = {"findings": []}
         result = asyncio.run(
-            llm_proxy._try_research_task("research web articles on tacit knowledge")
+            research_router._try_research_task(
+                "research web articles on tacit knowledge"
+            )
         )
         assert result is not None
         assert "no findings" in result.lower()
@@ -2581,11 +2577,11 @@ class TestResearchRouter:
     def test_orchestrator_failure_falls_back_to_llm(self, mock_orch):
         import asyncio
 
-        import llm_proxy
-
         mock_orch.side_effect = RuntimeError("channels down")
         result = asyncio.run(
-            llm_proxy._try_research_task("find reddit threads on chrome extensions")
+            research_router._try_research_task(
+                "find reddit threads on chrome extensions"
+            )
         )
         assert result is None
 
