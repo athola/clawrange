@@ -74,43 +74,44 @@ def _bypass_api_auth():
     app.dependency_overrides.pop(auth.require_token, None)
 
 
+def _resettable_tables(conn) -> list[str]:
+    """User tables, derived from the live schema so the list can't drift.
+
+    Skips SQLite internals, FTS/vec shadow tables (PRAGMA table_list marks
+    most as 'shadow'; sqlite-vec's vector chunk tables report as 'table', so
+    anything prefixed by a virtual table's name is skipped too) and the
+    virtual tables themselves, which are rebuilt separately.
+    """
+    rows = conn.execute("PRAGMA table_list").fetchall()
+    main = [r for r in rows if r["schema"] == "main"]
+    virtual = {r["name"] for r in main if r["type"] == "virtual"}
+    return [
+        r["name"]
+        for r in main
+        if r["type"] == "table"
+        and not r["name"].startswith("sqlite_")
+        and not any(r["name"].startswith(v + "_") for v in virtual)
+    ]
+
+
 @pytest.fixture(autouse=True)
 def _reset_brain_db():
-    """Clear all tables between tests for isolation."""
+    """Clear all tables between tests for isolation. Errors surface: a
+    failed reset means the next test would see this one's rows."""
     yield
     from app import brain_db
 
-    for table in (
-        "persona_learnings",
-        "research_findings",
-        "research_sessions",
-        "tasks",
-        "scan_cache",
-        "subreddit_stats",
-        "schedules",
-        "projects",
-        "page_tags",
-        "tags",
-        "links",
-        "timeline",
-        "page_versions",
-        "content_chunks",
-        "pages",
-    ):
-        try:
-            brain_db._conn.execute(f"DELETE FROM {table}")
-        except Exception:
-            pass
-    # Rebuild FTS index
+    conn = brain_db._conn
+    conn.execute("PRAGMA foreign_keys=OFF")
     try:
-        brain_db._conn.execute("DELETE FROM pages_fts")
-        brain_db._conn.execute(
-            "INSERT INTO pages_fts(slug, title, compiled) "
-            "SELECT slug, title, compiled FROM pages"
-        )
-    except Exception:
-        pass
-    brain_db._conn.commit()
+        for table in _resettable_tables(conn):
+            conn.execute(f"DELETE FROM {table}")
+        if brain_db._has_vec:
+            conn.execute("DELETE FROM chunk_embeddings")
+        conn.execute("DELETE FROM pages_fts")
+        conn.commit()
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
 
 
 @pytest.fixture(autouse=True)

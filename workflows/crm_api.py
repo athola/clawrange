@@ -10,6 +10,7 @@ and connector-sync paths are testable offline.
 from __future__ import annotations
 
 import logging
+import threading
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
@@ -27,6 +28,16 @@ class QueryPrompt(BaseModel):
 class TemplateRun(BaseModel):
     template: str
     params: dict = {}
+
+
+_sync_locks: dict[str, threading.Lock] = {}
+_sync_locks_guard = threading.Lock()
+
+
+def _connector_lock(connector_id: str) -> threading.Lock:
+    """One lock per connector so concurrent syncs can't double-run it."""
+    with _sync_locks_guard:
+        return _sync_locks.setdefault(connector_id, threading.Lock())
 
 
 def create_crm_router(profile, crm, *, llm=None, http_client=None) -> APIRouter:
@@ -81,11 +92,20 @@ def create_crm_router(profile, crm, *, llm=None, http_client=None) -> APIRouter:
         spec = profile.connector(connector_id)
         if spec is None:
             raise HTTPException(404, f"unknown connector '{connector_id}'")
+        lock = _connector_lock(connector_id)
+        if not lock.acquire(blocking=False):
+            raise HTTPException(409, f"connector '{connector_id}' is already syncing")
         try:
             counts = run_connector(spec, crm, http_client=http_client)
         except Exception as exc:
+            # Log the detail server-side only: httpx errors embed the full
+            # URL, which can carry a credential in its query string.
             logger.warning("crm sync %s failed: %s", connector_id, exc)
-            raise HTTPException(502, f"connector sync failed: {exc}")
+            raise HTTPException(
+                502, f"connector '{connector_id}' sync failed; see server logs"
+            )
+        finally:
+            lock.release()
         return counts
 
     @router.get("/healthz/crm")

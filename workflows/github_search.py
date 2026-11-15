@@ -94,7 +94,7 @@ async def search_repos(
     full_query = " ".join(parts)
 
     try:
-        resp = client.rest.search.search_repos(
+        resp = await client.rest.search.async_repos(
             q=full_query, sort=sort, order="desc", per_page=limit
         )
         return [
@@ -152,8 +152,8 @@ async def get_self_traffic(owner: str, repo: str) -> GitHubTrafficSnapshot | Non
         return None
 
     try:
-        views_resp = client.rest.repos.get_views(owner=owner, repo=repo)
-        clones_resp = client.rest.repos.get_clones(owner=owner, repo=repo)
+        views_resp = await client.rest.repos.async_get_views(owner=owner, repo=repo)
+        clones_resp = await client.rest.repos.async_get_clones(owner=owner, repo=repo)
 
         views_data = views_resp.parsed_data
         clones_data = clones_resp.parsed_data
@@ -174,20 +174,24 @@ async def get_self_traffic(owner: str, repo: str) -> GitHubTrafficSnapshot | Non
 
 async def check_awesome_list(
     list_owner: str, list_repo: str, target_urls: list[str]
-) -> dict[str, bool]:
+) -> dict[str, bool] | None:
     """Check whether target URLs appear in an awesome-list README.
 
-    Returns dict mapping each target URL to whether it was found.
+    Returns a dict mapping each target URL to whether it was found, or None
+    when the README could not be read: "unknown" must never look like "not
+    listed", or callers would queue false submission tasks.
     """
     client = _get_client()
     if not client:
-        return {url: False for url in target_urls}
+        return None
 
     try:
-        resp = client.rest.repos.get_readme(owner=list_owner, repo=list_repo)
+        resp = await client.rest.repos.async_get_readme(
+            owner=list_owner, repo=list_repo
+        )
 
         content = base64.b64decode(resp.parsed_data.content).decode()
         return {url: url in content for url in target_urls}
     except Exception as exc:
         logger.warning("Failed to fetch %s/%s README: %s", list_owner, list_repo, exc)
-        return {url: False for url in target_urls}
+        return None

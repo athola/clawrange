@@ -39,9 +39,12 @@ class RestCRM(CRMAdapter):
         return {}
 
     def _http(self) -> httpx.Client:
-        if self._client is not None:
-            return self._client
-        return httpx.Client(base_url=self.base_url, headers=self._headers(), timeout=15)
+        # Built once and reused: a client per call leaked connection pools.
+        if self._client is None:
+            self._client = httpx.Client(
+                base_url=self.base_url, headers=self._headers(), timeout=15
+            )
+        return self._client
 
     def _endpoint(self, object: str, action: str) -> tuple[str, str]:
         spec = (self.objects.get(object) or {}).get(action)

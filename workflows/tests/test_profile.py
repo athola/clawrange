@@ -358,3 +358,46 @@ def test_marketing_profile_ships_homelab_deals():
     block = p.raw["homelab_deals"]
     assert len(block["targets"]) >= 20
     assert set(block["sources"]) <= profile_mod.KNOWN_DEAL_SOURCE_KINDS
+
+
+# ─── catch_up flag, income_review block, name hygiene ─────────────
+
+
+def test_catch_up_must_be_bool(tmp_path):
+    _write_profile(
+        tmp_path,
+        "acme",
+        """
+        profile: acme
+        seeds:
+          schedules:
+            - id: s1
+              name: S1
+              kind: morning_digest
+              cron: "0 8 * * *"
+              catch_up: yes_please
+        """,
+    )
+    with pytest.raises(ProfileError, match="catch_up"):
+        load_profile("acme", profiles_dir=tmp_path, known_generator_kinds=KNOWN_KINDS)
+
+
+def test_marketing_flags_its_daily_reports_for_catch_up():
+    import scheduler
+
+    p = load_profile("marketing", profiles_dir=_real_profiles_dir())
+    ids = {s["id"] for s in p.schedules if s.get("catch_up") is True}
+    assert ids == {"morning_digest", "homelab_deals"}
+    assert scheduler.CATCH_UP_WINDOW  # window itself stays code-level
+
+
+def test_income_review_block_must_be_mapping(tmp_path):
+    _write_profile(tmp_path, "acme", "profile: acme\nincome_review: nope\n")
+    with pytest.raises(ProfileError, match="income_review"):
+        load_profile("acme", profiles_dir=tmp_path, known_generator_kinds=KNOWN_KINDS)
+
+
+@pytest.mark.parametrize("bad", ["../etc", "a/b", "A", "", "x.y", "..", "a b"])
+def test_profile_name_is_validated_before_path_use(tmp_path, bad):
+    with pytest.raises(ProfileError, match="invalid profile name"):
+        load_profile(bad or "/", profiles_dir=tmp_path)

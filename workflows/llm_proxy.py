@@ -77,16 +77,31 @@ CIRCUIT_FAILURE_THRESHOLD = 3
 CIRCUIT_COOLDOWN_SECONDS = 60
 
 
-def _circuit_open(tier_name: str) -> bool:
-    """Check if a tier's circuit breaker is open (should be skipped)."""
+def _circuit_open(tier_name: str, probe: bool = True) -> bool:
+    """Check if a tier's circuit breaker is open (should be skipped).
+
+    After the cooldown the breaker is half-open: exactly one caller is let
+    through as a probe (``probe=True`` claims it). A failure during the probe
+    re-trips immediately (the failure count is still at threshold); a success
+    closes the breaker. ``probe=False`` is a read-only status check that
+    never claims the probe slot.
+    """
     state = _circuit_state.get(tier_name)
     if not state:
         return False
-    if state["failures"] >= CIRCUIT_FAILURE_THRESHOLD:
-        elapsed = time.monotonic() - state["last_failure"]
-        if elapsed < CIRCUIT_COOLDOWN_SECONDS:
-            return True
-        _circuit_state.pop(tier_name, None)
+    if state["failures"] < CIRCUIT_FAILURE_THRESHOLD:
+        return False
+    now = time.monotonic()
+    if now - state["last_failure"] < CIRCUIT_COOLDOWN_SECONDS:
+        return True
+    # Half-open: one probe at a time (a probe that never reports back is
+    # considered lost after another cooldown).
+    probe_at = state.get("probe_at")
+    if probe_at is not None and now - probe_at < CIRCUIT_COOLDOWN_SECONDS:
+        return True
+    if probe:
+        state["probe_at"] = now
+        return False
     return False
 
 
@@ -94,6 +109,7 @@ def _record_failure(tier_name: str) -> None:
     state = _circuit_state.setdefault(tier_name, {"failures": 0, "last_failure": 0})
     state["failures"] += 1
     state["last_failure"] = time.monotonic()
+    state.pop("probe_at", None)
 
 
 def _record_success(tier_name: str) -> None:
@@ -112,8 +128,9 @@ def _record_rate_limit(tier_name: str) -> None:
 
 OPENROUTER_BALANCE_FLOOR = float(os.getenv("OPENROUTER_BALANCE_FLOOR", "10.0"))
 
-_balance_cache: dict[str, float | None] = {"remaining": None, "checked_at": 0.0}
+_balance_cache: dict[str, float | None] = {"remaining": None, "checked_at": None}
 _BALANCE_CHECK_INTERVAL = 300  # re-check at most every 5 minutes
+_BALANCE_FAILURE_BACKOFF = 60  # after a failed lookup, wait this long to retry
 
 
 async def _check_openrouter_balance() -> float | None:
@@ -126,7 +143,14 @@ async def _check_openrouter_balance() -> float | None:
     known value.
     """
     now = time.monotonic()
-    if now - (_balance_cache.get("checked_at") or 0) < _BALANCE_CHECK_INTERVAL:
+    checked_at = _balance_cache.get("checked_at")
+    # None (or the legacy 0.0 sentinel) means "never checked": due now, even
+    # on a host whose monotonic clock is younger than the interval.
+    if (
+        checked_at is not None
+        and checked_at != 0.0
+        and now - checked_at < _BALANCE_CHECK_INTERVAL
+    ):
         return _balance_cache.get("remaining")
 
     api_key = os.getenv("OPENROUTER_API_KEY", "")
@@ -145,9 +169,15 @@ async def _check_openrouter_balance() -> float | None:
                 _balance_cache["remaining"] = remaining
                 _balance_cache["checked_at"] = now
                 return remaining
-    except (httpx.HTTPError, KeyError, TypeError, ValueError):
-        pass
+            logger.warning("openrouter credits lookup: HTTP %s", resp.status_code)
+    except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+        logger.warning("openrouter credits lookup failed: %s", exc)
 
+    # Back off instead of re-hitting a failing API on every request: stamp
+    # the check so the next attempt comes _BALANCE_FAILURE_BACKOFF from now.
+    _balance_cache["checked_at"] = (
+        now - _BALANCE_CHECK_INTERVAL + _BALANCE_FAILURE_BACKOFF
+    )
     return _balance_cache.get("remaining")
 
 
@@ -160,8 +190,8 @@ _NOTIFICATION_DEBOUNCE_SECONDS = 120
 def _should_notify(tier_name: str) -> bool:
     """Return True if enough time has passed since last notification for this tier."""
     now = time.monotonic()
-    last = _notification_last_sent.get(tier_name, 0)
-    if now - last < _NOTIFICATION_DEBOUNCE_SECONDS:
+    last = _notification_last_sent.get(tier_name)
+    if last is not None and now - last < _NOTIFICATION_DEBOUNCE_SECONDS:
         return False
     _notification_last_sent[tier_name] = now
     return True
@@ -178,14 +208,6 @@ def _background_notify(tier_name: str, message: str) -> None:
         return
     clean = message.replace("*", "").replace("`", "")
     logger.info("[tier] %s", clean)
-
-
-async def _safe_notify(message: str) -> None:
-    """Fire-and-forget wrapper that logs failures instead of raising."""
-    try:
-        await telegram.notify(message)
-    except Exception:
-        logger.exception("Notification delivery failed")
 
 
 # ─── Auto-Retry ──────────────────────────────────────────────────
@@ -858,7 +880,7 @@ def _detect_tier_hint(messages: list[dict]) -> str | None:
             )
             text_lower = text.lower()
             for keyword, tier in TIER_HINTS.items():
-                if f"!{keyword}" in text_lower:
+                if re.search(rf"(?<!\S)!{re.escape(keyword)}\b", text_lower):
                     return tier
             break
     return None
@@ -893,7 +915,11 @@ def _wrap_json_as_sse(json_response: JSONResponse) -> StreamingResponse:
     data = json.loads(bytes(json_response.body))
     completion_id = data.get("id", "clawrange-fallback")
     model = data.get("model", "unknown")
-    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    first_choice = (data.get("choices") or [{}])[0]
+    message = first_choice.get("message") or {}
+    # Tool-call replies carry "content": null.
+    content = message.get("content") or ""
+    tool_calls = message.get("tool_calls") or []
     tier = data.get("_clawrange_tier", "")
 
     def _make_chunk(delta: dict, finish_reason: str | None = None) -> str:
@@ -911,11 +937,17 @@ def _wrap_json_as_sse(json_response: JSONResponse) -> StreamingResponse:
         # Role chunk (no content)
         yield _make_chunk({"role": "assistant"})
         # Token-by-token content — split on space boundaries, preserve spaces
-        for i, word in enumerate(content.split(" ")):
-            token = f" {word}" if i > 0 else word
-            yield _make_chunk({"content": token})
+        if content:
+            for i, word in enumerate(content.split(" ")):
+                token = f" {word}" if i > 0 else word
+                yield _make_chunk({"content": token})
+        if tool_calls:
+            # OpenAI streaming format: every tool call carries its index.
+            yield _make_chunk(
+                {"tool_calls": [{"index": i, **tc} for i, tc in enumerate(tool_calls)]}
+            )
         # Final chunk
-        yield _make_chunk({}, finish_reason="stop")
+        yield _make_chunk({}, finish_reason="tool_calls" if tool_calls else "stop")
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(
@@ -958,7 +990,7 @@ async def _handle_tier_command() -> JSONResponse:
     lines = ["Tier Status\n"]
     for tier in CONFIG["tiers"]:
         name = tier["name"]
-        if _circuit_open(name):
+        if _circuit_open(name, probe=False):
             marker = "TRIPPED"
         elif name == _last_tier_used:
             marker = "ACTIVE"
@@ -1067,7 +1099,6 @@ MARKETING
 # ─── !task Command ──────────────────────────────────────────────
 
 
-_TASK_TRIGGERS = ("!task", "/task", "!tasks", "/tasks")
 _TASK_ACTIONS = ("cancel", "priority", "list", "tail")
 
 # ─── Marketing Commands (/sched, /scan, /projects) ──────────────
@@ -1082,14 +1113,6 @@ _MARKETING_PREFIXES = (
     "/marketing",
     "!marketing",
 )
-
-
-def _strip_prefix(msg: str) -> str:
-    """Remove leading / or ! from a command message."""
-    msg = msg.strip()
-    if msg and msg[0] in "/!":
-        msg = msg[1:]
-    return msg
 
 
 def _extract_marketing_command(msg: str) -> dict | None:
@@ -1731,15 +1754,48 @@ _PROACTIVE_INTERVALS = {
 }
 
 # Path to soul.md inside the container (mounted read-only).
-_SOUL_MD_PATH = Path(__file__).parent / "soul.md"
+_SOUL_MD_PATH = Path(
+    os.environ.get("SOUL_MD_PATH") or Path(__file__).parent / "soul.md"
+)
+
+
+# Task prefixes owned by other consumers. The heartbeat must leave these
+# pending: `research:tome:` tasks belong to scripts/tome_bridge.py (keep in
+# sync with its _TOME_PATTERNS); `[DRAFT] persona` mirrors a learning the
+# operator approves via /persona/*, and `[DRAFT] income:` is claimed by the
+# operator. `[DRAFT] Comment draft` tasks stay heartbeat-owned: they ask the
+# LLM worker to write the draft that the operator then reviews.
+_FOREIGN_TASK = re.compile(
+    r"^\s*(research:tome:|\[research:tome\]|research via tome:"
+    r"|\[DRAFT\]\s*persona\b|\[DRAFT\]\s*income:)",
+    re.IGNORECASE,
+)
+
+
+def _next_heartbeat_task(pending: list[dict]) -> dict | None:
+    """First pending task the heartbeat owns, or None."""
+    for task in pending:
+        if not _FOREIGN_TASK.match(task.get("description") or ""):
+            return task
+    return None
 
 
 def _load_soul() -> str:
-    """Read soul.md for persona context. Returns empty string if missing."""
-    try:
-        return _SOUL_MD_PATH.read_text().strip()
-    except FileNotFoundError:
-        return ""
+    """Persona context for self-directed prompts. Empty string if missing.
+
+    Prefers the rendered OpenClaw workspace SOUL.md, which carries approved
+    learnings. The bundled soul.md is a read-only bind of the repo template
+    and never sees them.
+    """
+    state = os.environ.get("OPENCLAW_STATE_DIR")
+    candidates = [Path(state) / "workspace" / "SOUL.md"] if state else []
+    candidates.append(_SOUL_MD_PATH)
+    for path in candidates:
+        try:
+            return path.read_text().strip()
+        except OSError:
+            continue
+    return ""
 
 
 # Persona sections that hold pure character backstory. When a prompt
@@ -1911,8 +1967,8 @@ def _is_heartbeat(msg: str) -> bool:
 def _proactive_ready(check_name: str) -> bool:
     """Return True if enough time has passed since the last run of this check."""
     interval = _PROACTIVE_INTERVALS.get(check_name, 3600)
-    last_run = _proactive_state.get(check_name, 0.0)
-    return (time.monotonic() - last_run) >= interval
+    last_run = _proactive_state.get(check_name)
+    return last_run is None or (time.monotonic() - last_run) >= interval
 
 
 def _proactive_mark(check_name: str) -> None:
@@ -2027,13 +2083,29 @@ async def _llm_call(
     package the GLM Coding Plan does not unlock, so it's bypassed.
     """
     if web_search:
-        return await _llm_call_search(prompt, max_tokens)
+        try:
+            return await asyncio.wait_for(
+                _llm_call_search(prompt, max_tokens), timeout=LLM_CALL_DEADLINE
+            )
+        except TimeoutError:
+            logger.warning("Search call exceeded %ss deadline", LLM_CALL_DEADLINE)
+            return None
 
     async def _try_tiers() -> str | None:
         for tier in CONFIG["tiers"]:
-            if _circuit_open(tier["name"]):
+            tier_name = tier["name"]
+            # Background work never spends paid credit: the paid tier is
+            # opt-in per chat message (!paid / !claude), never automatic.
+            if tier_name == "openrouter-paid":
                 continue
             provider = tier["provider"]
+            if provider not in PROVIDER_URLS:
+                logger.warning(
+                    "tier %s: provider %r has no URL configured — skipping",
+                    tier_name,
+                    provider,
+                )
+                continue
 
             if provider == "openrouter":
                 remaining = await _check_openrouter_balance()
@@ -2046,6 +2118,9 @@ async def _llm_call(
             provider_config = CONFIG["providers"][provider]
             api_key = os.getenv(provider_config["env_key"], "")
             if not api_key:
+                continue
+            # Last gate, so a claimed half-open probe is always really used.
+            if _circuit_open(tier_name):
                 continue
 
             body: dict = {
@@ -2061,9 +2136,21 @@ async def _llm_call(
                     msg = data.get("choices", [{}])[0].get("message", {})
                     text = (msg.get("content") or "").strip()
                     if text:
+                        _record_success(tier_name)
                         return text
-            except Exception:
-                pass
+                    _record_failure(tier_name)
+                elif _is_rate_limited(resp):
+                    _record_rate_limit(tier_name)
+                else:
+                    _record_failure(tier_name)
+            except Exception as exc:
+                logger.warning(
+                    "background LLM call failed on tier %s: %s: %s",
+                    tier_name,
+                    type(exc).__name__,
+                    exc,
+                )
+                _record_failure(tier_name)
         return None
 
     # Cap total time so a hung provider can't compound across tiers and block
@@ -2211,7 +2298,7 @@ async def _gather_system_state() -> str:
         name = tier["name"]
         status = (
             "TRIPPED"
-            if _circuit_open(name)
+            if _circuit_open(name, probe=False)
             else ("ACTIVE" if name == _last_tier_used else "ready")
         )
         tier_lines.append(f"  {name}: {status} — {tier['description']}")
@@ -2679,27 +2766,31 @@ def _digest_due(now: float | None = None) -> bool:
     return now - _digest_state["last_flush"] >= HEARTBEAT_DIGEST_INTERVAL
 
 
-def _digest_take(
+def _digest_take_ex(
     now: float,
     remaining: float | None,
     tripped: list[str],
     waiting: list[str] | None = None,
-) -> tuple[list[str], str]:
-    """Drain the buffer into direct messages plus the relayed summary.
+) -> tuple[list[str], str, list[int | None], list[str]]:
+    """Plan a digest flush WITHOUT clearing the buffer.
 
-    Returns ``(messages, summary)``: each message is one digest item (sent
-    straight to Telegram by the caller); the summary rides the heartbeat
-    response, which OpenClaw relays — keeping an independent channel for
-    the actionable footer (open questions, tripped tiers, balance).
+    Returns ``(messages, summary, owners, lines)``. The clock advances now
+    (a concurrent heartbeat must not flush the same hour twice) but the
+    buffered lines are only released by ``_digest_commit`` once the sends
+    have been attempted, so a failed send never loses the hour.
 
-    A due interval with an empty buffer stays silent — no empty chit-chat —
-    unless unanswered questions are waiting on the operator: that silence is
+    Each message is one digest item (sent straight to Telegram by the
+    caller); the summary rides the heartbeat response, which OpenClaw
+    relays, keeping an independent channel for the actionable footer
+    (open questions, tripped tiers, balance).
+
+    A due interval with an empty buffer stays silent, unless unanswered
+    questions are waiting on the operator: that silence is
     indistinguishable from a dead assistant, so the questions surface.
     """
     waiting = waiting or []
     _digest_load()
-    lines = _digest_state["lines"]
-    _digest_state["lines"] = []
+    lines = list(_digest_state["lines"])
     _digest_state["last_flush"] = now
     _digest_save()
     footer = list(waiting)
@@ -2709,9 +2800,10 @@ def _digest_take(
         footer.append(f"OpenRouter balance: ${remaining:.2f}")
     if not lines:
         if not footer:
-            return [], ""
-        return [], "\n".join(["Heartbeat digest: nothing new this hour.", *footer])
-    messages = _digest_messages(lines)
+            return [], "", [], lines
+        summary = "\n".join(["Heartbeat digest: nothing new this hour.", *footer])
+        return [], summary, [], lines
+    messages, owners, _kept = _digest_plan(lines)
     summary = "\n".join(
         [
             f"Heartbeat digest: {len(lines)} item(s) this hour — "
@@ -2719,6 +2811,41 @@ def _digest_take(
             *footer,
         ]
     )
+    return messages, summary, owners, lines
+
+
+def _digest_commit(
+    lines: list[str], owners: list[int | None], failed: set[int]
+) -> None:
+    """Release the flushed lines, keeping what was not delivered.
+
+    Re-buffered: lines with any failed message, and lines deferred past the
+    per-digest message cap. Lines recorded while the sends were in flight
+    (anything after the taken prefix) are preserved.
+    """
+    _digest_load()
+    kept = max((o for o in owners if o is not None), default=-1) + 1
+    failed_lines = {owners[i] for i in failed if owners[i] is not None}
+    carry = [ln for idx, ln in enumerate(lines[:kept]) if idx in failed_lines]
+    carry += lines[kept:]
+    _digest_state["lines"] = carry + _digest_state["lines"][len(lines) :]
+    _digest_save()
+
+
+def _digest_take(
+    now: float,
+    remaining: float | None,
+    tripped: list[str],
+    waiting: list[str] | None = None,
+) -> tuple[list[str], str]:
+    """Drain the buffer into direct messages plus the relayed summary.
+
+    Convenience wrapper that assumes every message will be delivered; the
+    heartbeat uses ``_digest_take_ex`` + ``_digest_commit`` so failed sends
+    are re-buffered.
+    """
+    messages, summary, owners, lines = _digest_take_ex(now, remaining, tripped, waiting)
+    _digest_commit(lines, owners, set())
     return messages, summary
 
 
@@ -2756,7 +2883,7 @@ def _split_for_telegram(text: str, limit: int = TELEGRAM_MAX_CHARS) -> list[str]
     rest = text
     while rest:
         if len(rest) <= limit:
-            parts.append("… " + rest)
+            parts.append(rest)
             break
         head = rest[:limit]
         cut = max(
@@ -2768,17 +2895,22 @@ def _split_for_telegram(text: str, limit: int = TELEGRAM_MAX_CHARS) -> list[str]
             cut = limit
         parts.append(rest[: cut + 1].rstrip())
         rest = rest[cut + 1 :].lstrip()
-    return parts
+    # Exactly one marker on every continuation part.
+    return [parts[0], *("… " + p for p in parts[1:])]
 
 
-def _digest_messages(lines: list[str]) -> list[str]:
-    """One Telegram message per buffered item, oldest first.
+def _digest_plan(lines: list[str]) -> tuple[list[str], list[int | None], int]:
+    """Plan the direct sends for the buffered items, oldest first.
+
+    Returns ``(messages, owners, kept)``: ``owners[i]`` is the index of the
+    line message ``i`` belongs to (None for the overflow pointer) and
+    ``lines[kept:]`` are the items deferred to the next digest.
 
     The hour's header rides the first message; an item longer than the send
     limit chunks across messages instead of being clipped. A runaway hour
     (scheduler bug, burst of created-task lines) stops at
     HEARTBEAT_DIGEST_MAX_MESSAGES direct sends — Telegram rate-limits bots —
-    and names what was deferred so nothing is silently lost.
+    and names what was deferred; deferred items stay buffered for the next digest.
     """
     item_word = "item" if len(lines) == 1 else "items"
     header = f"Heartbeat digest ({len(lines)} {item_word} this hour):"
@@ -2791,19 +2923,29 @@ def _digest_messages(lines: list[str]) -> list[str]:
         kept = kept[:-1]
         deferred += 1
     messages: list[str] = []
+    owners: list[int | None] = []
     for idx, line in enumerate(kept):
         parts = _split_for_telegram(line, limit=budget)
         for part_idx, part in enumerate(parts):
             if idx == 0 and part_idx == 0:
                 messages.append(f"{header}\n\n{part}")
             else:
-                messages.append(part if part_idx == 0 else f"… {part}")
+                # Continuation parts already carry their one "… " marker.
+                messages.append(part)
+            owners.append(idx)
     if deferred > 0:
         more_word = "item" if deferred == 1 else "items"
         messages.append(
-            f"… {deferred} more {more_word} this hour — see the task queue (GET /task)"
+            f"… {deferred} more {more_word} follow in the next digest "
+            "(full results: GET /task)"
         )
-    return messages
+        owners.append(None)
+    return messages, owners, len(kept)
+
+
+def _digest_messages(lines: list[str]) -> list[str]:
+    """One Telegram message per buffered item, oldest first."""
+    return _digest_plan(lines)[0]
 
 
 _ALERT_TASK_PREFIXES = ("low balance alert:", "investigate tier recovery:")
@@ -2832,13 +2974,47 @@ def _status_alert_result(description: str, remaining: float | None) -> str:
     lowered = description.lower()
     if lowered.startswith("investigate tier recovery:"):
         name = description.split(":", 1)[1].strip()
-        if _circuit_open(name):
+        if _circuit_open(name, probe=False):
             state = "TRIPPED (circuit open)"
         else:
             state = "recovered (circuit closed)"
         return f"Tier {name}: {state}. OpenRouter balance: {balance}."
     floor = f"${OPENROUTER_BALANCE_FLOOR:.0f}"
     return f"Live status: OpenRouter balance {balance} (floor {floor}); {routing}."
+
+
+# Total ceiling for one heartbeat task's work. OpenClaw's client times out the
+# heartbeat request (see LLM_CALL_DEADLINE above), so stay well under it.
+HEARTBEAT_WORK_DEADLINE_DEFAULT = 90.0
+
+
+def _heartbeat_work_deadline() -> float:
+    """Seconds allowed for one heartbeat task (env HEARTBEAT_WORK_DEADLINE)."""
+    raw = os.environ.get("HEARTBEAT_WORK_DEADLINE", "")
+    try:
+        value = float(raw)
+    except ValueError:
+        return HEARTBEAT_WORK_DEADLINE_DEFAULT
+    return value if value > 0 else HEARTBEAT_WORK_DEADLINE_DEFAULT
+
+
+async def _run_heartbeat_task(task: dict, brain_db, remaining: float | None) -> str:
+    """Do one claimed task's work and return its result text.
+
+    Structured interception, in order: self-created status alerts (closed
+    with live facts, never the LLM), then marketing scans, then
+    research-shaped tasks (web-capable orchestrator), then the LLM.
+    """
+    description = task["description"]
+    if _is_status_alert(description):
+        return _status_alert_result(description, remaining)
+    scan_result = await _try_marketing_scan(description, brain_db)
+    if scan_result is not None:
+        return scan_result
+    research_result = await _try_research_task(description)
+    if research_result is not None:
+        return research_result
+    return await _llm_work_task(description)
 
 
 async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse:
@@ -2863,7 +3039,11 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
     tasks_created: list[dict] = []
 
     # ── 1. Tier status ──────────────────────────────────────────
-    tripped = [tier["name"] for tier in CONFIG["tiers"] if _circuit_open(tier["name"])]
+    tripped = [
+        tier["name"]
+        for tier in CONFIG["tiers"]
+        if _circuit_open(tier["name"], probe=False)
+    ]
 
     remaining = await _check_openrouter_balance()
 
@@ -2872,49 +3052,71 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
     # ── 2. Check for pending tasks ──────────────────────────────
     # Process one task per cycle — both system-generated and user-created.
     pending = brain_db.list_tasks(status="pending")
+    task = _next_heartbeat_task(pending)
+    skipped = False
+    label = "SYSTEM"
 
-    if pending:
-        task = pending[0]
+    if task:
         source = task.get("source", "system")
         label = _operator_label() if source == "user" else "SYSTEM"
-        brain_db.claim_task(task["id"])
+        try:
+            claimed = brain_db.claim_task(task["id"])
+        except ValueError as exc:
+            # Another consumer won the race (or the task was cancelled):
+            # leave it alone this cycle, never mark it failed.
+            print(f"[PROXY] claim skipped for #{task['id']}: {exc}", flush=True)
+            claimed = None
+        if not claimed:
+            # Lost the race / not pending: skip this cycle entirely.
+            task = None
+            skipped = True
 
-        # Structured interception, in order: self-created status alerts
-        # (closed with live facts, never the LLM), then marketing scans,
-        # then research-shaped tasks (web-capable orchestrator), then the LLM.
-        if _is_status_alert(task["description"]):
-            result = _status_alert_result(task["description"], remaining)
-        else:
-            scan_result = await _try_marketing_scan(task["description"], brain_db)
-            if scan_result is not None:
-                result = scan_result
-            else:
-                research_result = await _try_research_task(task["description"])
-                if research_result is not None:
-                    result = research_result
-                else:
-                    result = await _llm_work_task(task["description"])
-
-        if _needs_input(result):
-            # The model asked the operator a question instead of finishing. Close it
-            # as blocked so it leaves the pending queue -- left pending it is
-            # reworked every cycle -- and spend one digest line on it.
-            brain_db.complete_task(task["id"], result, "blocked")
-            _digest_record(_blocked_digest_line(task))
-        else:
-            brain_db.complete_task(task["id"], result, "completed")
-            # One digest item per task; the result gets most of a Telegram
-            # message now that items flush as separate messages. The full
-            # result still lives on the task (!tasks / GET /task/{id}).
-            _digest_record(
-                f"[{label}] #{task['id']}: {task['description']}\n"
-                f"Result: {_clip_result(result, limit=DIGEST_RESULT_LIMIT)}"
+    if task:
+        deadline = _heartbeat_work_deadline()
+        try:
+            result = await asyncio.wait_for(
+                _run_heartbeat_task(task, brain_db, remaining), timeout=deadline
             )
+            failure: str | None = None
+        except TimeoutError:
+            result = ""
+            failure = f"timed out after {deadline:g}s"
+        except Exception as exc:
+            logger.exception("heartbeat task #%s failed", task["id"])
+            result = ""
+            failure = f"{type(exc).__name__}: {str(exc)[:200]}"
+
+        try:
+            if failure is not None:
+                logger.warning("heartbeat task #%s failed: %s", task["id"], failure)
+                brain_db.complete_task(task["id"], f"Failed: {failure}", "failed")
+                _digest_record(
+                    f"[{label}] #{task['id']}: {task['description']}\nFailed: {failure}"
+                )
+            elif _needs_input(result):
+                # The model asked the operator a question instead of finishing.
+                # Close it as blocked so it leaves the pending queue -- left
+                # pending it is reworked every cycle -- and spend one digest
+                # line on it.
+                brain_db.complete_task(task["id"], result, "blocked")
+                _digest_record(_blocked_digest_line(task))
+            else:
+                brain_db.complete_task(task["id"], result, "completed")
+                # One digest item per task; the result gets most of a Telegram
+                # message now that items flush as separate messages. The full
+                # result still lives on the task (!tasks / GET /task/{id}).
+                _digest_record(
+                    f"[{label}] #{task['id']}: {task['description']}\n"
+                    f"Result: {_clip_result(result, limit=DIGEST_RESULT_LIMIT)}"
+                )
+        except ValueError as exc:
+            # Task was cancelled or finished elsewhere meanwhile.
+            logger.warning("could not complete task #%s: %s", task["id"], exc)
 
         # No direct Telegram notification: the digest line above carries
         # the completion, at most once per hour.
 
-    else:
+    elif not skipped:
         # ── PROACTIVE SCAN ──────────────────────────────────────
         # (all_tasks is fetched before the pending branch: the digest
         # footer also needs it to re-surface blocked questions.)
@@ -2981,7 +3183,7 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
         _digest_record(f"Created #{t['id']} [P{t['priority']}] {t['description'][:60]}")
 
     if _digest_due():
-        messages, text = _digest_take(
+        messages, text, owners, taken = _digest_take_ex(
             time.time(),
             remaining,
             tripped,
@@ -2990,14 +3192,23 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
         # Items go straight to Telegram — one message each — before the
         # response returns, so they land ahead of the relayed summary.
         # Sequential sends keep the burst in order (header, oldest first).
-        failed = 0
-        for msg in messages:
-            if not await telegram.notify(msg):
-                failed += 1
+        failed_idx: set[int] = set()
+        try:
+            for i, msg in enumerate(messages):
+                if not await telegram.notify(msg):
+                    failed_idx.add(i)
+        except BaseException:
+            # Interrupted mid-burst: nothing unsent may be lost.
+            failed_idx.update(range(len(messages)))
+            _digest_commit(taken, owners, failed_idx)
+            raise
+        _digest_commit(taken, owners, failed_idx)
+        failed = len(failed_idx)
         if failed:
             text += (
                 f"\n{failed} digest message(s) failed to send — "
-                "full results remain in the task queue (GET /task)."
+                "they stay buffered for the next digest; full results remain "
+                "in the task queue (GET /task)."
             )
         # OpenClaw logs only Telegram *failures*, so a silent digest and a
         # dropped one look identical downstream. Log the handoff to give the
@@ -3029,6 +3240,20 @@ async def _notify_tier_change(tier_name: str) -> None:
     _last_tier_used = tier_name
 
 
+# ─── Fire-and-forget tasks ───────────────────────────────────────
+
+# asyncio keeps only weak references to tasks; an un-held fire-and-forget
+# task can be garbage collected mid-flight. Hold them until they finish.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
 # ─── Single-Tier Attempt ─────────────────────────────────────────
 
 
@@ -3048,8 +3273,8 @@ async def _try_single_tier(
     api_key = os.getenv(provider_config["env_key"], "")
 
     if status_msg_id:
-        asyncio.create_task(telegram.send_typing())
-        asyncio.create_task(
+        _spawn_background(telegram.send_typing())
+        _spawn_background(
             telegram.edit_status(status_msg_id, f"\u23f3 {tier['description']}")
         )
 
@@ -3156,9 +3381,31 @@ async def _try_single_tier(
         _record_failure(tier_name)
         _background_notify(tier_name, f"*Network error* on `{tier_name}`: {exc}")
         return None, None
+    except (ValueError, IndexError, KeyError, TypeError, AttributeError) as exc:
+        # A 200 with a non-JSON body, an empty/odd `choices`, or a non-dict
+        # payload is a broken provider: count it against the breaker.
+        logger.warning(
+            "tier %s returned a malformed response: %s: %s",
+            tier_name,
+            type(exc).__name__,
+            exc,
+        )
+        _record_failure(tier_name)
+        return None, None
 
 
 # ─── Proxy Endpoint ───────────────────────────────────────────────
+
+
+async def _json_object(request: Request) -> dict:
+    """Parse the request body as a JSON object or raise 400."""
+    try:
+        raw = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from None
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+    return raw
 
 
 @router.post("/v1/embeddings")
@@ -3171,7 +3418,7 @@ async def embeddings(
     if not auth.bearer_ok(authorization, PROXY_AUTH_TOKEN):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    raw_body = await request.json()
+    raw_body = await _json_object(request)
     inputs = raw_body.get("input")
     if not inputs:
         raise HTTPException(status_code=400, detail="input is required")
@@ -3209,11 +3456,16 @@ async def chat_completions(
     request: Request,
     authorization: str | None = Header(None),
 ):
+    # Auth check — fails closed when PROXY_AUTH_TOKEN is unset
     if not auth.bearer_ok(authorization, PROXY_AUTH_TOKEN):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    raw_body = await request.json()
+    raw_body = await _json_object(request)
     messages = raw_body.get("messages", [])
+    if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
+        raise HTTPException(
+            status_code=400, detail="messages must be a list of objects"
+        )
     is_stream = raw_body.get("stream", False)
 
     # Intercept status commands before they hit the LLM
@@ -3358,7 +3610,7 @@ async def chat_completions(
         print("[PROXY] no tier hint — racing all free tiers", flush=True)
 
     # Show typing indicator and send a transient status message
-    asyncio.create_task(telegram.send_typing())
+    _spawn_background(telegram.send_typing())
     status_msg_id = await telegram.send_status("\u23f3")
 
     # Always use non-streaming internally for full sanitization + garbled
@@ -3375,10 +3627,14 @@ async def chat_completions(
             "I took too long to respond — the LLM providers might be slow. "
             "Please try again in a moment."
         )
-
-    # Remove the status message — OpenClaw delivers the real response
-    if status_msg_id:
-        asyncio.create_task(telegram.delete_message(status_msg_id))
+    finally:
+        # Remove the status message — OpenClaw delivers the real response.
+        # In a finally so an error never strands the "⏳" message.
+        if status_msg_id:
+            try:
+                await asyncio.wait_for(telegram.delete_message(status_msg_id), 5)
+            except Exception as exc:
+                logger.warning("status message delete failed: %s", exc)
 
     if is_stream and isinstance(result, JSONResponse):
         return _wrap_json_as_sse(result)
@@ -3406,7 +3662,7 @@ async def _handle_non_streaming(
         provider = tier["provider"]
         provider_config = CONFIG["providers"][provider]
         api_key = os.getenv(provider_config["env_key"], "")
-        if not api_key or _circuit_open(tier_name):
+        if not api_key:
             continue
         if provider not in PROVIDER_URLS:
             continue
@@ -3429,6 +3685,10 @@ async def _handle_non_streaming(
             remaining = await _check_openrouter_balance()
             if remaining is not None and remaining <= OPENROUTER_BALANCE_FLOOR:
                 continue
+        # Last gate: claiming the half-open probe slot must mean the tier
+        # really is going to be called.
+        if _circuit_open(tier_name):
+            continue
         available.append(tier)
 
     if not available:
@@ -3486,14 +3746,17 @@ async def _handle_non_streaming(
                     f"All tiers rate-limited — auto-retrying in {wait}s",
                 )
                 if status_msg_id:
-                    asyncio.create_task(
+                    _spawn_background(
                         telegram.edit_status(
                             status_msg_id, f"\u23f3 Rate limited — retrying in {wait}s"
                         )
                     )
                 await asyncio.sleep(wait)
-                for name, _ in rate_limit_resets:
-                    _circuit_state.pop(name, None)
+                # Only tiers whose reset window has elapsed by now; a tier
+                # with a longer (or unknown) reset stays tripped.
+                for name, secs in rate_limit_resets:
+                    if secs is not None and secs <= wait:
+                        _circuit_state.pop(name, None)
                 return await _handle_non_streaming(
                     body,
                     forced_tier,

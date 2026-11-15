@@ -3,7 +3,7 @@ tenant-specific surface (persona, seeds, connector wiring, CRM config).
 
 A profile lives at ``config/profiles/<name>/profile.yaml``. The active
 profile is chosen by the ``CLAWRANGE_PROFILE`` env var (default
-``marketing``), so a fresh clone configures behavior by editing YAML
+``starter``), so a fresh clone configures behavior by editing YAML
 rather than Python.
 
 Named ``tenant_profile`` (not ``profile``) deliberately: a top-level
@@ -83,6 +83,9 @@ def resolve_env(value: Any, env: dict[str, str] | None = None) -> Any:
     if isinstance(value, list):
         return [resolve_env(v, env) for v in value]
     return value
+
+
+_PROFILE_NAME_RE = re.compile(r"[a-z0-9_-]+")
 
 
 @dataclass
@@ -213,8 +216,14 @@ def validate(
         raise ProfileError("reddit.default_subreddits must be a list of names")
     _validate_homelab_deals(profile.raw.get("homelab_deals"))
     _validate_outreach(profile.raw.get("outreach"))
+    _validate_income_review(profile.raw.get("income_review"))
 
     for s in profile.schedules:
+        catch_up = s.get("catch_up")
+        if catch_up is not None and not isinstance(catch_up, bool):
+            raise ProfileError(
+                f"schedule '{s.get('id')}' catch_up must be true or false"
+            )
         kind = s.get("kind")
         if kind not in known_generator_kinds:
             raise ProfileError(
@@ -259,6 +268,13 @@ def _validate_search_hygiene(block: Any) -> None:
 
 def _is_str_list(value: Any) -> bool:
     return isinstance(value, list) and all(isinstance(v, str) for v in value)
+
+
+def _validate_income_review(block: Any) -> None:
+    if block is None:
+        return
+    if not isinstance(block, dict) or not isinstance(block.get("checklist", ""), str):
+        raise ProfileError("income_review must be a mapping with text `checklist`")
 
 
 def _validate_outreach(block: Any) -> None:
@@ -451,6 +467,8 @@ def load_profile(
     if env is None:
         env = dict(os.environ)
     name = name or env.get("CLAWRANGE_PROFILE") or "starter"
+    if not _PROFILE_NAME_RE.fullmatch(name):
+        raise ProfileError(f"invalid profile name {name!r}: use [a-z0-9_-]+")
 
     base = Path(profiles_dir) if profiles_dir is not None else default_profiles_dir()
     path = base / name / "profile.yaml"

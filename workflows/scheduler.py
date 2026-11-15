@@ -7,12 +7,14 @@ would try to persist `brain_db` itself (which holds a live sqlite
 connection) and fail at startup.
 """
 
+import inspect
 import json
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from apscheduler.jobstores.base import JobLookupError
 from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -24,10 +26,20 @@ logger = logging.getLogger("clawrange.scheduler")
 
 # Daily reports that must arrive even when workflows was down at fire time.
 # The jobstore is in-memory, so without this a restart spanning 08:00
-# silently drops that day's rundown.
-CATCH_UP_SCHEDULES = {"morning_digest", "homelab_deals"}
+# silently drops that day's rundown. Which schedules qualify is profile
+# config: a schedule opts in with `catch_up: true`.
 CATCH_UP_WINDOW = timedelta(hours=4)
 CATCH_UP_DELAY = timedelta(seconds=90)  # let Telegram/LLM deps settle
+
+
+def catch_up_ids() -> set[str]:
+    """Schedule ids the active profile marks `catch_up: true`."""
+    import tenant_profile
+
+    profile = tenant_profile.active_profile()
+    if profile is None:
+        return set()
+    return {str(s["id"]) for s in profile.schedules if s.get("catch_up") is True}
 
 
 def _last_fire(cron: str, now: datetime, tz_name: str) -> datetime | None:
@@ -63,8 +75,9 @@ def _queue_catch_ups(
     scheduler: AsyncIOScheduler, schedules: list, brain_db, tz_name: str
 ) -> None:
     now = datetime.now(ZoneInfo(tz_name))
+    opted_in = catch_up_ids()
     for sched in schedules:
-        if sched.get("paused") or sched["kind"] not in CATCH_UP_SCHEDULES:
+        if sched.get("paused") or sched["id"] not in opted_in:
             continue
         try:
             missed = _missed_fire(sched, now, tz_name)
@@ -175,8 +188,68 @@ def _parse_cron(cron_str: str) -> dict:
         "hour": fields[1],
         "day": fields[2],
         "month": fields[3],
-        "day_of_week": fields[4],
+        "day_of_week": _translate_dow(fields[4]),
     }
+
+
+_DOW_NAMES = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"]
+
+
+def _translate_dow(field: str) -> str:
+    """Standard cron day-of-week (0/7=Sun, 1=Mon) -> APScheduler names.
+
+    APScheduler 3.x numbers Monday as 0, so numeric fields are expanded to
+    explicit day names. Name-based items (mon-fri) pass through unchanged.
+    """
+    if field == "*":
+        return field
+    out: list[str] = []
+    for item in field.split(","):
+        if re.search(r"[A-Za-z]", item):
+            out.append(item)
+            continue
+        base, _, step_s = item.partition("/")
+        try:
+            step = int(step_s) if step_s else 1
+            if base == "*":
+                lo, hi = 0, 6
+            elif "-" in base:
+                a, b = base.split("-", 1)
+                lo, hi = int(a), int(b)
+            else:
+                lo = int(base)
+                hi = 7 if step_s else lo
+        except ValueError:
+            raise ValueError(f"Invalid day_of_week: {field}") from None
+        if step < 1 or lo < 0 or hi > 7 or lo > hi:
+            raise ValueError(f"Invalid day_of_week: {field}")
+        out.extend(_DOW_NAMES[d % 7] for d in range(lo, hi + 1, step))
+    return ",".join(dict.fromkeys(out))
+
+
+def validate_schedule(kind: str, cron: str, kwargs: dict | None) -> None:
+    """Raise ValueError when a schedule could not run. Used before persisting."""
+    if kind not in GENERATORS:
+        raise ValueError(f"unknown kind '{kind}' (known: {sorted(GENERATORS)})")
+    try:
+        CronTrigger(**_parse_cron(cron), timezone="UTC")
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"invalid cron '{cron}': {exc}") from exc
+    if kwargs is None:
+        return
+    if not isinstance(kwargs, dict):
+        raise ValueError("kwargs must be an object")
+    try:
+        json.dumps(kwargs)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"kwargs must be JSON-serialisable: {exc}") from exc
+    if "brain_db" in kwargs:
+        raise ValueError("kwargs may not set brain_db")
+    params = inspect.signature(GENERATORS[kind]).parameters
+    if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        unknown = sorted(set(kwargs) - set(params))
+        if unknown:
+            raise ValueError(f"kwargs not accepted by {kind}: {unknown}")
 
 
 def _parse_duration(duration_str: str) -> dict:
@@ -213,8 +286,20 @@ async def add_schedule(
     """Add a new schedule (persists to DB and registers with APScheduler)."""
     sched = brain_db.upsert_schedule(schedule_id, name, kind, cron, kwargs)
     if scheduler:
-        _register_job(scheduler, sched, brain_db)
+        if sched.get("paused"):
+            # Editing a paused schedule must not silently un-pause it; the
+            # job is registered fresh when it is resumed.
+            _remove_job(scheduler, sched["id"])
+        else:
+            _register_job(scheduler, sched, brain_db)
     return sched
+
+
+def _remove_job(scheduler: AsyncIOScheduler, schedule_id: str) -> None:
+    try:
+        scheduler.remove_job(f"marketing_{schedule_id}")
+    except JobLookupError:
+        pass
 
 
 async def remove_schedule(
@@ -245,12 +330,12 @@ async def resume_schedule(
     scheduler: AsyncIOScheduler | None, brain_db, schedule_id: str
 ) -> dict | None:
     """Resume a paused schedule."""
-    if scheduler:
-        try:
-            scheduler.resume_job(f"marketing_{schedule_id}")
-        except Exception:
-            pass
-    return brain_db.set_schedule_paused(schedule_id, False)
+    sched = brain_db.set_schedule_paused(schedule_id, False)
+    if scheduler and sched:
+        # Paused schedules are not registered at boot, so resume_job alone
+        # would find nothing after a restart: register from the DB row.
+        _register_job(scheduler, sched, brain_db)
+    return sched
 
 
 async def run_schedule_now(
@@ -274,19 +359,11 @@ async def run_schedule_now(
         # "delivered N/N msgs") keep it; the catch-up check depends on it.
         after = brain_db.get_schedule(sched["id"]) or {}
         if after.get("last_run") == sched.get("last_run"):
-            now = (
-                __import__("datetime")
-                .datetime.now(__import__("datetime").timezone.utc)
-                .isoformat()
-            )
+            now = datetime.now(UTC).isoformat()
             brain_db.update_schedule_status(sched["id"], now, "ok")
         return {"status": "ok", "schedule_id": sched["id"]}
     except Exception as exc:
-        now = (
-            __import__("datetime")
-            .datetime.now(__import__("datetime").timezone.utc)
-            .isoformat()
-        )
+        now = datetime.now(UTC).isoformat()
         brain_db.update_schedule_status(sched["id"], now, f"error: {exc}")
         return {"status": "error", "schedule_id": sched["id"], "error": str(exc)}
 

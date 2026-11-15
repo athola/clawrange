@@ -48,6 +48,10 @@ TENANT_TOKENS = [
     "localllama",
     "awesome-claude",
     "texas",
+    # One tenant's income-testbed strategy.
+    "usdc",
+    "20-week",
+    "$50",
 ]
 # Shipped non-Python surfaces OpenClaw, Docker and operators read.
 TEXT_SURFACES = [
@@ -318,3 +322,23 @@ class TestMarketAndAudienceFromProfile:
         assert "local food forums" in prompts[-1]
         await rundown.synthesize([project], TestOutreachPolicyFromProfile.EV, policy)
         assert "brief for a bakery owner" in prompts[-1]
+
+
+class TestIncomeReviewChecklist:
+    def test_default_is_generic(self, monkeypatch):
+        import generators
+
+        monkeypatch.setattr(
+            tenant_profile,
+            "load_profile",
+            lambda name=None: tenant_profile.Profile("x", {}),
+        )
+        text = generators._income_review_checklist()
+        assert "P&L" in text and "$" not in text
+
+    def test_profile_block_overrides(self, monkeypatch):
+        import generators
+
+        prof = tenant_profile.Profile("x", {"income_review": {"checklist": "Mine."}})
+        monkeypatch.setattr(tenant_profile, "load_profile", lambda name=None: prof)
+        assert generators._income_review_checklist() == "Mine."

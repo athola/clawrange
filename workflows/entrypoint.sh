@@ -34,7 +34,14 @@ except Exception:
 PY
 }
 
-uvicorn app:app --host 0.0.0.0 --port "$PORT" --reload &
+# Hot reload is a dev convenience (source bind-mounted by the base compose
+# file). Prod runs the baked image without it: every reload wiped the
+# in-memory scheduler jobs and module state.
+if [ "${UVICORN_RELOAD:-0}" = "1" ]; then
+  uvicorn app:app --host 0.0.0.0 --port "$PORT" --reload &
+else
+  uvicorn app:app --host 0.0.0.0 --port "$PORT" &
+fi
 UVICORN_PID=$!
 
 # shellcheck disable=SC2317  # reached via trap, not linearly

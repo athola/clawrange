@@ -5,10 +5,10 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 import auth
 import github_search
@@ -32,6 +32,7 @@ from scheduler import (
     remove_schedule,
     resume_schedule,
     run_schedule_now,
+    validate_schedule,
 )
 from telegram import notify
 from tenant_profile import load_profile
@@ -137,23 +138,37 @@ app.include_router(llm_router)
 app.include_router(create_brain_router(brain_db), prefix="/brain")
 
 
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 def _persona_render_targets(profile):
-    repo = os.path.dirname(os.path.dirname(__file__))
+    """Where an approved learning re-renders the persona.
+
+    The repo's openclaw/ templates only exist on the host (``make persona``);
+    in the container app.py lives at /app, so those targets are skipped
+    rather than failing on every approve. Workspace targets are every
+    ``workspace*`` directory OpenClaw created under its state dir, so the
+    core never hard-codes one operator's agent names.
+    """
     state = os.environ.get(
-        "OPENCLAW_STATE_DIR", os.path.join(repo, "data", "openclaw-state")
+        "OPENCLAW_STATE_DIR", os.path.join(_REPO_ROOT, "data", "openclaw-state")
     )
-    return {
-        "soul": os.path.join(repo, "openclaw", "soul.md"),
-        "identity": os.path.join(repo, "openclaw", "identity.md"),
-        "workspace_soul": [
-            os.path.join(state, "workspace", "SOUL.md"),
-            os.path.join(state, "workspace-max-ops", "SOUL.md"),
-        ],
-        "workspace_identity": [
-            os.path.join(state, "workspace", "IDENTITY.md"),
-            os.path.join(state, "workspace-max-ops", "IDENTITY.md"),
-        ],
-    }
+    targets: dict[str, Any] = {}
+    repo_openclaw = os.path.join(_REPO_ROOT, "openclaw")
+    if os.path.isdir(repo_openclaw):
+        targets["soul"] = os.path.join(repo_openclaw, "soul.md")
+        targets["identity"] = os.path.join(repo_openclaw, "identity.md")
+    try:
+        workspaces = sorted(
+            e.path
+            for e in os.scandir(state)
+            if e.is_dir() and e.name.startswith("workspace")
+        )
+    except OSError:
+        workspaces = []
+    targets["workspace_soul"] = [os.path.join(w, "SOUL.md") for w in workspaces]
+    targets["workspace_identity"] = [os.path.join(w, "IDENTITY.md") for w in workspaces]
+    return targets
 
 
 def _current_profile():
@@ -182,9 +197,19 @@ app.include_router(
 
 
 class TaskCreate(BaseModel):
-    description: str
+    description: str = Field(min_length=1, max_length=4000)
     priority: int = 3  # 1=urgent, 3=normal, 5=low
-    source: str = "user"  # user (via !task / API) or system (heartbeat-generated)
+    # user (via !task / API) or system (heartbeat-generated). Internal
+    # producers (persona, schedule, scan) write via brain_db directly, so the
+    # public API can't impersonate them.
+    source: Literal["user", "system"] = "user"
+
+    @field_validator("description")
+    @classmethod
+    def _not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("description must not be blank")
+        return v
 
 
 class TaskResult(BaseModel):
@@ -409,7 +434,7 @@ class SchedulePatch(BaseModel):
 
 
 @app.get("/sched")
-async def list_schedules():
+def list_schedules():
     scheds = brain_db.list_schedules()
     jobs = (
         list_scheduled_jobs(app.state.scheduler)
@@ -424,7 +449,7 @@ async def list_schedules():
 
 
 @app.get("/sched/{schedule_id}")
-async def get_schedule(schedule_id: str):
+def get_schedule(schedule_id: str):
     sched = brain_db.get_schedule(schedule_id)
     if not sched:
         raise HTTPException(status_code=404, detail="Schedule not found")
@@ -441,6 +466,10 @@ async def get_schedule(schedule_id: str):
 
 @app.post("/sched")
 async def create_schedule(body: ScheduleCreate):
+    try:
+        validate_schedule(body.kind, body.cron, body.kwargs)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     sched = await add_schedule(
         app.state.scheduler if hasattr(app.state, "scheduler") else None,
         brain_db,
@@ -473,6 +502,17 @@ async def update_schedule(schedule_id: str, body: SchedulePatch):
         existing = brain_db.get_schedule(schedule_id)
         if not existing:
             raise HTTPException(status_code=404, detail="Schedule not found")
+        new_kwargs = (
+            body.kwargs
+            if body.kwargs is not None
+            else json.loads(existing.get("kwargs") or "{}")
+        )
+        try:
+            validate_schedule(
+                existing["kind"], body.cron or existing["cron"], new_kwargs
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         return await add_schedule(
             app.state.scheduler if hasattr(app.state, "scheduler") else None,
             brain_db,
@@ -480,9 +520,7 @@ async def update_schedule(schedule_id: str, body: SchedulePatch):
             existing["name"],
             existing["kind"],
             body.cron or existing["cron"],
-            body.kwargs
-            if body.kwargs is not None
-            else json.loads(existing.get("kwargs", "{}")),
+            new_kwargs,
         )
 
     return brain_db.get_schedule(schedule_id)

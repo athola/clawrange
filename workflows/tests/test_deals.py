@@ -4,6 +4,7 @@ price parsing, and deal classification against targets and history."""
 import pytest
 
 import deals
+import tenant_profile
 from deals import Listing, WatchTarget
 
 RTX3090 = WatchTarget(
@@ -347,12 +348,21 @@ class TestHomelabDealsGenerator:
         assert db.get_schedule("homelab_deals")["last_status"].startswith("FAILED")
         assert not db.is_seen("deal", "ebay:f1")
 
-    def test_registered_and_caught_up(self):
+    def test_registered_and_caught_up(self, monkeypatch):
         from generators import GENERATORS
-        from scheduler import CATCH_UP_SCHEDULES
+        from scheduler import catch_up_ids
 
         assert "homelab_deals" in GENERATORS
-        assert "homelab_deals" in CATCH_UP_SCHEDULES
+        import yaml
+
+        raw = yaml.safe_load(
+            (
+                tenant_profile.default_profiles_dir() / "marketing" / "profile.yaml"
+            ).read_text()
+        )
+        marketing = tenant_profile.Profile("marketing", raw)
+        monkeypatch.setattr(tenant_profile, "active_profile", lambda: marketing)
+        assert "homelab_deals" in catch_up_ids()
 
 
 class TestHaveWantTitles:
@@ -965,3 +975,20 @@ class TestHistoryPrune:
         db.init_db()
         db.record_deal_observation("eBay", "1", "X", 1.0, title="t")
         assert db.deal_observations()[0]["title"] == "t"
+
+
+class TestSynthesizeFailureIsLogged:
+    @pytest.mark.asyncio
+    async def test_exception_is_logged_not_swallowed(self, monkeypatch, caplog):
+        from unittest.mock import AsyncMock
+
+        import llm_proxy
+
+        monkeypatch.setattr(
+            llm_proxy, "_llm_call", AsyncMock(side_effect=RuntimeError("quota"))
+        )
+        deal = deals.classify(_listing("RTX 3090 24GB", price=500.0), RTX3090, None)
+        deals.order_and_number([deal])
+        with caplog.at_level("WARNING", logger="clawrange.deals"):
+            assert await deals.synthesize([deal], "") is None
+        assert any("synthesis failed" in r.getMessage() for r in caplog.records)

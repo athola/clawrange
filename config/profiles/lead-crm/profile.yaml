@@ -120,4 +120,4 @@ crm:
       description: "Find leads matching a name, email or phone fragment."
       params:
         q: {type: string}
-      sql: "SELECT * FROM leads WHERE email LIKE :like OR name LIKE :like OR phone LIKE :like LIMIT 10"
+      sql: "SELECT * FROM leads WHERE email LIKE :like ESCAPE '\\' OR name LIKE :like ESCAPE '\\' OR phone LIKE :like ESCAPE '\\' LIMIT 10"

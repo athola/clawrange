@@ -105,3 +105,23 @@ async def test_answer_fallback_on_unmappable(crm):
     res = await answer("what is the weather", crm, TEMPLATES, llm=_stub("nope"))
     assert res["template"] is None
     assert "couldn't map" in res["answer"].lower()
+
+
+def test_enum_value_missing_from_map_is_a_value_error():
+    from crm.query import coerce_params
+
+    t = {
+        "params": {
+            "g": {"type": "enum", "values": ["day", "week"], "map": {"day": "%d"}}
+        }
+    }
+    with pytest.raises(ValueError, match="map"):
+        coerce_params(t, {"g": "week"})
+
+
+def test_string_like_escapes_wildcards():
+    """'%' and '_' in user input are literal characters, not LIKE wildcards."""
+    from crm.query import coerce_params
+
+    t = {"params": {"q": {"type": "string"}}}
+    assert coerce_params(t, {"q": "50%_off"})["like"] == "%50\\%\\_off%"

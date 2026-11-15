@@ -230,11 +230,17 @@ async def fetch_reddit(
         if i and pace:
             await sleep(pace)
         url = REDDIT_NEW_RSS.format(sub=sub)
+        # One bad sub (timeout, malformed feed) must not drop the others.
         for attempt in range(2):
-            resp = await client.get(url, headers={"User-Agent": USER_AGENT})
-            health.record(resp.status_code)
-            if resp.status_code == 200:
-                out.extend(parse_feed(resp.text, f"r/{sub}"))
+            try:
+                resp = await client.get(url, headers={"User-Agent": USER_AGENT})
+                health.record(resp.status_code)
+                if resp.status_code == 200:
+                    out.extend(parse_feed(resp.text, f"r/{sub}"))
+                    break
+            except Exception as exc:
+                logger.warning("deals: reddit r/%s feed failed: %r", sub, exc)
+                health.record("error")
                 break
             if resp.status_code != 429 or attempt:
                 break
@@ -273,7 +279,10 @@ def _ebay_listing(item: dict) -> Listing | None:
     shipping = None
     opts = item.get("shippingOptions") or []
     if opts and (opts[0].get("shippingCost") or {}).get("value") is not None:
-        shipping = float(opts[0]["shippingCost"]["value"])
+        try:
+            shipping = float(opts[0]["shippingCost"]["value"])
+        except (TypeError, ValueError):
+            shipping = None  # unknown shipping beats losing the listing
     return Listing(
         source="eBay",
         listing_id=item.get("itemId", ""),
@@ -299,6 +308,7 @@ async def fetch_ebay(
     pace: float = 1.0,
     _sleep: Sleep | None = None,
     config: dict | None = None,
+    failed: list[str] | None = None,
 ) -> list[Listing]:
     """Fixed-price and auction listings per target, excluding for-parts.
 
@@ -306,6 +316,8 @@ async def fetch_ebay(
     great price, so the history median sees the normal market, not only
     bargains. `config` is the profile's `sources.ebay` block: `marketplace`
     (default EBAY_US), `currency` (USD) and `delivery_country` (US).
+    A target whose request fails is skipped and its query appended to
+    `failed` (when given); credential rejections still abort the source.
     """
     cfg = config or {}
     currency = cfg.get("currency") or "USD"
@@ -332,14 +344,29 @@ async def fetch_ebay(
         }
         if t.ebay_category:
             params["category_ids"] = t.ebay_category
-        resp = await client.get(EBAY_SEARCH_URL, headers=headers, params=params)
-        if resp.status_code in (401, 403):
-            raise NotConfigured(f"eBay search rejected (HTTP {resp.status_code})")
-        if resp.status_code != 200:
-            logger.warning("deals: ebay '%s' -> HTTP %d", t.query, resp.status_code)
+        try:
+            resp = await client.get(EBAY_SEARCH_URL, headers=headers, params=params)
+            if resp.status_code in (401, 403):
+                raise NotConfigured(f"eBay search rejected (HTTP {resp.status_code})")
+            if resp.status_code != 200:
+                logger.warning("deals: ebay '%s' -> HTTP %d", t.query, resp.status_code)
+                if failed is not None:
+                    failed.append(t.query)
+                continue
+            items = resp.json().get("itemSummaries") or []
+        except NotConfigured:
+            raise
+        except Exception as exc:
+            logger.warning("deals: ebay '%s' failed: %r", t.query, exc)
+            if failed is not None:
+                failed.append(t.query)
             continue
-        for item in resp.json().get("itemSummaries") or []:
-            listing = _ebay_listing(item)
+        for item in items:
+            try:
+                listing = _ebay_listing(item)
+            except Exception as exc:  # one odd item must not drop the target
+                logger.warning("deals: ebay item skipped: %r", exc)
+                continue
             if listing is not None:
                 out.append(listing)
     return out
@@ -374,10 +401,18 @@ async def gather(
                 continue
             fn = globals()[fn_name]
             try:
-                kwargs = {"config": sources.get(key) or {}} if key == "ebay" else {}
+                kwargs: dict = {}
+                failed: list[str] = []
+                if key == "ebay":
+                    kwargs = {"config": sources.get(key) or {}, "failed": failed}
                 found = await fn(client, targets, pace=pace, **kwargs)
+                if failed and len(failed) >= len(targets):
+                    raise RuntimeError(f"all {len(targets)} target searches failed")
                 listings.extend(found)
-                statuses.append(SourceStatus(name, True, f"{len(found)} listings"))
+                detail = f"{len(found)} listings"
+                if failed:
+                    detail += f" ({len(failed)}/{len(targets)} targets failed)"
+                statuses.append(SourceStatus(name, True, detail))
             except NotConfigured as exc:
                 statuses.append(SourceStatus(name, False, str(exc), EBAY_FIX))
             except Exception as exc:

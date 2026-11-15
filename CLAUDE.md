@@ -13,10 +13,14 @@ Tailscale and Caddy gateway.
 - `docker-compose.yml`: OpenClaw and workflows orchestration
 - `docker-compose.prod.yml`: production overrides (Tailscale binding)
 - `openclaw/`: assistant config: `soul.md` (persona), `soul-ops.md`
-  (ops mode), `HEARTBEAT.md` (5-minute heartbeat instructions),
+  (ops mode), `HEARTBEAT.md` (10-minute heartbeat instructions),
   `config/openclaw.json` (tool routing)
 - `workflows/`: FastAPI service replacing n8n:
   - `app.py`: FastAPI entrypoint and route registration
+  - `auth.py`: app-wide bearer auth (`PROXY_AUTH_TOKEN`), fails closed;
+    only `/healthz*`, `GET /tier`, `GET /sched[/{id}]` are public
+  - `rundown.py`, `deals.py`, `deal_sources.py`: daily outreach and
+    homelab deal rundowns
   - `brain.py`, `brain_db.py`: persistent knowledge store and task queue
   - `llm_proxy.py`: OpenAI-compatible proxy with tiered routing,
     web-search routing, anti-hallucination guard, balance circuit breaker
@@ -61,11 +65,17 @@ Tailscale and Caddy gateway.
 - Docker images use `:latest` for testing: pin versions before production.
 - `.env` is gitignored. `.env.example` is the template.
 - OpenClaw runs internally on port 18789, mapped to host port 3000.
+- Ports bind `127.0.0.1` plus `DOCKER_HOST_IP` (docker0, for sibling
+  compose projects); prod adds `TAILSCALE_IP`. Never `0.0.0.0`: under WSL
+  mirrored networking that is LAN-reachable.
+- Dev compose bind-mounts `./workflows` and runs `uvicorn --reload`; prod
+  (`make start-prod`) runs the baked image without reload, so code changes
+  need a rebuild.
 - Workflows runs on port 5678 (replaces the n8n port).
 - DeerFlow runs via its own docker-compose (multi-service), connected to
   `msp-network`.
-- Single uvicorn worker is a hard requirement: APScheduler 4 runs in
-  single-process mode.
+- Single uvicorn worker is a hard requirement: APScheduler 3.x (pinned
+  `<4`) runs in single-process mode.
 - Brain database lives at `data/brain/brain.db` (bind-mounted into the
   workflows container at `/data/brain.db`).
 
@@ -89,6 +99,10 @@ make py-lint          # uv run ruff check .
 ```
 
 ## API Endpoints
+
+Every route requires `Authorization: Bearer $PROXY_AUTH_TOKEN` except
+`/healthz*`, `GET /tier`, `GET /sched` and `GET /sched/{id}` (polled by
+the homepage dashboard). An unset token fails closed (401).
 
 **Health and tiers**
 - `GET  /healthz` (port 3000): OpenClaw health
@@ -172,7 +186,8 @@ make py-lint          # uv run ruff check .
   human approval: never auto-post.
 - **Tracked projects**: `claude-night-market`, `skrills`,
   `simple-resume`, `personal-brand` (Alex's AI-systems voice).
-  Seeded by `seed_default_projects` on workflows startup.
+  Seeded from the active profile by `seed_from_profile` on startup
+  (the `marketing` profile defines them; the default `starter` has none).
 - **Heavy research**: when a question needs academic literature,
   TRIZ analogies, or multi-hop digs, queue a `research:tome` task
   for the local Claude Code session to handle via `/tome:research`.

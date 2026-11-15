@@ -208,8 +208,8 @@ for the full operator guide.
 
 ### Marketing Orchestrator
 
-Scheduled scans are driven by APScheduler with six built-in generators
-registered in `workflows/generators.py`:
+Scheduled scans are driven by APScheduler. `workflows/generators.py`
+registers 14 generators in `GENERATORS`; the marketing ones are:
 
 - `morning_scan`: daily Reddit and GitHub scan per tracked project
 - `morning_digest`: 8am outreach rundown (Reddit, Hacker News, GitHub
@@ -223,9 +223,9 @@ registered in `workflows/generators.py`:
 - `comment_draft`: drafts a useful, non-promotional reply for a
   given URL and queues it as a `[DRAFT]` task for human approval
 
-The four tracked projects (`claude-night-market`, `skrills`,
-`simple-resume`, and `personal-brand` for Alex's AI-systems voice)
-are seeded automatically on first boot. Schedules are stored in the
+The `marketing` profile seeds four tracked projects
+(`claude-night-market`, `skrills`, `simple-resume`, and
+`personal-brand`) on first boot. Schedules are stored in the
 brain DB and managed via `/sched`. Each generator enqueues tasks
 into the same queue agents read from `/task/{id}/claim`, so manual
 and scheduled work share one pipeline. Drafts are never auto-posted:
@@ -237,8 +237,9 @@ ClawRange is a pull-down-and-configure template. A declarative **tenant
 profile** (`config/profiles/<name>/profile.yaml`) owns everything
 tenant-specific: persona, seeded projects/schedules, connector wiring, and
 CRM config: while the connector registry and CRM adapters live in code and
-are shared. The active profile is chosen by `CLAWRANGE_PROFILE` (default
-`marketing`, reproducing the original John-117 setup exactly).
+are shared. The active profile is chosen by `CLAWRANGE_PROFILE` (default `starter`,
+an identity-free baseline; `marketing` reproduces the original John-117
+setup).
 
 A second profile, `lead-crm`, is a worked business example: an assistant that
 hourly syncs leads from a web portal into a pluggable CRM (SQLite by default)

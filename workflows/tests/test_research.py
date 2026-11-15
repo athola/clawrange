@@ -8,6 +8,7 @@ it as a single endpoint.
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from research import (
@@ -15,7 +16,6 @@ from research import (
     compute_relevance_score,
     compute_triangulation_bonus,
     deduplicate,
-    fuzzy_deduplicate,
     merge_findings,
     rank_findings,
 )
@@ -88,47 +88,6 @@ class TestDeduplicateByUrl:
         a = Finding("github", "code", "A", "https://g/a", 0.5, "")
         b = Finding("github", "code", "B", "https://g/b", 0.6, "")
         assert len(deduplicate([a, b])) == 2
-
-
-# ─── Fuzzy deduplication by title ────────────────────────────────
-
-
-class TestFuzzyDeduplicate:
-    def test_same_channel_high_similarity_dedup(self):
-        """
-        GIVEN two findings on the same channel with near-identical titles
-        WHEN fuzzy_deduplicate runs
-        THEN only the higher-relevance one survives.
-        """
-        a = Finding(
-            "reddit",
-            "discourse",
-            "Best Way to Build LLM Agents",
-            "https://x/a",
-            0.4,
-            "",
-        )
-        b = Finding(
-            "reddit", "discourse", "Best Way Build LLM Agents", "https://x/b", 0.7, ""
-        )
-        result = fuzzy_deduplicate([a, b])
-        assert len(result) == 1
-        assert result[0].relevance == 0.7
-
-    def test_cross_channel_dedup_optional(self):
-        """
-        GIVEN two findings on different channels with similar titles
-        WHEN fuzzy_deduplicate runs without cross_channel
-        THEN both survive.
-        """
-        a = Finding("reddit", "discourse", "Building AI agents", "https://x/a", 0.5, "")
-        b = Finding("github", "code", "Building AI agents", "https://x/b", 0.6, "")
-        # default: no cross-channel folding
-        assert len(fuzzy_deduplicate([a, b])) == 2
-        # with cross-channel: lower-relevance one drops
-        merged = fuzzy_deduplicate([a, b], cross_channel=True)
-        assert len(merged) == 1
-        assert merged[0].relevance == 0.6
 
 
 # ─── Authority and recency bonuses ───────────────────────────────
@@ -348,7 +307,7 @@ class TestOrchestrateResearch:
 
         result = await orchestrate_research("anything")
         assert len(result["findings"]) == 1
-        # Errors are keyed by short channel name (discourse_web -> discourse)
+        # Errors are keyed by the full channel name
         assert "discourse" in result["errors"]
 
     @pytest.mark.asyncio
@@ -532,14 +491,13 @@ class TestChannelHealth:
             assert "source" in info
 
     def test_unconfigured_channel_includes_reason(self, monkeypatch):
-        # Force github 'not configured' branch
-        monkeypatch.setenv("GITHUB_PAT", "")
-        # Re-import to pick up env change
-        import importlib
-
+        # Force github 'not configured' branch. No importlib.reload: it
+        # would leak the emptied GITHUB_PAT constant into later tests;
+        # monkeypatch restores both the env var and the module constant.
         import github_search
 
-        importlib.reload(github_search)
+        monkeypatch.setenv("GITHUB_PAT", "")
+        monkeypatch.setattr(github_search, "GITHUB_PAT", "")
 
         from research import channel_health
 
@@ -585,3 +543,79 @@ class TestConfidenceFlags:
         assert flagged[0]["confidence"] == "low"
         # Cross-source claim appears on two channels -> not flagged
         assert flagged[1]["confidence"] in ("medium", "high")
+
+
+class TestResearchReviewFixes:
+    @pytest.mark.asyncio
+    async def test_reddit_summary_comes_from_snippet(self, monkeypatch):
+        import research
+        from reddit_search import RedditPost
+
+        post = RedditPost(
+            id="a",
+            url="https://r/a",
+            title="T",
+            subreddit="s",
+            score=3,
+            comments=1,
+            created_utc="2026-01-01T00:00:00+00:00",
+            snippet="body text here",
+        )
+
+        async def fake(*a, **kw):
+            return [post]
+
+        monkeypatch.setattr(research, "search_subreddits", fake)
+        out = await research._fetch_reddit("t", subreddits=["s"])
+        assert out[0].summary == "body text here"
+
+    @pytest.mark.asyncio
+    async def test_error_keys_use_full_channel_name(self, monkeypatch):
+        from research import orchestrate_research
+
+        async def boom(topic, **kw):
+            raise RuntimeError("down")
+
+        async def empty(topic, **kw):
+            return []
+
+        monkeypatch.setattr("research._fetch_reddit", empty)
+        monkeypatch.setattr("research._fetch_github", empty)
+        monkeypatch.setattr("research._fetch_web", boom)
+        result = await orchestrate_research("topic", channels=["discourse", "web"])
+        assert set(result["errors"]) == {"discourse_web"}
+
+    def test_recency_uses_current_year_at_call_time(self, monkeypatch):
+        import research
+
+        monkeypatch.setattr(research, "_current_year", lambda: 2040)
+        f = Finding("arxiv", "academic", "t", "u", 0.5, "", {"year": 2039})
+        old = Finding("arxiv", "academic", "t", "u", 0.5, "", {"year": 2030})
+        assert research.compute_relevance_score(f) > research.compute_relevance_score(
+            old
+        )
+
+    @pytest.mark.asyncio
+    async def test_academic_failure_is_logged_as_warning(self, monkeypatch, caplog):
+        import research
+
+        class Boom:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                raise httpx.ConnectError("nope")
+
+            async def __aexit__(self, *a):
+                return False
+
+        monkeypatch.setattr(research.httpx, "AsyncClient", Boom)
+        with caplog.at_level("INFO", logger="clawrange.research"):
+            assert await research._fetch_academic("x") == []
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 2
+
+    def test_fuzzy_deduplicate_is_gone(self):
+        import research
+
+        assert not hasattr(research, "fuzzy_deduplicate")

@@ -61,17 +61,34 @@ def in_active_hours(now_dt: datetime) -> bool:
     return _ACTIVE_START <= local.hour < _ACTIVE_END
 
 
+def _window_open_ts(now_dt: datetime) -> float:
+    """Epoch seconds when today's active window opened (local start hour)."""
+    local = now_dt.astimezone(ZoneInfo(_tz_name()))
+    return local.replace(
+        hour=_ACTIVE_START, minute=0, second=0, microsecond=0
+    ).timestamp()
+
+
+def _silent_since(last_seen: float | None, now_dt: datetime) -> float:
+    """Start of the current silence: the last heartbeat, but never earlier
+    than the window opening. The gate was closed overnight, so a stamp from
+    last evening is not 12 hours of missed heartbeats."""
+    opened = _window_open_ts(now_dt)
+    return opened if last_seen is None else max(float(last_seen), opened)
+
+
 def stalled(last_seen: float | None, now_ts: float, now_dt: datetime) -> bool:
     """True when heartbeats should be arriving but are not.
 
-    A missing stamp counts as stalled: on a fresh deploy or a broken
-    proxy path, "never seen a heartbeat" is the outage, not a pass.
+    A missing stamp counts as stalled once the window has been open for
+    STALL_SECS: on a fresh deploy or a broken proxy path, "never seen a
+    heartbeat" is the outage. Right after the window opens, though, the
+    first heartbeat has had no time to arrive, so nothing is flagged until
+    a full STALL_SECS has elapsed since opening (the grace period).
     """
     if not in_active_hours(now_dt):
         return False
-    if last_seen is None:
-        return True
-    return (now_ts - last_seen) >= STALL_SECS
+    return (now_ts - _silent_since(last_seen, now_dt)) >= STALL_SECS
 
 
 def _read_json(path: str) -> dict:
@@ -84,9 +101,11 @@ def _read_json(path: str) -> dict:
 
 
 def _write_json(path: str, data: dict) -> None:
+    tmp = f"{path}.tmp"
     try:
-        with open(path, "w") as fh:
+        with open(tmp, "w") as fh:
             json.dump(data, fh)
+        os.replace(tmp, path)  # atomic: a crash never leaves half a file
     except OSError as exc:
         logger.warning("watchdog state write failed (%s): %s", path, exc)
 
@@ -118,10 +137,14 @@ async def check(
 
     if not stalled(seen, now_ts, now_dt):
         if alerting:
-            await notify(
+            delivered = await notify(
                 "Heartbeat watchdog: heartbeats recovered — Telegram "
                 "digest delivery should be back."
             )
+            if not delivered:
+                # Keep the alert state so the next pass retries the notice.
+                logger.warning("watchdog: recovery notice not delivered; retrying")
+                return None
             _write_json(_state_path(), {"alerting": False, "last_alert_ts": None})
             return "recovered"
         return None
@@ -133,7 +156,7 @@ async def check(
     if seen is None:
         detail = "no heartbeat has ever been recorded"
     else:
-        minutes = int((now_ts - float(seen)) // 60)
+        minutes = int((now_ts - _silent_since(seen, now_dt)) // 60)
         detail = f"no heartbeat for {minutes}m during active hours"
 
     ok = await notify(

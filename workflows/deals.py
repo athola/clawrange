@@ -14,8 +14,11 @@ Everything here is pure so the thresholds are easy to test and tune.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
+
+logger = logging.getLogger("clawrange.deals")
 
 # A listing at or under this share of max_price_great is "insane".
 INSANE_OF_TARGET = 0.85
@@ -687,4 +690,6 @@ async def synthesize(
     try:
         return await llm_proxy._llm_call(prompt, max_tokens=1200)
     except Exception:
+        # The report degrades to "synthesis off"; the cause must stay visible.
+        logger.exception("deals: synthesis failed")
         return None

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 
 import yaml
 
@@ -17,6 +18,9 @@ VALID_KINDS = {"identity", "persona"}
 VALID_SOURCES = {"feedback", "reflect", "scheduled", "signal", "seed"}
 CONTENT_MAX = 500
 TARGET_MAX = 80  # interpolated verbatim into rendered headings
+# Learnings render as one Markdown bullet in soul.md; a newline or control
+# character would let a proposal open its own heading and inject instructions.
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 _log = logging.getLogger("clawrange.persona")
 
@@ -34,6 +38,8 @@ def _validate_learning(kind, content, source, target=""):
         raise ValueError(f"source must be one of {sorted(VALID_SOURCES)}")
     if len(target or "") > TARGET_MAX:
         raise ValueError(f"target exceeds {TARGET_MAX} chars")
+    if _CONTROL.search(content) or _CONTROL.search(target or ""):
+        raise ValueError("target and content must be a single line of plain text")
     return content
 
 
@@ -59,8 +65,11 @@ def approve(brain_db, profile_name, learning_id, render_fn):
         return row  # idempotent
     brain_db.set_learning_status(learning_id, "approved")
     approved = brain_db.list_learnings(profile=profile_name, status="approved")
-    render_fn(approved)
-    return brain_db.get_learning(learning_id)
+    rendered = render_fn(approved)
+    out = dict(brain_db.get_learning(learning_id))
+    # Per-target write results, so a render that wrote nothing is visible.
+    out["render"] = rendered
+    return out
 
 
 def reject(brain_db, profile_name, learning_id, render_fn=None):

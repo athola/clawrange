@@ -19,10 +19,14 @@ the generic core never leaks one operator's identity into another's deploy.
 
 from __future__ import annotations
 
+import logging
 import os
+import tempfile
 from pathlib import Path
 
 from tenant_profile import Profile
+
+_log = logging.getLogger("clawrange.persona")
 
 _TEMPLATE_PATH = (
     Path(__file__).resolve().parent.parent / "openclaw" / "soul.template.md"
@@ -127,8 +131,12 @@ def _learned_region(learnings: list, kind: str) -> str:
         return ""
     lines = ["", "## Learned", ""]
     for x in rows:
-        target = x.get("target") or "General"
-        lines.append(f"- **{target}:** {x['content']}")
+        # Collapse whitespace so a stored multi-line value can't open its
+        # own heading (input validation rejects these; this covers old rows
+        # and hand-edited learned.yaml).
+        target = " ".join((x.get("target") or "General").split())
+        content = " ".join(str(x["content"]).split())
+        lines.append(f"- **{target}:** {content}")
     return "\n".join(lines) + "\n"
 
 
@@ -143,14 +151,26 @@ def compose_identity(profile: Profile, learnings: list) -> str:
 
 
 def _atomic_write(path: Path, text: str) -> bool:
-    """Write text atomically; return False (no raise) if dir is unwritable."""
+    """Write text atomically; return False (no raise) if dir is unwritable.
+
+    A unique temp file in the target directory plus fsync, then os.replace,
+    so concurrent renders never share a temp name and a crash never leaves a
+    truncated persona behind.
+    """
+    tmp_name = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(text)
-        os.replace(tmp, path)
+        fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
         return True
-    except OSError:
+    except OSError as exc:
+        _log.warning("persona render: cannot write %s: %s", path, exc)
+        if tmp_name and os.path.exists(tmp_name):
+            os.unlink(tmp_name)
         return False
 
 

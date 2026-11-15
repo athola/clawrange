@@ -24,13 +24,25 @@ repos:
     hooks:
       - id: gitleaks
 
-  # Python linting
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.11.4
+  # Python linting. Runs the ruff pinned in uv.lock via `uv run` so the hook,
+  # `make lint` and `make format` always agree (no mirror-rev drift).
+  # --force-exclude keeps pyproject's [tool.ruff] exclude in effect even when
+  # pre-commit passes filenames explicitly.
+  - repo: local
     hooks:
       - id: ruff
+        name: ruff (lint via uv)
+        entry: uv run ruff check --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
         args: [--fix]
       - id: ruff-format
+        name: ruff-format (via uv)
+        entry: uv run ruff format --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
 
   # Python typechecking. Runs the mypy pinned in uv.lock via `uv run` so the
   # hook and `make typecheck` use the exact same version (no mirror drift).
@@ -51,7 +63,7 @@ repos:
         language: system
         types: [python]
         pass_filenames: false
-        args: [-q]
+        args: [-q, -rf]
         stages: [pre-push]
         # Full async+sync suite (~80s), gated at pre-push — not commit —
         # to keep commits fast. Requires `pre-commit install

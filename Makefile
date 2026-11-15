@@ -35,11 +35,11 @@ PROD_COMPOSE := -f docker-compose.yml -f docker-compose.prod.yml
 .PHONY: start-prod start-prod-full stop-prod
 
 start-prod: ## Start core stack bound to Tailscale + localhost only
-	@BIND_ADDR=127.0.0.1 docker compose $(PROD_COMPOSE) up -d --build
+	@docker compose $(PROD_COMPOSE) up -d --build
 	@echo "Services bound to 127.0.0.1 + $${TAILSCALE_IP} (Tailscale)"
 
 start-prod-full: ## Start full stack (prod mode) including DeerFlow
-	@BIND_ADDR=127.0.0.1 docker compose $(PROD_COMPOSE) up -d --build
+	@docker compose $(PROD_COMPOSE) up -d --build
 	@./scripts/start.sh --with-deerflow --skip-core
 
 stop-prod: ## Stop production stack
@@ -50,7 +50,8 @@ reset: ## Wipe all data and start fresh (interactive confirmation)
 
 # ─── Testing ──────────────────────────────────────────────────────
 
-.PHONY: test test-openclaw test-workflows test-deerflow test-ollama test-unit validate
+.PHONY: test test-openclaw test-workflows test-deerflow test-ollama test-research \
+	test-unit validate tome-bridge tome-bridge-watch
 
 test: ## Run full validation suite (6 tests)
 	@./scripts/test_all.sh
@@ -70,35 +71,43 @@ test-ollama: ## Test local Ollama inference
 test-research: ## Smoke test the /research endpoint with a live topic
 	@./scripts/test_research.sh "$(TOPIC)"
 
+# The task queue API requires a bearer token: export PROXY_AUTH_TOKEN from
+# .env (never printed) and refuse to run without it.
+TOME_BRIDGE_ENV = if [ -f .env ]; then set -a; . ./.env; set +a; fi; \
+	if [ -z "$${PROXY_AUTH_TOKEN:-}" ]; then \
+		echo "PROXY_AUTH_TOKEN is empty: set it in .env (the task queue API requires it)." >&2; \
+		exit 1; \
+	fi
+
 tome-bridge: ## Run one bridge pass for research:tome tasks
-	@python3 scripts/tome_bridge.py
+	@$(TOME_BRIDGE_ENV); uv run python scripts/tome_bridge.py
 
 tome-bridge-watch: ## Watch task queue for research:tome tasks
-	@python3 scripts/tome_bridge.py --watch --interval 60
+	@$(TOME_BRIDGE_ENV); uv run python scripts/tome_bridge.py --watch --interval 60
 
 persona-export: ## Export approved persona learnings to learned.yaml (PROFILE=<name>)
-	@python3 workflows/scripts/persona_export.py $(PROFILE)
+	@test -n "$(PROFILE)" || { echo "usage: make persona-export PROFILE=<name>"; exit 1; }
+	@uv run python workflows/scripts/persona_export.py "$(PROFILE)"
 
+# PROFILE is passed as argv, never interpolated into the Python source.
 persona: ## Render soul.md + identity.md from a profile's identity + learned overlay (PROFILE=<name>)
 	@test -n "$(PROFILE)" || { echo "usage: make persona PROFILE=<name>"; exit 1; }
-	@python3 -c "import sys; sys.path.insert(0,'workflows'); \
+	@uv run python -c "import sys; sys.path.insert(0,'workflows'); \
 from persona import render_all; from tenant_profile import load_profile; \
 import persona_learning as pl; \
-p=load_profile('$(PROFILE)'); \
-r=render_all(p, {'soul':'openclaw/soul.md','identity':'openclaw/identity.md'}, pl.load_overlay('$(PROFILE)')); \
-print('rendered ->', {k:('ok' if v else 'failed') for k,v in r.items()})"
+name=sys.argv[1]; p=load_profile(name); \
+r=render_all(p, {'soul':'openclaw/soul.md','identity':'openclaw/identity.md'}, pl.load_overlay(name)); \
+print('rendered ->', {k:('ok' if v else 'failed') for k,v in r.items()})" "$(PROFILE)"
 
 persona-demo: ## Offline walkthrough of the persona meta-learning loop (PROFILE=<name>)
-	@python3 workflows/scripts/persona_demo.py $${PROFILE:-chief-of-staff}
+	@uv run python workflows/scripts/persona_demo.py "$${PROFILE:-chief-of-staff}"
 
 test-unit: ## Run Python unit tests (no containers needed)
 	@uv run pytest workflows/tests/ -v
 
 validate: ## Validate config files and project structure
-	@python3 tests/validate_stack.py
-	@if command -v pytest >/dev/null 2>&1; then \
-		python3 -m pytest tests/test_validate_stack.py -q; \
-	fi
+	@uv run python tests/validate_stack.py
+	@uv run pytest tests/test_validate_stack.py -q
 
 # ─── Tenant Profiles (multi-tenant template) ──────────────────────
 
@@ -106,10 +115,10 @@ validate: ## Validate config files and project structure
 
 profile: ## Render openclaw/soul.md from a profile + set it in .env (PROFILE=<name>)
 	@test -n "$(PROFILE)" || { echo "usage: make profile PROFILE=<name>"; exit 1; }
-	@python3 -c "import sys; sys.path.insert(0,'workflows'); \
+	@uv run python -c "import sys; sys.path.insert(0,'workflows'); \
 from persona import write_soul; from tenant_profile import load_profile; \
-p=write_soul(load_profile('$(PROFILE)'), 'openclaw/soul.md'); \
-print('rendered persona ->', p)"
+p=write_soul(load_profile(sys.argv[1]), 'openclaw/soul.md'); \
+print('rendered persona ->', p)" "$(PROFILE)"
 	@if [ -f .env ]; then \
 		if grep -q '^CLAWRANGE_PROFILE=' .env; then \
 			sed -i.bak 's/^CLAWRANGE_PROFILE=.*/CLAWRANGE_PROFILE=$(PROFILE)/' .env && rm -f .env.bak; \
@@ -118,7 +127,7 @@ print('rendered persona ->', p)"
 	else echo "no .env yet — run 'make setup' first (CLAWRANGE_PROFILE not set)"; fi
 
 seed-demo: ## Load the lead-crm demo leads into the CRM for an offline demo
-	@CRM_DB_PATH=$${CRM_DB_PATH:-data/crm/crm.db} python3 scripts/seed_demo.py
+	@CRM_DB_PATH=$${CRM_DB_PATH:-data/crm/crm.db} uv run python scripts/seed_demo.py
 
 # ─── Docker Inspection ────────────────────────────────────────────
 
@@ -126,7 +135,7 @@ seed-demo: ## Load the lead-crm demo leads into the CRM for an offline demo
 
 ps: ## Show running containers
 	@docker compose ps 2>/dev/null; \
-	if [ -d deerflow ]; then \
+	if [ -f deer-flow/docker/docker-compose.yaml ]; then \
 		(cd deer-flow 2>/dev/null && COMPOSE_FILE=docker/docker-compose.yaml docker compose ps 2>/dev/null) || true; \
 	fi
 
@@ -161,20 +170,27 @@ py-lint: ## Lint Python with ruff (uv managed)
 typecheck: ## Typecheck Python with mypy (uv managed)
 	@uv run mypy workflows scripts tests
 
+# Mirrors the commit gate: the pre-commit shellcheck hook (warning severity),
+# then ruff and mypy from uv.lock. A missing shellcheck is a failure, not a skip.
 lint: ## Run all linters: ShellCheck (scripts) + ruff + mypy (Python)
-	@if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck --severity=warning scripts/*.sh workflows/*.sh && echo "All scripts pass ShellCheck"; \
-	else \
-		echo "shellcheck not installed (skipping — install with: apt install shellcheck)"; \
-	fi
+	@command -v shellcheck >/dev/null 2>&1 || { \
+		echo "ERROR: shellcheck not installed (apt install shellcheck / brew install shellcheck)" >&2; \
+		exit 1; }
+	@shellcheck --severity=warning scripts/*.sh workflows/*.sh && echo "All scripts pass ShellCheck"
 	@uv run ruff check .
+	@uv run ruff format --check .
 	@uv run mypy workflows scripts tests
 
 format: ## Check formatting: YAML/JSON + ruff format (does not modify files)
-	@command -v yamllint >/dev/null 2>&1 && yamllint -d relaxed docker-compose.yml deerflow/config.yaml || echo "yamllint not installed (skipping)"
-	@for f in openclaw/config/openclaw.json; do \
-		python3 -m json.tool "$$f" > /dev/null && echo "OK: $$f" || echo "FAIL: $$f"; \
-	done
+	@if command -v yamllint >/dev/null 2>&1; then \
+		yamllint -d relaxed docker-compose.yml deerflow/config.yaml; \
+	else \
+		echo "yamllint not installed (skipping YAML style check; check-yaml runs in pre-commit)"; \
+	fi
+	@rc=0; for f in openclaw/config/openclaw.json; do \
+		if python3 -m json.tool "$$f" > /dev/null; then echo "OK: $$f"; \
+		else echo "FAIL: $$f"; rc=1; fi; \
+	done; exit $$rc
 	@uv run ruff format --check .
 
 format-fix: ## Apply ruff formatting + safe auto-fixes
@@ -183,9 +199,7 @@ format-fix: ## Apply ruff formatting + safe auto-fixes
 
 # ─── Setup ────────────────────────────────────────────────────────
 
-.PHONY: setup env-check
-
-.PHONY: hooks
+.PHONY: setup env-check hooks
 
 hooks: ## Install git hooks (pre-commit + pre-push) via pre-commit
 	@uv run pre-commit install -t pre-commit -t pre-push
@@ -194,14 +208,20 @@ hooks: ## Install git hooks (pre-commit + pre-push) via pre-commit
 setup: .env hooks ## One-time setup: .env + gateway token + git hooks
 	@echo "Setup complete. Fill in OPENROUTER_API_KEY in .env, then run: make start"
 
+# Single recipe line on purpose: an existing .env (even one older than
+# .env.example) is never overwritten, and setup continues on to `hooks`.
 .env: .env.example
-	@if [ -f .env ]; then echo ".env already exists. Remove it first to regenerate."; exit 1; fi
-	@cp .env.example .env
-	@TOKEN=$$(openssl rand -base64 32 | tr -d '/+=' | head -c 40) && \
+	@if [ -f .env ]; then \
+		echo "NOTE: .env already exists (older than .env.example?) — leaving it untouched."; \
+		echo "      Diff it against .env.example for new keys; remove it to regenerate."; \
+	else \
+		cp .env.example .env && \
+		TOKEN=$$(openssl rand -base64 32 | tr -d '/+=' | head -c 40) && \
 		sed "s/^OPENCLAW_GATEWAY_TOKEN=.*/OPENCLAW_GATEWAY_TOKEN=$${TOKEN}/" .env > .env.tmp && \
-		mv .env.tmp .env
-	@echo "Created .env with generated OPENCLAW_GATEWAY_TOKEN."
-	@echo "Edit .env and add your OPENROUTER_API_KEY."
+		mv .env.tmp .env && \
+		echo "Created .env with generated OPENCLAW_GATEWAY_TOKEN." && \
+		echo "Edit .env and add your OPENROUTER_API_KEY."; \
+	fi
 
 env-check: ## Validate .env has required values
 	@if [ ! -f .env ]; then echo "FAIL: .env not found. Run: make setup"; exit 1; fi

@@ -130,6 +130,7 @@
       "name": "Morning Reddit comment-candidate digest",
       "kind": "morning_digest",
       "cron": "0 8 * * *",
+      "catch_up": true,
       "kwargs": {}
     },
     {
@@ -151,6 +152,7 @@
       "name": "Daily homelab hardware deal rundown",
       "kind": "homelab_deals",
       "cron": "30 8 * * *",
+      "catch_up": true,
       "kwargs": {}
     },
     {

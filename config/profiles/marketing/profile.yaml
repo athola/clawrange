@@ -366,6 +366,7 @@ seeds:
     name: Morning Reddit comment-candidate digest
     kind: morning_digest
     cron: 0 8 * * *
+    catch_up: true
     kwargs: {}
   - id: hot_pulse
     name: 5-min Reddit hot-pulse for fresh comment candidates
@@ -381,6 +382,7 @@ seeds:
     name: Daily homelab hardware deal rundown
     kind: homelab_deals
     cron: 30 8 * * *
+    catch_up: true
     kwargs: {}
   - id: daily-research-pulse
     name: Daily research freshness pulse via tome bridge
@@ -408,6 +410,17 @@ reddit:
   # tooling appear.
   digest_extra_subreddits: [vibecoding, opensourceai, claudecode, ClaudeAI,
     codex, sideprojects]
+
+# Weekly strategy-review checklist (kind: income_review). The generic default
+# lives in code; this tenant's benchmarks are profile text.
+income_review:
+  checklist: >-
+    Cover: balances and P&L vs the two benchmarks ($50 held as USDC; $50
+    all-in BTC on day one), the paper sleeve's 20-week-SMA decision and
+    hypothetical result, fees paid this week, and proposed adjustments with
+    cited sources (single-source claims flagged). Hard rules in
+    docs/income-strategy.md apply; this task is a draft for operator
+    approval: never execute trades.
 
 # Daily outreach rundown policy (morning_digest). Defaults live in code;
 # these override them for this tenant. See docs/multi-tenant-guide.md.

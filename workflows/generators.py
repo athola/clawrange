@@ -6,6 +6,7 @@ into the existing task queue via brain_db.create_task().
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -180,6 +181,14 @@ async def awesome_lists_watch_generator(
         found = await github_search.check_awesome_list(
             list_owner, list_repo, target_urls
         )
+        if found is None:
+            logger.warning(
+                "awesome_lists_watch: %s/%s unreadable, skipping (no tasks queued)",
+                list_owner,
+                list_repo,
+            )
+            continue
+        pending = {t["description"] for t in brain_db.list_tasks(status="pending")}
 
         for project in projects:
             url = f"github.com/{project['owner']}/{project['repo']}"
@@ -190,6 +199,8 @@ async def awesome_lists_watch_generator(
                     f"{list_owner}/{list_repo}. Draft a PR description and "
                     f"submission plan. Posture: {posture}"
                 )
+                if desc in pending:
+                    continue
                 brain_db.create_task(desc, priority=3, source="schedule")
                 logger.info(
                     "awesome_lists_watch: %s missing from %s/%s",
@@ -211,6 +222,15 @@ async def custom_scan_generator(
     desc = f"Custom scan{slug_ctx}: {topic}"
     brain_db.create_task(desc, priority=3, source="schedule")
     logger.info("custom_scan: enqueued '%s'", desc[:80])
+
+
+def _task_text(value: object, limit: int = 160) -> str:
+    """Single-line, control-free text for embedding untrusted titles in a
+    task description (an agent later reads that description as instructions)."""
+    text = "".join(" " if ch in "\r\n\t" else ch for ch in str(value or ""))
+    text = "".join(ch for ch in text if ch.isprintable())
+    text = " ".join(text.split()).replace('"', "'")
+    return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
 async def content_idea_generator(
@@ -255,6 +275,9 @@ async def content_idea_generator(
     # Highest-relevance first, but still cap one idea per project per run.
     candidate_findings.sort(key=lambda f: f.get("relevance", 0), reverse=True)
     top = candidate_findings[0]
+    # Every status: a handled idea for the same finding must not come back
+    # tomorrow just because it is no longer pending.
+    existing = {t["description"] for t in brain_db.list_tasks()}
 
     for project in projects:
         slug = project["slug"]
@@ -264,16 +287,19 @@ async def content_idea_generator(
 
         # Some channels (e.g. TRIZ analogies) carry no URL; cite without
         # the parens rather than rendering a dangling "()" in the task.
-        citation = f" ({top['url']})" if top.get("url") else ""
+        citation = f" ({_task_text(top['url'], 300)})" if top.get("url") else ""
         desc = (
-            f"Content idea for {slug}: research on '{top['topic']}' "
-            f'surfaced "{top["title"]}"{citation}. '
+            f"Content idea for {slug}: research on '{_task_text(top['topic'])}' "
+            f'surfaced "{_task_text(top["title"])}"{citation}. '
             f"Draft three angles - "
             f"(1) technical post tying this to {topic_hint}, "
             f"(2) useful Reddit/HN comment offering specifics, "
             f"(3) short X thread on the lesson. "
             f"Posture: {posture}"
         )
+        if desc in existing:
+            logger.info("content_idea: %s already has this idea, skipping", slug)
+            continue
         brain_db.create_task(desc, priority=3, source="schedule")
         logger.info(
             "content_idea: enqueued idea for %s based on session %s",
@@ -389,7 +415,9 @@ def _render_pick_lines(
 
     The link is the literal post.url so it works as a tap target in
     Telegram clients regardless of Markdown rendering quirks."""
-    title = post.title if len(post.title) <= 90 else post.title[:87] + "..."
+    # Reddit titles are untrusted: strip Markdown control characters so a
+    # title can't break or inject into the `[title](url)` link.
+    title = rundown._clean_title(post.title) or "(untitled)"
     star = "★ " if is_bonus else ""
     return [
         f"  • {star}[{title}]({post.url})",
@@ -968,6 +996,9 @@ async def hot_pulse_generator(
     # and the search query that brought the post back. The query
     # becomes the "category bucket" we group by in the render.
     best_for_post: dict[str, tuple[dict, RedditPost, float, str]] = {}
+    # One health spans the fire so an outage is visible in the status row
+    # instead of reading as a quiet "0 picks" cycle.
+    health = reddit_search.SearchHealth()
 
     for project in projects:
         slug = project["slug"]
@@ -983,6 +1014,8 @@ async def hot_pulse_generator(
                     since=window,
                     sort="new",
                     limit_per_sub=10,
+                    health=health,
+                    feed_fallback=True,
                 )
             except Exception as exc:
                 logger.warning(
@@ -1000,28 +1033,35 @@ async def hot_pulse_generator(
                 if prior is None or rel > prior[2]:
                     best_for_post[post.id] = (project, post, rel, query)
 
-    # Group by project, then by category (the search query that
-    # brought the post). Each project block in the digest renders one
-    # subsection per category so the operator sees which area is
-    # currently active.
-    by_project_by_category: dict[str, dict[str, list[tuple[RedditPost, float]]]] = {}
-    for project, post, rel, query in best_for_post.values():
-        slug = project["slug"]
-        by_project_by_category.setdefault(slug, {}).setdefault(query, []).append(
-            (post, rel)
-        )
-
+    # Cap first, then render and mark seen from the same capped picks: a
+    # post that was cut must stay unseen so a later fire can surface it.
     by_project: dict[str, list[tuple[RedditPost, float]]] = {}
-    for slug, cat_map in by_project_by_category.items():
-        for cat_picks in cat_map.values():
-            by_project.setdefault(slug, []).extend(cat_picks)
-
+    for project, post, rel, query in best_for_post.values():
+        by_project.setdefault(project["slug"], []).append((post, rel))
     for slug in list(by_project.keys()):
         by_project[slug].sort(
             key=lambda pr: pr[1] * (1 + math.log(max(pr[0].score, 1))),
             reverse=True,
         )
         by_project[slug] = by_project[slug][:max_per_project]
+
+    # Group by project, then by category (the search query that
+    # brought the post). Each project block in the digest renders one
+    # subsection per category so the operator sees which area is
+    # currently active.
+    kept_ids = {
+        slug: {post.id for post, _ in picks} for slug, picks in by_project.items()
+    }
+    by_project_by_category: dict[str, dict[str, list[tuple[RedditPost, float]]]] = {}
+    for project, post, rel, query in best_for_post.values():
+        if post.id in kept_ids.get(project["slug"], set()):
+            by_project_by_category.setdefault(project["slug"], {}).setdefault(
+                query, []
+            ).append((post, rel))
+
+    n_picks = sum(len(v) for v in by_project.values())
+    outage = health.requests > 0 and health.ok == 0
+    health_note = health.summary() if health.requests else "no reddit requests"
 
     # Update the schedule's last_run/last_status so the operator can
     # see the cron is firing even on silent cycles. APScheduler-driven
@@ -1032,7 +1072,9 @@ async def hot_pulse_generator(
         brain_db.update_schedule_status(
             "hot_pulse",
             datetime.now(UTC).isoformat(),
-            f"ok ({sum(len(v) for v in by_project.values())} picks)",
+            f"reddit outage, 0 picks ({health_note})"
+            if outage
+            else f"ok ({n_picks} picks; {health_note})",
         )
     except Exception as exc:
         logger.warning("hot_pulse: could not update schedule status: %s", exc)
@@ -1086,9 +1128,21 @@ async def hot_pulse_generator(
         lines.append("")
 
     pulse = "\n".join(lines).strip()
-    delivered = await telegram.notify(pulse)
-    if not delivered:
-        logger.warning("hot_pulse: telegram delivery failed; not marking seen")
+    # Split at the 4096-char limit: an oversized message is rejected
+    # whole by Telegram and every pick in it would be lost.
+    sent, total = await telegram.notify_long(pulse)
+    if sent < total:
+        logger.warning(
+            "hot_pulse: telegram delivered %d/%d msgs; not marking seen", sent, total
+        )
+        try:
+            brain_db.update_schedule_status(
+                "hot_pulse",
+                datetime.now(UTC).isoformat(),
+                f"FAILED telegram {sent}/{total} msgs ({n_picks} picks)",
+            )
+        except Exception as exc:
+            logger.warning("hot_pulse: could not update schedule status: %s", exc)
         return
 
     # Cross-project mark_seen: a delivered post is marked seen for ALL
@@ -1256,25 +1310,33 @@ async def pipeline_generator(
         return None
 
     try:
-        counts = run_connector(spec, adapter, http_client=http_client)
+        # Sync HTTP + SQLite work: keep it off the event loop.
+        counts = await asyncio.to_thread(
+            run_connector, spec, adapter, http_client=http_client
+        )
     except Exception as exc:
         logger.warning("pipeline: connector %s failed: %s", connector, exc)
         if schedule_id:
             brain_db.update_schedule_status(schedule_id, now, f"error ({exc})")
         return None
 
-    if schedule_id:
-        brain_db.update_schedule_status(
-            schedule_id, now, f"ok ({counts['written']} written)"
-        )
-
+    delivery = ""
     if counts["written"]:
-        await telegram.notify(
+        sent, total = await telegram.notify_long(
             f"Lead sync ({connector}): {counts['written']} written "
             f"({counts['fetched']} fetched, {counts['kept']} kept)."
         )
+        if sent < total:
+            delivery = f"; telegram FAILED {sent}/{total} msgs"
+            logger.warning("pipeline: telegram summary delivered %d/%d", sent, total)
     else:
         logger.info("pipeline: %s wrote 0 rows; no telegram summary", connector)
+
+    # Recorded after delivery so the status says whether the summary landed.
+    if schedule_id:
+        brain_db.update_schedule_status(
+            schedule_id, now, f"ok ({counts['written']} written{delivery})"
+        )
     return counts
 
 
@@ -1321,12 +1383,14 @@ async def crm_digest_generator(
 
     digest = "\n".join(lines).strip()
 
+    sent, total = await telegram.notify_long(digest)
     if schedule_id:
-        brain_db.update_schedule_status(
-            schedule_id, now, f"ok ({len(queries)} queries)"
+        status = (
+            f"delivered {sent}/{total} msgs ({len(queries)} queries)"
+            if sent == total
+            else f"FAILED telegram {sent}/{total} msgs ({len(queries)} queries)"
         )
-
-    await telegram.notify(digest)
+        brain_db.update_schedule_status(schedule_id, now, status)
     return digest
 
 
@@ -1425,18 +1489,36 @@ async def research_pulse_generator(
 
 INCOME_REVIEW_DESC = "[DRAFT] income: weekly strategy review"
 
+# Neutral default; a tenant supplies its own via the profile's
+# `income_review.checklist` block.
 _INCOME_REVIEW_CHECKLIST = (
-    "Cover: balances and P&L vs the two benchmarks ($50 held as USDC; "
-    "$50 all-in BTC on day one), the paper sleeve's 20-week-SMA decision "
-    "and hypothetical result, fees paid this week, and proposed "
-    "adjustments with cited sources (single-source claims flagged). "
-    "Hard rules in docs/income-strategy.md apply; this task is a draft "
-    "for operator approval — never execute trades."
+    "Cover: balances and P&L against the benchmarks the strategy doc "
+    "defines, decisions taken this week and their results, fees paid, and "
+    "proposed adjustments with cited sources (single-source claims "
+    "flagged). This task is a draft for operator approval: never execute "
+    "trades."
 )
 
 
-async def income_review_generator(brain_db, **kwargs) -> None:
-    """Enqueue the weekly $50-testbed strategy review as a [DRAFT] task.
+def _income_review_checklist(profile_name: str | None = None) -> str:
+    """The profile's `income_review.checklist`, else the generic default."""
+    try:
+        block = tenant_profile.load_profile(profile_name).raw.get("income_review")
+    except Exception as exc:
+        logger.warning("income_review: profile checklist unavailable: %s", exc)
+        return _INCOME_REVIEW_CHECKLIST
+    text = (block or {}).get("checklist")
+    return (
+        text.strip()
+        if isinstance(text, str) and text.strip()
+        else (_INCOME_REVIEW_CHECKLIST)
+    )
+
+
+async def income_review_generator(
+    brain_db, profile_name: str | None = None, **kwargs
+) -> None:
+    """Enqueue the weekly strategy review as a [DRAFT] task.
 
     Mirrors research_pulse: idempotent (skips while a review is still
     pending), enqueue-first so a Telegram outage never loses the task,
@@ -1450,7 +1532,7 @@ async def income_review_generator(brain_db, **kwargs) -> None:
         return
 
     brain_db.create_task(
-        f"{INCOME_REVIEW_DESC} — {_INCOME_REVIEW_CHECKLIST}",
+        f"{INCOME_REVIEW_DESC} — {_income_review_checklist(profile_name)}",
         priority=2,
         source="schedule",
     )

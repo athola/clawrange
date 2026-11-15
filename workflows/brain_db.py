@@ -4,10 +4,13 @@ Contract-first: all brain operations defined here.
 The FastAPI router (brain.py) is a thin wrapper over this module.
 """
 
+import functools
 import hashlib
+import inspect
 import os
 import re
 import sqlite3
+import threading
 import uuid
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -123,6 +126,7 @@ def _chunk_text(text: str, max_words: int = 300, overlap_words: int = 50) -> lis
 
 
 EMBEDDING_DIM = 1536  # text-embedding-3-small
+MAX_SEARCH_LIMIT = 100
 
 
 def _connect(db_path: str) -> tuple[sqlite3.Connection, bool]:
@@ -157,6 +161,10 @@ class BrainDB:
         if parent:
             os.makedirs(parent, exist_ok=True)
         self._conn, self._has_vec = _connect(db_path)
+        # One connection is shared by FastAPI's threadpool and the event loop.
+        # Every public method holds this lock (see _serialize_methods below)
+        # so one thread's commit() can't commit another's half-done write.
+        self._lock = threading.RLock()
 
     def init_db(self) -> None:
         conn = self._conn
@@ -661,8 +669,14 @@ class BrainDB:
     # ─── FTS5 Keyword Search ─────────────────────────────────────
 
     def search_keyword(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
-        if not query.strip():
+        # Treat user input as plain words: quote each token so FTS5 operators
+        # and stray quotes/parens can't raise a syntax error (a 500).
+        tokens = [t.replace('"', '""') for t in query.split()]
+        tokens = [t for t in tokens if t.strip('"')]
+        if not tokens:
             return []
+        query = " ".join(f'"{t}"' for t in tokens)
+        limit = max(1, min(int(limit), MAX_SEARCH_LIMIT))
         rows = self._conn.execute(
             """
             SELECT p.slug, p.title, p.page_type, p.compiled,
@@ -968,10 +982,15 @@ class BrainDB:
             raise ValueError("Task not found")
         if task["status"] != "pending":
             raise ValueError(f"Task is {task['status']}, not pending")
-        self._conn.execute(
-            "UPDATE tasks SET status = 'active' WHERE id = ?", (task_id,)
+        # The status predicate makes the claim atomic: if another consumer
+        # claimed it between the read above and this write, nothing changes.
+        cur = self._conn.execute(
+            "UPDATE tasks SET status = 'active' WHERE id = ? AND status = 'pending'",
+            (task_id,),
         )
         self._conn.commit()
+        if cur.rowcount != 1:
+            raise ValueError("Task was claimed by another consumer")
         result = self.get_task(task_id)
         assert result is not None, "task not found after write"
         return result
@@ -982,11 +1001,19 @@ class BrainDB:
         if status not in ("completed", "failed", "blocked"):
             raise ValueError("Status must be completed or failed")
         now = _now()
-        self._conn.execute(
-            "UPDATE tasks SET status=?, result=?, completed_at=? WHERE id=?",
+        # Only open tasks can be completed: a terminal result is final and a
+        # cancelled task stays cancelled.
+        cur = self._conn.execute(
+            "UPDATE tasks SET status=?, result=?, completed_at=? "
+            "WHERE id=? AND status IN ('pending', 'active')",
             (status, result, now, task_id),
         )
         self._conn.commit()
+        if cur.rowcount != 1:
+            existing = self.get_task(task_id)
+            if not existing:
+                raise ValueError("Task not found")
+            raise ValueError(f"Task is {existing['status']}, cannot complete")
         updated = self.get_task(task_id)
         assert updated is not None, "task not found after write"
         return updated
@@ -1538,3 +1565,24 @@ class BrainDB:
         result = self.get_learning(learning_id)
         assert result is not None, "learning not found after write"
         return result
+
+
+def _serialize_methods(cls: type) -> type:
+    """Wrap every public BrainDB method in the instance's RLock."""
+    for name, fn in list(vars(cls).items()):
+        if name.startswith("_") or not inspect.isfunction(fn):
+            continue
+
+        def make(f):
+            @functools.wraps(f)
+            def locked(self, *args, **kwargs):
+                with self._lock:
+                    return f(self, *args, **kwargs)
+
+            return locked
+
+        setattr(cls, name, make(fn))
+    return cls
+
+
+_serialize_methods(BrainDB)

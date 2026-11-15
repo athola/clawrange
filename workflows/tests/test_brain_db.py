@@ -42,8 +42,23 @@ class TestSchemaInit:
         assert expected.issubset(tables)
 
     def test_init_idempotent(self, db):
-        """Calling init_db() twice does not error."""
-        db.init_db()  # should not raise
+        """A second init_db() keeps the schema and the data."""
+        db.upsert_page("a", "Alpha", "concept", "body")
+        db.create_task("work")
+
+        def schema():
+            return sorted(
+                r["name"]
+                for r in db._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table','index')"
+                )
+            )
+
+        before = schema()
+        db.init_db()
+        assert schema() == before
+        assert db.get_page("a") is not None
+        assert len(db.list_tasks()) == 1
 
 
 # ─── Page CRUD ────────────────────────────────────────────────────
@@ -669,3 +684,79 @@ def test_persona_learning_lifecycle(tmp_path):
     db.set_learning_status(row["id"], "approved")
     approved = db.list_learnings(profile="chief-of-staff", status="approved")
     assert len(approved) == 1 and approved[0]["decided_at"]
+
+
+class TestTaskStateIntegrity:
+    """Claims must be atomic and terminal states final: the queue is shared
+    by the heartbeat, the tome bridge and the HTTP API."""
+
+    def test_claim_is_atomic_against_stale_read(self, db, monkeypatch):
+        """Two consumers both read 'pending' before either writes. Only the
+        first UPDATE may win; the second must see the row already active."""
+        t = db.create_task("work")
+        db.claim_task(t["id"])  # consumer A wins
+        real_get = db.get_task
+        stale = dict(real_get(t["id"]), status="pending")
+        monkeypatch.setattr(db, "get_task", lambda tid: stale)  # B's stale read
+        with pytest.raises(ValueError):
+            db.claim_task(t["id"])
+
+    def test_complete_rejects_terminal_task(self, db):
+        t = db.create_task("work")
+        db.complete_task(t["id"], "done")
+        with pytest.raises(ValueError):
+            db.complete_task(t["id"], "overwrite")
+        assert db.get_task(t["id"])["result"] == "done"
+
+    def test_complete_rejects_cancelled_task(self, db):
+        t = db.create_task("nevermind")
+        db.cancel_task(t["id"])
+        with pytest.raises(ValueError):
+            db.complete_task(t["id"], "revived")
+        assert db.get_task(t["id"])["status"] == "cancelled"
+
+    def test_complete_unknown_task_raises(self, db):
+        with pytest.raises(ValueError):
+            db.complete_task("nope", "x")
+
+
+class TestConnectionLock:
+    """One sqlite connection is shared by FastAPI's threadpool and the event
+    loop; without a lock one thread's commit() can commit another's
+    half-finished write. Every BrainDB method serializes on one RLock."""
+
+    def test_methods_wait_for_the_lock(self, db):
+        import threading
+
+        done = threading.Event()
+        db._lock.acquire()
+        try:
+            th = threading.Thread(
+                target=lambda: (db.create_task("x"), done.set()), daemon=True
+            )
+            th.start()
+            assert not done.wait(0.3), "create_task ran without the lock"
+        finally:
+            db._lock.release()
+        assert done.wait(2), "create_task never completed after release"
+
+    def test_lock_is_reentrant(self, db):
+        """create_task calls get_task internally; an RLock must allow it."""
+        assert db.create_task("nested")["status"] == "pending"
+
+
+class TestKeywordSearchInput:
+    @pytest.mark.parametrize("q", ['"', "foo(", "a AND", "NEAR(", "*"])
+    def test_fts_syntax_in_user_query_does_not_raise(self, db, q):
+        db.upsert_page("a", "Alpha", "concept", "alpha foo body")
+        assert isinstance(db.search_keyword(q), list)
+
+    def test_plain_words_still_match(self, db):
+        db.upsert_page("a", "Alpha", "concept", "alpha foo body")
+        assert [r["slug"] for r in db.search_keyword("alpha foo")] == ["a"]
+
+    def test_limit_is_clamped(self, db):
+        for i in range(5):
+            db.upsert_page(f"p{i}", f"T{i}", "concept", "common word")
+        assert len(db.search_keyword("common", limit=10_000)) == 5
+        assert len(db.search_keyword("common", limit=0)) == 1

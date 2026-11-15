@@ -38,7 +38,8 @@ def coerce_params(template: dict, raw: dict | None) -> dict:
       - ``duration``: binds ``since`` (or ``bind``) to now-minus-duration ISO.
       - ``enum``: validates membership; an optional ``map`` translates the
         chosen value (e.g. day -> '%Y-%m-%d'); binds to ``bind`` or the name.
-      - ``string``: binds ``q`` and ``like`` (``%value%``); required.
+      - ``string``: binds ``q`` and ``like`` (``%value%``, with ``%``/``_``
+        escaped: the SQL must say ``LIKE :like ESCAPE '\\'``); required.
       - anything else: binds the value under its name.
     """
     raw = raw or {}
@@ -59,12 +60,20 @@ def coerce_params(template: dict, raw: dict | None) -> dict:
                     f"param '{name}' must be one of {allowed}, got {value!r}"
                 )
             mapping = spec.get("map")
+            if mapping and value not in mapping:
+                raise ValueError(
+                    f"param '{name}': template map has no entry for {value!r}"
+                )
             binds[bind] = mapping[value] if mapping else value
         elif ptype == "string":
             if value in (None, ""):
                 raise ValueError(f"param '{name}' is required")
             binds["q"] = value
-            binds["like"] = f"%{value}%"
+            # Escape LIKE wildcards; templates must declare ESCAPE '\\'.
+            escaped = (
+                str(value).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            )
+            binds["like"] = f"%{escaped}%"
         else:
             binds[bind] = value
     return binds

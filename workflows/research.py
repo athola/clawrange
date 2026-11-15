@@ -38,11 +38,13 @@ from reddit_search import search_subreddits
 
 logger = logging.getLogger("clawrange.research")
 
-_CURRENT_YEAR = datetime.now(tz=UTC).year
+
+def _current_year() -> int:
+    return datetime.now(tz=UTC).year
+
 
 # Same thresholds as tome.synthesis.merger
 _PUNCTUATION_RE = re.compile(r"[^\w\s]")
-_JACCARD_THRESHOLD_SAME_CHANNEL = 0.8
 _JACCARD_THRESHOLD_CROSS_CHANNEL = 0.6
 _TRIANGULATION_CAP = 0.15
 _TRIANGULATION_PER_CHANNEL = 0.05
@@ -113,58 +115,6 @@ def deduplicate(findings: list[Finding]) -> list[Finding]:
     return out
 
 
-def _normalize_title(title: str) -> str:
-    if not title:
-        return ""
-    stripped = _PUNCTUATION_RE.sub("", title.lower())
-    return " ".join(sorted(stripped.split()))
-
-
-def _jaccard(a: str, b: str) -> float:
-    sa, sb = set(a.split()), set(b.split())
-    if not sa and not sb:
-        return 1.0
-    if not sa or not sb:
-        return 0.0
-    return len(sa & sb) / len(sa | sb)
-
-
-def fuzzy_deduplicate(
-    findings: list[Finding], cross_channel: bool = False
-) -> list[Finding]:
-    """Drop near-duplicate titles, keeping higher-relevance.
-
-    Within the same channel, similarity >= 0.8 collapses. Across
-    channels (when `cross_channel=True`), threshold drops to 0.6.
-    """
-    if not findings:
-        return []
-    normals = [_normalize_title(f.title) for f in findings]
-    removed: set[int] = set()
-
-    for i in range(len(findings)):
-        if i in removed:
-            continue
-        for j in range(i + 1, len(findings)):
-            if j in removed:
-                continue
-            same = findings[i].channel == findings[j].channel
-            if not cross_channel and not same:
-                continue
-            threshold = (
-                _JACCARD_THRESHOLD_SAME_CHANNEL
-                if same
-                else _JACCARD_THRESHOLD_CROSS_CHANNEL
-            )
-            if _jaccard(normals[i], normals[j]) >= threshold:
-                if findings[i].relevance >= findings[j].relevance:
-                    removed.add(j)
-                else:
-                    removed.add(i)
-                    break
-    return [f for idx, f in enumerate(findings) if idx not in removed]
-
-
 def merge_findings(channel_results: list[list[Finding]]) -> list[Finding]:
     """Flatten and dedupe by URL across channels."""
     flat: list[Finding] = []
@@ -217,7 +167,7 @@ def compute_relevance_score(f: Finding) -> float:
             score += 0.05
 
     year = meta.get("year")
-    if year is not None and (_CURRENT_YEAR - int(year or 0)) <= 2:
+    if year is not None and (_current_year() - int(year or 0)) <= 2:
         score += 0.05
 
     return min(score, 1.0)
@@ -350,7 +300,7 @@ async def _fetch_reddit(topic: str, **kwargs: Any) -> list[Finding]:
             title=p.title,
             url=p.url,
             relevance=0.5,
-            summary=getattr(p, "summary", "") or getattr(p, "selftext", "")[:300],
+            summary=(p.snippet or "")[:300],
             metadata={"score": getattr(p, "score", 0)},
         )
         for p in posts
@@ -411,7 +361,7 @@ async def _fetch_academic(topic: str, **kwargs: Any) -> list[Finding]:
                 resp.raise_for_status()
                 root = ET.fromstring(resp.text)
         except Exception as exc:
-            logger.info("academic.arxiv: %s", exc)
+            logger.warning("academic.arxiv failed: %s", exc)
             return []
 
         ns = {"atom": "http://www.w3.org/2005/Atom"}
@@ -459,7 +409,7 @@ async def _fetch_academic(topic: str, **kwargs: Any) -> list[Finding]:
                 resp.raise_for_status()
                 data = resp.json()
         except Exception as exc:
-            logger.info("academic.s2: %s", exc)
+            logger.warning("academic.s2 failed: %s", exc)
             return []
 
         out: list[Finding] = []
@@ -618,8 +568,7 @@ async def orchestrate_research(
     channel_findings: list[list[Finding]] = []
     for ch, result in zip(used_channels, raw):
         if isinstance(result, BaseException):
-            short = ch.split("_")[0]
-            errors[short] = str(result)
+            errors[ch] = str(result)
             channel_findings.append([])
             continue
         channel_findings.append(result)

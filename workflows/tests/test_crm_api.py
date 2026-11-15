@@ -176,3 +176,35 @@ def test_shipped_lead_lookup_matches_phone(tmp_path):
     )
     assert r.status_code == 200
     assert [row["name"] for row in r.json()["rows"]] == ["Ada"]
+
+
+def test_sync_failure_hides_upstream_detail(tmp_path):
+    """httpx error text includes the full URL, which can carry a token."""
+    crm = SQLiteCRM(str(tmp_path / "crm.db"))
+    crm.init()
+
+    def boom(req):
+        raise httpx.ConnectError("failed to reach https://p/e?token=SECRET")
+
+    http = httpx.Client(transport=httpx.MockTransport(boom))
+    app = FastAPI()
+    app.include_router(create_crm_router(_profile(), crm, http_client=http))
+    r = TestClient(app).post("/crm/sync/portal-leads")
+    assert r.status_code == 502
+    assert "SECRET" not in r.text
+
+
+def test_concurrent_sync_of_same_connector_is_rejected(tmp_path, monkeypatch):
+    import crm_api
+
+    crm = SQLiteCRM(str(tmp_path / "crm.db"))
+    crm.init()
+    app = FastAPI()
+    app.include_router(create_crm_router(_profile(), crm, http_client=None))
+    lock = crm_api._connector_lock("portal-leads")
+    lock.acquire()
+    try:
+        r = TestClient(app).post("/crm/sync/portal-leads")
+    finally:
+        lock.release()
+    assert r.status_code == 409

@@ -1745,8 +1745,10 @@ class TestCircuitBreakerState:
         llm_proxy._circuit_state["test-tier"]["last_failure"] = (
             time.monotonic() - llm_proxy.CIRCUIT_COOLDOWN_SECONDS - 1
         )
+        # Half-open: one probe is allowed, state is kept until it succeeds.
         assert llm_proxy._circuit_open("test-tier") is False
-        # State should be cleaned up
+        assert "test-tier" in llm_proxy._circuit_state
+        llm_proxy._record_success("test-tier")
         assert "test-tier" not in llm_proxy._circuit_state
 
 
@@ -4661,3 +4663,615 @@ def test_sentence_start_keeps_multi_word_names():
     assert llm_proxy._sentence_start("Mary Ann") == "Mary Ann"
     assert llm_proxy._sentence_start("the operator") == "The operator"
     assert llm_proxy._sentence_start("") == ""
+
+
+class TestLoadSoulPrefersRenderedWorkspace:
+    """The proxy's own soul.md is a read-only bind of the repo template, so
+    approved learnings (rendered into the OpenClaw workspace) never reached
+    heartbeat prompts. Prefer the rendered workspace copy when present."""
+
+    def test_workspace_soul_wins(self, tmp_path, monkeypatch):
+        import llm_proxy
+
+        (tmp_path / "workspace").mkdir()
+        (tmp_path / "workspace" / "SOUL.md").write_text("rendered soul\n")
+        monkeypatch.setenv("OPENCLAW_STATE_DIR", str(tmp_path))
+        assert llm_proxy._load_soul() == "rendered soul"
+
+    def test_falls_back_to_bundled_soul(self, tmp_path, monkeypatch):
+        import llm_proxy
+
+        bundled = tmp_path / "soul.md"
+        bundled.write_text("bundled soul\n")
+        monkeypatch.setenv("OPENCLAW_STATE_DIR", str(tmp_path / "missing"))
+        monkeypatch.setattr(llm_proxy, "_SOUL_MD_PATH", bundled)
+        assert llm_proxy._load_soul() == "bundled soul"
+
+
+class TestNextHeartbeatTask:
+    """The heartbeat must only claim tasks it owns. `research:tome:` tasks
+    belong to the local tome bridge; persona and income `[DRAFT]` tasks wait
+    for the operator. Claiming them answered them with the free-tier LLM
+    before their real consumer ever saw them."""
+
+    def test_skips_tome_and_draft_tasks(self):
+        import llm_proxy
+
+        pending = [
+            {"id": "a", "description": "research:tome: agent platforms"},
+            {"id": "b", "description": "[research:tome] x"},
+            {"id": "c", "description": "Research via tome: y"},
+            {"id": "d", "description": "[DRAFT] persona persona enhancement (Tone): x"},
+            {"id": "e", "description": "[DRAFT] income: weekly strategy review"},
+            {"id": "f", "description": "check disk usage"},
+        ]
+        assert llm_proxy._next_heartbeat_task(pending)["id"] == "f"
+
+    def test_comment_drafts_stay_heartbeat_owned(self):
+        """Comment-draft tasks instruct the LLM worker to write the reply."""
+        import llm_proxy
+
+        pending = [{"id": "a", "description": "[DRAFT] Comment draft for x on y."}]
+        assert llm_proxy._next_heartbeat_task(pending)["id"] == "a"
+
+    def test_none_when_only_foreign_tasks(self):
+        import llm_proxy
+
+        pending = [{"id": "a", "description": "[DRAFT] income: weekly review"}]
+        assert llm_proxy._next_heartbeat_task(pending) is None
+
+
+@patch.dict("os.environ", FAKE_ENV)
+@patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
+class TestHeartbeatLeavesForeignTasks:
+    def setup_method(self):
+        _reset_state()
+        from app import brain_db
+
+        brain_db._conn.execute("DELETE FROM tasks")
+        brain_db._conn.commit()
+
+    @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
+    def test_tome_task_stays_pending(self, _notify):
+        import time as _time
+
+        import llm_proxy
+        from app import brain_db
+
+        llm_proxy._proactive_state["stale_tasks"] = _time.monotonic()
+        llm_proxy._proactive_state["llm_thinking"] = _time.monotonic()
+        llm_proxy._proactive_state["pending_reminder"] = _time.monotonic()
+        t = brain_db.create_task("research:tome: agent platforms")
+        caller = AsyncMock(return_value=_mock_response(200))
+        with patch("llm_proxy._call_provider", caller):
+            client.post(
+                "/v1/chat/completions",
+                json=TestHeartbeatInterceptor._heartbeat_body(None),
+                headers=AUTH_HEADER,
+            )
+        assert brain_db.get_task(t["id"])["status"] == "pending"
+
+
+class TestBalanceFailureBackoff:
+    """A failed credits lookup used to leave checked_at untouched, so during
+    an OpenRouter outage every request re-ran a 10s-timeout HTTP call (twice
+    per chat request, before any tier started). Back off after a failure."""
+
+    def test_failure_not_retried_immediately(self, monkeypatch):
+        import asyncio
+
+        import llm_proxy
+
+        calls = {"n": 0}
+
+        class FailingClient:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, *a, **k):
+                calls["n"] += 1
+                raise httpx.ConnectError("down")
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+        monkeypatch.setattr(llm_proxy.httpx, "AsyncClient", FailingClient)
+        monkeypatch.setattr(
+            llm_proxy, "_balance_cache", {"remaining": 42.0, "checked_at": 0.0}
+        )
+        assert asyncio.run(llm_proxy._check_openrouter_balance()) == 42.0
+        assert asyncio.run(llm_proxy._check_openrouter_balance()) == 42.0
+        assert calls["n"] == 1
+
+
+# ─── Review-finding regressions ──────────────────────────────────
+
+
+def _collect_sse(sse_resp) -> list[dict]:
+    async def _run():
+        return [c async for c in sse_resp.body_iterator]
+
+    raw = "".join(asyncio.run(_run()))
+    return [
+        json.loads(ln.removeprefix("data: "))
+        for ln in raw.split("\n")
+        if ln.startswith("data: ") and "[DONE]" not in ln
+    ]
+
+
+class TestStreamToolCalls:
+    def test_null_content_tool_calls_stream(self):
+        calls = [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "exec", "arguments": '{"a": 1}'},
+            },
+            {
+                "id": "call_2",
+                "type": "function",
+                "function": {"name": "read", "arguments": "{}"},
+            },
+        ]
+        resp = JSONResponse(
+            content={
+                "id": "x",
+                "model": "m",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": calls,
+                        }
+                    }
+                ],
+            }
+        )
+        chunks = _collect_sse(llm_proxy._wrap_json_as_sse(resp))
+        tool_chunks = [c for c in chunks if c["choices"][0]["delta"].get("tool_calls")]
+        assert tool_chunks
+        streamed = tool_chunks[0]["choices"][0]["delta"]["tool_calls"]
+        assert [t["index"] for t in streamed] == [0, 1]
+        assert streamed[0]["function"]["name"] == "exec"
+        assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+    def test_null_content_without_tool_calls_does_not_crash(self):
+        resp = JSONResponse(
+            content={"choices": [{"message": {"role": "assistant", "content": None}}]}
+        )
+        chunks = _collect_sse(llm_proxy._wrap_json_as_sse(resp))
+        assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+class TestBackgroundLlmCallFreeTiersOnly:
+    @patch.dict("os.environ", FAKE_ENV)
+    def test_llm_call_never_uses_paid_tier(self):
+        paid = next(
+            t for t in llm_proxy.CONFIG["tiers"] if t["name"] == "openrouter-paid"
+        )
+        seen: list[list[str]] = []
+
+        async def fail(provider, models, body, api_key):
+            seen.append(list(models))
+            return _mock_response(500, {"error": "boom"})
+
+        with patch("llm_proxy._call_provider", side_effect=fail):
+            assert asyncio.run(llm_proxy._llm_call("hi")) is None
+        assert seen
+        assert paid["models"] not in seen
+
+    @patch.dict("os.environ", FAKE_ENV)
+    def test_llm_call_skips_tier_missing_from_provider_urls(self, monkeypatch):
+        monkeypatch.delitem(llm_proxy.PROVIDER_URLS, "zai")
+        providers: list[str] = []
+
+        async def fail(provider, models, body, api_key):
+            providers.append(provider)
+            return _mock_response(500, {"error": "boom"})
+
+        with patch("llm_proxy._call_provider", side_effect=fail):
+            asyncio.run(llm_proxy._llm_call("hi"))
+        assert "zai" not in providers
+
+
+class TestLlmCallExceptionHandling:
+    @patch.dict("os.environ", FAKE_ENV)
+    def test_exception_logged_and_recorded(self, caplog):
+        async def boom(provider, models, body, api_key):
+            raise RuntimeError("kaput")
+
+        with patch("llm_proxy._call_provider", side_effect=boom):
+            with caplog.at_level("WARNING", logger=llm_proxy.logger.name):
+                assert asyncio.run(llm_proxy._llm_call("hi")) is None
+        assert "kaput" in caplog.text
+        assert any(s["failures"] >= 1 for s in llm_proxy._circuit_state.values())
+
+    @patch.dict("os.environ", FAKE_ENV)
+    def test_429_in_background_call_trips_breaker(self):
+        async def limited(provider, models, body, api_key):
+            return _mock_response(429, {"error": "rate limited"})
+
+        with patch("llm_proxy._call_provider", side_effect=limited):
+            asyncio.run(llm_proxy._llm_call("hi"))
+        assert llm_proxy._circuit_open("openrouter-free", probe=False)
+
+
+@patch.dict("os.environ", FAKE_ENV)
+@patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
+class TestHeartbeatRobustness:
+    def setup_method(self):
+        _reset_state()
+        from app import brain_db
+
+        brain_db._conn.execute("DELETE FROM tasks")
+        brain_db._conn.commit()
+        for key in ("stale_tasks", "llm_thinking", "pending_reminder"):
+            llm_proxy._proactive_state[key] = time.monotonic()
+
+    def _beat(self):
+        return client.post(
+            "/v1/chat/completions",
+            json=TestHeartbeatInterceptor._heartbeat_body(None),
+            headers=AUTH_HEADER,
+        )
+
+    @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
+    def test_work_exception_fails_task_and_beat_continues(self, _n):
+        from app import brain_db
+
+        t = brain_db.create_task("Test task for heartbeat")
+        with patch(
+            "llm_proxy._llm_work_task", AsyncMock(side_effect=RuntimeError("boom"))
+        ):
+            r = self._beat()
+        assert r.status_code == 200
+        got = brain_db.get_task(t["id"])
+        assert got["status"] == "failed"
+        assert "boom" in got["result"]
+
+    @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
+    def test_claim_valueerror_skips_task_without_failing_it(self, _n):
+        from app import brain_db
+
+        t = brain_db.create_task("Test task for heartbeat")
+        work = AsyncMock(return_value="done")
+        with (
+            patch.object(brain_db, "claim_task", side_effect=ValueError("claimed")),
+            patch("llm_proxy._llm_work_task", work),
+        ):
+            r = self._beat()
+        assert r.status_code == 200
+        work.assert_not_called()
+        assert brain_db.get_task(t["id"])["status"] == "pending"
+
+    @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
+    def test_claim_falsy_skips_task(self, _n):
+        from app import brain_db
+
+        brain_db.create_task("Test task for heartbeat")
+        work = AsyncMock(return_value="done")
+        with (
+            patch.object(brain_db, "claim_task", return_value=None),
+            patch("llm_proxy._llm_work_task", work),
+        ):
+            assert self._beat().status_code == 200
+        work.assert_not_called()
+
+    @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
+    def test_complete_valueerror_tolerated(self, _n):
+        from app import brain_db
+
+        brain_db.create_task("Test task for heartbeat")
+        with (
+            patch("llm_proxy._llm_work_task", AsyncMock(return_value="ok")),
+            patch.object(brain_db, "complete_task", side_effect=ValueError("gone")),
+        ):
+            assert self._beat().status_code == 200
+
+    @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
+    def test_overall_work_deadline(self, _n, monkeypatch):
+        from app import brain_db
+
+        monkeypatch.setenv("HEARTBEAT_WORK_DEADLINE", "0.05")
+        t = brain_db.create_task("Test task for heartbeat")
+
+        async def hang(_desc):
+            await asyncio.sleep(10)
+
+        with patch("llm_proxy._llm_work_task", hang):
+            r = self._beat()
+        assert r.status_code == 200
+        assert brain_db.get_task(t["id"])["status"] == "failed"
+
+
+class TestSearchPathDeadline:
+    @patch.dict("os.environ", FAKE_ENV)
+    def test_search_call_honours_deadline(self, monkeypatch):
+        monkeypatch.setattr(llm_proxy, "LLM_CALL_DEADLINE", 0.05)
+
+        async def hang(provider, models, body, api_key):
+            await asyncio.sleep(10)
+
+        async def run():
+            return await asyncio.wait_for(
+                llm_proxy._llm_call("q", web_search=True), timeout=2
+            )
+
+        with patch("llm_proxy._call_provider", side_effect=hang):
+            assert asyncio.run(run()) is None
+
+
+class TestAutoRetryPopsOnlyElapsedTiers:
+    @patch.dict("os.environ", FAKE_ENV)
+    @patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
+    @patch("llm_proxy._background_notify")
+    def test_long_reset_tier_stays_tripped(self, _bg):
+        _reset_state()
+        phase = {"retry": False}
+        retry_providers: list[str] = []
+
+        async def fake_sleep(_s):
+            phase["retry"] = True
+
+        async def mock_call(provider, models, body, api_key):
+            if phase["retry"]:
+                retry_providers.append(provider)
+                return _mock_response(200)
+            secs = "5" if provider == "openrouter" else "25"
+            return _mock_response(
+                429, {"error": "rate limited"}, headers={"retry-after": secs}
+            )
+
+        with (
+            patch("llm_proxy._call_provider", side_effect=mock_call),
+            patch("llm_proxy.asyncio.sleep", side_effect=fake_sleep),
+        ):
+            r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
+        assert "_clawrange_tier" in r.json()
+        assert retry_providers
+        assert "zai" not in retry_providers
+
+
+class TestTrySingleTierGarbage:
+    @pytest.mark.parametrize(
+        "resp",
+        [
+            httpx.Response(200, content=b"<html>not json</html>"),
+            httpx.Response(200, json={"choices": []}),
+            httpx.Response(200, json={"choices": [{"nomessage": 1}]}),
+            httpx.Response(200, json=["list"]),
+        ],
+    )
+    @patch.dict("os.environ", FAKE_ENV)
+    def test_garbage_records_failure(self, resp):
+        tier = llm_proxy.CONFIG["tiers"][0]
+        with patch("llm_proxy._call_provider", AsyncMock(return_value=resp)):
+            out = asyncio.run(llm_proxy._try_single_tier(tier, {"messages": []}))
+        assert out == (None, None)
+        assert llm_proxy._circuit_state[tier["name"]]["failures"] == 1
+
+
+class TestBackgroundTasksHeld:
+    def test_spawn_keeps_reference_until_done(self):
+        async def run():
+            gate = asyncio.Event()
+
+            async def work():
+                await gate.wait()
+
+            task = llm_proxy._spawn_background(work())
+            assert task in llm_proxy._background_tasks
+            gate.set()
+            await task
+            await asyncio.sleep(0)
+            assert task not in llm_proxy._background_tasks
+
+        asyncio.run(run())
+
+    @patch.dict("os.environ", FAKE_ENV)
+    @patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
+    def test_status_message_deleted_even_on_error(self):
+        delete = AsyncMock()
+        with (
+            patch("telegram.send_status", AsyncMock(return_value=42)),
+            patch("telegram.send_typing", AsyncMock()),
+            patch("telegram.delete_message", delete),
+            patch(
+                "llm_proxy._handle_non_streaming",
+                AsyncMock(side_effect=RuntimeError("x")),
+            ),
+        ):
+            with pytest.raises(RuntimeError):
+                client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
+        delete.assert_awaited_once_with(42)
+
+
+@patch.dict("os.environ", FAKE_ENV)
+@patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
+class TestDigestNotLostOnFailure:
+    def setup_method(self):
+        _reset_state()
+        from app import brain_db
+
+        brain_db._conn.execute("DELETE FROM tasks")
+        brain_db._conn.commit()
+        for key in ("stale_tasks", "llm_thinking", "pending_reminder"):
+            llm_proxy._proactive_state[key] = time.monotonic()
+        llm_proxy._digest_state["last_flush"] = (
+            time.time() - llm_proxy.HEARTBEAT_DIGEST_INTERVAL - 1
+        )
+
+    def _beat(self):
+        return client.post(
+            "/v1/chat/completions",
+            json=TestHeartbeatInterceptor._heartbeat_body(None),
+            headers=AUTH_HEADER,
+        )
+
+    def test_failed_send_rebuffers_line(self):
+        llm_proxy._digest_record("[SYSTEM] #1: important")
+        with patch("telegram.notify", AsyncMock(return_value=False)):
+            assert self._beat().status_code == 200
+        assert llm_proxy._digest_state["lines"] == ["[SYSTEM] #1: important"]
+
+    def test_successful_send_clears_buffer(self):
+        llm_proxy._digest_record("[SYSTEM] #1: important")
+        with patch("telegram.notify", AsyncMock(return_value=True)):
+            self._beat()
+        assert llm_proxy._digest_state["lines"] == []
+
+    def test_overflow_items_carry_over(self):
+        for i in range(30):
+            llm_proxy._digest_record(f"[SYSTEM] #{i}: item")
+        with patch("telegram.notify", AsyncMock(return_value=True)):
+            self._beat()
+        assert len(llm_proxy._digest_state["lines"]) == 11
+        assert llm_proxy._digest_state["lines"][0] == "[SYSTEM] #19: item"
+
+
+class TestRequestValidation:
+    @patch.dict("os.environ", FAKE_ENV)
+    @patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"content": b"not json"},
+            {"json": [1, 2]},
+            {"json": {"messages": "hello"}},
+            {"json": {"messages": [1, "a"]}},
+        ],
+    )
+    def test_chat_bad_body_is_400(self, kwargs):
+        r = client.post(
+            "/v1/chat/completions",
+            headers={**AUTH_HEADER, "Content-Type": "application/json"},
+            **kwargs,
+        )
+        assert r.status_code == 400
+
+    @patch.dict("os.environ", FAKE_ENV)
+    @patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
+    @pytest.mark.parametrize("kwargs", [{"content": b"nope"}, {"json": ["x"]}])
+    def test_embeddings_bad_body_is_400(self, kwargs):
+        r = client.post(
+            "/v1/embeddings",
+            headers={**AUTH_HEADER, "Content-Type": "application/json"},
+            **kwargs,
+        )
+        assert r.status_code == 400
+
+
+class TestHalfOpenBreaker:
+    def _trip(self, name="t"):
+        for _ in range(llm_proxy.CIRCUIT_FAILURE_THRESHOLD):
+            llm_proxy._record_failure(name)
+        llm_proxy._circuit_state[name]["last_failure"] = (
+            time.monotonic() - llm_proxy.CIRCUIT_COOLDOWN_SECONDS - 1
+        )
+
+    def test_probe_failure_retrips_immediately(self):
+        self._trip()
+        assert llm_proxy._circuit_open("t") is False  # the probe
+        llm_proxy._record_failure("t")
+        assert llm_proxy._circuit_open("t") is True
+
+    def test_only_one_probe_at_a_time(self):
+        self._trip()
+        assert llm_proxy._circuit_open("t") is False
+        assert llm_proxy._circuit_open("t") is True
+
+    def test_probe_success_closes(self):
+        self._trip()
+        assert llm_proxy._circuit_open("t") is False
+        llm_proxy._record_success("t")
+        assert llm_proxy._circuit_open("t") is False
+        llm_proxy._record_failure("t")
+        assert llm_proxy._circuit_open("t") is False  # needs N fresh failures
+
+
+class TestTierHintBoundary:
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("please use !claude for this", "openrouter-paid"),
+            ("!paid summarize", "openrouter-paid"),
+            ("look at foo!claude bar", None),
+            ("see https://x.io/a!paid", None),
+            ("!claudette is a name", None),
+        ],
+    )
+    def test_boundaries(self, text, expected):
+        got = llm_proxy._detect_tier_hint([{"role": "user", "content": text}])
+        assert got == expected
+
+
+class TestDigestContinuationPrefix:
+    def test_exactly_one_prefix_per_continuation(self):
+        messages = llm_proxy._digest_messages(["[SYSTEM] #1: " + "x" * 9000])
+        assert len(messages) >= 3
+        assert not messages[0].startswith("…")
+        for m in messages[1:]:
+            assert m.startswith("… ")
+            assert not m.startswith("… …")
+
+    def test_split_parts_not_double_prefixed(self):
+        text = ("word " * 2000).strip()
+        parts = llm_proxy._split_for_telegram(text, limit=500)
+        assert all(not p.startswith("… …") for p in parts)
+
+
+class TestLowUptimeClock:
+    def _fake_time(self, monkeypatch):
+        from types import SimpleNamespace
+
+        monkeypatch.setattr(
+            llm_proxy,
+            "time",
+            SimpleNamespace(monotonic=lambda: 5.0, time=time.time),
+        )
+
+    def test_proactive_due_on_fresh_host(self, monkeypatch):
+        self._fake_time(monkeypatch)
+        assert llm_proxy._proactive_ready("never_ran") is True
+
+    def test_notification_not_debounced_on_fresh_host(self, monkeypatch):
+        self._fake_time(monkeypatch)
+        assert llm_proxy._should_notify("fresh-tier") is True
+
+    @patch.dict("os.environ", FAKE_ENV)
+    def test_balance_checked_on_fresh_host(self, monkeypatch):
+        self._fake_time(monkeypatch)
+        calls = {"n": 0}
+
+        class FakeClient:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, *a, **k):
+                calls["n"] += 1
+                return httpx.Response(
+                    200, json={"data": {"total_credits": 20, "total_usage": 5}}
+                )
+
+        monkeypatch.setattr(llm_proxy.httpx, "AsyncClient", FakeClient)
+        assert asyncio.run(llm_proxy._check_openrouter_balance()) == 15.0
+        assert calls["n"] == 1
+
+
+class TestDeadCodeRemoved:
+    @pytest.mark.parametrize(
+        "name", ["_safe_notify", "_TASK_TRIGGERS", "_strip_prefix"]
+    )
+    def test_removed(self, name):
+        assert not hasattr(llm_proxy, name)

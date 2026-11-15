@@ -165,3 +165,29 @@ def test_render_all_unwritable_target_returns_false(tmp_path):
     target = blocker / "soul.md"  # parent is a file -> OSError on write
     result = render_all(p, {"soul": str(target)}, [])
     assert result == {"soul": False}
+
+
+def test_learned_region_flattens_stored_multiline_content():
+    """Defense in depth: rows that predate input validation (or arrive via a
+    hand-edited learned.yaml) still render as a single bullet."""
+    p = Profile(name="t", raw={"profile": "t", "assistant": {"name": "Max"}})
+    evil = [{"kind": "persona", "target": "A\nB", "content": "x\n## Injected\ny"}]
+    out = compose_persona(p, evil)
+    # Mid-line "##" is inert text; only a line *starting* with it is a heading.
+    assert not any(line.startswith("## Injected") for line in out.splitlines())
+    assert "- **A B:** x ## Injected y" in out
+
+
+def test_render_all_logs_unwritable_target(tmp_path, caplog):
+    p = Profile("x", {"profile": "x", "assistant": {"name": "Max"}})
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    with caplog.at_level("WARNING", logger="clawrange.persona"):
+        render_all(p, {"soul": str(blocker / "soul.md")}, [])
+    assert "soul.md" in caplog.text
+
+
+def test_render_all_leaves_no_temp_files(tmp_path):
+    p = Profile("x", {"profile": "x", "assistant": {"name": "Max"}})
+    render_all(p, {"soul": str(tmp_path / "soul.md")}, [])
+    assert sorted(f.name for f in tmp_path.iterdir()) == ["soul.md"]

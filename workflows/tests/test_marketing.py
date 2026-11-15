@@ -1256,15 +1256,23 @@ class TestHotPulseGenerator:
     pulse history (independent of the 24h digest's dedup namespace)."""
 
     @pytest.fixture(autouse=True)
-    def _reset_throttle(self):
+    def _reset_throttle(self, request, monkeypatch):
         """Reset the module-level delivery-throttle timestamp before
         each test so cross-test pollution doesn't make the second
-        test's first fire throttle on the previous test's delivery."""
+        test's first fire throttle on the previous test's delivery.
+
+        Quiet hours depend on the wall clock (00:00-05:00 in the operator
+        tz, UTC when unset), so every test except the quiet-hours ones
+        pins the gate open and resets the once-per-window flag."""
         import generators
 
         generators._LAST_HOT_PULSE_DELIVERY_AT = None
+        generators._HOT_PULSE_IN_QUIET_HOURS = False
+        if "quiet" not in request.node.name:
+            monkeypatch.setattr(generators, "_is_quiet_hours", lambda *a, **kw: False)
         yield
         generators._LAST_HOT_PULSE_DELIVERY_AT = None
+        generators._HOT_PULSE_IN_QUIET_HOURS = False
 
     @pytest.mark.asyncio
     async def test_hot_pulse_in_registry(self):
@@ -1580,9 +1588,12 @@ class TestHotPulseGenerator:
         notify_mock = AsyncMock(return_value=True)
         monkeypatch.setattr("telegram.notify", notify_mock)
 
+        brain_db.upsert_schedule("hot_pulse", "hp", "hot_pulse", "*/5 * * * *")
         await hot_pulse_generator(brain_db)
 
         notify_mock.assert_not_awaited()
+        status = brain_db.get_schedule("hot_pulse")["last_status"]
+        assert status.startswith("ok (0 picks"), status
 
     @pytest.mark.asyncio
     async def test_hot_pulse_min_relevance_is_overridable(self, monkeypatch):
@@ -1760,7 +1771,11 @@ class TestHotPulseGenerator:
         notify_mock.assert_not_awaited()
         sched = brain_db.get_schedule("hot_pulse")
         assert sched is not None
-        assert "throttled" in (sched.get("last_status") or "")
+        import re
+
+        assert re.fullmatch(
+            r"throttled \(5\.\d+m of 15m\)", sched.get("last_status") or ""
+        ), sched.get("last_status")
 
     @pytest.mark.asyncio
     async def test_hot_pulse_delivers_after_interval_elapses(self, monkeypatch):

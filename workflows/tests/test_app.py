@@ -385,3 +385,25 @@ class TestCurrentProfileGuard:
         assert r.status_code == 200
         assert soul.exists()
         assert "Max" in soul.read_text()
+
+
+class TestTaskInputBounds:
+    """POST /task is the queue's public entry: callers may not spoof an
+    internal source (persona, schedule, ...) or submit unbounded text."""
+
+    def test_rejects_internal_source(self):
+        r = client.post("/task", json={"description": "x", "source": "persona"})
+        assert r.status_code == 422
+
+    def test_accepts_user_and_system(self):
+        for src in ("user", "system"):
+            r = client.post("/task", json={"description": "x", "source": src})
+            assert r.status_code == 200, src
+
+    def test_rejects_oversized_description(self):
+        r = client.post("/task", json={"description": "x" * 4001})
+        assert r.status_code == 422
+
+    def test_rejects_empty_description(self):
+        r = client.post("/task", json={"description": "   "})
+        assert r.status_code == 422

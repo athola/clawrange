@@ -178,7 +178,10 @@ LEADS_OVER_TIME = {
 LEAD_LOOKUP = {
     "name": "lead_lookup",
     "params": {"q": {"type": "string"}},
-    "sql": "SELECT * FROM leads WHERE email LIKE :like OR name LIKE :like LIMIT 10",
+    "sql": (
+        "SELECT * FROM leads WHERE email LIKE :like ESCAPE '\\' "
+        "OR name LIKE :like ESCAPE '\\' LIMIT 10"
+    ),
 }
 
 
@@ -310,3 +313,94 @@ def test_rest_upsert_via_injected_client():
     assert seen[0].method == "POST"
     assert seen[0].url.path == "/leads"
     assert seen[0].headers["Authorization"] == "Bearer t"
+
+
+# ─── review fixes: upsert integrity, SQL guard, limits ────────────
+
+
+def test_upsert_rejects_non_unique_key(crm):
+    """ON CONFLICT(col) needs a UNIQUE index; only email has one. A non-unique
+    key used to raise mid-loop and leave earlier rows in an open transaction."""
+    with pytest.raises(ValueError, match="unique"):
+        crm.upsert("leads", [_lead("a@x.com", phone="1")], "phone")
+
+
+def test_upsert_failure_rolls_back_whole_batch(crm, monkeypatch):
+    real = crm._rw()
+
+    class Exploding:
+        """Proxy that fails on the second INSERT."""
+
+        def __init__(self):
+            self.n = 0
+
+        def execute(self, sql, *a):
+            if sql.startswith("INSERT"):
+                self.n += 1
+                if self.n == 2:
+                    raise RuntimeError("disk full")
+            return real.execute(sql, *a)
+
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+    monkeypatch.setattr(crm, "_rw", lambda: Exploding())
+    with pytest.raises(RuntimeError):
+        crm.upsert("leads", [_lead("a@x.com"), _lead("b@x.com")], "email")
+    monkeypatch.undo()
+    real.commit()  # a later commit must not flush the half-batch
+    assert crm.list("leads") == []
+
+
+def test_template_with_keyword_text_in_literal_is_allowed(crm):
+    """The old substring blacklist rejected harmless SELECTs whose string
+    literals contained words like ' delete '."""
+    crm.upsert("leads", [_lead("a@x.com", name="please delete me")], "email")
+    rows = crm.run_template(
+        {"name": "t", "sql": "SELECT name FROM leads WHERE name LIKE '% delete %'"},
+        {},
+    )
+    assert rows == [{"name": "please delete me"}]
+
+
+def test_template_cte_mutation_rejected(crm):
+    crm.upsert("leads", [_lead("a@x.com")], "email")
+    with pytest.raises(ValueError):
+        crm.run_template(
+            {"name": "t", "sql": "WITH x AS (SELECT 1) DELETE FROM leads"}, {}
+        )
+    assert len(crm.list("leads")) == 1
+
+
+def test_template_rows_are_capped(crm, monkeypatch):
+    import crm.sqlite_adapter as sa
+
+    monkeypatch.setattr(sa, "MAX_TEMPLATE_ROWS", 3)
+    crm.upsert("leads", [_lead(f"{i}@x.com") for i in range(5)], "email")
+    assert len(crm.run_template({"name": "t", "sql": "SELECT * FROM leads"}, {})) == 3
+
+
+def test_list_rejects_unknown_filter_column(crm):
+    with pytest.raises(ValueError):
+        crm.list("leads", filters={"status = 'x' OR 1=1 --": "y"})
+
+
+def test_unique_keys_match_schema(crm):
+    """_UNIQUE_LEAD_KEYS must mirror the UNIQUE indexes in _SCHEMA."""
+    import crm.sqlite_adapter as sa
+
+    conn = crm._rw()
+    unique = set()
+    for idx in conn.execute("PRAGMA index_list(leads)").fetchall():
+        if idx["unique"]:
+            for col in conn.execute(f"PRAGMA index_info({idx['name']})").fetchall():
+                unique.add(col["name"])
+    assert unique == set(sa._UNIQUE_LEAD_KEYS)
+
+
+def test_rest_adapter_reuses_one_client():
+    """RestCRM built a fresh httpx.Client per call and never closed it."""
+    from crm.rest_adapter import RestCRM
+
+    r = RestCRM({"base_url": "https://crm.example"})
+    assert r._http() is r._http()

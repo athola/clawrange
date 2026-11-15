@@ -15,6 +15,7 @@ import base64
 import csv
 import io
 import logging
+from urllib.parse import urljoin
 
 import httpx
 
@@ -39,6 +40,11 @@ def _auth_headers(auth: dict | None) -> dict:
             raw = f"{b.get('username', '')}:{b.get('password', '')}".encode()
             return {"Authorization": f"Basic {base64.b64encode(raw).decode()}"}
     return {}
+
+
+def _looks_like_html(resp: httpx.Response) -> bool:
+    ctype = resp.headers.get("content-type", "").lower()
+    return "html" in ctype or resp.text.lstrip()[:1] == "<"
 
 
 def _parse_csv(text: str) -> list[Record]:
@@ -82,10 +88,17 @@ def login_scrape(spec: dict, *, client: httpx.Client | None = None) -> list[Reco
             lf.get("username_field", "username"): lf.get("username", ""),
             lf.get("password_field", "password"): lf.get("password", ""),
         }
-        login = c.post(login_url, data=form)
+        # Form logins usually answer 302 -> dashboard; follow it as success.
+        login = c.post(login_url, data=form, follow_redirects=True)
         login.raise_for_status()
-        resp = c.get(export_path)
+        resp = c.get(urljoin(login_url, export_path), follow_redirects=True)
         resp.raise_for_status()
+        if _looks_like_html(resp):
+            # A rejected login often serves the login page with a 200;
+            # parsing that as CSV would write junk leads.
+            raise ValueError(
+                "login_scrape: export returned HTML, not CSV (login likely failed)"
+            )
         return _parse_csv(resp.text)
     finally:
         if owned:

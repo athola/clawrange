@@ -230,3 +230,69 @@ def test_run_connector_unknown_source_raises(tmp_path):
     crm.init()
     with pytest.raises(ValueError):
         run_connector({"source": {"kind": "nope"}, "sink": {"kind": "crm"}}, crm)
+
+
+def _login_spec(export_path):
+    return {
+        "kind": "login_scrape",
+        "auth": {
+            "kind": "login_form",
+            "login_form": {
+                "login_url": "https://portal/login",
+                "username": "dana",
+                "password": "pw",
+                "export_path": export_path,
+            },
+        },
+    }
+
+
+def test_login_scrape_follows_post_login_redirect():
+    """Most form logins answer 302 -> dashboard; that's success, not an error."""
+
+    def handler(request):
+        if request.url.path == "/login":
+            return httpx.Response(
+                302, headers={"location": "/home", "set-cookie": "session=abc; Path=/"}
+            )
+        if request.url.path == "/home":
+            return httpx.Response(200, text="welcome")
+        if request.url.path == "/export":
+            if "session=abc" not in request.headers.get("cookie", ""):
+                return httpx.Response(403)
+            return httpx.Response(200, text=CSV, headers={"content-type": "text/csv"})
+        return httpx.Response(404)
+
+    rows = login_scrape(
+        _login_spec("https://portal/export"), client=_mock_client(handler)
+    )
+    assert len(rows) == 3
+
+
+def test_login_scrape_relative_export_path_resolves_against_login_url():
+    def handler(request):
+        if request.url.path == "/login":
+            return httpx.Response(200, headers={"set-cookie": "session=abc; Path=/"})
+        if str(request.url) == "https://portal/export":
+            return httpx.Response(200, text=CSV, headers={"content-type": "text/csv"})
+        return httpx.Response(404)
+
+    rows = login_scrape(_login_spec("/export"), client=_mock_client(handler))
+    assert len(rows) == 3
+
+
+def test_login_scrape_html_export_is_an_error_not_junk_leads():
+    """A failed login often returns 200 with an HTML login page; parsing that
+    as CSV wrote junk leads."""
+
+    def handler(request):
+        if request.url.path == "/login":
+            return httpx.Response(200, text="bad password")
+        return httpx.Response(
+            200,
+            text="<html><body>Login</body></html>",
+            headers={"content-type": "text/html"},
+        )
+
+    with pytest.raises(ValueError, match="CSV"):
+        login_scrape(_login_spec("/export"), client=_mock_client(handler))
