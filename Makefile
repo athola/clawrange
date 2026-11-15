@@ -52,7 +52,7 @@ reset: ## Wipe all data and start fresh (interactive confirmation)
 
 .PHONY: test test-openclaw test-workflows test-deerflow test-ollama test-research \
 	test-unit validate tome-bridge tome-bridge-watch \
-	retrieval-eval retrieval-eval-refresh
+	retrieval-eval retrieval-eval-refresh retrieval-harvest retrieval-eval-brain
 
 test: ## Run full validation suite (6 tests)
 	@./scripts/test_all.sh
@@ -112,6 +112,13 @@ retrieval-eval: ## Compare search configs on the fixture golden set (offline)
 retrieval-eval-refresh: ## Embed fixture cache misses via OpenRouter, then compare
 	@if [ -f .env ]; then set -a; . ./.env; set +a; fi; \
 	cd workflows && uv run python retrieval_eval.py --refresh --check-truncation
+
+retrieval-harvest: ## Add John's real brain searches to data/retrieval/golden.json (unlabelled)
+	@cd workflows && uv run python retrieval_eval.py --brain ../data/brain/brain.db --harvest
+
+retrieval-eval-brain: ## Compare search configs on the real brain with your labelled queries
+	@if [ -f .env ]; then set -a; . ./.env; set +a; fi; \
+	cd workflows && uv run python retrieval_eval.py --brain ../data/brain/brain.db --refresh
 
 validate: ## Validate config files and project structure
 	@uv run python tests/validate_stack.py

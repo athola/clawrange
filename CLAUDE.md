@@ -32,7 +32,9 @@ Tailscale and Caddy gateway.
   - `retrieval_eval.py`: offline search eval (hit@k, MRR, nDCG, paired
     bootstrap) over a fixture corpus and golden set with cached vectors in
     `tests/fixtures/retrieval/`; the pre-push pytest run gates production
-    and the no-vector fallback against `baseline.json`
+    and the no-vector fallback (overall and per query tag) against
+    `baseline.json`. Real-brain mode keeps its golden set under
+    `data/retrieval/` (gitignored)
   - `llm_proxy.py`: OpenAI-compatible proxy with tiered routing,
     web-search routing, anti-hallucination guard, balance circuit breaker
   - `scheduler.py`, `generators.py`: APScheduler jobs and generators
@@ -101,6 +103,8 @@ make start-prod       # bind to 127.0.0.1 and Tailscale IP only
 make test             # run validation suite
 make test-unit        # uv run pytest workflows/tests/
 make retrieval-eval   # compare search configs offline (fixture golden set)
+make retrieval-harvest   # real brain searches -> data/retrieval/golden.json
+make retrieval-eval-brain # same matrix on the real brain (label queries first)
 make health           # quick curl health checks
 make logs             # tail docker logs
 

@@ -25,9 +25,12 @@ import json
 import math
 import os
 import random
+import re
+import sqlite3
 import struct
 import sys
 import tempfile
+import urllib.parse
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -35,6 +38,11 @@ from typing import Any
 from brain_db import BrainDB
 
 FIXTURES = os.path.join(os.path.dirname(__file__), "tests", "fixtures", "retrieval")
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Real-brain mode keeps its golden set and vectors under data/ (gitignored):
+# real queries and page contents are operator-private.
+LOCAL_DIR = os.path.join(_REPO, "data", "retrieval")
+SESSIONS_DIR = os.path.join(_REPO, "data", "openclaw-state", "agents")
 METRICS = ("hit@1", "hit@3", "hit@5", "mrr@10", "ndcg@10")
 HEADERS = ("none", "title")
 
@@ -127,15 +135,80 @@ class Case:
 def load_cases(path: str) -> list[Case]:
     with open(path) as f:
         raw = json.load(f)["cases"]
+    # Harvested candidates have no labels yet; they are kept in the file
+    # for the operator to fill in, but not scored.
     return [
         Case(c["query"], frozenset(c["relevant"]), tuple(c.get("tags", ())))
         for c in raw
+        if c.get("relevant")
     ]
 
 
 def load_pages(path: str) -> list[dict[str, Any]]:
     with open(path) as f:
         return json.load(f)["pages"]
+
+
+def load_brain_pages(path: str) -> list[dict[str, Any]]:
+    """Pages from a real brain DB, opened read-only."""
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        rows = con.execute(
+            "SELECT slug, title, page_type, compiled FROM pages ORDER BY slug"
+        ).fetchall()
+    finally:
+        con.close()
+    return [
+        {"slug": s, "title": t, "page_type": pt, "compiled": c or ""}
+        for s, t, pt, c in rows
+    ]
+
+
+_SEARCH_Q = re.compile(r"brain/search\?q=([^\"&\s\\]+)")
+
+
+def harvest_queries(root: str) -> list[str]:
+    """Real /brain/search queries found in OpenClaw session files, in order."""
+    found: dict[str, None] = {}
+    for dirpath, _dirs, files in os.walk(root):
+        for name in sorted(files):
+            if not name.endswith((".json", ".jsonl")):
+                continue
+            try:
+                with open(os.path.join(dirpath, name), errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            for raw in _SEARCH_Q.findall(text):
+                q = " ".join(urllib.parse.unquote_plus(raw).split())
+                if q and q != "...":
+                    found.setdefault(q, None)
+    return list(found)
+
+
+def merge_candidates(path: str, queries: Iterable[str]) -> int:
+    """Append unseen queries as unlabelled cases; returns how many were added."""
+    try:
+        with open(path) as f:
+            body = json.load(f)
+    except FileNotFoundError:
+        body = {
+            "description": "Local golden set for the real brain. Fill in "
+            "'relevant' with page slugs; unlabelled cases are not scored.",
+            "cases": [],
+        }
+    known = {c["query"] for c in body["cases"]}
+    added = 0
+    for q in queries:
+        if q not in known:
+            body["cases"].append({"query": q, "relevant": [], "tags": ["harvested"]})
+            known.add(q)
+            added += 1
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(body, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    return added
 
 
 # ─── Vector cache ─────────────────────────────────────────────────
@@ -406,16 +479,27 @@ GATED_METRICS = ("hit@1", "hit@3", "mrr@10")
 GATE_EPSILON = 1e-9
 
 
-def gate(baseline: dict[str, float], current: dict[str, float]) -> list[str]:
+def gate(
+    baseline: dict[str, float],
+    current: dict[str, float],
+    baseline_tags: dict[str, dict[str, float]] | None = None,
+    current_tags: dict[str, dict[str, float]] | None = None,
+) -> list[str]:
     """Return one message per gated metric that fell below the baseline.
 
-    A deliberate trade (worse on one metric for a win elsewhere) is made by
-    rewriting baseline.json with --write-baseline in the same change.
+    Overall metrics are checked first, then hit@1 per query tag, so a gain
+    on semantic questions cannot hide a loss on lexical ones. A deliberate
+    trade is made by rewriting baseline.json with --write-baseline in the
+    same change.
     """
     failures = []
     for m in GATED_METRICS:
         if current[m] < baseline[m] - GATE_EPSILON:
             failures.append(f"{m} fell from {baseline[m]:.3f} to {current[m]:.3f}")
+    for tag, base in sorted((baseline_tags or {}).items()):
+        now = (current_tags or {}).get(tag, {}).get("hit@1", 0.0)
+        if now < base["hit@1"] - GATE_EPSILON:
+            failures.append(f"{tag} hit@1 fell from {base['hit@1']:.3f} to {now:.3f}")
     return failures
 
 
@@ -485,21 +569,50 @@ def format_report(report: dict[str, Result], baseline: str = "production") -> st
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Offline retrieval evaluation.")
     ap.add_argument("--fixtures", default=FIXTURES)
+    ap.add_argument("--brain", help="evaluate a real brain DB (read-only) instead")
+    ap.add_argument("--golden", help="golden set path (default per mode)")
+    ap.add_argument("--vectors", help="vector cache path (default per mode)")
+    ap.add_argument(
+        "--harvest",
+        nargs="?",
+        const=SESSIONS_DIR,
+        metavar="SESSIONS_DIR",
+        help="add real /brain/search queries from OpenClaw sessions to the "
+        "golden set as unlabelled cases, then exit",
+    )
     ap.add_argument("--refresh", action="store_true", help="embed cache misses live")
     ap.add_argument("--check-truncation", action="store_true")
     ap.add_argument("--write-baseline", action="store_true")
     args = ap.parse_args(argv)
 
-    pages = load_pages(os.path.join(args.fixtures, "corpus.json"))
-    cases = load_cases(os.path.join(args.fixtures, "golden.json"))
-    vec_path = os.path.join(args.fixtures, "vectors.json")
+    base_dir = LOCAL_DIR if args.brain else args.fixtures
+    golden = args.golden or os.path.join(base_dir, "golden.json")
+    vec_path = args.vectors or os.path.join(base_dir, "vectors.json")
+
+    if args.harvest:
+        n = merge_candidates(golden, harvest_queries(args.harvest))
+        print(f"added {n} unlabelled queries to {golden}; label them, then rerun")
+        return 0
+    if args.brain and args.write_baseline:
+        sys.exit("--write-baseline only applies to the committed fixtures")
+
+    if args.brain:
+        pages = load_brain_pages(args.brain)
+    else:
+        pages = load_pages(os.path.join(args.fixtures, "corpus.json"))
+    if not os.path.exists(golden):
+        sys.exit(f"no golden set at {golden} (try --harvest)")
+    cases = load_cases(golden)
+    if not cases:
+        sys.exit(f"{golden} has no labelled cases yet")
     if os.path.exists(vec_path):
         cache = VectorCache.load(vec_path)
     else:
         import embeddings
 
-        base = embeddings.config()
-        cache = VectorCache(vec_path, base.model, base.dim)
+        cfg = embeddings.config()
+        os.makedirs(os.path.dirname(vec_path) or ".", exist_ok=True)
+        cache = VectorCache(vec_path, cfg.model, cfg.dim)
 
     needed = texts_needed(pages, cases, DEFAULT_MATRIX)
     if args.refresh:
@@ -517,7 +630,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{len(pages)} pages, {len(cases)} queries, model {cache.model}\n")
     print(format_report(report))
     if args.write_baseline:
-        body = {"configs": {name: report[name].mean for name in GATED_CONFIGS}}
+        body = {
+            "configs": {
+                name: {"mean": report[name].mean, "by_tag": report[name].by_tag}
+                for name in GATED_CONFIGS
+            }
+        }
         with open(os.path.join(args.fixtures, "baseline.json"), "w") as f:
             json.dump(body, f, indent=2)
             f.write("\n")

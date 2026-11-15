@@ -218,13 +218,23 @@ class TestFixtureGate:
         baseline = json.load(open(os.path.join(FIXTURES, "baseline.json")))
         cfg = next(c for c in rev.DEFAULT_MATRIX if c.name == name)
         current = rev.evaluate(corpus, cases, [cfg], cache)[name]
-        failures = rev.gate(baseline["configs"][name], current.mean)
+        base = baseline["configs"][name]
+        failures = rev.gate(base["mean"], current.mean, base["by_tag"], current.by_tag)
         assert failures == [], failures
 
     def test_one_query_regression_fails_the_gate(self):
         base = {m: 0.5 for m in rev.METRICS}
         worse = dict(base, **{"hit@1": 0.5 - 1 / 72})
         assert rev.gate(base, worse)
+
+    def test_tag_loss_hidden_by_overall_gain_fails(self):
+        """Overall hit@1 can rise while one query type gets worse."""
+        base = {m: 0.5 for m in rev.METRICS}
+        base_tags = {"lexical": {"hit@1": 1.0}, "semantic": {"hit@1": 0.5}}
+        better = dict(base, **{"hit@1": 0.6})
+        tags = {"lexical": {"hit@1": 0.9}, "semantic": {"hit@1": 0.7}}
+        failures = rev.gate(base, better, base_tags, tags)
+        assert failures == ["lexical hit@1 fell from 1.000 to 0.900"]
 
     def test_production_config_mirrors_real_defaults(self):
         """The gate copies production's knobs into SearchConfig; if the real
@@ -244,3 +254,60 @@ class TestFixtureGate:
         probe = BrainDB(":memory:")
         assert prod.chunk_words == probe.chunk_max_words
         assert prod.chunk_overlap == probe.chunk_overlap_words
+
+
+# ─── Real-brain mode (local, operator-private data) ───────────────
+
+
+class TestRealBrain:
+    def test_pages_load_read_only_from_a_brain_db(self, tmp_path):
+        from brain_db import BrainDB
+
+        path = tmp_path / "brain.db"
+        db = BrainDB(str(path))
+        db.init_db()
+        db.upsert_page("n/a", "Alpha", "note", "body text")
+        db._conn.close()
+        pages = rev.load_brain_pages(str(path))
+        assert pages == [
+            {
+                "slug": "n/a",
+                "title": "Alpha",
+                "page_type": "note",
+                "compiled": "body text",
+            }
+        ]
+
+    def test_harvest_finds_url_encoded_queries_in_sessions(self, tmp_path):
+        agent = tmp_path / "max" / "sessions"
+        agent.mkdir(parents=True)
+        (agent / "s.jsonl").write_text(
+            '{"url": "http://x:5678/brain/search?q=lead+conversion&mode=hybrid"}\n'
+            '{"url": "http://x/brain/search?q=who%20pays%3F"}\n'
+            '{"url": "http://x/brain/search?q=lead+conversion"}\n'
+        )
+        assert rev.harvest_queries(str(tmp_path)) == ["lead conversion", "who pays?"]
+
+    def test_merge_adds_unlabelled_cases_once(self, tmp_path):
+        golden = tmp_path / "golden.json"
+        golden.write_text(
+            '{"cases": [{"query": "known", "relevant": ["a"], "tags": []}]}'
+        )
+        added = rev.merge_candidates(str(golden), ["known", "new one"])
+        assert added == 1
+        data = json.loads(golden.read_text())["cases"]
+        assert data[1] == {"query": "new one", "relevant": [], "tags": ["harvested"]}
+        assert rev.merge_candidates(str(golden), ["new one"]) == 0
+
+    def test_merge_creates_missing_golden_file(self, tmp_path):
+        golden = tmp_path / "sub" / "golden.json"
+        assert rev.merge_candidates(str(golden), ["q"]) == 1
+        assert json.loads(golden.read_text())["cases"][0]["query"] == "q"
+
+    def test_unlabelled_cases_are_not_scored(self, tmp_path):
+        golden = tmp_path / "g.json"
+        golden.write_text(
+            '{"cases": [{"query": "a", "relevant": ["x"]},'
+            ' {"query": "b", "relevant": []}]}'
+        )
+        assert [c.query for c in rev.load_cases(str(golden))] == ["a"]
