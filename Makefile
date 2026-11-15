@@ -36,7 +36,8 @@ PROD_COMPOSE := -f docker-compose.yml -f docker-compose.prod.yml
 
 start-prod: ## Start core stack bound to Tailscale + localhost only
 	@docker compose $(PROD_COMPOSE) up -d --build
-	@echo "Services bound to 127.0.0.1 + $${TAILSCALE_IP} (Tailscale)"
+	@if [ -f .env ]; then set -a; . ./.env; set +a; fi; \
+	echo "Services bound to 127.0.0.1 + $${TAILSCALE_IP:-<TAILSCALE_IP unset>} (Tailscale)"
 
 start-prod-full: ## Start full stack (prod mode) including DeerFlow
 	@docker compose $(PROD_COMPOSE) up -d --build
