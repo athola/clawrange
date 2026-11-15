@@ -156,17 +156,6 @@ class TestScanCache:
         assert not brain_db.is_seen("reddit_post", "abc123", "different-project")
         assert not brain_db.is_seen("reddit_post", "xyz789", "claude-night-market")
 
-    def test_get_unseen(self):
-        brain_db.mark_seen("reddit_post", "seen1", "proj-a")
-        brain_db.mark_seen("reddit_post", "seen2", "proj-a")
-        unseen = brain_db.get_unseen(
-            "reddit_post", ["seen1", "seen2", "unseen1"], "proj-a"
-        )
-        assert unseen == ["unseen1"]
-
-    def test_get_unseen_empty(self):
-        assert brain_db.get_unseen("reddit_post", [], "proj-a") == []
-
     def test_mark_seen_idempotent(self):
         brain_db.mark_seen("github_repo", "repo1", None)
         brain_db.mark_seen("github_repo", "repo1", None)

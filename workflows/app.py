@@ -1,4 +1,4 @@
-"""ClawRange Workflow Service — replaces n8n with testable Python endpoints."""
+"""ClawRange workflows service: brain, task queue, LLM proxy, scheduler, scanners."""
 
 import json
 import logging
@@ -297,19 +297,7 @@ def healthz():
 
 @app.get("/tier")
 async def tier_status():
-    tiers = []
-    for tier in llm_proxy.CONFIG["tiers"]:
-        name = tier["name"]
-        if llm_proxy._circuit_open(name):
-            marker = "TRIPPED"
-        elif name == llm_proxy._last_tier_used:
-            marker = "ACTIVE"
-        else:
-            marker = "ready"
-        tiers.append(
-            {"name": name, "status": marker, "description": tier["description"]}
-        )
-
+    tiers = llm_proxy.tier_snapshot()
     remaining = await llm_proxy._check_openrouter_balance()
     return {
         "tiers": tiers,
@@ -326,15 +314,7 @@ async def tier_status():
 async def tier_notify():
     """Send tier status to Telegram — hit this endpoint to get status in chat."""
     lines = ["*Tier Status*\n"]
-    for tier in llm_proxy.CONFIG["tiers"]:
-        name = tier["name"]
-        if llm_proxy._circuit_open(name):
-            marker = "TRIPPED"
-        elif name == llm_proxy._last_tier_used:
-            marker = "ACTIVE"
-        else:
-            marker = "ready"
-        lines.append(f"  [{marker}] {name}")
+    lines += [f"  [{t['status']}] {t['name']}" for t in llm_proxy.tier_snapshot()]
 
     remaining = await llm_proxy._check_openrouter_balance()
     if remaining is not None:
@@ -561,13 +541,7 @@ async def scan_reddit(body: dict[str, Any]):
     subreddits = body.get("subreddits", [])
     project_slug = body.get("project_slug")
 
-    if not subreddits and project_slug:
-        project = brain_db.get_project(project_slug)
-        if project:
-            subreddits = json.loads(project.get("subreddits", "[]"))
-
-    if not subreddits:
-        subreddits = tenant_profile.default_subreddits()
+    subreddits = tenant_profile.resolve_subreddits(brain_db, subreddits, project_slug)
 
     results = await reddit_search.search_subreddits(
         topic,

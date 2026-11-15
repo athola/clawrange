@@ -1,3 +1,6 @@
+> **Archived.** Implemented. The plan's `workflows/profile.py` is now
+> `workflows/tenant_profile.py`; see [docs/multi-tenant-guide.md](../multi-tenant-guide.md).
+
 # ClawRange Multi-Tenant Template: Implementation Plan
 
 **Date**: 2026-06-07

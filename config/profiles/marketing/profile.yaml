@@ -419,7 +419,7 @@ income_review:
     all-in BTC on day one), the paper sleeve's 20-week-SMA decision and
     hypothetical result, fees paid this week, and proposed adjustments with
     cited sources (single-source claims flagged). Hard rules in
-    docs/income-strategy.md apply; this task is a draft for operator
+    config/profiles/marketing/income-strategy.md apply; this task is a draft for operator
     approval: never execute trades.
 
 # Daily outreach rundown policy (morning_digest). Defaults live in code;

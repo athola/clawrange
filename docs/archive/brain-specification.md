@@ -195,10 +195,10 @@ All existing `/task/*` endpoints remain identical. Backend changes from in-memor
 ```json
 POST /brain/pages
 {
-  "slug": "client/longview-home-center",
-  "title": "Longview Home Center",
+  "slug": "client/acme-homes",
+  "title": "Acme Homes",
   "page_type": "client",
-  "compiled": "Main contact: Bob Smith. 3 retail sites in Longview, TX."
+  "compiled": "Main contact: Pat Doe. 3 retail sites in Springfield."
 }
 ```
 
@@ -209,19 +209,19 @@ Upsert behavior: if slug exists, update title/compiled/updated_at. If not, creat
 ### Get Page
 
 ```json
-GET /brain/pages/client/longview-home-center
+GET /brain/pages/client/acme-homes
 
 {
-  "slug": "client/longview-home-center",
-  "title": "Longview Home Center",
+  "slug": "client/acme-homes",
+  "title": "Acme Homes",
   "page_type": "client",
-  "compiled": "Main contact: Bob Smith. 3 retail sites in Longview, TX.",
+  "compiled": "Main contact: Pat Doe. 3 retail sites in Springfield.",
   "created_at": "2026-04-10T12:00:00Z",
   "updated_at": "2026-04-10T14:30:00Z",
   "timeline": [
     {
       "id": 1,
-      "content": "Initial client onboarding. Bob Smith is primary contact.",
+      "content": "Initial client onboarding. Pat Doe is primary contact.",
       "source": "john-117",
       "created_at": "2026-04-10T12:00:00Z"
     }
@@ -254,7 +254,7 @@ GET /brain/search?q=wifi+issues&limit=5
 ### Append Timeline
 
 ```json
-POST /brain/pages/client/longview-home-center/timeline
+POST /brain/pages/client/acme-homes/timeline
 {
   "content": "Reported intermittent WiFi drops on site 2. Created incident page.",
   "source": "john-117"

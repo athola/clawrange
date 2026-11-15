@@ -173,7 +173,9 @@ curl -s https://ai.yourdomain.com/v1/chat/completions \
 ## Part 3: Tailscale ACLs (Optional but Recommended)
 
 Lock down which devices can talk to what. Go to
-https://login.tailscale.com/admin/acls and add:
+https://login.tailscale.com/admin/acls and add the policy below (also
+available paste-ready, with tagging instructions, as
+[tailscale-acls.json](tailscale-acls.json)):
 
 ```json
 {

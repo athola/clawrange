@@ -7,6 +7,8 @@ The FastAPI router (brain.py) is a thin wrapper over this module.
 import functools
 import hashlib
 import inspect
+import json
+import logging
 import os
 import re
 import sqlite3
@@ -151,6 +153,25 @@ def _connect(db_path: str) -> tuple[sqlite3.Connection, bool]:
         pass  # Graceful degradation: keyword-only search
 
     return conn, has_vec
+
+
+def project_list(project: dict[str, Any] | None, key: str) -> list[str]:
+    """Decode a project's JSON-list column (topics, subreddits, search_terms).
+
+    Tolerant by design: a missing, null, malformed or non-list value is an
+    empty list (logged), so one bad row can't abort a whole generator run.
+    """
+    raw = (project or {}).get(key)
+    if isinstance(raw, list):
+        return [str(x) for x in raw]
+    try:
+        value = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        logging.getLogger("clawrange.brain").warning(
+            "project %s: malformed %s column", (project or {}).get("slug"), key
+        )
+        return []
+    return [str(x) for x in value] if isinstance(value, list) else []
 
 
 class BrainDB:
@@ -1112,7 +1133,7 @@ class BrainDB:
         proj = self.get_project(slug)
         if not proj:
             return False
-        subs = json.loads(proj.get("subreddits", "[]"))
+        subs = project_list(proj, "subreddits")
         existing = {s.lower() for s in subs}
         if subreddit.lower() in existing:
             return False
@@ -1210,30 +1231,6 @@ class BrainDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def deal_price_stats(self, target: str, days: int = 30, floor: float = 0.0):
-        """Median asking price for a target over the window, or None.
-
-        Prices under `floor` are ignored: accessories and scams that once
-        matched a target would otherwise drag its median far below what
-        the real item sells for.
-        """
-        from statistics import median
-
-        from deals import PriceStats
-
-        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
-        prices = [
-            r[0]
-            for r in self._conn.execute(
-                "SELECT price FROM deal_observations"
-                " WHERE target=? AND observed_at>=? AND price>=?",
-                (target, cutoff, floor),
-            ).fetchall()
-        ]
-        if not prices:
-            return None
-        return PriceStats(median=float(median(prices)), samples=len(prices))
-
     # ─── Scan Cache (dedup) ─────────────────────────────────────
 
     def mark_seen(
@@ -1264,27 +1261,6 @@ class BrainDB:
             ).fetchone()
         return row is not None
 
-    def get_unseen(
-        self, kind: str, external_ids: list[str], project_slug: str | None = None
-    ) -> list[str]:
-        if not external_ids:
-            return []
-        placeholders = ",".join("?" * len(external_ids))
-        if project_slug is None:
-            rows = self._conn.execute(
-                f"SELECT external_id FROM scan_cache WHERE kind=? "
-                f"AND project_slug IS NULL AND external_id IN ({placeholders})",
-                (kind, *external_ids),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                f"SELECT external_id FROM scan_cache WHERE kind=? "
-                f"AND project_slug=? AND external_id IN ({placeholders})",
-                (kind, project_slug, *external_ids),
-            ).fetchall()
-        seen = {r["external_id"] for r in rows}
-        return [eid for eid in external_ids if eid not in seen]
-
     def prune_scan_cache(self, max_age_days: int = 14) -> int:
         cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
         cursor = self._conn.execute(
@@ -1298,15 +1274,19 @@ class BrainDB:
     def record_subreddit_search(
         self, subreddit: str, project_slug: str, is_curated: bool = False
     ) -> None:
-        """Record one search impression for a (subreddit, project) pair.
+        """Record one search impression for a (subreddit, project) pair."""
+        self.record_subreddit_searches([(subreddit, project_slug, is_curated)])
 
-        Each digest/pulse cycle increments impressions for every
-        subreddit it searched. Combined with hits, this gives a
-        per-(sub, project) yield rate.
+    def record_subreddit_searches(self, rows: list[tuple[str, str, bool]]) -> None:
+        """Record search impressions for many (subreddit, project, curated)
+        rows in one transaction.
+
+        Each digest/pulse cycle increments impressions for every subreddit it
+        searched; with hits this gives a per-(sub, project) yield rate. One
+        commit per cycle instead of one per (sub, project) pair.
         """
-        sub = subreddit.lower().strip()
         now = _now()
-        self._conn.execute(
+        self._conn.executemany(
             """INSERT INTO subreddit_stats
                  (subreddit, project_slug, hits, impressions,
                   last_searched_at, is_curated)
@@ -1315,7 +1295,10 @@ class BrainDB:
                  impressions = impressions + 1,
                  last_searched_at = excluded.last_searched_at,
                  is_curated = MAX(is_curated, excluded.is_curated)""",
-            (sub, project_slug, now, 1 if is_curated else 0),
+            [
+                (sub.lower().strip(), slug, now, 1 if curated else 0)
+                for sub, slug, curated in rows
+            ],
         )
         self._conn.commit()
 

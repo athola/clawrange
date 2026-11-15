@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 import llm_proxy
+import telegram
 from app import app
 
 client = TestClient(app)
@@ -46,6 +47,19 @@ def _mock_response(
     return httpx.Response(
         status_code=status_code, content=content, headers=headers or {}
     )
+
+
+def _take_digest(proxy, *args, **kwargs):
+    """Drain the digest the way the heartbeat does (take_ex + commit),
+    treating every message as delivered."""
+    messages, summary, owners, lines = proxy._digest_take_ex(*args, **kwargs)
+    proxy._digest_commit(lines, owners, set())
+    return messages, summary
+
+
+def _plan_messages(proxy, lines):
+    """One Telegram message per buffered item (the digest plan's messages)."""
+    return proxy._digest_plan(lines)[0]
 
 
 def _reset_state():
@@ -2810,7 +2824,7 @@ class TestHeartbeatInterceptor:
 
         sent = [call.args[0] for call in mock_notify.await_args_list]
         assert any("PAST-OLD-CLIP" in text for text in sent)
-        assert all(len(text) <= llm_proxy.TELEGRAM_MAX_CHARS for text in sent)
+        assert all(len(text) <= telegram.MAX_CHARS for text in sent)
 
     @patch("llm_proxy._llm_suggest_task", new_callable=AsyncMock, return_value=None)
     @patch("llm_proxy._check_openrouter_balance", new_callable=AsyncMock)
@@ -4019,7 +4033,7 @@ class TestDigestPersistence:
         proxy, _ = self._fresh(monkeypatch, tmp_path)
         now = time.time()
         proxy._digest_record("something")
-        proxy._digest_take(now, None, [])
+        _take_digest(proxy, now, None, [])
 
         monkeypatch.setattr(proxy, "_digest_state", {"lines": [], "last_flush": None})
         # A restart one second later must NOT reset the hour.
@@ -4044,10 +4058,10 @@ class TestDigestPersistence:
         for i in range(40):
             proxy._digest_record(f"[SYSTEM] #{i}: " + "x" * 540)
 
-        messages, summary = proxy._digest_take(time.time(), 28.65, [])
+        messages, summary = _take_digest(proxy, time.time(), 28.65, [])
 
         assert messages
-        assert all(len(m) <= proxy.TELEGRAM_MAX_CHARS for m in messages)
+        assert all(len(m) <= telegram.MAX_CHARS for m in messages)
         # The overflow pointer names what was deferred — nothing silently lost.
         assert "more item" in messages[-1]
         # The balance footer must survive — it is the actionable bit.
@@ -4079,13 +4093,13 @@ class TestDigestMultiMessageFlush:
         proxy._digest_record("[SYSTEM] #1: first")
         proxy._digest_record("[SYSTEM] #2: second")
 
-        messages, summary = proxy._digest_take(time.time(), 28.65, [])
+        messages, summary = _take_digest(proxy, time.time(), 28.65, [])
 
         assert messages == [
             "Heartbeat digest (2 items this hour):\n\n[SYSTEM] #1: first",
             "[SYSTEM] #2: second",
         ]
-        assert all(len(m) <= proxy.TELEGRAM_MAX_CHARS for m in messages)
+        assert all(len(m) <= telegram.MAX_CHARS for m in messages)
         # The relayed summary carries the actionable footer.
         assert "2 item(s) this hour" in summary
         assert "$28.65" in summary
@@ -4094,7 +4108,7 @@ class TestDigestMultiMessageFlush:
         proxy = self._fresh(monkeypatch, tmp_path)
         proxy._digest_record("[SYSTEM] #1: only")
 
-        messages, summary = proxy._digest_take(time.time(), None, [])
+        messages, summary = _take_digest(proxy, time.time(), None, [])
 
         assert messages[0].startswith("Heartbeat digest (1 item this hour):")
         assert "1 item(s) this hour" in summary
@@ -4104,10 +4118,10 @@ class TestDigestMultiMessageFlush:
         # No sentence or word boundaries: forces hard cuts at the limit.
         proxy._digest_record("[SYSTEM] #1: " + "x" * 9000 + " TAIL-SENTINEL")
 
-        messages, _ = proxy._digest_take(time.time(), None, [])
+        messages, _ = _take_digest(proxy, time.time(), None, [])
 
         assert len(messages) >= 3
-        assert all(len(m) <= proxy.TELEGRAM_MAX_CHARS for m in messages)
+        assert all(len(m) <= telegram.MAX_CHARS for m in messages)
         # The tail survives — the old single-message format dropped it.
         assert messages[-1].endswith("TAIL-SENTINEL")
         # Continuations are marked so the burst reads as one item.
@@ -4118,7 +4132,7 @@ class TestDigestMultiMessageFlush:
         for i in range(30):
             proxy._digest_record(f"[SYSTEM] #{i}: item")
 
-        messages, summary = proxy._digest_take(time.time(), None, [])
+        messages, summary = _take_digest(proxy, time.time(), None, [])
 
         # 19 item messages + 1 pointer = the 20-send cap, pointer names the 11
         # deferred items — nothing silently lost.
@@ -4129,7 +4143,7 @@ class TestDigestMultiMessageFlush:
     def test_silent_hour_with_no_footer_stays_silent(self, monkeypatch, tmp_path):
         proxy = self._fresh(monkeypatch, tmp_path)
 
-        messages, summary = proxy._digest_take(time.time(), None, [])
+        messages, summary = _take_digest(proxy, time.time(), None, [])
 
         assert messages == []
         assert summary == ""
@@ -4137,8 +4151,8 @@ class TestDigestMultiMessageFlush:
     def test_waiting_questions_surface_without_items(self, monkeypatch, tmp_path):
         proxy = self._fresh(monkeypatch, tmp_path)
 
-        messages, summary = proxy._digest_take(
-            time.time(), None, [], waiting=["Waiting on you: #12 — domain?"]
+        messages, summary = _take_digest(
+            proxy, time.time(), None, [], waiting=["Waiting on you: #12 — domain?"]
         )
 
         assert messages == []
@@ -4446,8 +4460,8 @@ class TestDigestTakeWaiting:
 
     def test_waiting_only_makes_digest_nonempty(self, monkeypatch, tmp_path):
         proxy = self._fresh(monkeypatch, tmp_path)
-        messages, summary = proxy._digest_take(
-            time.time(), 28.64, [], waiting=["Waiting on you: #abc focus areas"]
+        messages, summary = _take_digest(
+            proxy, time.time(), 28.64, [], waiting=["Waiting on you: #abc focus areas"]
         )
         assert messages == []
         assert summary != ""
@@ -4458,22 +4472,22 @@ class TestDigestTakeWaiting:
     def test_waiting_appended_after_buffered_lines(self, monkeypatch, tmp_path):
         proxy = self._fresh(monkeypatch, tmp_path)
         proxy._digest_record("[SYSTEM] #1: did a thing")
-        messages, summary = proxy._digest_take(
-            time.time(), None, [], waiting=["Waiting on you: #abc focus areas"]
+        messages, summary = _take_digest(
+            proxy, time.time(), None, [], waiting=["Waiting on you: #abc focus areas"]
         )
         assert any("did a thing" in m for m in messages)
         assert "#abc" in summary
 
     def test_empty_and_no_waiting_stays_silent(self, monkeypatch, tmp_path):
         proxy = self._fresh(monkeypatch, tmp_path)
-        assert proxy._digest_take(time.time(), None, []) == ([], "")
+        assert _take_digest(proxy, time.time(), None, []) == ([], "")
 
     def test_digest_header_pluralizes(self, monkeypatch, tmp_path):
         proxy = self._fresh(monkeypatch, tmp_path)
-        messages = proxy._digest_messages(["[SYSTEM] #1: did a thing"])
+        messages = _plan_messages(proxy, ["[SYSTEM] #1: did a thing"])
         assert "1 item this hour" in messages[0]
         assert "item(s)" not in messages[0]
-        messages = proxy._digest_messages(["a", "b"])
+        messages = _plan_messages(proxy, ["a", "b"])
         assert "2 items this hour" in messages[0]
 
 
@@ -5212,7 +5226,7 @@ class TestTierHintBoundary:
 
 class TestDigestContinuationPrefix:
     def test_exactly_one_prefix_per_continuation(self):
-        messages = llm_proxy._digest_messages(["[SYSTEM] #1: " + "x" * 9000])
+        messages = _plan_messages(llm_proxy, ["[SYSTEM] #1: " + "x" * 9000])
         assert len(messages) >= 3
         assert not messages[0].startswith("…")
         for m in messages[1:]:
@@ -5221,7 +5235,7 @@ class TestDigestContinuationPrefix:
 
     def test_split_parts_not_double_prefixed(self):
         text = ("word " * 2000).strip()
-        parts = llm_proxy._split_for_telegram(text, limit=500)
+        parts = telegram.split_sentences(text, limit=500)
         assert all(not p.startswith("… …") for p in parts)
 
 
@@ -5275,3 +5289,46 @@ class TestDeadCodeRemoved:
     )
     def test_removed(self, name):
         assert not hasattr(llm_proxy, name)
+
+
+class TestTierSnapshot:
+    """Status displays must never claim the half-open probe. GET /tier is
+    polled by a dashboard; claiming the probe there kept a tripped tier from
+    ever getting the real request that would close it."""
+
+    def _trip_past_cooldown(self, llm_proxy, name):
+        llm_proxy._circuit_state[name] = {
+            "failures": llm_proxy.CIRCUIT_FAILURE_THRESHOLD,
+            "last_failure": time.monotonic() - llm_proxy.CIRCUIT_COOLDOWN_SECONDS - 1,
+        }
+
+    def test_snapshot_does_not_claim_probe(self):
+        import llm_proxy
+
+        name = llm_proxy.CONFIG["tiers"][0]["name"]
+        self._trip_past_cooldown(llm_proxy, name)
+        llm_proxy.tier_snapshot()
+        assert "probe_at" not in llm_proxy._circuit_state[name]
+
+    def test_snapshot_markers(self):
+        import llm_proxy
+
+        tiers = llm_proxy.CONFIG["tiers"]
+        llm_proxy._circuit_state[tiers[0]["name"]] = {
+            "failures": llm_proxy.CIRCUIT_FAILURE_THRESHOLD,
+            "last_failure": time.monotonic(),
+        }
+        llm_proxy._last_tier_used = tiers[1]["name"]
+        snap = {t["name"]: t["status"] for t in llm_proxy.tier_snapshot()}
+        assert snap[tiers[0]["name"]] == "TRIPPED"
+        assert snap[tiers[1]["name"]] == "ACTIVE"
+        assert all(t["description"] for t in llm_proxy.tier_snapshot())
+
+    def test_get_tier_route_does_not_claim_probe(self):
+        import llm_proxy
+
+        name = llm_proxy.CONFIG["tiers"][0]["name"]
+        self._trip_past_cooldown(llm_proxy, name)
+        with patch("llm_proxy._check_openrouter_balance", return_value=None):
+            assert client.get("/tier").status_code == 200
+        assert "probe_at" not in llm_proxy._circuit_state[name]

@@ -14,7 +14,6 @@ every raw URL, so an invented source cannot reach the operator.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 from dataclasses import dataclass
@@ -26,6 +25,7 @@ import httpx
 
 import github_search
 import llm_proxy
+from brain_db import project_list
 from reddit_search import SearchHealth
 
 logger = logging.getLogger("clawrange.rundown")
@@ -37,6 +37,12 @@ def report_tz() -> str:
     import tenant_profile
 
     return tenant_profile.operator_timezone()
+
+
+def report_header(title: str, now: datetime, suffix: str = "") -> str:
+    """Bold report title with the local date, then the time (and suffix)."""
+    local = now.astimezone(ZoneInfo(report_tz()))
+    return f"*{title} — {local:%a %b %d}* ({local:%H:%M %Z}{suffix})"
 
 
 HN_SEARCH_URL = "https://hn.algolia.com/api/v1/search_by_date"
@@ -99,8 +105,8 @@ def engagement_angle(comments: int) -> str:
 
 def _keywords(project: dict) -> tuple[list[str], list[str]]:
     return (
-        json.loads(project.get("topics", "[]")),
-        json.loads(project.get("search_terms", "[]")),
+        project_list(project, "topics"),
+        project_list(project, "search_terms"),
     )
 
 
@@ -639,9 +645,8 @@ def build_report(
     banned_actions)."""
     if not all(e.ref for e in evidence):
         evidence = assign_refs(projects, evidence)
-    local = now.astimezone(ZoneInfo(report_tz()))
     lines = [
-        f"*Daily outreach rundown — {local:%a %b %d}* ({local:%H:%M %Z}, last 24h)",
+        report_header("Daily outreach rundown", now, ", last 24h"),
         "Sources: "
         + " · ".join(
             f"{s.name} {'✓' if s.ok else '✗'} {_escape_md(s.detail)}" for s in statuses

@@ -18,6 +18,22 @@ API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 MAX_CHARS = 4000
 
 
+async def _call(
+    method: str, payload: dict, timeout: float = 10
+) -> httpx.Response | None:
+    """POST one Bot API method. None when unconfigured or on network error."""
+    if not BOT_TOKEN or not CHAT_ID:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            return await client.post(
+                f"{API_BASE}/{method}", json={"chat_id": CHAT_ID, **payload}
+            )
+    except httpx.HTTPError as exc:
+        logger.warning("Telegram %s failed: %s", method, exc)
+        return None
+
+
 async def notify(text: str) -> bool:
     """Send a message to the configured Telegram chat.
 
@@ -31,32 +47,23 @@ async def notify(text: str) -> bool:
         logger.warning("Telegram not configured — skipping notification")
         return False
 
-    async def _send(payload: dict) -> tuple[bool, int, str]:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(f"{API_BASE}/sendMessage", json=payload)
-            return r.is_success, r.status_code, r.text
-
-    try:
-        ok, status, body = await _send(
-            {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
-        )
-        if ok:
+    r = await _call("sendMessage", {"text": text, "parse_mode": "Markdown"})
+    if r is None:
+        return False
+    if r.is_success:
+        return True
+    # Markdown parse failure -> retry as plain text. Telegram auto-detects
+    # URLs in plain mode, so links stay clickable; only bold is lost.
+    if r.status_code == 400 and "parse" in r.text.lower():
+        logger.warning("Telegram Markdown rejected (parse error), retrying plain")
+        r2 = await _call("sendMessage", {"text": text})
+        if r2 is not None and r2.is_success:
             return True
-        # Markdown parse failure -> retry as plain text. Telegram
-        # auto-detects URLs in plain mode, so links stay clickable;
-        # only inline bold formatting is lost.
-        if status == 400 and "parse" in body.lower():
-            logger.warning("Telegram Markdown rejected (parse error), retrying plain")
-            ok2, status2, body2 = await _send({"chat_id": CHAT_ID, "text": text})
-            if ok2:
-                return True
-            logger.error("Telegram plain retry failed: %s %s", status2, body2)
-            return False
-        logger.error("Telegram API error: %s %s", status, body)
+        if r2 is not None:
+            logger.error("Telegram plain retry failed: %s %s", r2.status_code, r2.text)
         return False
-    except httpx.HTTPError as exc:
-        logger.error("Telegram request failed: %s", exc)
-        return False
+    logger.error("Telegram API error: %s %s", r.status_code, r.text)
+    return False
 
 
 def split_text(text: str, limit: int = MAX_CHARS) -> list[str]:
@@ -94,6 +101,39 @@ def split_text(text: str, limit: int = MAX_CHARS) -> list[str]:
     return chunks
 
 
+def split_sentences(text: str, limit: int = MAX_CHARS) -> list[str]:
+    """Split prose (one over-long digest item) into sendable parts.
+
+    Unlike split_text, which packs whole lines so a Markdown link is never
+    cut, this cuts long running text at sentence ends.
+
+    Cuts preferentially after a sentence terminator or newline, then at a
+    word boundary, hard-cutting only when the item has neither. Continuation
+    parts carry an ellipsis prefix so a burst of messages reads as one item
+    flowing on rather than unrelated entries.
+    """
+    if len(text) <= limit:
+        return [text]
+    parts: list[str] = []
+    rest = text
+    while rest:
+        if len(rest) <= limit:
+            parts.append(rest)
+            break
+        head = rest[:limit]
+        cut = max(
+            head.rfind(". "), head.rfind("! "), head.rfind("? "), head.rfind("\n")
+        )
+        if cut < limit // 2:
+            cut = head.rfind(" ")
+        if cut <= 0:
+            cut = limit
+        parts.append(rest[: cut + 1].rstrip())
+        rest = rest[cut + 1 :].lstrip()
+    # Exactly one marker on every continuation part.
+    return [parts[0], *("… " + p for p in parts[1:])]
+
+
 async def notify_long(
     text: str,
     attempts: int = 3,
@@ -121,65 +161,29 @@ async def notify_long(
 
 async def send_typing() -> bool:
     """Send 'typing' chat action so the user sees the bot is working."""
-    if not BOT_TOKEN or not CHAT_ID:
-        return False
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.post(
-                f"{API_BASE}/sendChatAction",
-                json={"chat_id": CHAT_ID, "action": "typing"},
-            )
-            return r.is_success
-    except httpx.HTTPError:
-        return False
+    r = await _call("sendChatAction", {"action": "typing"}, timeout=5)
+    return r is not None and r.is_success
 
 
 async def send_status(text: str) -> int | None:
     """Send a status message and return its message_id for later editing/deletion."""
-    if not BOT_TOKEN or not CHAT_ID:
+    r = await _call("sendMessage", {"text": text})
+    if r is None or not r.is_success:
         return None
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(
-                f"{API_BASE}/sendMessage",
-                json={"chat_id": CHAT_ID, "text": text},
-            )
-            if r.is_success:
-                return r.json().get("result", {}).get("message_id")
-    except httpx.HTTPError:
-        pass
-    return None
+    return r.json().get("result", {}).get("message_id")
 
 
 async def edit_status(message_id: int, text: str) -> bool:
     """Edit a previously sent status message."""
-    if not BOT_TOKEN or not CHAT_ID or not message_id:
+    if not message_id:
         return False
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(
-                f"{API_BASE}/editMessageText",
-                json={
-                    "chat_id": CHAT_ID,
-                    "message_id": message_id,
-                    "text": text,
-                },
-            )
-            return r.is_success
-    except httpx.HTTPError:
-        return False
+    r = await _call("editMessageText", {"message_id": message_id, "text": text})
+    return r is not None and r.is_success
 
 
 async def delete_message(message_id: int) -> bool:
     """Delete a message by ID."""
-    if not BOT_TOKEN or not CHAT_ID or not message_id:
+    if not message_id:
         return False
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.post(
-                f"{API_BASE}/deleteMessage",
-                json={"chat_id": CHAT_ID, "message_id": message_id},
-            )
-            return r.is_success
-    except httpx.HTTPError:
-        return False
+    r = await _call("deleteMessage", {"message_id": message_id}, timeout=5)
+    return r is not None and r.is_success

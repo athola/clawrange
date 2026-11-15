@@ -1,3 +1,6 @@
+> **Archived.** Original specification; the code and CLAUDE.md are the
+> current reference.
+
 # ClawRange Marketing Orchestrator: Specification
 
 ## Overview

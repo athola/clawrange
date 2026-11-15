@@ -91,7 +91,8 @@ def check_env_example() -> TestResult:
         "OPENROUTER_API_KEY",
         "OPENCLAW_GATEWAY_TOKEN",
         "WORKFLOWS_PORT",
-        "TIMEZONE",
+        "PROXY_AUTH_TOKEN",
+        "SCHEDULER_TZ",
     ]
     missing = [k for k in required_keys if k not in content]
     if missing:

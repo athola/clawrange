@@ -25,6 +25,7 @@ import github_search
 import reddit_search
 import telegram
 import tenant_profile
+from brain_db import project_list
 
 # NOTE on deferred imports: ``app`` imports this module at module scope and
 # ``generators``/``scheduler`` import it transitively, so every use of
@@ -244,77 +245,7 @@ def _is_rate_limited(resp: httpx.Response) -> bool:
     return False
 
 
-def _get_reset_info(resp: httpx.Response) -> str:
-    """Extract rate limit reset time as a human-readable string.
-
-    Checks retry-after (seconds), x-ratelimit-reset-* (epoch/ISO),
-    response body metadata, and error message text. Returns '' if nothing found.
-    """
-    # retry-after header — seconds until reset
-    retry_after = resp.headers.get("retry-after")
-    if retry_after:
-        try:
-            seconds = int(retry_after)
-            if seconds < 120:
-                return f"in {seconds}s"
-            return f"in ~{seconds // 60}min"
-        except ValueError:
-            pass
-
-    # Reset timestamp headers (epoch or ISO)
-    for header in (
-        "x-ratelimit-reset-requests",
-        "x-ratelimit-reset",
-        "ratelimit-reset",
-    ):
-        value = resp.headers.get(header)
-        if not value:
-            continue
-        # Try epoch seconds
-        try:
-            reset_dt = datetime.fromtimestamp(float(value), tz=UTC)
-            delta = reset_dt - datetime.now(UTC)
-            if delta > timedelta(0):
-                mins = int(delta.total_seconds()) // 60
-                return f"at {reset_dt.strftime('%H:%M UTC')} (~{mins}min)"
-            return f"at {reset_dt.strftime('%H:%M UTC')}"
-        except (ValueError, OSError):
-            pass
-        # Try ISO timestamp
-        try:
-            reset_dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            return f"at {reset_dt.strftime('%H:%M UTC')}"
-        except (ValueError, AttributeError):
-            pass
-
-    # Check response body — metadata fields and error message text
-    try:
-        body = resp.json()
-        error = body.get("error", {})
-        if isinstance(error, dict):
-            meta = error.get("metadata", {})
-            if isinstance(meta, dict):
-                # Explicit reset fields
-                raw = meta.get("ratelimit_reset") or meta.get("retry_after")
-                if raw:
-                    return f"at {raw}"
-                # OpenRouter puts provider error in metadata.raw
-                raw_msg = meta.get("raw", "")
-                if raw_msg:
-                    parsed = _parse_reset_from_message(raw_msg)
-                    if parsed:
-                        return parsed
-            # Fallback: extract timing from the top-level error message
-            msg = error.get("message", "")
-            if msg:
-                parsed = _parse_reset_from_message(msg)
-                if parsed:
-                    return parsed
-    except Exception:
-        pass
-
-    return ""
-
+_RESET_HEADERS = ("x-ratelimit-reset-requests", "x-ratelimit-reset", "ratelimit-reset")
 
 # Patterns to extract timing from OpenRouter error messages
 _RESET_SECONDS_RE = re.compile(r"(\d+)\s*(?:second|sec|s\b)", re.IGNORECASE)
@@ -322,130 +253,127 @@ _RESET_MINUTES_RE = re.compile(r"(\d+)\s*(?:minute|min|m\b)", re.IGNORECASE)
 _RESET_HOURS_RE = re.compile(r"(\d+)\s*(?:hour|hr|h\b)", re.IGNORECASE)
 
 
-def _parse_reset_from_message(msg: str) -> str:
-    """Extract reset timing from an error message string."""
-    hours = _RESET_HOURS_RE.search(msg)
-    if hours:
-        h = int(hours.group(1))
-        reset_dt = datetime.now(UTC) + timedelta(hours=h)
-        return f"at ~{reset_dt.strftime('%H:%M UTC')} (~{h}h)"
-
-    minutes = _RESET_MINUTES_RE.search(msg)
-    if minutes:
-        m = int(minutes.group(1))
-        return f"in ~{m}min"
-
-    seconds = _RESET_SECONDS_RE.search(msg)
-    if seconds:
-        s = int(seconds.group(1))
-        return f"in {s}s"
-
-    # Daily limit — no specific time given
-    if "day" in msg.lower() or "daily" in msg.lower():
-        return "daily limit — resets in up to 24h"
-
-    # Upstream provider throttling — transient, no specific reset time
-    if "upstream" in msg.lower() or "retry shortly" in msg.lower():
-        return "upstream provider throttled — retry in a few minutes"
-
-    return ""
-
-
-def _parse_reset_seconds_from_message(msg: str) -> int | None:
-    """Extract reset time in seconds from error message text."""
-    hours = _RESET_HOURS_RE.search(msg)
-    if hours:
-        return int(hours.group(1)) * 3600
-
-    minutes = _RESET_MINUTES_RE.search(msg)
-    if minutes:
-        return int(minutes.group(1)) * 60
-
-    seconds = _RESET_SECONDS_RE.search(msg)
-    if seconds:
-        return int(seconds.group(1))
-
-    if "day" in msg.lower() or "daily" in msg.lower():
-        return 86400
-
-    if "upstream" in msg.lower() or "retry shortly" in msg.lower():
-        return 20  # transient upstream throttle — conservative estimate
-
-    return None
-
-
-def _get_reset_seconds(resp: httpx.Response) -> int | None:
-    """Extract rate limit reset time in seconds, or None if unknown."""
-    retry_after = resp.headers.get("retry-after")
-    if retry_after:
-        try:
-            return max(int(retry_after), 1)
-        except ValueError:
-            pass
-
-    for header in (
-        "x-ratelimit-reset-requests",
-        "x-ratelimit-reset",
-        "ratelimit-reset",
-    ):
+def _header_reset_at(resp: httpx.Response) -> datetime | None:
+    """First reset timestamp in the rate-limit headers (epoch or ISO), UTC."""
+    for header in _RESET_HEADERS:
         value = resp.headers.get(header)
         if not value:
             continue
         try:
-            reset_dt = datetime.fromtimestamp(float(value), tz=UTC)
-            delta = reset_dt - datetime.now(UTC)
-            if delta > timedelta(0):
-                return max(int(delta.total_seconds()), 1)
+            return datetime.fromtimestamp(float(value), tz=UTC)
         except (ValueError, OSError):
             pass
+        try:
+            at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        return at if at.tzinfo else at.replace(tzinfo=UTC)
+    return None
 
+
+def _error_meta(resp: httpx.Response) -> tuple[dict, str]:
+    """(error.metadata, error.message) from an error body; empty when absent."""
     try:
         body = resp.json()
-        error = body.get("error", {})
-        if isinstance(error, dict):
-            meta = error.get("metadata", {})
-            if isinstance(meta, dict):
-                raw = meta.get("retry_after")
-                if raw:
-                    try:
-                        return max(int(raw), 1)
-                    except ValueError:
-                        pass
-                raw_msg = meta.get("raw", "")
-                if raw_msg:
-                    secs = _parse_reset_seconds_from_message(raw_msg)
-                    if secs is not None:
-                        return secs
-            msg = error.get("message", "")
-            if msg:
-                secs = _parse_reset_seconds_from_message(msg)
-                if secs is not None:
-                    return secs
     except Exception:
-        pass
+        return {}, ""
+    error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(error, dict):
+        return {}, ""
+    meta = error.get("metadata")
+    return (meta if isinstance(meta, dict) else {}), str(error.get("message") or "")
 
+
+def _message_reset(msg: str) -> tuple[int, str] | None:
+    """(seconds, human text) for the reset timing named in an error message."""
+    if m := _RESET_HOURS_RE.search(msg):
+        h = int(m.group(1))
+        at = datetime.now(UTC) + timedelta(hours=h)
+        return h * 3600, f"at ~{at.strftime('%H:%M UTC')} (~{h}h)"
+    if m := _RESET_MINUTES_RE.search(msg):
+        return int(m.group(1)) * 60, f"in ~{int(m.group(1))}min"
+    if m := _RESET_SECONDS_RE.search(msg):
+        return int(m.group(1)), f"in {int(m.group(1))}s"
+    lower = msg.lower()
+    if "day" in lower or "daily" in lower:
+        return 86400, "daily limit — resets in up to 24h"
+    if "upstream" in lower or "retry shortly" in lower:
+        # Transient upstream throttle: no stated time, conservative estimate.
+        return 20, "upstream provider throttled — retry in a few minutes"
+    return None
+
+
+def _parse_reset_from_message(msg: str) -> str:
+    """Human-readable reset timing from an error message, or ''."""
+    found = _message_reset(msg)
+    return found[1] if found else ""
+
+
+def _parse_reset_seconds_from_message(msg: str) -> int | None:
+    """Reset timing in seconds from an error message, or None."""
+    found = _message_reset(msg)
+    return found[0] if found else None
+
+
+def _get_reset_info(resp: httpx.Response) -> str:
+    """Rate limit reset time as a human-readable string, '' if unknown.
+
+    Checks retry-after (seconds), x-ratelimit-reset-* (epoch/ISO), body
+    metadata, then error message text.
+    """
+    retry_after = resp.headers.get("retry-after")
+    if retry_after and retry_after.isdigit():
+        seconds = int(retry_after)
+        return f"in {seconds}s" if seconds < 120 else f"in ~{seconds // 60}min"
+    at = _header_reset_at(resp)
+    if at is not None:
+        delta = at - datetime.now(UTC)
+        stamp = f"at {at.strftime('%H:%M UTC')}"
+        return (
+            f"{stamp} (~{int(delta.total_seconds()) // 60}min)"
+            if delta > timedelta(0)
+            else stamp
+        )
+    meta, message = _error_meta(resp)
+    raw = meta.get("ratelimit_reset") or meta.get("retry_after")
+    if raw:
+        return f"at {raw}"
+    # OpenRouter puts the provider error in metadata.raw.
+    for text in (meta.get("raw", ""), message):
+        if text and (found := _message_reset(text)):
+            return found[1]
+    return ""
+
+
+def _get_reset_seconds(resp: httpx.Response) -> int | None:
+    """Rate limit reset time in seconds, or None if unknown."""
+    retry_after = resp.headers.get("retry-after")
+    if retry_after and retry_after.isdigit():
+        return max(int(retry_after), 1)
+    at = _header_reset_at(resp)
+    if at is not None:
+        delta = at - datetime.now(UTC)
+        if delta > timedelta(0):
+            return max(int(delta.total_seconds()), 1)
+    meta, message = _error_meta(resp)
+    raw = meta.get("retry_after")
+    if raw and str(raw).isdigit():
+        return max(int(raw), 1)
+    for text in (meta.get("raw", ""), message):
+        if text and (found := _message_reset(text)):
+            return found[0]
     return None
 
 
 def _get_rate_limit_detail(resp: httpx.Response) -> str:
-    """Extract provider name and reason from a rate limit response."""
-    try:
-        body = resp.json()
-        error = body.get("error", {})
-        if isinstance(error, dict):
-            meta = error.get("metadata", {})
-            if isinstance(meta, dict):
-                provider = meta.get("provider_name", "")
-                raw = meta.get("raw", "")
-                if provider and raw:
-                    return f"({provider}: {raw[:120]})"
-                if provider:
-                    return f"(provider: {provider})"
-                if raw:
-                    return f"({raw[:120]})"
-    except Exception:
-        pass
-    return ""
+    """Provider name and reason from a rate limit response."""
+    meta, _ = _error_meta(resp)
+    provider, raw = meta.get("provider_name", ""), meta.get("raw", "")
+    if provider and raw:
+        return f"({provider}: {raw[:120]})"
+    if provider:
+        return f"(provider: {provider})"
+    return f"({raw[:120]})" if raw else ""
 
 
 # ─── Provider Calls ───────────────────────────────────────────────
@@ -985,9 +913,14 @@ def _get_last_user_message(messages: list[dict]) -> str:
 # ─── /tier Command ───────────────────────────────────────────────
 
 
-async def _handle_tier_command() -> JSONResponse:
-    """Return current tier status, balance, and circuit breaker state."""
-    lines = ["Tier Status\n"]
+def tier_snapshot() -> list[dict[str, str]]:
+    """Read-only status of every tier: TRIPPED, ACTIVE (last used) or ready.
+
+    Never claims the half-open probe (probe=False): status displays are
+    polled, and claiming the probe there kept a tripped tier from ever
+    getting the real request that would close its breaker.
+    """
+    out = []
     for tier in CONFIG["tiers"]:
         name = tier["name"]
         if _circuit_open(name, probe=False):
@@ -996,7 +929,15 @@ async def _handle_tier_command() -> JSONResponse:
             marker = "ACTIVE"
         else:
             marker = "ready"
-        lines.append(f"  [{marker}] {name} — {tier['description']}")
+        out.append({"name": name, "status": marker, "description": tier["description"]})
+    return out
+
+
+async def _handle_tier_command() -> JSONResponse:
+    """Return current tier status, balance, and circuit breaker state."""
+    lines = ["Tier Status\n"]
+    for t in tier_snapshot():
+        lines.append(f"  [{t['status']}] {t['name']} — {t['description']}")
 
     remaining = await _check_openrouter_balance()
     lines.append("")
@@ -1303,13 +1244,9 @@ async def _handle_scan_command(subcmd: str, args: str) -> str:
         if not topic:
             return "Usage: /scan reddit <topic> [--subs sub1,sub2] [--project <slug>]"
 
-        if not subreddits and project_slug:
-            project = brain_db.get_project(project_slug)
-            if project:
-                subreddits = json.loads(project.get("subreddits", "[]"))
-
-        if not subreddits:
-            subreddits = tenant_profile.default_subreddits()
+        subreddits = tenant_profile.resolve_subreddits(
+            brain_db, subreddits, project_slug
+        )
 
         results: list = await reddit_search.search_subreddits(
             topic, subreddits, since=since, limit_per_sub=10
@@ -1468,7 +1405,7 @@ async def _handle_projects_command(subcmd: str, args: str) -> str:
             return "No projects tracked. Use /projects add <slug> <owner>/<repo>"
         lines = ["Tracked Projects:\n"]
         for p in projects:
-            sub_list = json.loads(p.get("subreddits", "[]"))
+            sub_list = project_list(p, "subreddits")
             lines.append(
                 f"  {p['slug']} — {p['owner']}/{p['repo']}\n"
                 f"    subs: {', '.join(sub_list[:5]) or 'none'}\n"
@@ -1485,9 +1422,9 @@ async def _handle_projects_command(subcmd: str, args: str) -> str:
         return (
             f"Project: {project['slug']}\n"
             f"  Repo: {project['owner']}/{project['repo']}\n"
-            f"  Topics: {json.loads(project.get('topics', '[]'))}\n"
-            f"  Subreddits: {json.loads(project.get('subreddits', '[]'))}\n"
-            f"  Search terms: {json.loads(project.get('search_terms', '[]'))}\n"
+            f"  Topics: {project_list(project, 'topics')}\n"
+            f"  Subreddits: {project_list(project, 'subreddits')}\n"
+            f"  Search terms: {project_list(project, 'search_terms')}\n"
             f"  Posture: {project.get('posture', 'none')}"
         )
 
@@ -2561,9 +2498,9 @@ async def _try_marketing_scan(description: str, brain_db) -> str | None:
             if not project:
                 return None
 
-            topics = json.loads(project.get("topics", "[]"))
-            subreddits = json.loads(project.get("subreddits", "[]"))
-            search_terms = json.loads(project.get("search_terms", "[]"))
+            topics = project_list(project, "topics")
+            subreddits = project_list(project, "subreddits")
+            search_terms = project_list(project, "search_terms")
 
             query = (
                 " OR ".join(search_terms[:3]) if search_terms else " ".join(topics[:3])
@@ -2595,8 +2532,8 @@ async def _try_marketing_scan(description: str, brain_db) -> str | None:
             if not project:
                 return None
 
-            search_terms = json.loads(project.get("search_terms", "[]"))
-            topics = json.loads(project.get("topics", "[]"))
+            search_terms = project_list(project, "search_terms")
+            topics = project_list(project, "topics")
             query = (
                 " OR ".join(search_terms[:3]) if search_terms else " ".join(topics[:3])
             )
@@ -2664,7 +2601,6 @@ HEARTBEAT_DIGEST_INTERVAL = float(
 # whole digest is lost. Items go out as one direct message each (the
 # OpenClaw relay is structurally a single message), so the limit governs
 # per-message chunking, not how many items survive the hour.
-TELEGRAM_MAX_CHARS = 4096
 
 HEARTBEAT_DIGEST_MAX_MESSAGES = int(
     os.getenv("HEARTBEAT_DIGEST_MAX_MESSAGES", "20")
@@ -2832,23 +2768,6 @@ def _digest_commit(
     _digest_save()
 
 
-def _digest_take(
-    now: float,
-    remaining: float | None,
-    tripped: list[str],
-    waiting: list[str] | None = None,
-) -> tuple[list[str], str]:
-    """Drain the buffer into direct messages plus the relayed summary.
-
-    Convenience wrapper that assumes every message will be delivered; the
-    heartbeat uses ``_digest_take_ex`` + ``_digest_commit`` so failed sends
-    are re-buffered.
-    """
-    messages, summary, owners, lines = _digest_take_ex(now, remaining, tripped, waiting)
-    _digest_commit(lines, owners, set())
-    return messages, summary
-
-
 def _clip_result(text: str, limit: int = 500) -> str:
     """Shorten a task result for one digest line without cutting mid-word.
 
@@ -2869,36 +2788,6 @@ def _clip_result(text: str, limit: int = 500) -> str:
     return text[: cut + 1].rstrip() + "…"
 
 
-def _split_for_telegram(text: str, limit: int = TELEGRAM_MAX_CHARS) -> list[str]:
-    """Split one over-long digest item into sendable parts.
-
-    Cuts preferentially after a sentence terminator or newline, then at a
-    word boundary, hard-cutting only when the item has neither. Continuation
-    parts carry an ellipsis prefix so a burst of messages reads as one item
-    flowing on rather than unrelated entries.
-    """
-    if len(text) <= limit:
-        return [text]
-    parts: list[str] = []
-    rest = text
-    while rest:
-        if len(rest) <= limit:
-            parts.append(rest)
-            break
-        head = rest[:limit]
-        cut = max(
-            head.rfind(". "), head.rfind("! "), head.rfind("? "), head.rfind("\n")
-        )
-        if cut < limit // 2:
-            cut = head.rfind(" ")
-        if cut <= 0:
-            cut = limit
-        parts.append(rest[: cut + 1].rstrip())
-        rest = rest[cut + 1 :].lstrip()
-    # Exactly one marker on every continuation part.
-    return [parts[0], *("… " + p for p in parts[1:])]
-
-
 def _digest_plan(lines: list[str]) -> tuple[list[str], list[int | None], int]:
     """Plan the direct sends for the buffered items, oldest first.
 
@@ -2915,7 +2804,7 @@ def _digest_plan(lines: list[str]) -> tuple[list[str], list[int | None], int]:
     item_word = "item" if len(lines) == 1 else "items"
     header = f"Heartbeat digest ({len(lines)} {item_word} this hour):"
     # Leave headroom on every part for the header or the "…" continuation.
-    budget = TELEGRAM_MAX_CHARS - 64
+    budget = telegram.MAX_CHARS - 64
     kept = lines[:HEARTBEAT_DIGEST_MAX_MESSAGES]
     deferred = len(lines) - len(kept)
     if deferred:
@@ -2925,7 +2814,7 @@ def _digest_plan(lines: list[str]) -> tuple[list[str], list[int | None], int]:
     messages: list[str] = []
     owners: list[int | None] = []
     for idx, line in enumerate(kept):
-        parts = _split_for_telegram(line, limit=budget)
+        parts = telegram.split_sentences(line, limit=budget)
         for part_idx, part in enumerate(parts):
             if idx == 0 and part_idx == 0:
                 messages.append(f"{header}\n\n{part}")
@@ -2941,11 +2830,6 @@ def _digest_plan(lines: list[str]) -> tuple[list[str], list[int | None], int]:
         )
         owners.append(None)
     return messages, owners, len(kept)
-
-
-def _digest_messages(lines: list[str]) -> list[str]:
-    """One Telegram message per buffered item, oldest first."""
-    return _digest_plan(lines)[0]
 
 
 _ALERT_TASK_PREFIXES = ("low balance alert:", "investigate tier recovery:")

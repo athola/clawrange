@@ -496,17 +496,15 @@ def render_report(
     `leads` are matched listings whose price could not be parsed (forum
     posts often put it in a table); they are worth a click, not a verdict.
     """
-    from zoneinfo import ZoneInfo
 
-    from rundown import _clean_title, _escape_md, link_refs, report_tz
+    from rundown import _clean_title, _escape_md, link_refs, report_header
 
     if not all(d.ref for d in found):
         clean, flagged = order_and_number(found)
     else:
         clean = [d for d in found if not d.flags]
         flagged = [d for d in found if d.flags]
-    local = now.astimezone(ZoneInfo(report_tz()))
-    lines = [f"*{_escape_md(title)} — {local:%a %b %d}* ({local:%H:%M %Z})"]
+    lines = [report_header(_escape_md(title), now)]
     if goal:
         lines.append(f"Goal: {_escape_md(goal)}")
     if statuses:

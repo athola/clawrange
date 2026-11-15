@@ -74,18 +74,6 @@ class Finding:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> Finding:
-        return cls(
-            source=d["source"],
-            channel=d["channel"],
-            title=d["title"],
-            url=d["url"],
-            relevance=float(d["relevance"]),
-            summary=d.get("summary", ""),
-            metadata=dict(d.get("metadata", {})),
-        )
-
 
 # ─── Deduplication ────────────────────────────────────────────────
 

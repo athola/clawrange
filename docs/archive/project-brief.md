@@ -1,3 +1,6 @@
+> **Archived.** Planning artifact for the shipped marketing orchestrator.
+> Per-project strategy now lives in `config/profiles/marketing/profile.yaml`.
+
 # ClawRange Marketing Orchestrator: Project Brief
 
 ## Problem Statement

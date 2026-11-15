@@ -103,7 +103,7 @@ fi
 echo ""
 
 # ─── Test 4: Task Queue Lifecycle ──────────────────────────────────
-# Validates the core FastAPI surface that replaced n8n: create a task,
+# Validates the core FastAPI surface: create a task,
 # read it back, then cancel it. Round-trips the brain DB.
 echo "Test 4 — Task Queue Lifecycle"
 TASK_DESC="stack-validation probe $(date +%s)"

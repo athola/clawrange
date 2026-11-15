@@ -1,3 +1,6 @@
+> **Archived.** Implemented on `variable-config`; the operator guide is
+> [docs/multi-tenant-guide.md](../multi-tenant-guide.md).
+
 # ClawRange Multi-Tenant Template: Project Brief
 
 **Date**: 2026-06-07

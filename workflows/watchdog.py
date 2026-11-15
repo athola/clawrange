@@ -25,6 +25,8 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import tenant_profile
+
 logger = logging.getLogger("clawrange.watchdog")
 
 # 15 min = 1.5 missed heartbeats at the 10-minute cadence: long enough
@@ -35,8 +37,6 @@ REALERT_SECS = float(os.getenv("HEARTBEAT_WATCH_REALERT_SECS", "7200"))
 
 def _tz_name() -> str:
     """HEARTBEAT_WATCH_TZ, else the operator timezone from config."""
-    import tenant_profile
-
     return os.getenv("HEARTBEAT_WATCH_TZ", "").strip() or (
         tenant_profile.operator_timezone()
     )
@@ -57,8 +57,7 @@ def _state_path() -> str:
 
 def in_active_hours(now_dt: datetime) -> bool:
     """True inside the heartbeat gate OpenClaw runs (08:00-20:00 local)."""
-    local = now_dt.astimezone(ZoneInfo(_tz_name()))
-    return _ACTIVE_START <= local.hour < _ACTIVE_END
+    return tenant_profile.hour_in_window(now_dt, _ACTIVE_START, _ACTIVE_END, _tz_name())
 
 
 def _window_open_ts(now_dt: datetime) -> float:

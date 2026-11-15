@@ -87,6 +87,8 @@ def create_persona_router(brain_db, profile_provider, render_targets_fn) -> APIR
     def reflect():
         p = _profile()
         _run_reflection(p.name)
+        # Flagged outcome-signal source; a no-op unless PERSONA_SIGNAL_LEARNING.
+        pl.scan_signals(brain_db, p.name)
         pending = brain_db.list_learnings(profile=p.name, status="pending")
         return {"queued": len(pending)}
 

@@ -168,7 +168,7 @@ def parse_feed_posts(xml_text: str, cutoff: datetime) -> list[RedditPost]:
                 score=0,
                 comments=0,
                 created_utc=created.astimezone(UTC).isoformat(),
-                snippet=(body[:200] + "...") if len(body) > 200 else (body or None),
+                snippet=_snippet(body),
                 engagement_known=False,
             )
         )
@@ -228,37 +228,70 @@ async def _feed_search(
 # ─── Time Filter Parsing ────────────────────────────────────────────
 
 
-def _parse_since(since: str) -> str:
-    """Convert duration string to asyncpraw time_filter value.
+# Duration -> (Reddit time_filter bucket, hours for the precise client-side
+# cutoff). Reddit has no sub-hour time_filter, so 5m/15m request the 'hour'
+# bucket and the caller post-filters by created_utc.
+_SINCE: dict[str, tuple[str, float]] = {
+    "5m": ("hour", 5 / 60),
+    "15m": ("hour", 15 / 60),
+    "1h": ("hour", 1),
+    "24h": ("day", 24),
+    "7d": ("week", 168),
+    "30d": ("month", 720),
+    "365d": ("year", 8760),
+}
+_SINCE_DEFAULT = _SINCE["7d"]
 
-    Reddit's API has no sub-hour time_filter, so '5m' and '15m'
-    request the 'hour' bucket and the caller post-filters by
-    created_utc against the precise cutoff.
-    """
-    mapping = {
-        "5m": "hour",
-        "15m": "hour",
-        "1h": "hour",
-        "24h": "day",
-        "7d": "week",
-        "30d": "month",
-        "365d": "year",
-    }
-    return mapping.get(since, "week")
+
+def _parse_since(since: str) -> str:
+    """Duration string -> asyncpraw/Reddit time_filter value."""
+    return _SINCE.get(since, _SINCE_DEFAULT)[0]
 
 
 def _parse_since_hours(since: str) -> float:
-    """Convert duration string to hours for client-side filtering."""
-    mapping = {
-        "5m": 5 / 60,
-        "15m": 15 / 60,
-        "1h": 1,
-        "24h": 24,
-        "7d": 168,
-        "30d": 720,
-        "365d": 8760,
-    }
-    return mapping.get(since, 168)
+    """Duration string -> hours for client-side filtering."""
+    return _SINCE.get(since, _SINCE_DEFAULT)[1]
+
+
+def _cutoff(since: str) -> datetime:
+    return datetime.now(UTC) - timedelta(hours=_parse_since_hours(since))
+
+
+def _snippet(text: str | None) -> str | None:
+    """First 200 chars of a post body, '...' when truncated, None if empty."""
+    text = text or ""
+    return text[:200] + "..." if len(text) > 200 else (text or None)
+
+
+def _post_from_json(
+    d: dict, cutoff: datetime, seen: set[str], default_sub: str = ""
+) -> RedditPost | None:
+    """A search.json child as a RedditPost; None if seen, idless or too old."""
+    pid = d.get("id")
+    if not pid or pid in seen:
+        return None
+    seen.add(pid)
+    created = datetime.fromtimestamp(d.get("created_utc", 0) or 0, tz=UTC)
+    if created < cutoff:
+        return None
+    permalink = d.get("permalink") or ""
+    return RedditPost(
+        id=pid,
+        url=f"https://reddit.com{permalink}" if permalink else d.get("url", ""),
+        title=d.get("title", ""),
+        subreddit=d.get("subreddit", default_sub),
+        score=int(d.get("score", 0) or 0),
+        comments=int(d.get("num_comments", 0) or 0),
+        created_utc=created.isoformat(),
+        snippet=_snippet(d.get("selftext")),
+    )
+
+
+def _add_unique(results: list[RedditPost], seen: set[str], posts) -> None:
+    for post in posts:
+        if post.id not in seen:
+            seen.add(post.id)
+            results.append(post)
 
 
 # ─── Search ──────────────────────────────────────────────────────────
@@ -299,8 +332,7 @@ async def search_subreddits(
 
     creds = _get_credentials()
     time_filter = _parse_since(since)
-    since_hours = _parse_since_hours(since)
-    cutoff = datetime.now(UTC) - timedelta(hours=since_hours)
+    cutoff = _cutoff(since)
 
     seen_ids: set[str] = set()
     results: list[RedditPost] = []
@@ -330,12 +362,6 @@ async def search_subreddits(
                     if created < cutoff:
                         continue
 
-                    snippet = None
-                    if post.selftext:
-                        snippet = post.selftext[:200] + (
-                            "..." if len(post.selftext) > 200 else ""
-                        )
-
                     results.append(
                         RedditPost(
                             id=post.id,
@@ -345,7 +371,7 @@ async def search_subreddits(
                             score=post.score,
                             comments=post.num_comments,
                             created_utc=created.isoformat(),
-                            snippet=snippet,
+                            snippet=_snippet(post.selftext),
                         )
                     )
                 if health is not None:
@@ -385,8 +411,7 @@ async def search_all(
     """
     user_agent = os.getenv("REDDIT_USER_AGENT", "clawrange-marketing-bot/0.1")
     time_filter = _parse_since(since)
-    since_hours = _parse_since_hours(since)
-    cutoff = datetime.now(UTC) - timedelta(hours=since_hours)
+    cutoff = _cutoff(since)
 
     seen_ids: set[str] = set()
     results: list[RedditPost] = []
@@ -427,33 +452,9 @@ async def search_all(
             return []
 
     for child in payload.get("data", {}).get("children", []):
-        d = child.get("data", {}) or {}
-        pid = d.get("id")
-        if not pid or pid in seen_ids:
-            continue
-        seen_ids.add(pid)
-
-        created = datetime.fromtimestamp(d.get("created_utc", 0) or 0, tz=UTC)
-        if created < cutoff:
-            continue
-
-        selftext = d.get("selftext") or ""
-        snippet = selftext[:200] + "..." if len(selftext) > 200 else (selftext or None)
-        permalink = d.get("permalink") or ""
-        post_url = f"https://reddit.com{permalink}" if permalink else d.get("url", "")
-
-        results.append(
-            RedditPost(
-                id=pid,
-                url=post_url,
-                title=d.get("title", ""),
-                subreddit=d.get("subreddit", ""),
-                score=int(d.get("score", 0) or 0),
-                comments=int(d.get("num_comments", 0) or 0),
-                created_utc=created.isoformat(),
-                snippet=snippet,
-            )
-        )
+        post = _post_from_json(child.get("data", {}) or {}, cutoff, seen_ids)
+        if post is not None:
+            results.append(post)
 
     results.sort(key=lambda p: p.score, reverse=True)
     return results
@@ -477,8 +478,7 @@ async def _public_search(
     """
     user_agent = os.getenv("REDDIT_USER_AGENT", "clawrange-marketing-bot/0.1")
     time_filter = _parse_since(since)
-    since_hours = _parse_since_hours(since)
-    cutoff = datetime.now(UTC) - timedelta(hours=since_hours)
+    cutoff = _cutoff(since)
 
     seen_ids: set[str] = set()
     results: list[RedditPost] = []
@@ -492,10 +492,8 @@ async def _public_search(
     ) as client:
         for sub_name in subreddits:
             if health.feed_mode:
-                for post in await _feed_search(client, sub_name, topic, cutoff, health):
-                    if post.id not in seen_ids:
-                        seen_ids.add(post.id)
-                        results.append(post)
+                feed = await _feed_search(client, sub_name, topic, cutoff, health)
+                _add_unique(results, seen_ids, feed)
                 continue
             if health.tripped:
                 health.skipped += 1
@@ -517,12 +515,8 @@ async def _public_search(
                     logger.info("Reddit JSON refused; switching to feeds")
                     health.feed_mode, health.mode = True, "rss"
                     health._block_streak = 0
-                    for post in await _feed_search(
-                        client, sub_name, topic, cutoff, health
-                    ):
-                        if post.id not in seen_ids:
-                            seen_ids.add(post.id)
-                            results.append(post)
+                    feed = await _feed_search(client, sub_name, topic, cutoff, health)
+                    _add_unique(results, seen_ids, feed)
                     continue
                 if resp.status_code != 200:
                     logger.warning(
@@ -539,39 +533,11 @@ async def _public_search(
                 continue
 
             for child in payload.get("data", {}).get("children", []):
-                d = child.get("data", {}) or {}
-                pid = d.get("id")
-                if not pid or pid in seen_ids:
-                    continue
-                seen_ids.add(pid)
-
-                created = datetime.fromtimestamp(d.get("created_utc", 0) or 0, tz=UTC)
-                if created < cutoff:
-                    continue
-
-                selftext = d.get("selftext") or ""
-                snippet = (
-                    selftext[:200] + "..."
-                    if len(selftext) > 200
-                    else (selftext or None)
+                post = _post_from_json(
+                    child.get("data", {}) or {}, cutoff, seen_ids, sub_name
                 )
-                permalink = d.get("permalink") or ""
-                post_url = (
-                    f"https://reddit.com{permalink}" if permalink else d.get("url", "")
-                )
-
-                results.append(
-                    RedditPost(
-                        id=pid,
-                        url=post_url,
-                        title=d.get("title", ""),
-                        subreddit=d.get("subreddit", sub_name),
-                        score=int(d.get("score", 0) or 0),
-                        comments=int(d.get("num_comments", 0) or 0),
-                        created_utc=created.isoformat(),
-                        snippet=snippet,
-                    )
-                )
+                if post is not None:
+                    results.append(post)
 
     results.sort(key=lambda p: p.score, reverse=True)
     return results

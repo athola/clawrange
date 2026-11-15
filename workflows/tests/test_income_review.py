@@ -1,6 +1,7 @@
 """Tests for the income_review generator.
 
-The $50 crypto testbed (docs/income-strategy.md) is reevaluated weekly.
+The $50 crypto testbed (config/profiles/marketing/income-strategy.md) is
+reevaluated weekly.
 income_review_generator enqueues a [DRAFT] review task for human
 approval — it never trades or calls exchanges — and pings Telegram.
 """

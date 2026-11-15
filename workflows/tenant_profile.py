@@ -16,8 +16,10 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import yaml
 
@@ -422,6 +424,22 @@ def search_hygiene(profile: Profile | None = None) -> dict:
     return (profile.assistant.get("search_hygiene") or {}) if profile else {}
 
 
+def resolve_subreddits(brain_db, subreddits, project_slug) -> list[str]:
+    """Subreddits for a scan: explicit ones, else the project's, else the
+    profile default. Shared by the /scan API route and the chat command."""
+    if subreddits:
+        return list(subreddits)
+    if project_slug:
+        from brain_db import project_list
+
+        project = brain_db.get_project(project_slug)
+        if project:
+            subs = project_list(project, "subreddits")
+            if subs:
+                return subs
+    return default_subreddits()
+
+
 def default_subreddits(profile: Profile | None = None) -> list[str]:
     """Subreddits for scans that name none: `reddit.default_subreddits`,
     else the union of the tracked projects' subreddits."""
@@ -436,6 +454,30 @@ def default_subreddits(profile: Profile | None = None) -> list[str]:
         for sub in proj.get("subreddits") or []:
             subs.setdefault(str(sub), None)
     return list(subs)
+
+
+def hour_in_window(
+    now_utc: datetime, start_hour: int, end_hour: int, tz_name: str
+) -> bool:
+    """Return True when `now_utc` falls inside the half-open
+    [start_hour, end_hour) window in the named tz.
+
+    DST-aware via zoneinfo: passing ``America/Chicago`` produces the
+    correct CST/CDT offset for any date so the operator's 12am-5am
+    sleep window stays anchored to local clock time across the
+    daylight-saving boundary.
+
+    End hour is exclusive: a window of (0, 5) covers 00:00:00 through
+    04:59:59 local, so the */5 cron fire at exactly 05:00 wakes the
+    pulse back up. Wrap-around windows (e.g. 22 → 6) are supported.
+    """
+    local = now_utc.astimezone(ZoneInfo(tz_name))
+    hour = local.hour
+    if start_hour == end_hour:
+        return False
+    if start_hour < end_hour:
+        return start_hour <= hour < end_hour
+    return hour >= start_hour or hour < end_hour
 
 
 def operator_timezone(profile: Profile | None = None) -> str:

@@ -7,7 +7,6 @@ into the existing task queue via brain_db.create_task().
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import math
 import statistics
@@ -25,6 +24,7 @@ import reddit_search
 import rundown
 import telegram
 import tenant_profile
+from brain_db import project_list
 from connectors import run_connector
 from crm import get_adapter
 
@@ -55,28 +55,8 @@ _LAST_HOT_PULSE_DELIVERY_AT: datetime | None = None
 _HOT_PULSE_IN_QUIET_HOURS: bool = False
 
 
-def _is_quiet_hours(
-    now_utc: datetime, start_hour: int, end_hour: int, tz_name: str
-) -> bool:
-    """Return True when `now_utc` falls inside the half-open
-    [start_hour, end_hour) window in the named tz.
-
-    DST-aware via zoneinfo: passing ``America/Chicago`` produces the
-    correct CST/CDT offset for any date so the operator's 12am-5am
-    sleep window stays anchored to local clock time across the
-    daylight-saving boundary.
-
-    End hour is exclusive: a window of (0, 5) covers 00:00:00 through
-    04:59:59 local, so the */5 cron fire at exactly 05:00 wakes the
-    pulse back up. Wrap-around windows (e.g. 22 → 6) are supported.
-    """
-    local = now_utc.astimezone(ZoneInfo(tz_name))
-    hour = local.hour
-    if start_hour == end_hour:
-        return False
-    if start_hour < end_hour:
-        return start_hour <= hour < end_hour
-    return hour >= start_hour or hour < end_hour
+# Quiet-hours check (patchable by name in tests): the shared hour window.
+_is_quiet_hours = tenant_profile.hour_in_window
 
 
 def digest_extra_subreddits() -> list[str]:
@@ -97,9 +77,9 @@ async def morning_scan_generator(
         projects = [p for p in projects if p["slug"] in project_slugs]
 
     for project in projects:
-        topics = json.loads(project.get("topics", "[]"))
-        subreddits = json.loads(project.get("subreddits", "[]"))
-        search_terms = json.loads(project.get("search_terms", "[]"))
+        topics = project_list(project, "topics")
+        subreddits = project_list(project, "subreddits")
+        search_terms = project_list(project, "search_terms")
         slug = project["slug"]
 
         topic_str = ", ".join(topics[:3]) if topics else slug
@@ -282,7 +262,7 @@ async def content_idea_generator(
     for project in projects:
         slug = project["slug"]
         posture = project.get("posture", "")
-        topics = json.loads(project.get("topics", "[]"))
+        topics = project_list(project, "topics")
         topic_hint = ", ".join(topics[:3]) if topics else slug
 
         # Some channels (e.g. TRIZ analogies) carry no URL; cite without
@@ -429,8 +409,8 @@ def _render_pick_lines(
 def _reddit_evidence(
     project: dict, post: RedditPost, is_bonus: bool, group: str
 ) -> rundown.Evidence:
-    topics = json.loads(project.get("topics", "[]"))
-    terms = json.loads(project.get("search_terms", "[]"))
+    topics = project_list(project, "topics")
+    terms = project_list(project, "search_terms")
     return rundown.Evidence(
         source="reddit",
         group=group,
@@ -455,6 +435,45 @@ def _outreach_policy(profile_name: str | None = None) -> dict:
     except Exception as exc:
         logger.warning("morning_digest: outreach policy unavailable: %s", exc)
         return {}
+
+
+def _scan_plan(
+    brain_db, project_slugs, extra_subreddits, tag: str
+) -> tuple[list[dict], list[str], dict[str, set[str]]] | None:
+    """Shared setup for the Reddit digest generators.
+
+    Returns ``(projects, scan_subreddits, project_sub_sets)`` or None when no
+    tracked project matches. ``scan_subreddits`` is the union of every
+    project's subreddits plus the extras; ``project_sub_sets`` holds each
+    project's lowercased subreddits for case-insensitive affinity checks.
+    Records one search impression per (subreddit, project) pair, the
+    denominator for the stats table's hit rate.
+    """
+    projects = brain_db.list_projects()
+    if project_slugs:
+        projects = [p for p in projects if p["slug"] in project_slugs]
+    if not projects:
+        logger.info("%s: no tracked projects, skipping", tag)
+        return None
+    extras = (
+        list(extra_subreddits)
+        if extra_subreddits is not None
+        else digest_extra_subreddits()
+    )
+    project_sub_sets = {
+        p["slug"]: {s.lower() for s in project_list(p, "subreddits")} for p in projects
+    }
+    scan_subreddits = sorted(
+        set(extras) | {s for p in projects for s in project_list(p, "subreddits")}
+    )
+    brain_db.record_subreddit_searches(
+        [
+            (sub, slug, sub.lower() in subs)
+            for slug, subs in project_sub_sets.items()
+            for sub in scan_subreddits
+        ]
+    )
+    return projects, scan_subreddits, project_sub_sets
 
 
 async def morning_digest_generator(
@@ -491,33 +510,10 @@ async def morning_digest_generator(
     their own replies.
     """
 
-    projects = brain_db.list_projects()
-    if project_slugs:
-        projects = [p for p in projects if p["slug"] in project_slugs]
-
-    if not projects:
-        logger.info("morning_digest: no tracked projects, skipping")
+    plan = _scan_plan(brain_db, project_slugs, extra_subreddits, "morning_digest")
+    if plan is None:
         return
-
-    extras = (
-        list(extra_subreddits)
-        if extra_subreddits is not None
-        else digest_extra_subreddits()
-    )
-
-    # Union of every project's subreddit list plus the user's extras.
-    sub_set: set[str] = set(extras)
-    for p in projects:
-        for s in json.loads(p.get("subreddits", "[]")):
-            sub_set.add(s)
-    scan_subreddits = sorted(sub_set)
-
-    # Per-project subreddit affinity sets (lowercased for case-insensitive
-    # match against post.subreddit).
-    project_sub_sets: dict[str, set[str]] = {
-        p["slug"]: {s.lower() for s in json.loads(p.get("subreddits", "[]"))}
-        for p in projects
-    }
+    projects, scan_subreddits, project_sub_sets = plan
 
     # One tally across every Reddit call this run, so the report can say
     # why Reddit came back empty instead of looking like a quiet day.
@@ -532,18 +528,10 @@ async def morning_digest_generator(
     # its subreddit, not one that doesn't.
     best_for_post: dict[str, tuple[dict, RedditPost, float, bool]] = {}
 
-    # Record one search impression per (sub, project) pair this cycle —
-    # gives the stats table a denominator for hit-rate analysis.
     for project in projects:
         slug = project["slug"]
-        for sub in scan_subreddits:
-            is_curated = sub.lower() in project_sub_sets[slug]
-            brain_db.record_subreddit_search(sub, slug, is_curated=is_curated)
-
-    for project in projects:
-        slug = project["slug"]
-        topics = json.loads(project.get("topics", "[]"))
-        terms = json.loads(project.get("search_terms", "[]"))
+        topics = project_list(project, "topics")
+        terms = project_list(project, "search_terms")
         # Cap query fan-out: pick top 3 search terms (or fall back to
         # topics) so we don't hammer the Reddit API on every boot.
         queries = terms[:3] if terms else (topics[:3] if topics else [slug])
@@ -717,8 +705,8 @@ async def _discover_emerging(
     out: dict[str, list[RedditPost]] = {}
     for project in projects:
         slug = project["slug"]
-        terms = json.loads(project.get("search_terms", "[]"))
-        topics = json.loads(project.get("topics", "[]"))
+        terms = project_list(project, "search_terms")
+        topics = project_list(project, "topics")
         if not terms and not topics:
             continue
         query = (terms or topics)[0]
@@ -803,7 +791,7 @@ def _render_subreddit_report(
     pairs. Renders at the bottom of the morning_digest message."""
     all_subs: set[str] = set()
     for p in projects:
-        for s in json.loads(p.get("subreddits", "[]")):
+        for s in project_list(p, "subreddits"):
             all_subs.add(s.lower())
     for s in digest_extra_subreddits():
         all_subs.add(s.lower())
@@ -959,36 +947,10 @@ async def hot_pulse_generator(
             )
             return
 
-    projects = brain_db.list_projects()
-    if project_slugs:
-        projects = [p for p in projects if p["slug"] in project_slugs]
-
-    if not projects:
-        logger.info("hot_pulse: no tracked projects, skipping")
+    plan = _scan_plan(brain_db, project_slugs, extra_subreddits, "hot_pulse")
+    if plan is None:
         return
-
-    extras = (
-        list(extra_subreddits)
-        if extra_subreddits is not None
-        else digest_extra_subreddits()
-    )
-    sub_set: set[str] = set(extras)
-    for p in projects:
-        for s in json.loads(p.get("subreddits", "[]")):
-            sub_set.add(s)
-    scan_subreddits = sorted(sub_set)
-
-    project_sub_sets: dict[str, set[str]] = {
-        p["slug"]: {s.lower() for s in json.loads(p.get("subreddits", "[]"))}
-        for p in projects
-    }
-
-    # Record one search impression per (sub, project) pair this cycle.
-    for project in projects:
-        slug = project["slug"]
-        for sub in scan_subreddits:
-            is_curated = sub.lower() in project_sub_sets[slug]
-            brain_db.record_subreddit_search(sub, slug, is_curated=is_curated)
+    projects, scan_subreddits, project_sub_sets = plan
 
     # Per-post-id best-fit map. Each entry tracks the project that
     # claimed the post, the post object, the literal-match relevance
@@ -1002,8 +964,8 @@ async def hot_pulse_generator(
 
     for project in projects:
         slug = project["slug"]
-        topics = json.loads(project.get("topics", "[]"))
-        terms = json.loads(project.get("search_terms", "[]"))
+        topics = project_list(project, "topics")
+        terms = project_list(project, "search_terms")
         queries = terms[:3] if terms else (topics[:3] if topics else [slug])
 
         for query in queries:
@@ -1106,8 +1068,8 @@ async def hot_pulse_generator(
         cat_map = by_project_by_category.get(slug, {})
         if not cat_map:
             continue
-        topics = json.loads(project.get("topics", "[]"))
-        terms = json.loads(project.get("search_terms", "[]"))
+        topics = project_list(project, "topics")
+        terms = project_list(project, "search_terms")
         lines.append(f"*{slug}* ({project['owner']}/{project['repo']})")
         # Sort categories by total pick count desc (most active first).
         sorted_cats = sorted(cat_map.items(), key=lambda kv: len(kv[1]), reverse=True)
@@ -1469,7 +1431,7 @@ async def research_pulse_generator(
     candidates: list[str] = [t.strip() for t in (topics or []) if t and t.strip()]
     if not candidates:
         for project in brain_db.list_projects():
-            for topic in json.loads(project.get("topics", "[]")):
+            for topic in project_list(project, "topics"):
                 if topic and topic.strip():
                     candidates.append(topic.strip())
     if not candidates:
@@ -1523,7 +1485,8 @@ async def income_review_generator(
     Mirrors research_pulse: idempotent (skips while a review is still
     pending), enqueue-first so a Telegram outage never loses the task,
     and never acts on its own — the review is a draft the operator
-    approves on Telegram. See docs/income-strategy.md for the protocol.
+    approves on Telegram. The protocol is the profile's own doc, e.g.
+    config/profiles/marketing/income-strategy.md.
     """
 
     pending = {t["description"] for t in brain_db.list_tasks(status="pending")}

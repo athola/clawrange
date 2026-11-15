@@ -2,7 +2,7 @@
 
 **Date**: 2026-06-07
 **Status**: Approved
-**Brief**: docs/multi-tenant-brief.md
+**Brief**: docs/archive/multi-tenant-brief.md
 **Selected approach**: C, hybrid declarative profile and connector registry
 
 ## Overview
@@ -166,7 +166,7 @@ workflows/
 
 ## Functional Requirements
 
-### FR-1: Profile loader (`workflows/profile.py`)
+### FR-1: Profile loader (`workflows/tenant_profile.py`)
 - **FR-1.1** `load_profile(name=None)` reads `config/profiles/<name>/profile.yaml`,
   where `name` defaults to `os.environ["CLAWRANGE_PROFILE"]` or `"marketing"`.
 - **FR-1.2** `${VAR}` tokens in any string value resolve from `os.environ`.

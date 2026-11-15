@@ -3,7 +3,7 @@
 This guide covers John-117's multi-source research orchestrator
 and the top-of-funnel marketing tooling that surrounds it. It is
 the operator-side companion to the planning artifact in
-`research-and-marketing-plan.md`.
+`archive/research-and-marketing-plan.md`.
 
 ## TL;DR
 

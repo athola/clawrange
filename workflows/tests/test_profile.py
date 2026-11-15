@@ -401,3 +401,27 @@ def test_income_review_block_must_be_mapping(tmp_path):
 def test_profile_name_is_validated_before_path_use(tmp_path, bad):
     with pytest.raises(ProfileError, match="invalid profile name"):
         load_profile(bad or "/", profiles_dir=tmp_path)
+
+
+class TestResolveSubreddits:
+    """One resolution rule for /scan reddit (API and chat command)."""
+
+    class _DB:
+        def __init__(self, projects):
+            self.projects = projects
+
+        def get_project(self, slug):
+            return self.projects.get(slug)
+
+    def test_explicit_wins(self, monkeypatch):
+        monkeypatch.setattr(profile_mod, "default_subreddits", lambda: ["dflt"])
+        db = self._DB({"p": {"subreddits": '["proj"]'}})
+        assert profile_mod.resolve_subreddits(db, ["mine"], "p") == ["mine"]
+
+    def test_project_then_default(self, monkeypatch):
+        monkeypatch.setattr(profile_mod, "default_subreddits", lambda: ["dflt"])
+        db = self._DB({"p": {"subreddits": '["proj"]'}, "empty": {"subreddits": "[]"}})
+        assert profile_mod.resolve_subreddits(db, [], "p") == ["proj"]
+        assert profile_mod.resolve_subreddits(db, [], "empty") == ["dflt"]
+        assert profile_mod.resolve_subreddits(db, None, "missing") == ["dflt"]
+        assert profile_mod.resolve_subreddits(db, None, None) == ["dflt"]

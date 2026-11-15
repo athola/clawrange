@@ -1,3 +1,6 @@
+> **Archived.** Superseded by the operator guide
+> [docs/research-and-marketing.md](../research-and-marketing.md).
+
 # John-117 Research and Marketing Upgrade: Plan
 
 This document is the planning artifact for the overnight upgrade

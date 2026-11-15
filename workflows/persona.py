@@ -110,13 +110,6 @@ def render_identity(profile: Profile) -> str:
     return template.rstrip("\n") + "\n"
 
 
-def write_identity(profile: Profile, path: str | Path) -> Path:
-    dest = Path(path)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(render_identity(profile))
-    return dest
-
-
 def write_soul(profile: Profile, path: str | Path) -> Path:
     """Render the persona and write it to ``path`` (default OpenClaw soul)."""
     dest = Path(path)

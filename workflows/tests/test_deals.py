@@ -33,6 +33,19 @@ def _listing(title: str, price: float | None = 600.0, **kw) -> Listing:
     )
 
 
+def _stats(db, target: str, targets=None):
+    """Median the way the generator computes it: deals.history_stats over
+    the recorded observations (the old BrainDB.deal_price_stats was unused).
+    Pass the generator's own targets when their match rules matter."""
+    from deals import WatchTarget, history_stats
+
+    if targets is None:
+        targets = [
+            WatchTarget(name=target, query=target, category="gpu", great_price=1.0)
+        ]
+    return history_stats(db.deal_observations(), targets)[target]
+
+
 class TestParsePrice:
     @pytest.mark.parametrize(
         ("text", "expected"),
@@ -142,17 +155,17 @@ class TestPriceHistory:
     def test_median_over_recorded_observations(self, db):
         for i, price in enumerate([900, 950, 1000]):
             db.record_deal_observation("ebay", f"id{i}", "RTX 3090 24GB", price)
-        stats = db.deal_price_stats("RTX 3090 24GB", days=30)
+        stats = _stats(db, "RTX 3090 24GB")
         assert (stats.median, stats.samples) == (950.0, 3)
 
     def test_same_listing_counts_once(self, db):
         db.record_deal_observation("ebay", "dup", "RTX 3090 24GB", 900)
         db.record_deal_observation("ebay", "dup", "RTX 3090 24GB", 500)
-        stats = db.deal_price_stats("RTX 3090 24GB", days=30)
+        stats = _stats(db, "RTX 3090 24GB")
         assert (stats.median, stats.samples) == (900.0, 1)
 
     def test_no_history_returns_none(self, db):
-        assert db.deal_price_stats("Nothing", days=30) is None
+        assert _stats(db, "Nothing") is None
 
 
 class TestRenderReport:
@@ -326,7 +339,7 @@ class TestHomelabDealsGenerator:
         await homelab_deals_generator(db)
         first = "\n".join(self.sent)
         assert "https://s.test/d" in first
-        stats = db.deal_price_stats("RTX 3090 24GB", days=30)
+        stats = _stats(db, "RTX 3090 24GB", deals.load_targets(self.BLOCK))
         assert stats.samples == 2  # deal + pricey; the waterblock never matched
 
         self.sent.clear()
@@ -838,19 +851,6 @@ class TestNovember14DealRundown:
         body = report.split("*Buy read*")[1]
         assert "BUY READ" not in body
         assert "BUY [D1]" in body
-
-
-class TestHistoryIgnoresJunk:
-    def test_median_skips_prices_under_the_floor(self, tmp_path):
-        from brain_db import BrainDB
-
-        db = BrainDB(str(tmp_path / "b.db"))
-        db.init_db()
-        for i, price in enumerate([15, 20, 25, 30, 700, 720, 740]):
-            db.record_deal_observation("eBay", str(i), "RTX 3090", price)
-        assert db.deal_price_stats("RTX 3090").median < 100
-        stats = db.deal_price_stats("RTX 3090", floor=300)
-        assert stats.median == 720 and stats.samples == 3
 
 
 class TestOneVerdictPerDeal:

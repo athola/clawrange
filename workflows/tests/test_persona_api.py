@@ -167,3 +167,17 @@ def test_reject_after_approve_removes_rendered_content(tmp_path):
 
     assert client.post(f"/persona/proposals/{lid}/reject").status_code == 200
     assert "Be extremely terse." not in soul.read_text()
+
+
+def test_reflect_runs_signal_scan_when_flag_set(monkeypatch, tmp_path):
+    """PERSONA_SIGNAL_LEARNING was documented but nothing called the scan."""
+    import persona_api
+    import persona_learning as pl
+
+    calls = []
+    monkeypatch.setattr(persona_api, "_run_reflection", lambda name: None)
+    monkeypatch.setattr(pl, "scan_signals", lambda db, name: calls.append(name) or [])
+    monkeypatch.setenv("PERSONA_SIGNAL_LEARNING", "1")
+    c, _db = _client(tmp_path)
+    assert c.post("/persona/reflect").status_code == 200
+    assert calls, "reflect must run the flagged signal scan"

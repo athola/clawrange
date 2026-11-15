@@ -40,12 +40,12 @@ returns responses shaped by `openclaw/soul.md`. The default persona is
 "John-117", the operator's executive assistant. Accessible at
 http://localhost:3000.
 
-**Workflows** is the FastAPI service that replaced n8n. It owns the
+**Workflows** is the FastAPI service. It owns the
 brain database (SQLite and optional embeddings), the persistent task
 queue, the OpenAI-compatible LLM proxy with tiered routing, the
 APScheduler-driven cron jobs, and the marketing scanners
 (Reddit and GitHub). Endpoints live at http://localhost:5678 (see
-[specification.md](specification.md) for the full surface).
+[specification.md](archive/specification.md) for the full surface).
 
 **DeerFlow** is the deep research layer (optional). When a question
 needs broad research (market analysis, regulatory deep dives), DeerFlow

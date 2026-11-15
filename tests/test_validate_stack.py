@@ -320,22 +320,24 @@ class TestCheckEnvExample:
             "OPENROUTER_API_KEY=test\n"
             "OPENCLAW_GATEWAY_TOKEN=test\n"
             "WORKFLOWS_PORT=5678\n"
-            "TIMEZONE=America/Chicago\n"
+            "PROXY_AUTH_TOKEN=test\n"
+            "SCHEDULER_TZ=America/Chicago\n"
         )
         result = validate_stack.check_env_example()
         assert result.passed is True
 
     def test_fail_with_missing_key(self, project_tree):
-        """GIVEN .env.example is missing TIMEZONE
+        """GIVEN .env.example is missing SCHEDULER_TZ
         THEN the check should fail."""
         (project_tree / ".env.example").write_text(
             "OPENROUTER_API_KEY=test\n"
             "OPENCLAW_GATEWAY_TOKEN=test\n"
             "WORKFLOWS_PORT=5678\n"
+            "PROXY_AUTH_TOKEN=test\n"
         )
         result = validate_stack.check_env_example()
         assert result.passed is False
-        assert "TIMEZONE" in result.message
+        assert "SCHEDULER_TZ" in result.message
 
     def test_fail_when_file_missing(self, project_tree):
         """GIVEN .env.example does not exist
@@ -397,7 +399,7 @@ class TestCheckScriptsExecutable:
 # ─── check_workflow_service ───────────
 
 
-class TestCheckN8nWorkflows:
+class TestCheckWorkflowService:
     """Tests for workflow service validation."""
 
     def test_pass_with_valid_service(self, project_tree):

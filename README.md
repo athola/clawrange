@@ -12,7 +12,7 @@ gateway.
 | Service | Purpose | Port |
 |---------|---------|------|
 | [OpenClaw](https://github.com/openclaw/openclaw) | AI assistant gateway: routes Telegram and chat messages through the LLM proxy | 3000 |
-| Workflows (FastAPI) | Brain DB, task queue, LLM proxy, scheduler, Reddit/GitHub scanners: replaces n8n | 5678 |
+| Workflows (FastAPI) | Brain DB, task queue, LLM proxy, scheduler, Reddit/GitHub scanners | 5678 |
 | [DeerFlow](https://github.com/bytedance/deer-flow) | Deep research agent (optional, for heavy market analysis) | 2026 |
 | [Ollama](https://ollama.com/) | Local LLM inference (optional, for air-gapped tests) | 11434 |
 
@@ -55,10 +55,11 @@ that nothing matched. The report's `Setup needed` block names any missing
 credential (Reddit script app, GitHub PAT, eBay keyset).
 
 For Tailscale-secured deployment (cloud gateway and onsite node), see
-[docs/DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md). For specs covering
-the marketing orchestrator and brain database, see
-[docs/specification.md](docs/specification.md) and
-[docs/project-brief.md](docs/project-brief.md).
+[docs/DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md); for a local testbed,
+[docs/TESTBED_GUIDE.md](docs/TESTBED_GUIDE.md). Design decisions and their
+trade-offs are logged in [docs/tradeoffs.md](docs/tradeoffs.md). The original
+specs and plans (marketing orchestrator, brain database, multi-tenant
+template) are kept in [docs/archive/](docs/archive/).
 
 ## Testing
 
