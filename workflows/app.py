@@ -351,7 +351,6 @@ async def tier_notify():
 
 
 @app.post("/webhook/test")
-@app.post("/webhook-test/test")
 def test_webhook(body: dict[str, Any] = {}):
     keys = list(body.keys())
     summary = ", ".join(f"{k}={body[k]!r}" for k in keys) if keys else "(empty payload)"

@@ -88,7 +88,7 @@ echo ""
 
 # ─── Test 3: Webhook Roundtrip ─────────────────────────────────────
 echo "Test 3 — Webhook Roundtrip"
-RESPONSE=$(curl -sf --connect-timeout 5 --max-time 15 -X POST "http://localhost:${WORKFLOWS_PORT}/webhook-test/test" \
+RESPONSE=$(curl -sf --connect-timeout 5 --max-time 15 -X POST "http://localhost:${WORKFLOWS_PORT}/webhook/test" \
   -H @"$WF_AUTH_HEADER" \
   -H "Content-Type: application/json" \
   -d '{"message": "ping", "source": "openclaw-test"}' 2>/dev/null) || RESPONSE=""

@@ -44,12 +44,6 @@ class TestWebhook:
         r = client.post("/webhook/test", json={})
         assert "empty payload" in r.json()["message"]
 
-    def test_webhook_test_path(self):
-        """The /webhook-test/ path works identically for backward compat."""
-        r = client.post("/webhook-test/test", json={"source": "test"})
-        assert r.status_code == 200
-        assert "received" in r.json()["message"]
-
 
 # ─── Tier Status ─────────────────────────────────────────────────
 

@@ -39,7 +39,7 @@ fi
 # Test 2: Test webhook (connectivity canary)
 echo ""
 echo "Test 2: Test webhook roundtrip"
-RESPONSE=$(curl -sf --connect-timeout 5 --max-time 15 -X POST "${BASE}/webhook-test/test" \
+RESPONSE=$(curl -sf --connect-timeout 5 --max-time 15 -X POST "${BASE}/webhook/test" \
   -H @"$WF_AUTH_HEADER" \
   -H "Content-Type: application/json" \
   -d '{"message": "ping", "source": "test-script"}' 2>/dev/null) || RESPONSE=""

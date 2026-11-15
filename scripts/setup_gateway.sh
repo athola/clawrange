@@ -239,7 +239,7 @@ YOUR_DOMAIN {
 #
 # webhooks.YOUR_DOMAIN {
 #     # Only allow specific webhook paths
-#     @allowed-webhooks path /webhook/* /webhook-test/*
+#     @allowed-webhooks path /webhook/*
 #     reverse_proxy @allowed-webhooks NODE_TAILSCALE_IP_PLACEHOLDER:WORKFLOWS_PORT_PLACEHOLDER
 #
 #     # Block everything else

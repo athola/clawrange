@@ -181,7 +181,7 @@ The workflows service is a single FastAPI process. It owns:
   orchestrator (`/scan/web` routes through GLM server-side web search)
 - `/research`, `/research/sessions`: multi-source research
   orchestrator with citation flagging and persistent sessions
-- `/webhook-test/test`: connectivity canary
+- `/webhook/test`: connectivity canary
 
 ### Research Orchestrator
 

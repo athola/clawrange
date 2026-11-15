@@ -54,7 +54,7 @@ def _reset_proxy_globals(monkeypatch):
     monkeypatch.setattr(llm_proxy, "_notification_last_sent", {})
     monkeypatch.setattr(llm_proxy, "_proactive_state", {})
     monkeypatch.setattr(
-        llm_proxy, "_balance_cache", {"remaining": None, "checked_at": 0.0}
+        llm_proxy, "_balance_cache", {"remaining": None, "checked_at": None}
     )
     monkeypatch.setattr(llm_proxy, "_last_tier_used", None)
     monkeypatch.setattr(llm_proxy, "_thinking_focus_index", 0)

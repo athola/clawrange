@@ -143,13 +143,9 @@ async def _check_openrouter_balance() -> float | None:
     """
     now = time.monotonic()
     checked_at = _balance_cache.get("checked_at")
-    # None (or the legacy 0.0 sentinel) means "never checked": due now, even
-    # on a host whose monotonic clock is younger than the interval.
-    if (
-        checked_at is not None
-        and checked_at != 0.0
-        and now - checked_at < _BALANCE_CHECK_INTERVAL
-    ):
+    # None means "never checked": due now, even on a host whose monotonic
+    # clock is younger than the interval.
+    if checked_at is not None and now - checked_at < _BALANCE_CHECK_INTERVAL:
         return _balance_cache.get("remaining")
 
     api_key = os.getenv("OPENROUTER_API_KEY", "")
@@ -299,18 +295,6 @@ def _message_reset(msg: str) -> tuple[int, str] | None:
         # Transient upstream throttle: no stated time, conservative estimate.
         return 20, "upstream provider throttled — retry in a few minutes"
     return None
-
-
-def _parse_reset_from_message(msg: str) -> str:
-    """Human-readable reset timing from an error message, or ''."""
-    found = _message_reset(msg)
-    return found[1] if found else ""
-
-
-def _parse_reset_seconds_from_message(msg: str) -> int | None:
-    """Reset timing in seconds from an error message, or None."""
-    found = _message_reset(msg)
-    return found[0] if found else None
 
 
 def _get_reset_info(resp: httpx.Response) -> str:
@@ -1134,25 +1118,6 @@ async def _llm_call_search(prompt: str, max_tokens: int) -> str | None:
     return None
 
 
-def _extract_web_citations(tool_calls: list[dict]) -> str:
-    """Pull URLs and titles from GLM web_search tool call results.
-
-    Retained for backwards compatibility with any direct GLM web_search
-    integration. The active search path now uses _extract_openrouter_citations.
-    """
-    refs: list[str] = []
-    for tc in tool_calls:
-        if tc.get("type") == "web_search":
-            results = tc.get("web_search", {}).get("search_result", [])
-            for i, hit in enumerate(results, 1):
-                title = hit.get("title", "")
-                link = hit.get("link", "")
-                content = hit.get("content", "")[:120]
-                if link:
-                    refs.append(f"{i}. [{title}]({link})\n   {content}")
-    return "\n".join(refs)
-
-
 def _blocked_citation_patterns() -> list[re.Pattern[str]]:
     """Compiled `assistant.search_hygiene.blocked_citations` regexes."""
     patterns = tenant_profile.search_hygiene().get("blocked_citations") or []
@@ -1180,9 +1145,7 @@ def _extract_openrouter_citations(annotations: list[dict]) -> str:
         start_index, end_index}
 
     Citations matching the persona's blocked patterns are filtered out —
-    see _is_persona_citation. Format mirrors
-    _extract_web_citations so Telegram output stays consistent regardless
-    of which search backend produced the citations.
+    see _is_persona_citation.
     """
     refs: list[str] = []
     idx = 0

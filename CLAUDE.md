@@ -205,7 +205,7 @@ token fails closed (401).
   See `docs/multi-tenant-guide.md` for profile authoring.
 
 **Canary**
-- `POST /webhook-test/test`: echo payload back
+- `POST /webhook/test`: echo payload back
 
 ## Research and Marketing Conventions
 

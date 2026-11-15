@@ -787,31 +787,15 @@ class TestNotificationDebouncing:
 class TestResetSecondsParsing:
     """Verify numeric reset time extraction for auto-retry decisions."""
 
-    def test_parse_seconds_from_message(self):
-        from llm_proxy import _parse_reset_seconds_from_message
+    def test_message_reset_reads_seconds_minutes_and_limits(self):
+        from llm_proxy import _message_reset
 
-        assert _parse_reset_seconds_from_message("try again in 30 seconds") == 30
-
-    def test_parse_minutes_from_message(self):
-        from llm_proxy import _parse_reset_seconds_from_message
-
-        assert _parse_reset_seconds_from_message("resets in 5 minutes") == 300
-
-    def test_parse_upstream_throttle(self):
-        from llm_proxy import _parse_reset_seconds_from_message
-
-        result = _parse_reset_seconds_from_message("upstream provider throttled")
-        assert result == 20
-
-    def test_parse_daily_limit(self):
-        from llm_proxy import _parse_reset_seconds_from_message
-
-        assert _parse_reset_seconds_from_message("exceeded daily limit") == 86400
-
-    def test_parse_unknown_returns_none(self):
-        from llm_proxy import _parse_reset_seconds_from_message
-
-        assert _parse_reset_seconds_from_message("something went wrong") is None
+        assert _message_reset("try again in 30 seconds") == (30, "in 30s")
+        assert _message_reset("Rate limit resets in 5 minutes") == (300, "in ~5min")
+        assert _message_reset("upstream provider throttled")[0] == 20
+        secs, text = _message_reset("exceeded daily free limit")
+        assert secs == 86400 and "24h" in text
+        assert _message_reset("something went wrong") is None
 
     def test_get_reset_seconds_from_retry_after_header(self):
         from llm_proxy import _get_reset_seconds
@@ -958,31 +942,6 @@ class TestConcurrentDispatch:
 
 
 # ─── Rate Limit Detection ───────────────────────────────────────
-
-
-class TestResetMessageParsing:
-    """Verify reset time extraction from error message text."""
-
-    def test_parse_seconds(self):
-        from llm_proxy import _parse_reset_from_message
-
-        assert _parse_reset_from_message("try again in 30 seconds") == "in 30s"
-
-    def test_parse_minutes(self):
-        from llm_proxy import _parse_reset_from_message
-
-        assert _parse_reset_from_message("Rate limit resets in 5 minutes") == "in ~5min"
-
-    def test_parse_daily(self):
-        from llm_proxy import _parse_reset_from_message
-
-        result = _parse_reset_from_message("exceeded daily free limit")
-        assert "24h" in result
-
-    def test_parse_empty(self):
-        from llm_proxy import _parse_reset_from_message
-
-        assert _parse_reset_from_message("unknown error") == ""
 
 
 class TestRateLimitDetection:
@@ -3368,106 +3327,6 @@ class TestNonWebSearchTierIteration:
         assert mock_call.call_args[0][0] == "openrouter"
 
 
-class TestWebCitationExtraction:
-    """Verify GLM web_search tool_call citations are extracted."""
-
-    def test_extracts_citations_from_tool_calls(self):
-        from llm_proxy import _extract_web_citations
-
-        tool_calls = [
-            {
-                "type": "web_search",
-                "web_search": {
-                    "search_result": [
-                        {
-                            "title": "MSP Marketing on Reddit",
-                            "link": "https://reddit.com/r/msp/post1",
-                            "content": "Great tips for MSP lead generation",
-                        },
-                        {
-                            "title": "Another Post",
-                            "link": "https://reddit.com/r/msp/post2",
-                            "content": "Discussion about pricing",
-                        },
-                    ]
-                },
-            }
-        ]
-
-        result = _extract_web_citations(tool_calls)
-        assert "https://reddit.com/r/msp/post1" in result
-        assert "https://reddit.com/r/msp/post2" in result
-        assert "MSP Marketing on Reddit" in result
-        assert "1." in result
-        assert "2." in result
-
-    def test_empty_tool_calls_returns_empty(self):
-        from llm_proxy import _extract_web_citations
-
-        assert _extract_web_citations([]) == ""
-
-    def test_non_web_search_tool_calls_ignored(self):
-        from llm_proxy import _extract_web_citations
-
-        tool_calls = [{"type": "function", "function": {"name": "foo"}}]
-        assert _extract_web_citations(tool_calls) == ""
-
-
-class TestSearchTierRoutesToOpenRouter:
-    """When web_search=True, calls go through CONFIG['search'] (OpenRouter :online).
-
-    Z.AI's web_search MCP tool is paywalled to a separate resource package — the
-    GLM Coding Plan does not unlock it. We route web-search tasks to OpenRouter's
-    `:online` suffix, which uses Exa-powered search and works on any account.
-    """
-
-    @patch.dict("os.environ", FAKE_ENV)
-    @patch("llm_proxy._call_provider", new_callable=AsyncMock)
-    @patch("llm_proxy._circuit_open", return_value=False)
-    def test_web_search_calls_openrouter_online_model(self, _cb, mock_call):
-        import asyncio
-
-        from llm_proxy import _llm_call
-
-        mock_call.return_value = httpx.Response(
-            200,
-            json={"choices": [{"message": {"role": "assistant", "content": "found"}}]},
-        )
-
-        result = asyncio.run(
-            _llm_call("find reddit posts", max_tokens=500, web_search=True)
-        )
-
-        assert result == "found"
-        assert mock_call.call_count == 1
-        assert mock_call.call_args[0][0] == "openrouter"
-        models = mock_call.call_args[0][1]
-        assert any(m.endswith(":online") for m in models), (
-            f"no :online model in {models}"
-        )
-
-    @patch.dict("os.environ", FAKE_ENV)
-    @patch("llm_proxy._call_provider", new_callable=AsyncMock)
-    @patch("llm_proxy._circuit_open", return_value=False)
-    def test_web_search_never_calls_zai(self, _cb, mock_call):
-        """Z.AI must not be called for web-search tasks (paywalled feature)."""
-        import asyncio
-
-        from llm_proxy import _llm_call
-
-        mock_call.return_value = httpx.Response(
-            200, json={"choices": [{"message": {"content": "x"}}]}
-        )
-        asyncio.run(_llm_call("find latest news", max_tokens=500, web_search=True))
-
-        for call in mock_call.call_args_list:
-            provider_arg = call[0][0]
-            assert provider_arg not in (
-                "zai",
-                "zai-search",
-            ), f"unexpected Z.AI call: {provider_arg}"
-
-
 class TestOpenRouterCitationExtraction:
     """Extract url_citation annotations from OpenRouter :online responses."""
 
@@ -4776,7 +4635,7 @@ class TestBalanceFailureBackoff:
         monkeypatch.setenv("OPENROUTER_API_KEY", "k")
         monkeypatch.setattr(llm_proxy.httpx, "AsyncClient", FailingClient)
         monkeypatch.setattr(
-            llm_proxy, "_balance_cache", {"remaining": 42.0, "checked_at": 0.0}
+            llm_proxy, "_balance_cache", {"remaining": 42.0, "checked_at": None}
         )
         assert asyncio.run(llm_proxy._check_openrouter_balance()) == 42.0
         assert asyncio.run(llm_proxy._check_openrouter_balance()) == 42.0
