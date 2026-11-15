@@ -2159,14 +2159,14 @@ class TestSchedulerModule:
 
 class TestMarketingCommandParsing:
     def test_extract_sched_list(self):
-        from llm_proxy import _extract_marketing_command
+        from chat_commands import _extract_marketing_command
 
         cmd = _extract_marketing_command("/sched list")
         assert cmd["verb"] == "sched"
         assert cmd["subcmd"] == "list"
 
     def test_extract_sched_add(self):
-        from llm_proxy import _extract_marketing_command
+        from chat_commands import _extract_marketing_command
 
         cmd = _extract_marketing_command(
             '/sched add myscan cron "0 9 * * *" -- morning_scan'
@@ -2175,7 +2175,7 @@ class TestMarketingCommandParsing:
         assert cmd["subcmd"] == "add"
 
     def test_extract_scan_reddit(self):
-        from llm_proxy import _extract_marketing_command
+        from chat_commands import _extract_marketing_command
 
         cmd = _extract_marketing_command(
             "/scan reddit claude code plugins --subs ClaudeAI,LocalLLaMA"
@@ -2184,7 +2184,7 @@ class TestMarketingCommandParsing:
         assert cmd["subcmd"] == "reddit"
 
     def test_extract_scan_github(self):
-        from llm_proxy import _extract_marketing_command
+        from chat_commands import _extract_marketing_command
 
         cmd = _extract_marketing_command(
             "/scan github claude code --kind repos --stars 5"
@@ -2193,14 +2193,14 @@ class TestMarketingCommandParsing:
         assert cmd["subcmd"] == "github"
 
     def test_extract_projects_list(self):
-        from llm_proxy import _extract_marketing_command
+        from chat_commands import _extract_marketing_command
 
         cmd = _extract_marketing_command("/projects list")
         assert cmd["verb"] == "projects"
         assert cmd["subcmd"] == "list"
 
     def test_extract_marketing_alias(self):
-        from llm_proxy import _extract_marketing_command
+        from chat_commands import _extract_marketing_command
 
         cmd = _extract_marketing_command("/marketing")
         assert cmd["verb"] == "sched"
@@ -2208,19 +2208,19 @@ class TestMarketingCommandParsing:
         assert cmd["args"] == "morning_scan"
 
     def test_extract_non_marketing(self):
-        from llm_proxy import _extract_marketing_command
+        from chat_commands import _extract_marketing_command
 
         assert _extract_marketing_command("!task do something") is None
         assert _extract_marketing_command("hello") is None
 
     def test_bang_prefix(self):
-        from llm_proxy import _extract_marketing_command
+        from chat_commands import _extract_marketing_command
 
         cmd = _extract_marketing_command("!scan web test query")
         assert cmd["verb"] == "scan"
 
     def test_scan_args_parsing(self):
-        from llm_proxy import _parse_scan_args
+        from chat_commands import _parse_scan_args
 
         topic, subs, proj, since = _parse_scan_args(
             "claude plugins --subs ClaudeAI,LocalLLaMA --project cnm --since 30d"
@@ -2237,14 +2237,14 @@ class TestMarketingCommandParsing:
 class TestMarketingCommandDispatch:
     @pytest.mark.asyncio
     async def test_sched_list_empty(self):
-        from llm_proxy import _handle_sched_command
+        from chat_commands import _handle_sched_command
 
         result = await _handle_sched_command("list", "")
         assert "No schedules configured" in result
 
     @pytest.mark.asyncio
     async def test_sched_list_with_items(self):
-        from llm_proxy import _handle_sched_command
+        from chat_commands import _handle_sched_command
 
         brain_db.upsert_schedule(
             "test-sched", "Test Schedule", "morning_scan", "0 9 * * *"
@@ -2255,7 +2255,7 @@ class TestMarketingCommandDispatch:
 
     @pytest.mark.asyncio
     async def test_sched_show(self):
-        from llm_proxy import _handle_sched_command
+        from chat_commands import _handle_sched_command
 
         brain_db.upsert_schedule("show-test", "Showable", "custom_scan", "*/30 * * * *")
         result = await _handle_sched_command("show", "show-test")
@@ -2264,21 +2264,21 @@ class TestMarketingCommandDispatch:
 
     @pytest.mark.asyncio
     async def test_sched_show_missing(self):
-        from llm_proxy import _handle_sched_command
+        from chat_commands import _handle_sched_command
 
         result = await _handle_sched_command("show", "nonexistent")
         assert "not found" in result
 
     @pytest.mark.asyncio
     async def test_projects_list_empty(self):
-        from llm_proxy import _handle_projects_command
+        from chat_commands import _handle_projects_command
 
         result = await _handle_projects_command("list", "")
         assert "No projects tracked" in result
 
     @pytest.mark.asyncio
     async def test_projects_add_and_show(self):
-        from llm_proxy import _handle_projects_command
+        from chat_commands import _handle_projects_command
 
         result = await _handle_projects_command(
             "add", "test-proj athola/test-proj --topics yaml,pdf --subs Python"
@@ -2290,7 +2290,7 @@ class TestMarketingCommandDispatch:
 
     @pytest.mark.asyncio
     async def test_projects_rm(self):
-        from llm_proxy import _handle_projects_command
+        from chat_commands import _handle_projects_command
 
         brain_db.upsert_project("rm-test", "athola", "rm-test")
         result = await _handle_projects_command("rm", "rm-test")
@@ -2298,21 +2298,21 @@ class TestMarketingCommandDispatch:
 
     @pytest.mark.asyncio
     async def test_sched_help(self):
-        from llm_proxy import _handle_sched_command
+        from chat_commands import _handle_sched_command
 
         result = await _handle_sched_command("unknown", "")
         assert "Usage" in result
 
     @pytest.mark.asyncio
     async def test_scan_help(self):
-        from llm_proxy import _handle_scan_command
+        from chat_commands import _handle_scan_command
 
         result = await _handle_scan_command("unknown", "")
         assert "Usage" in result
 
     @pytest.mark.asyncio
     async def test_projects_help(self):
-        from llm_proxy import _handle_projects_command
+        from chat_commands import _handle_projects_command
 
         result = await _handle_projects_command("unknown", "")
         assert "Usage" in result

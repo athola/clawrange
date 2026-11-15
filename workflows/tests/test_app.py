@@ -10,7 +10,7 @@ import app as app_module
 import llm_proxy
 from app import _current_profile, app
 from brain_db import BrainDB
-from llm_proxy import _extract_task_command
+from chat_commands import _extract_task_command
 from persona_api import create_persona_router
 from research import Finding
 from tenant_profile import Profile

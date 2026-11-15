@@ -37,6 +37,13 @@ Tailscale and Caddy gateway.
     `data/retrieval/` (gitignored)
   - `llm_proxy.py`: OpenAI-compatible proxy with tiered routing,
     web-search routing, anti-hallucination guard, balance circuit breaker
+  - `chat_commands.py`: `/tier`, `!help`, `!task`, `/sched`, `/scan` and
+    `/projects` chat commands handled inside the proxy
+  - `heartbeat.py`: heartbeat interceptor (task selection, thinking
+    prompts, `_handle_heartbeat`)
+  - `digest.py`: hourly heartbeat digest buffer and message planner
+  - `research_router.py`: routes heartbeat tasks to the marketing scanners
+    and the research orchestrator
   - `scheduler.py`, `generators.py`: APScheduler jobs and generators
   - `watchdog.py`: heartbeat watchdog — alerts Telegram directly when
     OpenClaw heartbeats stall during active hours
