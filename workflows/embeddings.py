@@ -35,6 +35,9 @@ TIMEOUT = 45.0  # backfill batches: up to BATCH inputs per request
 # A search waits on its query embedding before it can answer, and falls back
 # to keyword search when the embed fails: a slow provider must not stall it.
 QUERY_TIMEOUT = 4.0
+# Statuses that blame the input itself (too long, malformed). Only these mark
+# a chunk as rejected; anything else is an outage and is retried next run.
+REJECTED_STATUSES = frozenset({400, 413, 422})
 
 
 @dataclass(frozen=True)
@@ -78,6 +81,35 @@ async def request(inputs: list[str], cfg: EmbedConfig) -> httpx.Response:
         )
 
 
+async def _embed_batch(
+    inputs: list[str], cfg: EmbedConfig
+) -> tuple[list[list[float]] | None, bool]:
+    """One request, as (vectors, refused).
+
+    (vectors, False) on success; (None, True) when the provider refused this
+    input; (None, False) on any other failure (network, 5xx, 429, auth, bad
+    dimensions), which says nothing about the input.
+    """
+    try:
+        resp = await request(inputs, cfg)
+    except httpx.HTTPError as exc:
+        logger.warning("embeddings request failed: %s", exc)
+        return None, False
+    if resp.status_code != 200:
+        logger.warning("embeddings HTTP %s: %s", resp.status_code, resp.text[:200])
+        return None, resp.status_code in REJECTED_STATUSES
+    try:
+        data = sorted(resp.json()["data"], key=lambda d: d["index"])
+        vectors = [list(map(float, d["embedding"])) for d in data]
+    except (ValueError, KeyError, TypeError) as exc:
+        logger.warning("embeddings response unreadable: %s", exc)
+        return None, False
+    if len(vectors) != len(inputs) or any(len(v) != cfg.dim for v in vectors):
+        logger.warning("embeddings: expected %d x %d-dim vectors", len(inputs), cfg.dim)
+        return None, False
+    return vectors, False
+
+
 async def embed_texts(
     texts: list[str], cfg: EmbedConfig | None = None, batch: int = BATCH
 ) -> list[list[float]] | None:
@@ -91,25 +123,8 @@ async def embed_texts(
         return None
     out: list[list[float]] = []
     for start in range(0, len(texts), batch):
-        chunk = texts[start : start + batch]
-        try:
-            resp = await request(chunk, cfg)
-        except httpx.HTTPError as exc:
-            logger.warning("embeddings request failed: %s", exc)
-            return None
-        if resp.status_code != 200:
-            logger.warning("embeddings HTTP %s: %s", resp.status_code, resp.text[:200])
-            return None
-        try:
-            data = sorted(resp.json()["data"], key=lambda d: d["index"])
-            vectors = [list(map(float, d["embedding"])) for d in data]
-        except (ValueError, KeyError, TypeError) as exc:
-            logger.warning("embeddings response unreadable: %s", exc)
-            return None
-        if len(vectors) != len(chunk) or any(len(v) != cfg.dim for v in vectors):
-            logger.warning(
-                "embeddings: expected %d x %d-dim vectors", len(chunk), cfg.dim
-            )
+        vectors, _ = await _embed_batch(texts[start : start + batch], cfg)
+        if vectors is None:
             return None
         out.extend(vectors)
     return out
@@ -125,6 +140,11 @@ async def embed_query(text: str, cfg: EmbedConfig | None = None) -> list[float] 
 async def backfill(brain_db, cfg: EmbedConfig | None = None, limit: int = 256) -> dict:
     """Embed chunks that have no vector in the configured model's table.
 
+    Each batch is stored as soon as it succeeds. When the provider refuses a
+    batch's input, the batch is bisected down to the chunks it refuses, and
+    those are marked so ``missing_embeddings`` stops returning them. Any
+    other failure (an outage) ends the run; the rest is retried next time.
+
     Also drops vectors whose chunk was rewritten (re-chunking replaces chunk
     rows, so the old vector no longer points at anything).
     """
@@ -135,9 +155,49 @@ async def backfill(brain_db, cfg: EmbedConfig | None = None, limit: int = 256) -
     missing = brain_db.missing_embeddings(limit)
     if not missing:
         return {"stored": 0, "pruned": pruned}
-    vectors = await embed_texts([m["content"] for m in missing], cfg)
-    if vectors is None:
-        return {"stored": 0, "pruned": pruned, "failed": len(missing)}
-    brain_db.store_embeddings([(m["id"], v) for m, v in zip(missing, vectors)])
-    logger.info("embeddings: stored %d vectors in %s", len(vectors), cfg.table)
-    return {"stored": len(vectors), "pruned": pruned}
+    stored = rejected = 0
+    out: dict = {"pruned": pruned}
+    for start in range(0, len(missing), BATCH):
+        s, r, ok = await _store_or_isolate(
+            brain_db, missing[start : start + BATCH], cfg
+        )
+        stored, rejected = stored + s, rejected + r
+        if not ok:
+            out["failed"] = len(missing) - start - s - r
+            break
+    out["stored"] = stored
+    if rejected:
+        out["rejected"] = rejected
+    if stored:
+        logger.info("embeddings: stored %d vectors in %s", stored, cfg.table)
+    return out
+
+
+async def _store_or_isolate(
+    brain_db, rows: list[dict], cfg: EmbedConfig
+) -> tuple[int, int, bool]:
+    """Embed and store ``rows``; isolate and mark the ones the provider refuses.
+
+    Returns (stored, rejected, ok); ok is False on a non-input failure, which
+    stops the caller rather than marking healthy chunks during an outage.
+    """
+    vectors, refused = await _embed_batch([r["content"] for r in rows], cfg)
+    if vectors is not None:
+        brain_db.store_embeddings([(r["id"], v) for r, v in zip(rows, vectors)])
+        return len(rows), 0, True
+    if not refused:
+        return 0, 0, False
+    if len(rows) == 1:
+        brain_db.mark_embedding_rejected([rows[0]["id"]])
+        logger.warning(
+            "embeddings: provider rejected chunk %s (%d words); skipping it",
+            rows[0]["id"],
+            len(rows[0]["content"].split()),
+        )
+        return 0, 1, True
+    mid = len(rows) // 2
+    s1, r1, ok = await _store_or_isolate(brain_db, rows[:mid], cfg)
+    if not ok:
+        return s1, r1, False
+    s2, r2, ok = await _store_or_isolate(brain_db, rows[mid:], cfg)
+    return s1 + s2, r1 + r2, ok

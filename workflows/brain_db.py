@@ -82,7 +82,16 @@ def _chunk_text(text: str, max_words: int = 300, overlap_words: int = 50) -> lis
                 raw_chunks.append("\n\n".join(current))
             # If single paragraph exceeds max_words, split at sentence boundaries
             if len(words) > max_words:
-                sentences = re.split(r"(?<=[.!?])\s+", para)
+                sentences = []
+                for sent in re.split(r"(?<=[.!?])\s+", para):
+                    # Unpunctuated text (logs, JSON, run-on prose) is one huge
+                    # "sentence": cut it into max_words windows.
+                    sw_words = sent.split()
+                    if len(sw_words) <= max_words:
+                        sentences.append(sent)
+                        continue
+                    for i in range(0, len(sw_words), max_words):
+                        sentences.append(" ".join(sw_words[i : i + max_words]))
                 sent_buf: list[str] = []
                 sent_words = 0
                 for sent in sentences:
@@ -129,6 +138,20 @@ def _chunk_text(text: str, max_words: int = 300, overlap_words: int = 50) -> lis
 
 
 MAX_SEARCH_LIMIT = 100
+
+# Chunks the embedding provider refused (per model table), so the backfill
+# stops re-sending them. A rewritten chunk gets a new id and is tried again;
+# prune_orphan_embeddings drops the stale row. Additive: a brain.db made
+# before this table existed gains it on the next init_db.
+_EMBEDDING_REJECTS_DDL = """
+    CREATE TABLE IF NOT EXISTS embedding_rejects (
+        vec_table    TEXT NOT NULL,
+        chunk_id     INTEGER NOT NULL,
+        rejected_at  TEXT NOT NULL,
+        PRIMARY KEY (vec_table, chunk_id)
+    )
+"""
+
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -303,6 +326,7 @@ class BrainDB:
             CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts
                 USING fts5(slug, title, compiled);
         """)
+        conn.execute(_EMBEDDING_REJECTS_DDL)
         # FTS5 sync triggers — standalone FTS, managed via triggers
         conn.execute("""
             CREATE TRIGGER IF NOT EXISTS pages_ai AFTER INSERT ON pages BEGIN
@@ -623,6 +647,9 @@ class BrainDB:
             f"chunk_id INTEGER PRIMARY KEY, vector float[{int(dim)}] "
             "distance_metric=cosine)"
         )
+        # Normally made by init_db; repeated so a caller that skipped it
+        # still gets a working missing_embeddings().
+        self._conn.execute(_EMBEDDING_REJECTS_DDL)
         self._conn.commit()
         self._vec_table = table
         return True
@@ -640,23 +667,49 @@ class BrainDB:
         return len(rows)
 
     def missing_embeddings(self, limit: int = 256) -> list[dict[str, Any]]:
-        """Chunks with no vector in the active table (id, content)."""
+        """Chunks with no vector in the active table (id, content).
+
+        Skips chunks the provider rejected for this table, so one bad chunk
+        can't hold the head of the queue forever.
+        """
         if self._vec_table is None:
             return []
         rows = self._conn.execute(
             f"SELECT cc.id, cc.content FROM content_chunks cc "
             f"WHERE cc.id NOT IN (SELECT chunk_id FROM {self._vec_table}) "
+            "AND cc.id NOT IN (SELECT chunk_id FROM embedding_rejects "
+            "WHERE vec_table = ?) "
             "ORDER BY cc.id LIMIT ?",
-            (limit,),
+            (self._vec_table, limit),
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
+    def mark_embedding_rejected(self, chunk_ids: list[int]) -> int:
+        """Record chunks the provider refused to embed for the active table."""
+        if self._vec_table is None or not chunk_ids:
+            return 0
+        now = _now()
+        self._conn.executemany(
+            "INSERT OR REPLACE INTO embedding_rejects "
+            "(vec_table, chunk_id, rejected_at) VALUES (?, ?, ?)",
+            [(self._vec_table, cid, now) for cid in chunk_ids],
+        )
+        self._conn.commit()
+        return len(chunk_ids)
+
     def prune_orphan_embeddings(self) -> int:
-        """Drop vectors whose chunk no longer exists (re-chunked pages)."""
+        """Drop vectors whose chunk no longer exists (re-chunked pages).
+
+        Also forgets rejections of chunks that are gone (in every table).
+        """
         if self._vec_table is None:
             return 0
         cur = self._conn.execute(
             f"DELETE FROM {self._vec_table} "
+            "WHERE chunk_id NOT IN (SELECT id FROM content_chunks)"
+        )
+        self._conn.execute(
+            "DELETE FROM embedding_rejects "
             "WHERE chunk_id NOT IN (SELECT id FROM content_chunks)"
         )
         self._conn.commit()

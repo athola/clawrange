@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 
 import embeddings
 from brain import create_brain_router
-from brain_db import BrainDB
+from brain_db import BrainDB, _chunk_text
 
 
 @pytest.fixture
@@ -306,3 +306,125 @@ class TestHybridAnyTermsFallback:
         data = _client(vec_db).get("/brain/search?q=Show+HN+timing").json()
         assert [r["slug"] for r in data["results"]] == ["n/a"]
         assert data["mode"] == "keyword"
+
+
+# ─── #36: no oversized chunk, and one bad chunk can't stall backfill ─
+
+
+class TestChunkUnpunctuated:
+    def test_unpunctuated_text_splits_into_word_windows(self):
+        text = " ".join(f"w{i}" for i in range(20_000))
+        chunks = _chunk_text(text, max_words=300, overlap_words=50)
+        assert len(chunks) >= 20_000 // 300
+        assert max(len(c.split()) for c in chunks) <= 350  # window + overlap
+        # nothing dropped: every word lands in some chunk
+        seen = {w for c in chunks for w in c.split()}
+        assert seen == {f"w{i}" for i in range(20_000)}
+
+    def test_long_sentence_among_short_ones(self):
+        long = " ".join(["word"] * 700)
+        text = f"Short one. {long}. Another short one."
+        chunks = _chunk_text(text, max_words=300, overlap_words=0)
+        assert max(len(c.split()) for c in chunks) <= 300
+        assert sum(len(c.split()) for c in chunks) == len(text.split())
+
+
+def _provider(dim, calls, refuse="POISON", status_for=None):
+    """Fake embeddings endpoint: HTTP 400 for any batch holding `refuse`,
+    or `status_for(call_number)` when given."""
+
+    async def fake(inputs, cfg):
+        calls.append(list(inputs))
+        if status_for is not None and (code := status_for(len(calls))) != 200:
+            return httpx.Response(code, json={"error": "nope"})
+        if any(refuse in t for t in inputs):
+            return httpx.Response(400, json={"error": "input too long"})
+        data = [{"index": i, "embedding": [0.1] * dim} for i in range(len(inputs))]
+        return httpx.Response(200, json={"data": data})
+
+    return fake
+
+
+class TestBackfillResilience:
+    def _pages(self, db, *bodies):
+        for i, body in enumerate(bodies):
+            db.upsert_page(f"p/{i}", f"Page {i}", "note", body)
+
+    def test_each_batch_is_stored_as_it_succeeds(self, vec_db, monkeypatch):
+        self._pages(vec_db, "alpha", "beta", "gamma")
+        calls: list = []
+        monkeypatch.setattr(embeddings, "BATCH", 2)
+        monkeypatch.setattr(
+            embeddings,
+            "request",
+            _provider(4, calls, status_for=lambda n: 200 if n == 1 else 503),
+        )
+        out = asyncio.run(embeddings.backfill(vec_db, _cfg4()))
+        assert out["stored"] == 2 and out["failed"] == 1
+        assert vec_db.embedding_count() == 2
+        assert len(vec_db.missing_embeddings(10)) == 1
+
+    def test_rejected_chunk_is_marked_and_queue_moves_on(self, vec_db, monkeypatch):
+        self._pages(vec_db, "alpha", "POISON blob", "beta", "gamma")
+        calls: list = []
+        monkeypatch.setattr(embeddings, "request", _provider(4, calls))
+        out = asyncio.run(embeddings.backfill(vec_db, _cfg4()))
+        assert out["stored"] == 3 and out["rejected"] == 1
+        assert vec_db.missing_embeddings(10) == []
+        # the next run has nothing to send
+        calls.clear()
+        again = asyncio.run(embeddings.backfill(vec_db, _cfg4()))
+        assert again["stored"] == 0 and calls == []
+
+    def test_outage_marks_nothing(self, vec_db, monkeypatch):
+        self._pages(vec_db, "alpha", "beta")
+        for code in (500, 429, 401):
+            calls: list = []
+            monkeypatch.setattr(
+                embeddings,
+                "request",
+                _provider(4, calls, status_for=lambda n, c=code: c),
+            )
+            out = asyncio.run(embeddings.backfill(vec_db, _cfg4()))
+            assert out["stored"] == 0 and out["failed"] == 2
+            assert len(calls) == 1  # no bisecting on a transient failure
+            assert len(vec_db.missing_embeddings(10)) == 2
+
+    def test_rewritten_page_is_retried(self, vec_db, monkeypatch):
+        self._pages(vec_db, "POISON blob")
+        calls: list = []
+        monkeypatch.setattr(embeddings, "request", _provider(4, calls))
+        asyncio.run(embeddings.backfill(vec_db, _cfg4()))
+        assert vec_db.missing_embeddings(10) == []
+        vec_db.upsert_page("p/0", "Page 0", "note", "fixed body")
+        assert len(vec_db.missing_embeddings(10)) == 1
+        out = asyncio.run(embeddings.backfill(vec_db, _cfg4()))
+        assert out["stored"] == 1
+
+    def test_rejection_is_per_model_table(self, vec_db, monkeypatch):
+        self._pages(vec_db, "POISON blob")
+        calls: list = []
+        monkeypatch.setattr(embeddings, "request", _provider(4, calls))
+        asyncio.run(embeddings.backfill(vec_db, _cfg4()))
+        vec_db.use_vector_table("vec_other_4", 4)
+        assert len(vec_db.missing_embeddings(10)) == 1
+
+    def test_db_created_without_rejects_table_still_opens(self, tmp_path):
+        """A brain.db from main has no embedding_rejects table; init_db adds
+        it without touching existing rows."""
+        path = str(tmp_path / "old.db")
+        old = BrainDB(path)
+        old.init_db()
+        old.upsert_page("a", "Alpha", "note", "alpha body")
+        old._conn.execute("DROP TABLE embedding_rejects")
+        old._conn.commit()
+        old._conn.close()
+
+        d = BrainDB(path)
+        d.init_db()
+        if not d._has_vec:
+            pytest.skip("sqlite-vec unavailable")
+        d.use_vector_table("vec_test_4", 4)
+        assert d.get_page("a") is not None
+        assert len(d.missing_embeddings(10)) == 1
+        d.init_db()  # idempotent
