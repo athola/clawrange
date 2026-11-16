@@ -772,7 +772,7 @@ async def _handle_persona_command(args: str) -> JSONResponse:
         brain_db, profile_name = _persona_context()
     except HTTPException as exc:
         return _synthetic_response(f"Persona unavailable: {exc.detail}.")
-    if args.startswith("reflect"):
+    if args.lower() == "reflect":
         try:
             queued = await asyncio.to_thread(
                 persona_api.reflect_now, brain_db, profile_name
@@ -798,6 +798,9 @@ async def _handle_persona_command(args: str) -> JSONResponse:
         )
     except ValueError as exc:
         return _synthetic_response(f"Feedback not queued: {exc}.")
+    except Exception as exc:
+        logger.exception("!persona propose failed")
+        return _synthetic_response(f"Feedback not queued: {type(exc).__name__}: {exc}")
     return _synthetic_response(
         f"Queued persona enhancement as [DRAFT] (id {row.get('id')}). "
         "Approve via /persona/proposals/<id>/approve."
@@ -1248,6 +1251,8 @@ async def _llm_call_search(prompt: str, max_tokens: int) -> str | None:
     if not search_cfg:
         return None
 
+    # The balance lookup and the attempt share one LLM_CALL_DEADLINE.
+    deadline_at = time.monotonic() + LLM_CALL_DEADLINE
     provider = search_cfg["provider"]
     env_key = CONFIG["providers"][provider]["env_key"]
     if not os.getenv(env_key, ""):
@@ -1262,6 +1267,10 @@ async def _llm_call_search(prompt: str, max_tokens: int) -> str | None:
                 OPENROUTER_BALANCE_FLOOR,
             )
             return None
+    budget = deadline_at - time.monotonic()
+    if budget <= 0:
+        logger.warning("background search: deadline reached before the attempt")
+        return None
     if _circuit_open(SEARCH_TIER):
         logger.info("background search: skip: breaker open")
         return None
@@ -1271,7 +1280,7 @@ async def _llm_call_search(prompt: str, max_tokens: int) -> str | None:
         search_cfg["models"],
         prompt,
         max_tokens,
-        LLM_CALL_DEADLINE,
+        budget,
         citations=True,
     )
 
@@ -1332,7 +1341,7 @@ async def _notify_tier_change(tier_name: str) -> None:
     if _last_tier_used is not None and _last_tier_used != tier_name:
         _background_notify(
             f"tier-change:{_last_tier_used}:{tier_name}",
-            f"*Tier switch*: `{_last_tier_used}` -> `{tier_name}`",
+            f"*Tier switch*: `{_last_tier_used}` to `{tier_name}`",
         )
     _last_tier_used = tier_name
 
@@ -1535,8 +1544,8 @@ async def create_embeddings(
 ):
     """OpenAI-compatible embeddings via OpenRouter, for any bearer-token client.
 
-    OpenClaw's own memory search is off (memory provider "none"), so no
-    built-in caller uses this today. Always uses the configured model
+    OpenClaw's own memory search is off (memory provider "none"), so it is
+    not a built-in caller. Always uses the configured model
     (embeddings.config) so vectors stay comparable; a GLM Coding Plan Z.AI
     key can't embed.
     """

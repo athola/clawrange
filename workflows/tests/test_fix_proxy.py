@@ -130,6 +130,24 @@ class TestPersonaInProcess:
         assert not handler.called
         assert len(db.list_learnings()) == before
 
+    def test_propose_storage_error_is_a_friendly_reply(self, authed_app):
+        import sqlite3
+
+        client, _db = authed_app
+        with patch(
+            "persona_learning.propose", side_effect=sqlite3.OperationalError("locked")
+        ):
+            r = _chat(client, "!persona Be brief.")
+        assert r.status_code == 200
+        assert "not queued" in _reply(r).lower()
+
+    def test_reflect_prefix_is_feedback_not_reflection(self, authed_app):
+        """'!persona reflective tone' is feedback, not the reflect subcommand."""
+        client, db = authed_app
+        r = _chat(client, "!persona reflective tone in weekly reviews")
+        assert r.status_code == 200
+        assert _learnings(db, "reflective tone in weekly reviews"), _reply(r)
+
     def test_reflect_failure_is_reported(self, authed_app, monkeypatch):
         import persona_api
 

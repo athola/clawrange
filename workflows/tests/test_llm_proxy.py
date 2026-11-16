@@ -4839,6 +4839,9 @@ class TestHeartbeatRobustness:
 
 class TestSearchPathDeadline:
     @patch.dict("os.environ", FAKE_ENV)
+    # Search is paid: without a known balance above the floor it never
+    # reaches the hung provider and the deadline would go untested (#23).
+    @patch("llm_proxy._check_openrouter_balance", AsyncMock(return_value=50.0))
     def test_search_call_honours_deadline(self, monkeypatch):
         monkeypatch.setattr(llm_proxy, "LLM_CALL_DEADLINE", 0.05)
 
@@ -4850,8 +4853,9 @@ class TestSearchPathDeadline:
                 llm_proxy._llm_call("q", web_search=True), timeout=2
             )
 
-        with patch("llm_proxy._call_provider", side_effect=hang):
+        with patch("llm_proxy._call_provider", side_effect=hang) as call:
             assert asyncio.run(run()) is None
+        assert call.called
 
 
 class TestAutoRetryPopsOnlyElapsedTiers:
