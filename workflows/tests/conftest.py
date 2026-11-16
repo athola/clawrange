@@ -9,6 +9,11 @@ import tempfile
 # test_app.py does `from app import app` at collection time.
 _tmpdir = tempfile.mkdtemp()
 os.environ["BRAIN_DB_PATH"] = os.path.join(_tmpdir, "test_brain.db")
+# Inside the container /data is the live brain directory: a test run there
+# must never overwrite the watchdog's real heartbeat stamp.
+os.environ.setdefault(
+    "HEARTBEAT_SEEN_PATH", os.path.join(_tmpdir, "heartbeat_seen.json")
+)
 
 
 import pytest  # noqa: E402
