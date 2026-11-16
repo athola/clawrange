@@ -51,8 +51,7 @@ APScheduler-driven cron jobs, and the marketing scanners
 (Reddit and GitHub). Endpoints live at http://localhost:5678 and need
 `Authorization: Bearer $PROXY_AUTH_TOKEN` except the health checks,
 `GET /tier` and `GET /sched[/{id}]` (the current list is in
-`CLAUDE.md`; [specification.md](archive/specification.md) is the
-original design).
+`CLAUDE.md`; the design decisions are in [tradeoffs.md](tradeoffs.md)).
 
 **DeerFlow** is the deep research layer (optional). When a question
 needs broad research (market analysis, regulatory deep dives), DeerFlow

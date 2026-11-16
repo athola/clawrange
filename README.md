@@ -70,9 +70,7 @@ credential (Reddit script app, GitHub PAT, eBay keyset).
 For Tailscale-secured deployment (cloud gateway and onsite node), see
 [docs/DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md); for a local testbed,
 [docs/TESTBED_GUIDE.md](docs/TESTBED_GUIDE.md). Design decisions and their
-trade-offs are logged in [docs/tradeoffs.md](docs/tradeoffs.md). The original
-specs and plans (marketing orchestrator, brain database, multi-tenant
-template) are kept in [docs/archive/](docs/archive/).
+trade-offs are logged in [docs/tradeoffs.md](docs/tradeoffs.md).
 
 ## Testing
 

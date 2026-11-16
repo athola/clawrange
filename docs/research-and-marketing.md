@@ -1,9 +1,8 @@
 # Research and Marketing Operator Guide
 
 This guide covers the assistant's multi-source research orchestrator
-and the top-of-funnel marketing tooling that surrounds it. It is
-the operator-side companion to the planning artifact in
-`archive/research-and-marketing-plan.md`.
+and the top-of-funnel marketing tooling that surrounds it. The design
+decisions behind it are TR-009 to TR-011 in [tradeoffs.md](tradeoffs.md).
 
 ## TL;DR
 
@@ -27,6 +26,8 @@ curl -s -X POST http://localhost:5678/sched \
   -H 'content-type: application/json' \
   -d '{"id":"daily-content","name":"Daily content ideas",
        "kind":"content_idea","cron":"0 8 * * *"}'
+# "cron" also takes "every <n><m|h|d>": n is 5, 6, 10, 12, 15, 20 or 30
+# for minutes; 1, 2, 3, 4, 6, 8, 12 or 24 for hours; 1 for days
 
 # Run an existing schedule now (here one with id draft-once)
 curl -s -X POST http://localhost:5678/sched/draft-once/run \

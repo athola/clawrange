@@ -197,8 +197,10 @@ To plug in a brand-new CRM, implement `CRMAdapter` in
 ### Query templates: the only way the LLM touches data
 
 The LLM **never writes SQL**. It only *selects* a named template and fills
-its parameters. The SQL is authored by you and executed read-only. Each
-template has a `name`, `description`, typed `params`, and `sql`:
+its parameters. The SQL is authored by you and executed read-only: each
+template must be a single `SELECT` or `WITH` statement with no `;`, and
+the SQLite adapter runs it on a read-only connection. Each template has a
+`name`, `description`, typed `params`, and `sql`:
 
 ```yaml
 query_templates:

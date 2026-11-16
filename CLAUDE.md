@@ -94,8 +94,10 @@ Tailscale and Caddy gateway.
 - `scripts/`: POSIX shell scripts for lifecycle and testing
 - `tests/`: Python validation suite (`validate_stack.py`)
 - `docs/`: testbed and deployment guides, the multi-tenant and
-  research/marketing operator guides, `tradeoffs.md` (decision journal);
-  finished plans and specs live in `docs/archive/`
+  research/marketing operator guides, `tradeoffs.md` (decision journal).
+  Plans and specs are working files: record the lasting decisions in
+  `tradeoffs.md` when the work ships, then delete them. `docs/archive/`
+  is gitignored for local scratch
 
 ## Key Conventions
 
@@ -186,7 +188,9 @@ stack without one. There is no `/docs`, `/redoc` or `/openapi.json`.
 - `GET/DELETE /brain/pages/{slug}`; per page `GET/POST .../timeline`,
   `GET/POST .../links`, `DELETE .../links/{link_id}`, `GET/POST .../tags`,
   `DELETE .../tags/{tag_name}`, `GET .../versions`, `GET .../chunks`,
-  `GET .../graph`. See `workflows/brain.py`. No embeddings route lives
+  `GET .../graph`. See `workflows/brain.py`. Slugs may contain `/`
+  (`client/acme`); search `mode` is `hybrid` (default), `keyword` or
+  `vector`; graph `depth` defaults to 2, capped at 5. No embeddings route lives
   here: the backfill job writes page vectors, and `POST /v1/embeddings`
   is the only embeddings endpoint.
 

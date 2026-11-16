@@ -60,3 +60,7 @@ reviews/
 .review/
 .tome/
 docs/research/
+
+# Local scratch for finished plans and specs. Lasting decisions go in
+# docs/tradeoffs.md; the old archive is in git history (git log -- docs/archive).
+docs/archive/

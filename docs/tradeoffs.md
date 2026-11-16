@@ -6,13 +6,17 @@ Decisions, the alternatives weighed, and what was given up. Newest first.
 
 | ID | Phase | Status | Decision |
 |----|-------|--------|----------|
+| TR-011 | specify | accepted | Marketing output is drafts for approval; nothing auto-posts |
+| TR-010 | specify | accepted | One server-side research orchestrator called as a tool, not lead/subagent agents |
+| TR-009 | specify | accepted | APScheduler 3.x inside the workflows process, in-memory jobstore rebuilt from the brain |
+| TR-008 | specify | accepted | Brain is SQLite (FTS5 and sqlite-vec) in the workflows container, not a separate vector DB |
 | TR-007 | execute | accepted | Workflows keeps running as root; persona renders copy the target's mode and owner |
 | TR-006 | execute | accepted | `/healthz` stays 200 while degraded; the body, boot alert and logs carry the state |
 | TR-005 | execute | proposed | Keyword fallback ORs terms; hybrid with vectors unchanged until the eval shows a win |
 | TR-004 | execute | superseded | Keep per-file dev mounts; directory mount blocked by the nested soul.md bind (resolved: soul.md moved to `/opt`) |
 | TR-003 | plan | accepted | Regression-lock marketing seeds (RED equivalence test) before deleting constants |
-| TR-002 | specify | proposed | Minimal CRMAdapter interface and templated-SQL only (no LLM raw SQL) |
-| TR-001 | brainstorm | proposed | Multi-tenant via hybrid declarative profile and connector registry |
+| TR-002 | specify | accepted | Minimal CRMAdapter interface and templated-SQL only (no LLM raw SQL) |
+| TR-001 | brainstorm | accepted | Multi-tenant via hybrid declarative profile and connector registry |
 
 ---
 
@@ -25,6 +29,121 @@ Decisions, the alternatives weighed, and what was given up. Newest first.
 - **Options weighed**: ...
 - **Negative consequences**: ...
 -->
+
+TR-008 to TR-011 were recovered from the planning briefs and specs that
+lived in `docs/archive/` (removed; see `git log -- docs/archive`). Each was
+checked against the code when it was written here, and the
+**Changed since** lines record where the shipped design moved away from
+the plan.
+
+## TR-011: Marketing output is drafts for approval; nothing auto-posts
+
+- **Phase**: specify
+- **Status**: accepted
+- **Decision (Y-statement)**: In the context of an assistant that finds
+  threads, issues and content ideas for the operator's projects, facing the
+  reputational cost of a bot posting off-tone or self-promotional replies
+  in communities that ban them, we decided that **every outward-facing
+  artifact is queued as a `[DRAFT]` task for the operator to approve and
+  post by hand**, with product mentions only when directly relevant, to
+  achieve useful-first participation, accepting a human in the loop on
+  every post.
+- **Options weighed**: automated replies and follow/engagement loops.
+  Rejected: they trade account standing for volume.
+- **Negative consequences**: throughput is bounded by the operator's
+  attention. Drafts that are not reviewed go stale.
+- **Evidence**: `content_idea` and `comment_draft` in
+  `workflows/generators.py` only call `create_task`. No code path posts to
+  Reddit, HN, GitHub or X.
+
+## TR-010: One server-side research orchestrator, called as a tool
+
+- **Phase**: specify
+- **Status**: accepted
+- **Decision (Y-statement)**: In the context of OpenClaw running a single
+  agent, facing questions that need several sources compared and cited,
+  we decided to **give that agent one rich tool (`POST /research`) that
+  fans out across channels server-side, ranks with tome's scoring and
+  flags confidence**, to achieve cited multi-source answers on one agent,
+  accepting no parallel deep-dive agents inside the stack.
+- **Options weighed**:
+  - Lead/subagent research topology (Anthropic's multi-agent pattern):
+    better on broad questions in their eval, but at roughly 15x the tokens
+    of a single agent. Rejected for a budget-bounded personal stack. Heavy
+    topics go to the operator's local Claude Code session through
+    `scripts/tome_bridge.py` instead.
+  - Let the model summarise raw search results. Rejected: models invent
+    citations, so every claim must carry a fetched URL or DOI and
+    single-source findings are flagged "needs verification".
+- **Ranking**: base score plus authority bonuses (stars, HN and Reddit
+  score, citations), +0.05 for recency within two years, capped at 1.0;
+  each corroborating channel adds 0.05 up to 0.15
+  (`_TRIANGULATION_CAP`, `workflows/research.py`). The triangulation bonus
+  sets the confidence flag (`flag_confidence`).
+- **Changed since**: the plan had three channels (Reddit, GitHub, web).
+  The code adds `academic` (arXiv, Semantic Scholar) and `triz`, and
+  defaults to `discourse`, `code` and `discourse_web`.
+- **Negative consequences**: one slow channel delays the whole response;
+  partial failures land in `errors` rather than failing the call.
+
+## TR-009: APScheduler 3.x inside the workflows process
+
+- **Phase**: specify
+- **Status**: accepted
+- **Decision (Y-statement)**: In the context of cron-driven scans and
+  rundowns on a single host with a 128M workflows container, facing the
+  cost of another service to run, we decided to **embed APScheduler 3.x
+  (`AsyncIOScheduler`) in the FastAPI lifespan with an in-memory jobstore,
+  rebuilding jobs from the brain's `schedules` table on every boot**, to
+  achieve schedules managed over `/sched` with no extra container,
+  accepting a hard single-uvicorn-worker requirement.
+- **Options weighed**:
+  - Celery beat or arq: both need Redis. Rejected as a second stateful
+    service for a handful of jobs.
+  - An external cron container calling the API: rejected, schedules would
+    live outside the brain and `/sched` could not manage them.
+  - FastAPI-Utils `@repeat_every`: no cron syntax, no persistence.
+  - A Node scheduler: a second runtime to maintain.
+- **Changed since**: the spec chose APScheduler 4 (alpha) with a
+  SQLAlchemy datastore and named 3.x as the fallback. The code took the
+  fallback (`apscheduler<4`). A serialising jobstore would try to persist
+  the `brain_db` handle and its live sqlite connection, so the `schedules`
+  table is the source of truth instead (`workflows/scheduler.py`
+  docstring). Jobs run with `coalesce` and a 300 s misfire grace.
+- **Negative consequences**: two uvicorn workers would fire every job
+  twice. Scaling out means moving the scheduler to its own process first.
+
+## TR-008: Brain is SQLite in the workflows container
+
+- **Phase**: specify
+- **Status**: accepted
+- **Decision (Y-statement)**: In the context of a persistent knowledge store
+  and task queue for one operator, facing an in-memory task list that was
+  lost on every restart, we decided to **store pages, timeline, links,
+  tags and tasks in SQLite inside the existing workflows container, with
+  FTS5 for keywords and sqlite-vec for vectors merged by reciprocal rank
+  fusion (k=60)**, to achieve hybrid search with no new service, accepting
+  a single node with no replication and a less proven vector extension.
+- **Options weighed**:
+  - FTS5 only: no semantic search. Kept as the fallback when vectors are
+    unavailable, not as the design.
+  - PostgreSQL and pgvector as a separate service: more operations than
+    one operator needs. Kept as the upgrade path if the brain outgrows a
+    single file.
+  - A hosted brain (gbrain on Supabase): a monthly bill and a Bun runtime.
+- **Model**: rewritable "compiled" pages plus an append-only timeline and
+  typed links. A content hash makes identical upserts no-ops, so they
+  neither version nor re-embed. Chunks are 300 words with 50 overlap.
+- **Changed since**: the spec embedded each page on write with one fixed
+  model. The code embeds chunks from a 10-minute backfill job, with the
+  model set by `EMBED_MODEL`/`EMBED_DIM` and one vec table per model, since
+  vectors from different models cannot be compared. Planned query
+  expansion, four-layer result dedup and `!remember`/`!recall` chat
+  commands were never built.
+- **Negative consequences**: every `BrainDB` call serialises on one
+  `RLock`, and writes share one WAL file. A plain copy of a live
+  `brain.db` can miss what is still in the `-wal` file, so back it up with
+  the service stopped or with SQLite's `.backup`.
 
 ## TR-007: Keep the workflows container on root
 
