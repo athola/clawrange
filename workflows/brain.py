@@ -13,7 +13,7 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 import embeddings
-from brain_db import BrainDB, LinkType, PageType
+from brain_db import BrainDB, LinkType, PageType, clamp_limit
 
 # ─── Request/Response Models ──────────────────────────────────────
 
@@ -56,6 +56,7 @@ def create_brain_router(db: BrainDB) -> APIRouter:
             raise HTTPException(
                 400, f"Invalid search mode: {mode}. Use keyword, vector, or hybrid"
             )
+        limit = clamp_limit(limit)
 
         fallback = None  # why hybrid ran keyword-only, when it did
         if mode == "keyword":

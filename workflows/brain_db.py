@@ -129,6 +129,16 @@ def _chunk_text(text: str, max_words: int = 300, overlap_words: int = 50) -> lis
 
 
 MAX_SEARCH_LIMIT = 100
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def clamp_limit(limit: int) -> int:
+    """A search limit forced into 1..MAX_SEARCH_LIMIT.
+
+    Every search path clamps: sqlite-vec rejects a knn k above 4096 or below
+    0, which an unchecked ?limit= turned into a 500.
+    """
+    return max(1, min(int(limit), MAX_SEARCH_LIMIT))
 
 
 def _connect(db_path: str) -> tuple[sqlite3.Connection, str | None]:
@@ -668,6 +678,7 @@ class BrainDB:
         """
         if self._vec_table is None:
             return []
+        limit = clamp_limit(limit)
         blob = struct.pack(f"{len(query_vector)}f", *query_vector)
         rows = self._conn.execute(
             f"""
@@ -750,27 +761,37 @@ class BrainDB:
         if match not in ("all", "any"):
             raise ValueError(f"match must be 'all' or 'any', not {match!r}")
         # Treat user input as plain words: quote each token so FTS5 operators
-        # and stray quotes/parens can't raise a syntax error (a 500).
+        # and stray quotes/parens can't raise a syntax error (a 500). Control
+        # characters (a NUL ends the FTS5 string early) become word breaks.
+        query = _CONTROL_CHARS.sub(" ", query)
         tokens = [t.replace('"', '""') for t in query.split()]
         tokens = [t for t in tokens if t.strip('"')]
         if not tokens:
             return []
         joiner = " OR " if match == "any" else " "
         query = joiner.join(f'"{t}"' for t in tokens)
-        limit = max(1, min(int(limit), MAX_SEARCH_LIMIT))
-        rows = self._conn.execute(
-            """
-            SELECT p.slug, p.title, p.page_type, p.compiled,
-                   snippet(pages_fts, 2, '...', '...', '...', 32) as snippet,
-                   pages_fts.rank as score
-            FROM pages_fts
-            JOIN pages p ON pages_fts.slug = p.slug
-            WHERE pages_fts MATCH ?
-            ORDER BY rank
-            LIMIT ?
-            """,
-            (query, limit),
-        ).fetchall()
+        limit = clamp_limit(limit)
+        try:
+            rows = self._conn.execute(
+                """
+                SELECT p.slug, p.title, p.page_type, p.compiled,
+                       snippet(pages_fts, 2, '...', '...', '...', 32) as snippet,
+                       pages_fts.rank as score
+                FROM pages_fts
+                JOIN pages p ON pages_fts.slug = p.slug
+                WHERE pages_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (query, limit),
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            # Escaping above should make this unreachable; a query FTS5 still
+            # refuses has no keyword matches rather than being a server error.
+            logging.getLogger("clawrange.brain").warning(
+                "FTS5 rejected query %r: %s", query[:200], exc
+            )
+            return []
         return [self._row_to_dict(r) for r in rows]
 
     def search_hybrid(
@@ -794,7 +815,8 @@ class BrainDB:
         (retrieval eval: hit@1 0.21 vs 0.79 on the fixture set). Falls back to
         keyword-only if vector is unavailable or query_vector is None.
         """
-        depth = depth or limit * 2
+        limit = clamp_limit(limit)
+        depth = clamp_limit(depth or limit * 2)
         use_vec = bool(query_vector) and self._vec_table is not None
         match = kw_match or ("all" if use_vec else "any")
         kw_results = self.search_keyword(query, limit=depth, match=match)

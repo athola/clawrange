@@ -6,6 +6,7 @@ or review ids (G2, G3, G4, G11, S5).
 
 import asyncio
 import logging
+import sqlite3
 import sys
 
 import httpx
@@ -213,3 +214,95 @@ class TestQueryTimeout:
         cfg = embeddings.EmbedConfig("u", "m", 4, "k", timeout=4.0)
         asyncio.run(embeddings.request(["x"], cfg))
         assert seen == [4.0]
+
+
+# ─── S5: /brain/search must not 500 on bad limit or control chars ─
+
+
+class TestSearchInputHardening:
+    @pytest.fixture
+    def embedded(self, vec_db, monkeypatch):
+        """A page with a vector, and a query embed that always succeeds."""
+        monkeypatch.setattr(embeddings, "config", lambda env=None: _cfg4())
+
+        async def ok(texts, cfg=None, batch=96):
+            return [[1.0, 0, 0, 0] for _ in texts]
+
+        monkeypatch.setattr(embeddings, "embed_texts", ok)
+        vec_db.upsert_page("net/wifi", "WiFi", "note", "wireless access points")
+        chunk = vec_db.missing_embeddings(1)[0]
+        vec_db.store_embeddings([(chunk["id"], [1.0, 0, 0, 0])])
+        return vec_db
+
+    @pytest.mark.parametrize("limit", [2000, 5000, -3, 0])
+    @pytest.mark.parametrize("mode", ["vector", "hybrid", "keyword"])
+    def test_out_of_range_limit_is_clamped(self, embedded, mode, limit):
+        r = _client(embedded).get(f"/brain/search?q=wireless&mode={mode}&limit={limit}")
+        assert r.status_code == 200
+        assert [x["slug"] for x in r.json()["results"]] == ["net/wifi"]
+
+    @pytest.mark.parametrize("limit", [5000, -3])
+    def test_search_vector_clamps_k(self, embedded, limit):
+        hits = embedded.search_vector([1.0, 0, 0, 0], limit=limit)
+        assert [h["slug"] for h in hits] == ["net/wifi"]
+
+    def test_hybrid_clamps_depth(self, embedded):
+        hits = embedded.search_hybrid("wireless", [1.0, 0, 0, 0], limit=3000)
+        assert [h["slug"] for h in hits] == ["net/wifi"]
+
+    def test_nul_byte_query_does_not_raise(self, db):
+        db.upsert_page("net/wifi", "WiFi", "note", "wireless access points")
+        assert db.search_keyword("\x00x") == []
+        r = _client(db).get("/brain/search?q=%00x&mode=keyword")
+        assert r.status_code == 200
+        assert r.json()["results"] == []
+
+    def test_control_chars_split_words(self, db):
+        db.upsert_page("net/wifi", "WiFi", "note", "wireless access points")
+        hits = db.search_keyword("wireless\x00\x1faccess\x7f")
+        assert [h["slug"] for h in hits] == ["net/wifi"]
+
+    def test_fts_operational_error_returns_empty(self, db, caplog):
+        db.upsert_page("net/wifi", "WiFi", "note", "wireless access points")
+        real = db._conn
+
+        class Raising:
+            def execute(self, sql, *args):
+                if "MATCH" in sql:
+                    raise sqlite3.OperationalError("fts5: syntax error")
+                return real.execute(sql, *args)
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+        db._conn = Raising()
+        with caplog.at_level(logging.WARNING):
+            assert db.search_keyword("wireless") == []
+        assert "fts5: syntax error" in caplog.text
+
+
+# ─── G11: no-vector hybrid search ORs the query words ─────────────
+
+
+class TestHybridAnyTermsFallback:
+    def test_vector_without_active_table_uses_any_terms(self, db):
+        """A query vector but no vector table (sqlite-vec missing, or no
+        model configured) is still keyword-only, so it must OR the words."""
+        db.upsert_page("n/a", "Launch", "note", "post Show HN on a weekday")
+        assert db._vec_table is None
+        hits = db.search_hybrid("Show HN timing", [0.0, 1.0, 0.0, 0.0])
+        assert [h["slug"] for h in hits] == ["n/a"]
+
+    def test_route_with_failed_query_embed_uses_any_terms(self, vec_db, monkeypatch):
+        monkeypatch.setattr(embeddings, "config", lambda env=None: _cfg4())
+
+        async def fail(texts, cfg=None, batch=96):
+            return None
+
+        monkeypatch.setattr(embeddings, "embed_texts", fail)
+        vec_db.upsert_page("n/a", "Launch", "note", "post Show HN on a weekday")
+        chunk = vec_db.missing_embeddings(1)[0]
+        vec_db.store_embeddings([(chunk["id"], [1.0, 0, 0, 0])])
+        data = _client(vec_db).get("/brain/search?q=Show+HN+timing").json()
+        assert [r["slug"] for r in data["results"]] == ["n/a"]
+        assert data["mode"] == "keyword"
