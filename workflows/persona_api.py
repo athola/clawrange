@@ -107,15 +107,18 @@ def create_persona_router(brain_db, profile_provider, render_targets_fn) -> APIR
         p = _profile()
         pending = brain_db.list_learnings(profile=p.name, status="pending")
         targets = render_targets_fn(p)
+        # Per target group (soul, ws_soul, ...): can every file a render
+        # would write be replaced right now? Keyed by group, not path: this
+        # route is public and must not reveal the state directory.
+        writable: dict[str, bool] = {}
+        for key, path, _ in planned_writes(p, targets):
+            group = key.split(":", 1)[0]
+            writable[group] = writable.get(group, True) and target_writable(path)
         return {
             "profile": p.name,
             "pending": len(pending),
             "targets": list(targets.keys()),
-            # Per file a render would write: can it be replaced right now?
-            "writable": {
-                key: target_writable(path)
-                for key, path, _ in planned_writes(p, targets)
-            },
+            "writable": writable,
         }
 
     return router

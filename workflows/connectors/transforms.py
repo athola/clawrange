@@ -1,7 +1,7 @@
 """Connector transforms — map/clean raw rows into CRM records (FR-3.2).
 
 ``leads_clean`` renames source columns to CRM fields via ``mapping``, trims
-whitespace, lowercases ``email``, drops rows missing any ``required`` field,
+whitespace, drops rows missing any ``required`` field,
 defaults ``created_at`` to now, then dedupes on ``dedup_key`` (last-wins,
 case-insensitive; rows without the key are kept as-is). ``status`` is left
 unset unless the source supplies it: the CRM schema defaults new leads to
@@ -43,11 +43,6 @@ def leads_clean(rows: list[Record], spec: dict) -> list[Record]:
         else:
             rec = dict(raw)
         rec = {k: (v.strip() if isinstance(v, str) else v) for k, v in rec.items()}
-        if isinstance(rec.get("email"), str):
-            # Addresses are case-insensitive in practice, and the CRM's
-            # UNIQUE(email) is not: store one spelling.
-            rec["email"] = rec["email"].lower()
-
         if any(not rec.get(field) for field in required):
             continue
 

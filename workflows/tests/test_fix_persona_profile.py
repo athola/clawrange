@@ -243,6 +243,15 @@ def test_seed_overlay_stores_stripped_content_once(db):
     assert pl.seed_overlay(db, "cos", overlay) == 0  # no re-seed on next boot
 
 
+def test_export_overlay_matches_padded_overlay_entries(db):
+    overlay = [{"kind": "persona", "target": "Tone", "content": "  Be terse.  "}]
+    pl.seed_overlay(db, "cos", overlay)
+    assert len(pl.export_overlay(db, "cos", existing=overlay)) == 1  # no dup
+    (row,) = db.list_learnings(profile="cos")
+    db.set_learning_status(row["id"], "rejected")
+    assert pl.export_overlay(db, "cos", existing=overlay) == []
+
+
 # ─── #51: /healthz/persona reports writability ─────────────────────
 
 
@@ -254,12 +263,11 @@ def test_persona_health_reports_writability(db, tmp_path):
         "workspace_soul": [str(blocker / "SOUL.md")],
     }
     client = _persona_client(db, lambda p: targets)
-    body = client.get("/healthz/persona").json()
-    assert body["writable"] == {
-        "soul": True,
-        f"ws_soul:{blocker / 'SOUL.md'}": False,
-    }
+    r = client.get("/healthz/persona")
+    body = r.json()
+    assert body["writable"] == {"soul": True, "ws_soul": False}
     assert sorted(body["targets"]) == ["soul", "workspace_soul"]
+    assert str(tmp_path) not in r.text  # public route: no paths
 
 
 # ─── #15: scan_signals ignores its own signal rows ─────────────────
@@ -558,6 +566,42 @@ def test_unknown_shipping_is_not_insane():
     assert classify(feed, t, None).tier == "insane"
 
 
+@pytest.mark.parametrize(
+    "code",
+    [
+        # The make persona path: tenant_profile first, nothing else imported.
+        "import tenant_profile; tenant_profile.load_profile('lead-crm')",
+        # The service path: active_profile() swallows errors and caches None.
+        "import app, tenant_profile; assert tenant_profile.active_profile()",
+    ],
+)
+def test_validate_schedule_import_is_cycle_free(tmp_path, code):
+    """validate() lazily imports scheduler; a cycle there would surface only
+    in a fresh interpreter, where nothing is imported yet."""
+    import pathlib
+    import subprocess
+    import sys
+
+    workflows = pathlib.Path(__file__).resolve().parents[1]
+    env = {
+        **os.environ,
+        "CLAWRANGE_PROFILE": "lead-crm",
+        "BRAIN_DB_PATH": str(tmp_path / "brain.db"),
+        "HEARTBEAT_SEEN_PATH": str(tmp_path / "seen.json"),
+        "PYTHONPATH": str(workflows),
+    }
+    env.pop("CLAWRANGE_PROFILES_DIR", None)
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+
+
 def test_shipped_profiles_validate_with_live_registry():
     from tenant_profile import load_profile
 
@@ -710,7 +754,10 @@ def test_leads_clean_email_dedup_ignores_case():
     rows = [{"email": "Ada@X.com", "name": "A"}, {"email": "ada@x.com", "name": "B"}]
     out = leads_clean(rows, {"dedup_key": "email"})
     assert len(out) == 1 and out[0]["name"] == "B"
+    # The spelling is kept: rewriting it would stop matching a lead already
+    # stored under the CRM's case-sensitive UNIQUE(email) and insert a copy.
     assert out[0]["email"] == "ada@x.com"
+    assert leads_clean(rows[:1], {})[0]["email"] == "Ada@X.com"
     assert "status" not in out[0]  # schema default covers inserts only
 
 

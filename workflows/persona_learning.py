@@ -102,12 +102,18 @@ def export_overlay(brain_db, profile_name, existing=None):
     statuses: dict[tuple, set] = {}
     for r in rows:
         statuses.setdefault((r["target"], r["content"]), set()).add(r["status"])
+
+    def _key(item):
+        # seed_overlay stores the stripped content; match on it too, or a
+        # padded learned.yaml entry would look unknown to the brain.
+        return (item.get("target"), str(item.get("content") or "").strip())
+
     out = []
     for item in existing or []:
-        seen = statuses.get((item.get("target"), item.get("content")), set())
+        seen = statuses.get(_key(item), set())
         if "rejected" not in seen or "approved" in seen:
             out.append(item)
-    kept = {(e.get("target"), e.get("content")) for e in out}
+    kept = {_key(e) for e in out}
     for r in rows:
         if r["status"] == "approved" and (r["target"], r["content"]) not in kept:
             out.append(
