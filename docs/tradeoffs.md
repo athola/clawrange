@@ -6,6 +6,8 @@ Decisions, the alternatives weighed, and what was given up. Newest first.
 
 | ID | Phase | Status | Decision |
 |----|-------|--------|----------|
+| TR-007 | execute | accepted | Workflows keeps running as root; persona renders copy the target's mode and owner |
+| TR-006 | execute | accepted | `/healthz` stays 200 while degraded; the body, boot alert and logs carry the state |
 | TR-005 | execute | proposed | Keyword fallback ORs terms; hybrid with vectors unchanged until the eval shows a win |
 | TR-004 | execute | superseded | Keep per-file dev mounts; directory mount blocked by the nested soul.md bind (resolved: soul.md moved to `/opt`) |
 | TR-003 | plan | accepted | Regression-lock marketing seeds (RED equivalence test) before deleting constants |
@@ -23,6 +25,60 @@ Decisions, the alternatives weighed, and what was given up. Newest first.
 - **Options weighed**: ...
 - **Negative consequences**: ...
 -->
+
+## TR-007: Keep the workflows container on root
+
+- **Phase**: execute
+- **Status**: accepted
+- **Decision (Y-statement)**: In the context of persona renders that the
+  workflows service writes into OpenClaw's state directory, facing root-owned
+  0600 files the gateway (`runuser -u node`, uid 1000) could not read, we
+  decided to **keep workflows on root and have each render copy the replaced
+  file's mode and owner** (`persona._match_existing`: `fchmod` to the old
+  mode, `fchown` to the old owner when running as root, 0644 for a new
+  file), to achieve readable persona files without a migration, accepting
+  that the service keeps root inside its container.
+- **Options weighed**:
+  - `user: "1000:1000"` on the workflows service (#16.c). Rejected for now:
+    the service has always run as root (no `user:` in either compose file,
+    no `USER` in `workflows/Dockerfile`), so the files it already wrote under
+    the `./data/brain` and `OPENCLAW_STATE_DIR` bind mounts are root-owned.
+    Switching would need a one-time ownership migration of those host
+    directories first, or the brain database stops being writable.
+  - Chmod every render to a fixed 0644. Rejected: it would loosen a file the
+    operator tightened on purpose.
+- **Negative consequences**: a compromise of the workflows process is root in
+  its container. The container keeps `no-new-privileges` and a read-only
+  root filesystem. Revisit with the ownership migration.
+
+## TR-006: `/healthz` stays 200 while degraded
+
+- **Phase**: execute
+- **Status**: accepted
+- **Decision (Y-statement)**: In the context of the workflows health probe,
+  facing degraded states (broken brain query, no vector search, failed
+  scheduler, unknown `CLAWRANGE_PROFILE`) that a restart cannot fix, we
+  decided to **return 200 with `status: degraded` and a `problems` list**
+  (#28.a, #28.c), to achieve an assistant that keeps answering while the
+  operator fixes the cause, accepting that Docker reports the container
+  healthy while it is degraded.
+- **Options weighed**:
+  - 503 when `problems` is non-empty. Rejected: the compose healthcheck and
+    `workflows/entrypoint.sh` both use `urlopen`, which treats any non-200 as
+    a failure. OpenClaw's `depends_on: condition: service_healthy` would keep
+    the assistant from starting at all, and the entrypoint exits after
+    `HEALTH_MAX_FAILS` consecutive failures, so `restart: unless-stopped`
+    would loop the service over a bad profile or table that a restart
+    leaves unchanged.
+  - Teach the probes to parse `status`. Rejected for now: two probes to keep
+    in step for no gain over reading the body.
+  - Fail startup on an explicitly set but unknown profile. Rejected: same
+    restart loop.
+- **Negative consequences**: degraded state is visible only where someone
+  looks: the `/healthz` body (problem names for anonymous callers, detail
+  with the token), the boot Telegram alert (`Workflows started degraded`,
+  which covers scheduler and profile errors, not db or vector search) and the
+  logs.
 
 ## TR-005: Measure retrieval offline before tuning it
 
