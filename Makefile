@@ -149,8 +149,9 @@ profile: ## Render a profile's persona files (as make persona) + set it in .env 
 		echo "set CLAWRANGE_PROFILE=$(PROFILE) in .env"; \
 	else echo "no .env yet — run 'make setup' first (CLAWRANGE_PROFILE not set)"; fi
 
-seed-demo: ## Load the lead-crm demo leads into the CRM for an offline demo
-	@CRM_DB_PATH=$${CRM_DB_PATH:-data/crm/crm.db} uv run python scripts/seed_demo.py
+seed-demo: ## Load the lead-crm demo leads into the CRM (CRM_DB_PATH: command line, then .env, then data/crm/crm.db)
+	@cli_db="$${CRM_DB_PATH:-}"; $(LOAD_ENV); \
+	CRM_DB_PATH="$${cli_db:-$${CRM_DB_PATH:-data/crm/crm.db}}" uv run python scripts/seed_demo.py
 
 # ─── Docker Inspection ────────────────────────────────────────────
 

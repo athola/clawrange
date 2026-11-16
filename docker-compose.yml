@@ -189,6 +189,18 @@ services:
       - HEARTBEAT_DIGEST_INTERVAL=${HEARTBEAT_DIGEST_INTERVAL:-3600}
       # 0 stops the heartbeat inventing its own research tasks.
       - HEARTBEAT_LLM_SUGGEST=${HEARTBEAT_LLM_SUGGEST:-1}
+      # Heartbeat and watchdog tunables. Defaults repeat the code's own:
+      # digest.py and watchdog.py parse several at import, so an empty value
+      # would stop the service booting (tests/test_compose_env.py).
+      - HEARTBEAT_WORK_DEADLINE=${HEARTBEAT_WORK_DEADLINE:-}
+      - HEARTBEAT_ACTIVE_REAP_HOURS=${HEARTBEAT_ACTIVE_REAP_HOURS:-}
+      - HEARTBEAT_DIGEST_MAX_MESSAGES=${HEARTBEAT_DIGEST_MAX_MESSAGES:-20}
+      - HEARTBEAT_DIGEST_RESULT_LIMIT=${HEARTBEAT_DIGEST_RESULT_LIMIT:-3500}
+      - HEARTBEAT_DIGEST_MAX_LINES=${HEARTBEAT_DIGEST_MAX_LINES:-200}
+      - HEARTBEAT_WATCH_TZ=${HEARTBEAT_WATCH_TZ:-}
+      - HEARTBEAT_WATCH_ACTIVE=${HEARTBEAT_WATCH_ACTIVE:-8-20}
+      - HEARTBEAT_WATCH_STALL_SECS=${HEARTBEAT_WATCH_STALL_SECS:-900}
+      - HEARTBEAT_WATCH_REALERT_SECS=${HEARTBEAT_WATCH_REALERT_SECS:-7200}
       # Non-empty enables the flagged outcome-signal persona proposals.
       - PERSONA_SIGNAL_LEARNING=${PERSONA_SIGNAL_LEARNING:-}
       # Lead-CRM profile connector credentials (unset -> connector disabled).
