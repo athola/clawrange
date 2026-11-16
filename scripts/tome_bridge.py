@@ -41,6 +41,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -51,11 +52,24 @@ DEFAULT_BASE = os.environ.get("WORKFLOWS_BASE", "http://localhost:5678")
 DEFAULT_CLAUDE = os.environ.get("CLAUDE_BIN", "claude")
 DEFAULT_TIMEOUT = int(os.environ.get("TOME_BRIDGE_TIMEOUT", "1800"))
 
-# Tools the bridged Claude session may never use. The topic comes from the
-# workflows task queue, so treat it as untrusted prompt text: research needs
-# search, fetch and read, never shell or file writes.
-DENIED_TOOLS = ("Bash", "Edit", "Write", "MultiEdit", "NotebookEdit")
+# The only tools the bridged Claude session gets. The topic comes from the
+# workflows task queue, so treat it as untrusted prompt text. An allowlist,
+# not a deny-list: a deny-list misses every tool it does not name (Read can
+# open .env, MCP servers bring their own). Research needs web search and
+# fetch, the tome skill and its channel subagents; nothing touches local
+# files or runs commands. --tools limits what exists, --allowedTools
+# pre-approves it, and dontAsk denies anything else instead of prompting.
+ALLOWED_TOOLS = ("WebSearch", "WebFetch", "Skill", "Agent")
 MAX_TOPIC_CHARS = 300
+
+# Workflows API failures that must not escape a pass: HTTPError and URLError
+# (connection refused, DNS), TimeoutError/ConnectionResetError (OSError), and
+# a non-JSON body (json.JSONDecodeError is a ValueError).
+NETWORK_ERRORS = (urllib.error.URLError, OSError, ValueError)
+# Posting the result is the step that loses work if it fails, so retry it
+# with bounded backoff (2s, 4s, 8s, 16s: about 30s in total).
+COMPLETE_ATTEMPTS = 5
+COMPLETE_BACKOFF_SECS = 2.0
 _UNSAFE_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 _TOME_PATTERNS = (
@@ -128,23 +142,33 @@ def run_tome_research(claude_bin: str, topic: str, timeout: int) -> tuple[int, s
 
     Returns (returncode, combined_stdout_stderr).
     """
-    # The prompt must precede --disallowedTools: that flag is variadic and
-    # would otherwise swallow the prompt as one more tool name.
+    # The prompt comes first and the tool lists use the --flag=a,b form:
+    # both flags are variadic and would otherwise swallow a later positional.
+    tools = ",".join(ALLOWED_TOOLS)
     cmd = [
         claude_bin,
         "--print",
         f"/tome:research {topic}",
-        "--disallowedTools",
-        *DENIED_TOOLS,
+        f"--tools={tools}",
+        f"--allowedTools={tools}",
+        "--permission-mode",
+        "dontAsk",
+        # Ignore every MCP server from user/project config: each brings
+        # tools the allowlist above never reviewed.
+        "--strict-mcp-config",
     ]
     try:
-        result = subprocess.run(
-            cmd,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        # An empty scratch dir as cwd: started from the repo root the session
+        # would sit next to .env and load the project's CLAUDE.md/settings.
+        with tempfile.TemporaryDirectory(prefix="tome-bridge-") as workdir:
+            result = subprocess.run(
+                cmd,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=workdir,
+            )
     except subprocess.TimeoutExpired:
         return 124, f"tome bridge: claude timed out after {timeout}s"
     except FileNotFoundError:
@@ -172,37 +196,63 @@ def process_one_task(
 
     try:
         claim_task(base, task_id)
-    except urllib.error.HTTPError as exc:
+    except NETWORK_ERRORS as exc:
+        # Unclaimed (or unknown): leave it for the next pass.
         logger.warning("tome bridge: claim failed for %s: %s", task_id, exc)
         return True
 
     problem = topic_problem(topic)
     if problem is not None:
         logger.warning("tome bridge: task %s topic rejected: %s", task_id, problem)
-        try:
-            complete_task(
-                base, task_id, f"tome bridge: topic rejected ({problem})", "failed"
-            )
-        except urllib.error.HTTPError as exc:
-            logger.error("tome bridge: complete_task failed for %s: %s", task_id, exc)
+        complete_with_retry(
+            base, task_id, f"tome bridge: topic rejected ({problem})", "failed"
+        )
         return True
 
     rc, output = run_tome_research(claude_bin, topic, timeout)
     status = "completed" if rc == 0 else "failed"
     body = output[:8000] if output else f"tome /research returned exit code {rc}"
 
-    try:
-        complete_task(base, task_id, body, status)
+    if complete_with_retry(base, task_id, body, status):
         logger.info("tome bridge: task %s -> %s", task_id, status)
-    except urllib.error.HTTPError as exc:
-        logger.error("tome bridge: complete_task failed for %s: %s", task_id, exc)
     return True
+
+
+def complete_with_retry(base: str, task_id: str, result: str, status: str) -> bool:
+    """Post a task result, retrying transient failures with bounded backoff.
+
+    Returns True once it lands. After the last attempt it logs the result
+    itself, so the research output is never lost silently, and returns False.
+    """
+    delay = COMPLETE_BACKOFF_SECS
+    for attempt in range(1, COMPLETE_ATTEMPTS + 1):
+        try:
+            complete_task(base, task_id, result, status)
+            return True
+        except NETWORK_ERRORS as exc:
+            logger.warning(
+                "tome bridge: complete_task attempt %d/%d failed for %s: %s",
+                attempt,
+                COMPLETE_ATTEMPTS,
+                task_id,
+                exc,
+            )
+            if attempt < COMPLETE_ATTEMPTS:
+                time.sleep(delay)
+                delay *= 2
+    logger.error(
+        "tome bridge: giving up posting %s (%s); task stays active. Result:\n%s",
+        task_id,
+        status,
+        result,
+    )
+    return False
 
 
 def run_once(base: str, claude_bin: str, timeout: int, dry_run: bool) -> int:
     try:
         tasks = list_pending_tasks(base)
-    except urllib.error.URLError as exc:
+    except NETWORK_ERRORS as exc:
         logger.error("tome bridge: workflows unreachable at %s: %s", base, exc)
         return 1
 
@@ -244,7 +294,13 @@ def main(argv: list[str] | None = None) -> int:
         return run_once(args.base_url, args.claude_bin, args.timeout, args.dry_run)
 
     while True:
-        rc = run_once(args.base_url, args.claude_bin, args.timeout, args.dry_run)
+        try:
+            rc = run_once(args.base_url, args.claude_bin, args.timeout, args.dry_run)
+        except Exception:
+            # Keep watching: one malformed task or an unforeseen error must
+            # not end the poll loop. Back off as if workflows were down.
+            logger.exception("tome bridge: pass failed")
+            rc = 1
         if rc == 1:
             # Workflows down; back off but keep watching.
             time.sleep(min(args.interval * 2, 300))
