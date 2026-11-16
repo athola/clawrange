@@ -3,6 +3,9 @@
 import asyncio
 import json
 import logging
+import os
+import subprocess
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -450,3 +453,90 @@ class TestConfigValidation:
         cfg = _config(search={"provider": "nowhere", "models": ["m"]})
         with pytest.raises(ValueError, match="search"):
             llm_proxy._validate_config(cfg, {})
+
+
+# ─── G1 / S2: auth allowlist and the shipped placeholder token ───────
+
+REPO = Path(__file__).resolve().parents[2]
+PLACEHOLDER = "generate-a-token-here"
+
+
+class TestAuthHardening:
+    @pytest.mark.parametrize("path", ["/tier\n", "/healthz\n", "/sched/x\n"])
+    def test_trailing_newline_is_not_public(self, path):
+        assert auth.is_public("GET", path) is False
+
+    def test_placeholder_token_never_authenticates(self):
+        assert auth.bearer_ok(f"Bearer {PLACEHOLDER}", PLACEHOLDER) is False
+
+    def test_placeholder_token_is_reported_at_startup(self, caplog):
+        caplog.set_level(logging.ERROR, logger="clawrange.auth")
+        assert auth.warn_if_unset(PLACEHOLDER) is True
+        assert "placeholder" in caplog.text
+
+    def test_placeholder_rejected_through_the_app(self, monkeypatch):
+        import app as app_module
+
+        monkeypatch.setattr(llm_proxy, "PROXY_AUTH_TOKEN", PLACEHOLDER)
+        saved = app_module.app.dependency_overrides.pop(auth.require_token, None)
+        try:
+            r = TestClient(app_module.app).get(
+                "/task", headers={"Authorization": f"Bearer {PLACEHOLDER}"}
+            )
+        finally:
+            if saved is not None:
+                app_module.app.dependency_overrides[auth.require_token] = saved
+        assert r.status_code == 401
+
+    def test_env_example_ships_no_token_value(self):
+        lines = (REPO / ".env.example").read_text().splitlines()
+        token = [ln for ln in lines if ln.startswith("PROXY_AUTH_TOKEN=")]
+        assert token == ["PROXY_AUTH_TOKEN="]
+
+    @pytest.mark.parametrize("value", ["", PLACEHOLDER])
+    def test_make_tome_bridge_refuses_unset_or_placeholder(self, tmp_path, value):
+        stub = tmp_path / "bin"
+        stub.mkdir()
+        marker = tmp_path / "ran"
+        uv = stub / "uv"
+        uv.write_text(f'#!/usr/bin/env bash\ntouch "{marker}"\n')
+        uv.chmod(0o755)
+        env = {
+            "PATH": f"{stub}{os.pathsep}{os.environ['PATH']}",
+            "PROXY_AUTH_TOKEN": value,
+        }
+        proc = subprocess.run(
+            ["make", "-s", "-f", str(REPO / "Makefile"), "tome-bridge"],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        assert proc.returncode != 0
+        assert "PROXY_AUTH_TOKEN" in proc.stderr
+        assert not marker.exists()
+
+    def test_make_tome_bridge_runs_with_a_real_token(self, tmp_path):
+        stub = tmp_path / "bin"
+        stub.mkdir()
+        marker = tmp_path / "ran"
+        uv = stub / "uv"
+        uv.write_text(f'#!/usr/bin/env bash\ntouch "{marker}"\n')
+        uv.chmod(0o755)
+        env = {
+            "PATH": f"{stub}{os.pathsep}{os.environ['PATH']}",
+            "PROXY_AUTH_TOKEN": "a-real-token",
+        }
+        proc = subprocess.run(
+            ["make", "-s", "-f", str(REPO / "Makefile"), "tome-bridge"],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert marker.exists()

@@ -79,10 +79,11 @@ test-research: ## Smoke test the /research endpoint with a live topic
 	@./scripts/test_research.sh "$(TOPIC)"
 
 # The task queue API requires a bearer token: export PROXY_AUTH_TOKEN from
-# .env (never printed) and refuse to run without it.
+# .env (never printed) and refuse to run without it. The old .env.example
+# placeholder counts as unset (the API rejects it too, see workflows/auth.py).
 TOME_BRIDGE_ENV = $(LOAD_ENV); \
-	if [ -z "$${PROXY_AUTH_TOKEN:-}" ]; then \
-		echo "PROXY_AUTH_TOKEN is empty: set it in .env (the task queue API requires it)." >&2; \
+	if [ -z "$${PROXY_AUTH_TOKEN:-}" ] || [ "$${PROXY_AUTH_TOKEN}" = "generate-a-token-here" ]; then \
+		echo "PROXY_AUTH_TOKEN is empty or a placeholder: set a real token in .env (the task queue API requires it)." >&2; \
 		exit 1; \
 	fi
 
