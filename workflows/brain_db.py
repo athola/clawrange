@@ -1351,11 +1351,15 @@ class BrainDB:
     def update_schedule_status(
         self, schedule_id: str, last_run: str, last_status: str
     ) -> None:
-        self._conn.execute(
+        """Raises ValueError when no schedule has ``schedule_id``: a status
+        written under the wrong id would otherwise vanish silently."""
+        cur = self._conn.execute(
             "UPDATE schedules SET last_run=?, last_status=?, updated_at=? WHERE id=?",
             (last_run, last_status, _now(), schedule_id),
         )
         self._conn.commit()
+        if cur.rowcount == 0:
+            raise ValueError(f"Schedule not found: {schedule_id}")
 
     def set_schedule_paused(
         self, schedule_id: str, paused: bool

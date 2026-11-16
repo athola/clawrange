@@ -516,6 +516,7 @@ async def morning_digest_generator(
     top_per_project: int = 4,
     popularity_multiplier: float = 2.0,
     popular_bonus_cap: int = 2,
+    schedule_id: str = "morning_digest",
     **kwargs,
 ) -> None:
     """Deliver the daily outreach rundown to Telegram.
@@ -702,7 +703,7 @@ async def morning_digest_generator(
         f"{len(newly_promoted)} promoted, synthesis {'ok' if synthesis else 'off'}"
     )
     status = _delivery_status(sent, total, counts)
-    _record_status(brain_db, "morning_digest", status)
+    _record_status(brain_db, schedule_id, status)
 
     if sent < total:
         logger.warning("morning_digest: %s; not marking seen", status)
@@ -869,6 +870,7 @@ async def hot_pulse_generator(
     quiet_hours_start: int = 0,
     quiet_hours_end: int = 5,
     quiet_hours_tz: str | None = None,
+    schedule_id: str = "hot_pulse",
     **kwargs,
 ) -> None:
     """Reddit pulse for brand-new comment candidates.
@@ -931,7 +933,7 @@ async def hot_pulse_generator(
             local_now = now.astimezone(ZoneInfo(quiet_hours_tz)).strftime("%H:%M")
             _record_status(
                 brain_db,
-                "hot_pulse",
+                schedule_id,
                 f"quiet hours (entered at {local_now} {quiet_hours_tz}, "
                 f"resume {quiet_hours_end:02d}:00)",
                 when=now,
@@ -958,7 +960,7 @@ async def hot_pulse_generator(
         if elapsed_min < min_delivery_interval_minutes:
             _record_status(
                 brain_db,
-                "hot_pulse",
+                schedule_id,
                 f"throttled ({elapsed_min:.1f}m of {min_delivery_interval_minutes}m)",
                 when=now,
             )
@@ -1051,7 +1053,7 @@ async def hot_pulse_generator(
     # operator can't distinguish "scheduler dead" from "no fresh hits".
     _record_status(
         brain_db,
-        "hot_pulse",
+        schedule_id,
         f"reddit outage, 0 picks ({health_note})"
         if outage
         else f"ok ({n_picks} picks; {health_note})",
@@ -1110,7 +1112,7 @@ async def hot_pulse_generator(
             "hot_pulse: telegram delivered %d/%d msgs; not marking seen", sent, total
         )
         _record_status(
-            brain_db, "hot_pulse", _delivery_status(sent, total, f"{n_picks} picks")
+            brain_db, schedule_id, _delivery_status(sent, total, f"{n_picks} picks")
         )
         return
 
@@ -1531,7 +1533,10 @@ async def income_review_generator(
 
 
 async def homelab_deals_generator(
-    brain_db, profile_name: str | None = None, **kwargs
+    brain_db,
+    profile_name: str | None = None,
+    schedule_id: str = "homelab_deals",
+    **kwargs,
 ) -> None:
     """Daily homelab hardware deal rundown, delivered to Telegram.
 
@@ -1602,7 +1607,7 @@ async def homelab_deals_generator(
         f"{len(leads)} leads, synthesis {'ok' if synthesis else 'off'}"
     )
     status = _delivery_status(sent, total_msgs, counts)
-    _record_status(brain_db, "homelab_deals", status)
+    _record_status(brain_db, schedule_id, status)
     if sent < total_msgs:
         logger.warning("homelab_deals: %s; not marking seen", status)
         return

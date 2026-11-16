@@ -12,17 +12,59 @@ import json
 import logging
 import re
 from datetime import UTC, datetime, timedelta
+from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
+from apscheduler.events import EVENT_JOB_ERROR, JobExecutionEvent
 from apscheduler.jobstores.base import JobLookupError
 from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from generators import GENERATORS
+import watchdog
+from generators import GENERATORS, _redact_urls
 from watchdog import register as register_watchdog
 
 logger = logging.getLogger("clawrange.scheduler")
+
+StatusKind = Literal["ok", "delivery_failed", "error"]
+
+
+def status_kind(text: str | None) -> StatusKind:
+    """Classify a stored schedule last_status.
+
+    One reader for the /sched dashboard and the catch-up check. Errors are
+    written as ``error: ...`` / ``error (...)`` and a Reddit outage as
+    ``reddit outage, ...``; a Telegram delivery shortfall contains
+    ``FAILED`` (``FAILED telegram 1/3`` or ``ok (...; telegram FAILED ...)``).
+    """
+    s = (text or "").strip()
+    if s.lower().startswith(("error", "reddit outage")):
+        return "error"
+    if "FAILED" in s:
+        return "delivery_failed"
+    return "ok"
+
+
+def _new_state() -> dict[str, Any]:
+    return {"status": "not_started", "errors": [], "timezone": None}
+
+
+# Startup outcome of init_scheduler, read by /healthz and the lifespan alert.
+_STATE: dict[str, Any] = _new_state()
+
+
+def scheduler_state() -> dict[str, Any]:
+    """``status`` is not_started, running, degraded (running with startup
+    errors) or failed (not running); ``errors`` lists what went wrong."""
+    return {**_STATE, "errors": list(_STATE["errors"])}
+
+
+def _startup_error(what: str, exc: BaseException | str) -> None:
+    msg = f"{what}: {exc}"
+    _STATE["errors"].append(msg)
+    logger.error("scheduler startup: %s", msg)
+
 
 # Daily reports that must arrive even when workflows was down at fire time.
 # The jobstore is in-memory, so without this a restart spanning 08:00
@@ -66,9 +108,21 @@ def _missed_fire(sched: dict, now: datetime, tz_name: str) -> datetime | None:
         return None
     last_run = sched.get("last_run")
     if last_run and datetime.fromisoformat(last_run) >= prev:
-        if not (sched.get("last_status") or "").startswith("FAILED"):
+        if status_kind(sched.get("last_status")) != "delivery_failed":
             return None
     return prev
+
+
+def _job_kwargs(sched: dict, brain_db) -> dict:
+    """Generator kwargs for a schedule row.
+
+    ``schedule_id`` is always the row's own id, so a generator records its
+    status on the schedule that fired it, whatever the stored kwargs say.
+    """
+    kwargs = json.loads(sched.get("kwargs") or "{}")
+    kwargs["brain_db"] = brain_db
+    kwargs["schedule_id"] = sched["id"]
+    return kwargs
 
 
 def _queue_catch_ups(
@@ -79,23 +133,22 @@ def _queue_catch_ups(
     for sched in schedules:
         if sched.get("paused") or sched["id"] not in opted_in:
             continue
+        # One bad row (unknown kind, bad cron or kwargs) skips only itself.
         try:
             missed = _missed_fire(sched, now, tz_name)
+            if missed is None:
+                continue
+            scheduler.add_job(
+                GENERATORS[sched["kind"]],
+                "date",
+                run_date=now + CATCH_UP_DELAY,
+                id=f"catchup_{sched['id']}",
+                kwargs=_job_kwargs(sched, brain_db),
+                replace_existing=True,
+            )
         except Exception as exc:
-            logger.warning("catch-up check failed for %s: %s", sched["id"], exc)
+            logger.warning("catch-up failed for %s: %r", sched["id"], exc)
             continue
-        if missed is None:
-            continue
-        kwargs = json.loads(sched.get("kwargs") or "{}")
-        kwargs["brain_db"] = brain_db
-        scheduler.add_job(
-            GENERATORS[sched["kind"]],
-            "date",
-            run_date=now + CATCH_UP_DELAY,
-            id=f"catchup_{sched['id']}",
-            kwargs=kwargs,
-            replace_existing=True,
-        )
         logger.warning(
             "catch-up: %s missed its %s fire; running at boot",
             sched["id"],
@@ -142,39 +195,104 @@ def register_maintenance(scheduler, brain_db) -> None:
     )
 
 
-def init_scheduler(brain_db) -> AsyncIOScheduler | None:
-    """Create and configure the scheduler. Returns None on failure."""
+def _valid_tz(name: str) -> bool:
     try:
-        import tenant_profile
+        ZoneInfo(name)
+    except (ValueError, KeyError):  # ZoneInfoNotFoundError is a KeyError
+        return False
+    return True
 
-        tz_name = tenant_profile.operator_timezone()
+
+def _job_error_listener(brain_db):
+    """EVENT_JOB_ERROR handler: a crashed tenant job records ``error: ...``
+    on its schedule row, so /sched and the dashboard show the failure."""
+
+    def listener(event: JobExecutionEvent) -> None:
+        job_id = event.job_id or ""
+        exc = event.exception
+        logger.error("scheduled job %s crashed: %r", job_id, exc)
+        for prefix in ("marketing_", "catchup_"):
+            if job_id.startswith(prefix):
+                status = _redact_urls(f"error: {type(exc).__name__}: {exc}")[:300]
+                try:
+                    brain_db.update_schedule_status(
+                        job_id[len(prefix) :], datetime.now(UTC).isoformat(), status
+                    )
+                except Exception as write_exc:
+                    logger.warning(
+                        "could not record crash of %s: %s", job_id, write_exc
+                    )
+                return
+
+    return listener
+
+
+def init_scheduler(brain_db) -> AsyncIOScheduler | None:
+    """Create, populate and start the scheduler.
+
+    Each step fails on its own: a bad timezone falls back to UTC, and a
+    broken schedules table or catch-up scan still leaves the heartbeat
+    watchdog and maintenance jobs running. Every failure is logged at ERROR
+    and recorded in ``scheduler_state()``. Returns None only when the
+    scheduler itself could not start.
+    """
+    import tenant_profile
+
+    _STATE.update(_new_state())
+    tz_name = tenant_profile.operator_timezone()
+    if not _valid_tz(tz_name):
+        _startup_error("timezone", f"unknown timezone {tz_name!r}, using UTC")
+        tz_name = "UTC"
+    _STATE["timezone"] = tz_name
+    watch_tz = watchdog._tz_name()
+    if not _valid_tz(watch_tz):
+        _startup_error("watchdog", f"unknown HEARTBEAT_WATCH_TZ {watch_tz!r}")
+
+    try:
         scheduler = AsyncIOScheduler(
             jobstores={"default": MemoryJobStore()},
             timezone=tz_name,
             job_defaults={"misfire_grace_time": 300, "coalesce": True},
         )
-
-        # Re-register schedules from the database table
-        schedules = brain_db.list_schedules()
-        for sched in schedules:
-            if not sched.get("paused"):
-                _register_job(scheduler, sched, brain_db)
-        try:
-            _queue_catch_ups(scheduler, schedules, brain_db, tz_name)
-        except Exception as exc:  # never let catch-up take the scheduler down
-            logger.warning("catch-up scan failed: %s", exc)
-
-        # Heartbeat watchdog: infrastructure, not a tenant schedule, so it
-        # registers directly and survives a wiped schedules table.
-        register_watchdog(scheduler)
-        register_maintenance(scheduler, brain_db)
-
-        scheduler.start()
-        logger.info("Scheduler started with %d active jobs", len(schedules))
-        return scheduler
+        scheduler.add_listener(_job_error_listener(brain_db), EVENT_JOB_ERROR)
     except Exception as exc:
-        logger.warning("Scheduler init failed (degrading to unscheduled mode): %s", exc)
+        _startup_error("create", exc)
+        _STATE["status"] = "failed"
         return None
+
+    # Heartbeat watchdog and maintenance: infrastructure, not tenant
+    # schedules, so they register first and survive a broken schedules table.
+    for what, register in (
+        ("watchdog", lambda: register_watchdog(scheduler)),
+        ("maintenance", lambda: register_maintenance(scheduler, brain_db)),
+    ):
+        try:
+            register()
+        except Exception as exc:
+            _startup_error(what, exc)
+
+    schedules: list = []
+    try:
+        schedules = brain_db.list_schedules()
+    except Exception as exc:
+        _startup_error("schedules", exc)
+    for sched in schedules:
+        if not sched.get("paused"):
+            _register_job(scheduler, sched, brain_db)
+    try:
+        _queue_catch_ups(scheduler, schedules, brain_db, tz_name)
+    except Exception as exc:  # never let catch-up take the scheduler down
+        _startup_error("catch-up", exc)
+
+    try:
+        scheduler.start()
+    except Exception as exc:
+        _startup_error("start", exc)
+        _STATE["status"] = "failed"
+        return None
+    _STATE["status"] = "degraded" if _STATE["errors"] else "running"
+    logger.info("Scheduler started with %d active jobs", len(schedules))
+    return scheduler
 
 
 def _register_job(scheduler: AsyncIOScheduler, sched: dict, brain_db) -> None:
@@ -185,12 +303,10 @@ def _register_job(scheduler: AsyncIOScheduler, sched: dict, brain_db) -> None:
         logger.warning("Unknown generator kind: %s", kind)
         return
 
-    kwargs = json.loads(sched.get("kwargs", "{}"))
-    kwargs["brain_db"] = brain_db
-
     job_id = f"marketing_{sched['id']}"
 
     try:
+        kwargs = _job_kwargs(sched, brain_db)
         existing = scheduler.get_job(job_id)
         if existing:
             scheduler.remove_job(job_id)
@@ -347,10 +463,7 @@ async def remove_schedule(
 ) -> bool:
     """Remove a schedule from DB and APScheduler."""
     if scheduler:
-        try:
-            scheduler.remove_job(f"marketing_{schedule_id}")
-        except Exception:
-            pass
+        _remove_job(scheduler, schedule_id)
     return brain_db.delete_schedule(schedule_id)
 
 
@@ -361,7 +474,7 @@ async def pause_schedule(
     if scheduler:
         try:
             scheduler.pause_job(f"marketing_{schedule_id}")
-        except Exception:
+        except JobLookupError:  # paused at boot, so never registered
             pass
     return brain_db.set_schedule_paused(schedule_id, True)
 
@@ -390,22 +503,29 @@ async def run_schedule_now(
     if kind not in GENERATORS:
         raise ValueError(f"Unknown generator kind: {kind}")
 
-    kwargs = json.loads(sched.get("kwargs", "{}"))
-    kwargs["brain_db"] = brain_db
-
     try:
-        await GENERATORS[kind](**kwargs)
-        # Generators that record their own outcome (e.g. morning_digest's
-        # "delivered N/N msgs") keep it; the catch-up check depends on it.
-        after = brain_db.get_schedule(sched["id"]) or {}
-        if after.get("last_run") == sched.get("last_run"):
-            now = datetime.now(UTC).isoformat()
-            brain_db.update_schedule_status(sched["id"], now, "ok")
-        return {"status": "ok", "schedule_id": sched["id"]}
+        await GENERATORS[kind](**_job_kwargs(sched, brain_db))
     except Exception as exc:
         now = datetime.now(UTC).isoformat()
-        brain_db.update_schedule_status(sched["id"], now, f"error: {exc}")
-        return {"status": "error", "schedule_id": sched["id"], "error": str(exc)}
+        status = _redact_urls(f"error: {exc}")
+        brain_db.update_schedule_status(sched["id"], now, status)
+        return {"status": "error", "schedule_id": sched["id"], "error": status}
+    # Generators that record their own outcome (e.g. morning_digest's
+    # "delivered N/N msgs") keep it; the catch-up check depends on it. They
+    # record under the schedule_id passed in, so a changed last_run means
+    # this run wrote it.
+    after = brain_db.get_schedule(sched["id"]) or {}
+    if after.get("last_run") == sched.get("last_run"):
+        brain_db.update_schedule_status(
+            sched["id"], datetime.now(UTC).isoformat(), "ok"
+        )
+        after = {**after, "last_status": "ok"}
+    last_status = after.get("last_status")
+    return {
+        "status": status_kind(last_status),
+        "schedule_id": sched["id"],
+        "last_status": last_status,
+    }
 
 
 def list_scheduled_jobs(scheduler: AsyncIOScheduler | None) -> list[dict]:
