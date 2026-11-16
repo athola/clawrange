@@ -71,10 +71,39 @@ if [ -z "$OPENROUTER_VAL" ] || echo "$OPENROUTER_VAL" | grep -qi "your-key\|exam
   echo "  Get a key at https://openrouter.ai/settings/keys"
 fi
 
+# ─── Persona (openclaw/soul.md) ────────────────────────────────────
+# soul.md is rendered per operator and gitignored, so a fresh clone has
+# none. Docker would then create the bind-mount source as an empty
+# root-owned directory, and OpenClaw would start with no persona.
+ensure_soul() {
+  local soul="openclaw/soul.md"
+  local profile="${CLAWRANGE_PROFILE:-starter}"
+  if [ -d "$soul" ]; then
+    echo "ERROR: $soul is a directory, not a file. Docker created it when the"
+    echo "  stack started before the persona was rendered. Remove it and retry:"
+    echo "  sudo rmdir $soul && make persona PROFILE=$profile"
+    exit 1
+  fi
+  [ -f "$soul" ] && return 0
+  if ! command -v uv >/dev/null 2>&1; then
+    echo "ERROR: $soul is missing and uv is not installed to render it."
+    echo "  Install uv, then run: make persona PROFILE=$profile"
+    exit 1
+  fi
+  echo "Rendering $soul from profile '$profile' (first run)..."
+  if ! make persona PROFILE="$profile" || [ ! -f "$soul" ]; then
+    echo "ERROR: could not render $soul from profile '$profile'."
+    echo "  Fix the profile (or CLAWRANGE_PROFILE in .env), then run:"
+    echo "  make persona PROFILE=$profile"
+    exit 1
+  fi
+}
+
 # ─── Start OpenClaw + workflows ────────────────────────────────────
 if [ "$SKIP_CORE" = true ]; then
   echo "Skipping core stack bring-up (--skip-core)."
 else
+  ensure_soul
   echo "Starting core stack (OpenClaw + workflows)..."
   docker compose up -d
 fi

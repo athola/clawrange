@@ -218,3 +218,75 @@ def test_heartbeat_marker_lives_in_root_owned_tmpfs():
     assert any(str(t).split(":")[0] == "/run" for t in tmpfs)
     for script in (SYNC, HEALTH):
         assert "${SYNC_HEARTBEAT_MARKER:-/run/" in script.read_text()
+
+
+# ─── start.sh: gitignored soul.md on a fresh clone ────────────────
+
+
+class TestStartSoul:
+    """openclaw/soul.md is gitignored, so a fresh clone has none. Docker then
+    creates the bind source as a root-owned directory and OpenClaw starts
+    with no persona. start.sh must render it or stop with a clear message."""
+
+    @pytest.fixture
+    def repo(self, tmp_path):
+        root = tmp_path / "repo"
+        (root / "scripts").mkdir(parents=True)
+        (root / "openclaw").mkdir()
+        shutil.copy(ROOT / "scripts" / "start.sh", root / "scripts" / "start.sh")
+        (root / ".env").write_text(
+            "OPENROUTER_API_KEY=sk-test\nCLAWRANGE_PROFILE=starter\n"
+        )
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        log = tmp_path / "calls.log"
+        _stub(bin_dir, "docker", f'echo "docker $*" >> "{log}"\n')
+        _stub(bin_dir, "curl", "exit 0\n")
+        _stub(bin_dir, "uv", "exit 0\n")
+        return root, bin_dir, log
+
+    def _start(self, repo, make_body):
+        root, bin_dir, log = repo
+        _stub(bin_dir, "make", make_body)
+        proc = subprocess.run(
+            ["bash", str(root / "scripts" / "start.sh")],
+            capture_output=True,
+            text=True,
+            env={"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+            check=False,
+            timeout=30,
+        )
+        calls = log.read_text() if log.exists() else ""
+        return proc, calls
+
+    def test_renders_missing_soul_before_compose_up(self, repo):
+        root = repo[0]
+        proc, calls = self._start(
+            repo,
+            f'echo "make $*" >> "{repo[2]}"; echo soul > "{root}/openclaw/soul.md"\n',
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "make persona PROFILE=starter" in calls
+        assert calls.index("make persona") < calls.index("docker compose up")
+        assert (root / "openclaw" / "soul.md").is_file()
+
+    def test_failed_render_stops_before_compose_up(self, repo):
+        proc, calls = self._start(repo, "exit 2\n")
+        assert proc.returncode != 0
+        assert "soul.md" in proc.stdout + proc.stderr
+        assert "compose up" not in calls
+
+    def test_soul_directory_fails_fast(self, repo):
+        (repo[0] / "openclaw" / "soul.md").mkdir()
+        proc, calls = self._start(repo, "exit 0\n")
+        assert proc.returncode != 0
+        assert "directory" in proc.stdout + proc.stderr
+        assert "compose up" not in calls
+
+    def test_existing_soul_is_left_alone(self, repo):
+        soul = repo[0] / "openclaw" / "soul.md"
+        soul.write_text("operator persona\n")
+        proc, calls = self._start(repo, f'echo "make $*" >> "{repo[2]}"\n')
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "make persona" not in calls
+        assert soul.read_text() == "operator persona\n"
