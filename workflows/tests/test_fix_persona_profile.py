@@ -188,6 +188,65 @@ def test_persona_render_warns_without_brain(tmp_path, monkeypatch, capsys):
     assert results == {"soul": True}  # no identity block -> identity skipped
 
 
+def test_persona_render_falls_back_to_overlay_on_corrupt_brain(
+    tmp_path, monkeypatch, capsys
+):
+    """A corrupt brain DB degrades to the overlay instead of failing setup.
+
+    GIVEN a brain.db path holding bytes that are not a SQLite database
+    WHEN make persona renders the profile
+    THEN it warns, still renders the learned.yaml overlay, and leaves the
+    corrupt file untouched for the operator to inspect
+    """
+    profiles = tmp_path / "profiles"
+    d = _write_profile(profiles, "cos", identity=False)
+    (d / "learned.yaml").write_text(
+        "learned:\n  - {kind: persona, target: Tone, content: From overlay.}\n"
+    )
+    monkeypatch.setenv("CLAWRANGE_PROFILES_DIR", str(profiles))
+    corrupt = tmp_path / "brain.db"
+    garbage = b"not a sqlite database\x00" * 64
+    corrupt.write_bytes(garbage)
+    out = tmp_path / "out"
+    results = _render_script().render(
+        "cos", str(corrupt), {"soul": str(out / "soul.md")}
+    )
+    assert "cannot read brain DB" in capsys.readouterr().err
+    assert "From overlay." in (out / "soul.md").read_text()
+    assert results == {"soul": True}
+    assert corrupt.read_bytes() == garbage
+
+
+def test_persona_render_main_without_args_prints_usage(capsys):
+    """GIVEN no profile name WHEN main runs THEN usage on stderr, exit 2."""
+    assert _render_script().main([]) == 2
+    assert "Usage:" in capsys.readouterr().err
+
+
+def test_persona_render_main_exit_code_tracks_target_results(monkeypatch, capsys):
+    """make persona must fail when any target could not be written.
+
+    GIVEN render reports one target failed
+    WHEN main runs
+    THEN it exits 1 and names the failed target; all ok exits 0
+    """
+    mod = _render_script()
+    seen: list[tuple[str, str]] = []
+    results: dict[str, bool] = {}
+
+    def fake_render(name, brain):
+        seen.append((name, brain))
+        return dict(results)
+
+    monkeypatch.setattr(mod, "render", fake_render)
+    results.update(soul=True, identity=False)
+    assert mod.main(["cos", "/x/brain.db"]) == 1
+    assert "'identity': 'failed'" in capsys.readouterr().out
+    results.pop("identity")
+    assert mod.main(["cos"]) == 0
+    assert seen == [("cos", "/x/brain.db"), ("cos", mod.DEFAULT_BRAIN)]
+
+
 # ─── G7 / #51: approve and reject return render results; retry re-renders ──
 
 
