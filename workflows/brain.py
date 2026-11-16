@@ -57,6 +57,7 @@ def create_brain_router(db: BrainDB) -> APIRouter:
                 400, f"Invalid search mode: {mode}. Use keyword, vector, or hybrid"
             )
 
+        fallback = None  # why hybrid ran keyword-only, when it did
         if mode == "keyword":
             results = await run_in_threadpool(db.search_keyword, q, limit)
             for r in results:
@@ -65,25 +66,31 @@ def create_brain_router(db: BrainDB) -> APIRouter:
             # Embed the query with the configured model: the same model whose
             # table search_vector reads, so the vectors are comparable.
             vector = None
-            if db.has_embeddings():
-                vectors = await embeddings.embed_texts([q])
-                vector = vectors[0] if vectors else None
+            if not db.has_embeddings():
+                fallback = "no embeddings yet"
+            else:
+                vector = await embeddings.embed_query(q)
+                if vector is None:
+                    fallback = "query embedding failed"
             if mode == "vector":
                 if vector is None:
-                    raise HTTPException(
-                        503, "Vector search unavailable (no embeddings yet)"
-                    )
+                    raise HTTPException(503, f"Vector search unavailable ({fallback})")
                 results = await run_in_threadpool(db.search_vector, vector, limit)
             else:
                 # Keyword + vector via RRF; keyword-only when no vector.
                 results = await run_in_threadpool(db.search_hybrid, q, vector, limit)
+                if vector is None:
+                    mode = "keyword"
 
-        return {
+        body = {
             "results": results,
             "query": q,
             "mode": mode,
             "total": len(results),
         }
+        if fallback:
+            body["fallback"] = fallback
+        return body
 
     # Tags listing (no slug conflict)
     @router.get("/tags")

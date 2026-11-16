@@ -184,7 +184,8 @@ class TestSearchEndpoint:
         assert data["mode"] == "keyword"
 
     def test_hybrid_search_defaults(self, client):
-        """Default search mode is hybrid, falls back to keyword without embeddings."""
+        """Default search mode is hybrid; without embeddings it runs keyword-only
+        and says so (#27: it used to report "hybrid" here)."""
         client.post(
             "/brain/pages",
             json={
@@ -198,7 +199,8 @@ class TestSearchEndpoint:
         assert r.status_code == 200
         data = r.json()
         assert data["total"] >= 1
-        assert data["mode"] == "hybrid"
+        assert data["mode"] == "keyword"
+        assert data["fallback"] == "no embeddings yet"
 
     def test_search_empty_query(self, client):
         r = client.get("/brain/search?q=")

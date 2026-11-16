@@ -21,7 +21,7 @@ import logging
 import os
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 
 import httpx
 
@@ -31,7 +31,10 @@ DEFAULT_URL = "https://openrouter.ai/api/v1/embeddings"
 DEFAULT_MODEL = "openai/text-embedding-3-small"
 DEFAULT_DIM = 1536
 BATCH = 96  # inputs per request
-TIMEOUT = 45.0
+TIMEOUT = 45.0  # backfill batches: up to BATCH inputs per request
+# A search waits on its query embedding before it can answer, and falls back
+# to keyword search when the embed fails: a slow provider must not stall it.
+QUERY_TIMEOUT = 4.0
 
 
 @dataclass(frozen=True)
@@ -39,7 +42,8 @@ class EmbedConfig:
     url: str
     model: str
     dim: int
-    api_key: str
+    api_key: str = field(repr=False)
+    timeout: float = TIMEOUT
 
     @property
     def table(self) -> str:
@@ -66,7 +70,7 @@ def request_body(inputs: list[str], cfg: EmbedConfig) -> dict:
 
 async def request(inputs: list[str], cfg: EmbedConfig) -> httpx.Response:
     """POST one embeddings request. Returns the raw response."""
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=cfg.timeout) as client:
         return await client.post(
             cfg.url,
             headers={"Authorization": f"Bearer {cfg.api_key}"},
@@ -109,6 +113,13 @@ async def embed_texts(
             return None
         out.extend(vectors)
     return out
+
+
+async def embed_query(text: str, cfg: EmbedConfig | None = None) -> list[float] | None:
+    """One search query's vector, or None. Uses the short QUERY_TIMEOUT."""
+    cfg = replace(cfg or config(), timeout=QUERY_TIMEOUT)
+    vectors = await embed_texts([text], cfg)
+    return vectors[0] if vectors else None
 
 
 async def backfill(brain_db, cfg: EmbedConfig | None = None, limit: int = 256) -> dict:

@@ -131,28 +131,33 @@ def _chunk_text(text: str, max_words: int = 300, overlap_words: int = 50) -> lis
 MAX_SEARCH_LIMIT = 100
 
 
-def _connect(db_path: str) -> tuple[sqlite3.Connection, bool]:
+def _connect(db_path: str) -> tuple[sqlite3.Connection, str | None]:
     """Connect to SQLite and attempt to load sqlite-vec extension.
 
-    Returns (connection, has_vec) — has_vec is True if vector search is available.
+    Returns (connection, vec_error): vec_error is None when vector search is
+    available, else the reason the extension failed to load. Search then
+    degrades to keyword-only, so the failure is logged loudly and kept for
+    /healthz rather than swallowed.
     """
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
 
-    has_vec = False
+    vec_error: str | None = None
     try:
         import sqlite_vec
 
         conn.enable_load_extension(True)
         sqlite_vec.load(conn)
         conn.enable_load_extension(False)
-        has_vec = True
-    except (ImportError, Exception):
-        pass  # Graceful degradation: keyword-only search
+    except Exception as exc:  # ImportError, AttributeError, sqlite3.Error...
+        vec_error = f"{type(exc).__name__}: {exc}"
+        logging.getLogger("clawrange.brain").error(
+            "sqlite-vec unavailable, vector search disabled: %s", vec_error
+        )
 
-    return conn, has_vec
+    return conn, vec_error
 
 
 def rrf_fuse(
@@ -207,7 +212,8 @@ class BrainDB:
         parent = os.path.dirname(db_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        self._conn, self._has_vec = _connect(db_path)
+        self._conn, self._vec_error = _connect(db_path)
+        self._has_vec = self._vec_error is None
         # One connection is shared by FastAPI's threadpool and the event loop.
         # Every public method holds this lock (see _serialize_methods below)
         # so one thread's commit() can't commit another's half-done write.
@@ -581,9 +587,16 @@ class BrainDB:
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
-    # ─── Embeddings (sqlite-vec) ─────────────────────────────────
-
     # ─── Embeddings (one sqlite-vec table per model) ─────────────
+
+    def vec_status(self) -> dict[str, Any]:
+        """Whether sqlite-vec loaded, and why not when it didn't (for /healthz)."""
+        return {"enabled": self._has_vec, "reason": self._vec_error}
+
+    def health_counts(self) -> dict[str, int]:
+        """Page and vector counts for /healthz, read under the lock."""
+        pages = self._conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
+        return {"pages": pages, "vectors": self.embedding_count()}
 
     def use_vector_table(self, table: str, dim: int) -> bool:
         """Point vector storage and search at ``table`` (created if missing).
