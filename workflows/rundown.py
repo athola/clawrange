@@ -36,7 +36,10 @@ logger = logging.getLogger("clawrange.rundown")
 def report_header(title: str, now: datetime, suffix: str = "") -> str:
     """Bold report title with the local date, then the time (and suffix),
     in the operator's timezone (tenant_profile.operator_timezone)."""
-    local = now.astimezone(ZoneInfo(tenant_profile.operator_timezone()))
+    # Same UTC fallback as the scheduler: a SCHEDULER_TZ typo must not kill
+    # the report it is heading.
+    tz = tenant_profile.operator_timezone(fallback="UTC")
+    local = now.astimezone(ZoneInfo(tz))
     return f"*{title} — {local:%a %b %d}* ({local:%H:%M %Z}{suffix})"
 
 

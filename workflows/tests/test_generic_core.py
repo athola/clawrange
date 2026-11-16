@@ -353,3 +353,11 @@ class TestIncomeReviewChecklist:
         prof = tenant_profile.Profile("x", {"income_review": {"checklist": "Mine."}})
         monkeypatch.setattr(tenant_profile, "load_profile", lambda name=None: prof)
         assert generators._income_review_checklist() == "Mine."
+
+
+def test_report_header_survives_unknown_scheduler_tz(monkeypatch):
+    """A SCHEDULER_TZ typo makes the scheduler fall back to UTC; the report
+    header must do the same instead of raising and killing the report."""
+    monkeypatch.setenv("SCHEDULER_TZ", "Mars/Olympus")
+    header = rundown.report_header("Rundown", datetime(2026, 11, 16, 12, tzinfo=UTC))
+    assert "12:00 UTC" in header
