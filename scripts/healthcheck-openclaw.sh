@@ -22,10 +22,22 @@
 # Detecting a wedged Telegram provider needs a positive liveness signal
 # OpenClaw does not currently emit. Reporting real health beats a detector
 # with no true positives and a guaranteed false one.
+#
+# It does check one positive failure signal: sync-heartbeat.sh (run in the
+# background at start) writes a marker when it could not load HEARTBEAT.md
+# into the heartbeat monitors. Without it every heartbeat is skipped as
+# empty, so that is reported as unhealthy with the recorded cause.
 
 set -e
 
+MARKER="${SYNC_HEARTBEAT_MARKER:-/tmp/sync-heartbeat.failed}"
+
 # curl, not wget: OpenClaw 2026.8+ images no longer ship wget.
 curl -sf -o /dev/null --max-time 5 http://127.0.0.1:18789/healthz || exit 1
+
+if [ -f "$MARKER" ]; then
+  echo "heartbeat sync failed: $(cat "$MARKER")"
+  exit 1
+fi
 
 exit 0

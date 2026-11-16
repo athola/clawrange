@@ -45,13 +45,27 @@ function merge(base, over) {
 }
 
 function main(templatePath, targetPath, env) {
+  if (!env.PROXY_AUTH_TOKEN) {
+    // Rendered anyway so the gateway still starts, but every proxied LLM
+    // call will get 401 from workflows until the token is set.
+    console.error(
+      "render-config: WARNING PROXY_AUTH_TOKEN is empty; the provider apiKey " +
+        "will be blank and the workflows proxy will reject every request"
+    );
+  }
   const rendered = render(JSON.parse(fs.readFileSync(templatePath, "utf8")), env);
   let current = {};
   try {
     current = JSON.parse(fs.readFileSync(targetPath, "utf8"));
   } catch (err) {
     if (err.code !== "ENOENT") {
-      console.error(`render-config: ignoring unreadable ${targetPath}: ${err.message}`);
+      // The file holds keys OpenClaw wrote at runtime (paired devices,
+      // command settings). Replacing it with the bare template would drop
+      // them silently, so stop and let the operator repair or remove it.
+      throw new Error(
+        `refusing to overwrite unreadable ${targetPath} (${err.message}); ` +
+          "fix or delete it and restart"
+      );
     }
   }
   const tmp = `${targetPath}.tmp`;
@@ -62,6 +76,11 @@ function main(templatePath, targetPath, env) {
 }
 
 if (require.main === module) {
-  main(process.argv[2], process.argv[3], process.env);
+  try {
+    main(process.argv[2], process.argv[3], process.env);
+  } catch (err) {
+    console.error(`render-config: ${err.message}`);
+    process.exit(1);
+  }
 }
 module.exports = { render, merge, main };

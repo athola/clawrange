@@ -83,6 +83,9 @@ services:
       - "sh"
       - "-c"
       - |
+        # Stop on the first failure: a failed render must not start the
+        # gateway on a stale or missing openclaw.json.
+        set -e
         chown 1000:1000 /home/node/.openclaw /tmp
         # Re-render on every start (rotated token / new SCHEDULER_TZ take
         # effect) while keeping keys OpenClaw wrote at runtime: see

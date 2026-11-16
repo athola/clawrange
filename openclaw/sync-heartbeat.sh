@@ -8,18 +8,32 @@
 # container command so every start re-syncs the repo file, which stays the
 # single source. The CLI talks to the running gateway, so wait for /healthz.
 #
+# The CLI's output goes to the container log. Any failure also writes
+# $SYNC_HEARTBEAT_MARKER, which healthcheck-openclaw.sh reports as unhealthy:
+# a background job's exit status is otherwise seen by nobody.
+#
 # Usage: sync-heartbeat.sh <heartbeat-file>
 set -u
 FILE="$1"
+MARKER="${SYNC_HEARTBEAT_MARKER:-/tmp/sync-heartbeat.failed}"
+rm -f "$MARKER"
+
+fail() {
+  echo "sync-heartbeat: $*" >&2
+  printf '%s\n' "$*" > "$MARKER"
+  exit 1
+}
+
 i=0
 until curl -sf -o /dev/null --max-time 5 http://127.0.0.1:18789/healthz; do
   i=$((i + 1))
-  [ "$i" -ge 60 ] && { echo "sync-heartbeat: gateway never became healthy" >&2; exit 1; }
+  [ "$i" -ge 60 ] && fail "gateway never became healthy"
   sleep 5
 done
 # The gateway creates heartbeat monitors shortly after /healthz goes green.
+# stderr is left on the container log so a CLI error is visible.
 heartbeat_ids() {
-  runuser -u node -- openclaw cron list --all --json 2>/dev/null | node -e '
+  runuser -u node -- openclaw cron list --all --json | node -e '
 let t = "";
 process.stdin.on("data", (d) => (t += d)).on("end", () => {
   const i = t.indexOf("{");
@@ -30,13 +44,16 @@ process.stdin.on("data", (d) => (t += d)).on("end", () => {
 i=0
 until ids=$(heartbeat_ids) && [ -n "$ids" ]; do
   i=$((i + 1))
-  [ "$i" -ge 24 ] && { echo "sync-heartbeat: no heartbeat monitors found" >&2; exit 1; }
+  [ "$i" -ge 24 ] && fail "no heartbeat monitors found"
   sleep 5
 done
+failed=""
 for id in $ids; do
-  if runuser -u node -- openclaw cron scratch "$id" --file "$FILE" >/dev/null 2>&1; then
+  if out=$(runuser -u node -- openclaw cron scratch "$id" --file "$FILE" 2>&1); then
     echo "sync-heartbeat: loaded $FILE into $id"
   else
-    echo "sync-heartbeat: failed to load scratch for $id" >&2
+    echo "sync-heartbeat: failed to load scratch for $id: $out" >&2
+    failed="$failed $id"
   fi
 done
+[ -z "$failed" ] || fail "scratch load failed for:$failed"
