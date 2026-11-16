@@ -13,15 +13,12 @@ already emits CRM-shaped rows.
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+
+from clock import utcnow_iso
 
 from .base import Record
 
 logger = logging.getLogger("clawrange.connectors.transforms")
-
-
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
 
 
 def passthrough(rows: list[Record], spec: dict) -> list[Record]:
@@ -47,7 +44,7 @@ def leads_clean(rows: list[Record], spec: dict) -> list[Record]:
             continue
 
         if not rec.get("created_at"):
-            rec["created_at"] = _now()
+            rec["created_at"] = utcnow_iso()
         cleaned.append(rec)
 
     if dedup_key:

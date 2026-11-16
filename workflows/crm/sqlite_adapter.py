@@ -11,7 +11,8 @@ from __future__ import annotations
 import logging
 import sqlite3
 import threading
-from datetime import UTC, datetime
+
+from clock import utcnow_iso
 
 from .adapter import CRMAdapter, RecordList
 
@@ -55,10 +56,6 @@ UNIQUE_LEAD_KEYS = frozenset({"email"})
 OBJECTS = frozenset({"leads"})  # objects upsert() writes
 _ACTIVITY_COLUMNS = ("id", "lead_id", "kind", "detail", "ts")
 MAX_TEMPLATE_ROWS = 1000
-
-
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
 
 
 class SQLiteCRM(CRMAdapter):
@@ -117,7 +114,7 @@ class SQLiteCRM(CRMAdapter):
             return written
 
     def _upsert_rows(self, conn, records: list[dict], upsert_key: str) -> int:
-        now = _now()
+        now = utcnow_iso()
         written = 0
         for rec in records:
             row = {k: rec[k] for k in _LEAD_COLUMNS if k in rec}
@@ -150,7 +147,7 @@ class SQLiteCRM(CRMAdapter):
             conn.execute(
                 "INSERT INTO activities (lead_id, kind, detail, ts) "
                 "VALUES (?, ?, ?, ?)",
-                (lead_id, kind, detail, ts or _now()),
+                (lead_id, kind, detail, ts or utcnow_iso()),
             )
             conn.commit()
 

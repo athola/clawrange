@@ -2,9 +2,12 @@
 
 import os
 import tempfile
+from datetime import UTC, datetime
 
 import pytest
 
+import brain_db
+import clock
 from brain_db import (
     BrainDB,
     LinkType,
@@ -12,6 +15,8 @@ from brain_db import (
     _chunk_text,
     rrf_fuse,
 )
+from connectors import transforms
+from crm import sqlite_adapter
 
 
 @pytest.fixture
@@ -930,3 +935,23 @@ class TestKeywordMatchMode:
         hits = db.search_hybrid("Show HN timing", [0.0, 1.0, 0.0, 0.0])
         # keyword side (AND) is empty, so the vector side alone answers
         assert [h["match_type"] for h in hits] == ["vector"]
+
+
+class TestUtcnowIso:
+    """#14: one timestamp helper replaces the three private `_now()` copies."""
+
+    def test_format_is_offset_aware_utc_iso(self):
+        stamp = clock.utcnow_iso()
+        parsed = datetime.fromisoformat(stamp)
+        assert parsed.utcoffset() == UTC.utcoffset(None)
+        assert stamp.endswith("+00:00")
+
+    def test_every_store_uses_the_shared_helper(self):
+        for module in (brain_db, transforms, sqlite_adapter):
+            assert module.utcnow_iso is clock.utcnow_iso
+            assert not hasattr(module, "_now")
+
+    def test_stored_task_timestamp_uses_the_format(self, db):
+        task = db.create_task("stamp check")
+        assert task["created_at"].endswith("+00:00")
+        datetime.fromisoformat(task["created_at"])

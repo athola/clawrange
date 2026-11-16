@@ -19,6 +19,8 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum, nonmember
 from typing import Any
 
+from clock import utcnow_iso
+
 
 class PageType(StrEnum):
     CLIENT = "client"
@@ -54,10 +56,6 @@ class LinkType(StrEnum):
     RELATED_TO = "related_to"
     WORKS_AT = "works_at"
     KNOWS = "knows"
-
-
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
 
 
 def _content_hash(title: str, compiled: str) -> str:
@@ -492,7 +490,7 @@ class BrainDB:
     ) -> dict[str, Any]:
         # An unknown type raises ValueError instead of being stored as-is.
         pt = PageType(page_type).value
-        now = _now()
+        now = utcnow_iso()
         chash = _content_hash(title, compiled)
 
         existing = self._conn.execute(
@@ -599,7 +597,7 @@ class BrainDB:
             self._conn.commit()
             return []
 
-        now = _now()
+        now = utcnow_iso()
         result = []
         for idx, content in enumerate(chunks):
             chash = hashlib.sha256(content.encode()).hexdigest()
@@ -712,7 +710,7 @@ class BrainDB:
         """Record chunks the provider refused to embed for the active table."""
         if self._vec_table is None or not chunk_ids:
             return 0
-        now = _now()
+        now = utcnow_iso()
         self._conn.executemany(
             "INSERT OR REPLACE INTO embedding_rejects "
             "(vec_table, chunk_id, rejected_at) VALUES (?, ?, ?)",
@@ -804,7 +802,7 @@ class BrainDB:
     def append_timeline(
         self, page_slug: str, content: str, source: str = ""
     ) -> dict[str, Any]:
-        now = _now()
+        now = utcnow_iso()
         cursor = self._conn.execute(
             "INSERT INTO timeline (page_slug, content, source, created_at) "
             "VALUES (?, ?, ?, ?)",
@@ -958,7 +956,7 @@ class BrainDB:
         to_slug: str,
         link_type: LinkType | str = LinkType.RELATED_TO,
     ) -> dict[str, Any]:
-        now = _now()
+        now = utcnow_iso()
         lt = link_type.value if isinstance(link_type, LinkType) else link_type
         try:
             cursor = self._conn.execute(
@@ -1131,7 +1129,7 @@ class BrainDB:
     def create_task(
         self, description: str, priority: int = 3, source: str = "system"
     ) -> dict[str, Any]:
-        now = _now()
+        now = utcnow_iso()
         task_id = str(uuid.uuid4())[:8]
         priority = max(1, min(5, priority))
         self._conn.execute(
@@ -1177,7 +1175,7 @@ class BrainDB:
         cur = self._conn.execute(
             "UPDATE tasks SET status = 'active', claimed_at = ? "
             "WHERE id = ? AND status = 'pending'",
-            (_now(), task_id),
+            (utcnow_iso(), task_id),
         )
         self._conn.commit()
         if cur.rowcount != 1:
@@ -1191,7 +1189,7 @@ class BrainDB:
     ) -> dict[str, Any]:
         if status not in TaskStatus.RESULTS:
             raise ValueError("Status must be completed, failed or blocked")
-        now = _now()
+        now = utcnow_iso()
         # Only open tasks can be completed: a terminal result is final and a
         # cancelled task stays cancelled.
         open_marks = ", ".join("?" * len(TaskStatus.OPEN))
@@ -1239,7 +1237,7 @@ class BrainDB:
             (TaskStatus.ACTIVE, cutoff),
         ).fetchall()
         note = f"Failed: still active after {hours:g}h; no worker completed it."
-        now = _now()
+        now = utcnow_iso()
         reaped = []
         for row in rows:
             cur = self._conn.execute(
@@ -1304,7 +1302,7 @@ class BrainDB:
     ) -> dict[str, Any]:
         import json
 
-        now = _now()
+        now = utcnow_iso()
         self._conn.execute(
             """INSERT INTO projects (slug, owner, repo, topics, subreddits,
                search_terms, posture, created_at, updated_at)
@@ -1354,7 +1352,7 @@ class BrainDB:
         subs.append(subreddit)
         self._conn.execute(
             "UPDATE projects SET subreddits=?, updated_at=? WHERE slug=?",
-            (json.dumps(subs), _now(), slug),
+            (json.dumps(subs), utcnow_iso(), slug),
         )
         self._conn.commit()
         return True
@@ -1382,7 +1380,7 @@ class BrainDB:
     ) -> dict[str, Any]:
         import json
 
-        now = _now()
+        now = utcnow_iso()
         self._conn.execute(
             """INSERT INTO schedules (id, name, kind, cron, kwargs,
                created_at, updated_at)
@@ -1405,7 +1403,7 @@ class BrainDB:
         written under the wrong id would otherwise vanish silently."""
         cur = self._conn.execute(
             "UPDATE schedules SET last_run=?, last_status=?, updated_at=? WHERE id=?",
-            (last_run, last_status, _now(), schedule_id),
+            (last_run, last_status, utcnow_iso(), schedule_id),
         )
         self._conn.commit()
         if cur.rowcount == 0:
@@ -1416,7 +1414,7 @@ class BrainDB:
     ) -> dict[str, Any] | None:
         self._conn.execute(
             "UPDATE schedules SET paused=?, updated_at=? WHERE id=?",
-            (1 if paused else 0, _now(), schedule_id),
+            (1 if paused else 0, utcnow_iso(), schedule_id),
         )
         self._conn.commit()
         return self.get_schedule(schedule_id)
@@ -1438,7 +1436,7 @@ class BrainDB:
             """INSERT OR IGNORE INTO deal_observations
                (source, listing_id, target, price, observed_at, title)
                VALUES (?, ?, ?, ?, ?, ?)""",
-            (source, listing_id, target, float(price), _now(), title),
+            (source, listing_id, target, float(price), utcnow_iso(), title),
         )
         self._conn.commit()
 
@@ -1458,7 +1456,7 @@ class BrainDB:
             """INSERT OR IGNORE INTO scan_cache (kind, external_id,
                project_slug, seen_at)
                VALUES (?, ?, ?, ?)""",
-            (kind, external_id, project_slug, _now()),
+            (kind, external_id, project_slug, utcnow_iso()),
         )
         self._conn.commit()
 
@@ -1503,7 +1501,7 @@ class BrainDB:
         searched; with hits this gives a per-(sub, project) yield rate. One
         commit per cycle instead of one per (sub, project) pair.
         """
-        now = _now()
+        now = utcnow_iso()
         self._conn.executemany(
             """INSERT INTO subreddit_stats
                  (subreddit, project_slug, hits, impressions,
@@ -1523,7 +1521,7 @@ class BrainDB:
     def record_subreddit_hit(self, subreddit: str, project_slug: str) -> None:
         """Record one relevance hit for a (subreddit, project) pair."""
         sub = subreddit.lower().strip()
-        now = _now()
+        now = utcnow_iso()
         self._conn.execute(
             """INSERT INTO subreddit_stats
                  (subreddit, project_slug, hits, impressions,
@@ -1598,7 +1596,7 @@ class BrainDB:
             """UPDATE subreddit_stats
                  SET is_curated = 1, promoted_at = ?
                WHERE subreddit = ? AND project_slug = ?""",
-            (_now(), sub, project_slug),
+            (utcnow_iso(), sub, project_slug),
         )
         self._conn.commit()
 
@@ -1609,7 +1607,7 @@ class BrainDB:
     ) -> dict[str, Any]:
         import json
 
-        now = _now()
+        now = utcnow_iso()
         session_id = str(uuid.uuid4())[:12]
         self._conn.execute(
             "INSERT INTO research_sessions "
@@ -1633,7 +1631,7 @@ class BrainDB:
     ) -> int:
         import json
 
-        now = _now()
+        now = utcnow_iso()
         cursor = self._conn.execute(
             "INSERT INTO research_findings "
             "(session_id, source, channel, title, url, relevance, summary, "
@@ -1659,7 +1657,7 @@ class BrainDB:
         return cursor.lastrowid or 0
 
     def complete_research_session(self, session_id: str) -> dict[str, Any]:
-        now = _now()
+        now = utcnow_iso()
         self._conn.execute(
             "UPDATE research_sessions SET status='complete', updated_at=? WHERE id=?",
             (now, session_id),
@@ -1722,7 +1720,7 @@ class BrainDB:
         task_id: str | None = None,
     ) -> dict[str, Any]:
         lid = str(uuid.uuid4())[:8]
-        now = _now()
+        now = utcnow_iso()
         self._conn.execute(
             "INSERT INTO persona_learnings "
             "(id, profile, kind, target, content, status, source, task_id, created_at) "
@@ -1760,7 +1758,7 @@ class BrainDB:
     def set_learning_status(self, learning_id: str, status: str) -> dict[str, Any]:
         self._conn.execute(
             "UPDATE persona_learnings SET status = ?, decided_at = ? WHERE id = ?",
-            (status, _now(), learning_id),
+            (status, utcnow_iso(), learning_id),
         )
         self._conn.commit()
         result = self.get_learning(learning_id)
