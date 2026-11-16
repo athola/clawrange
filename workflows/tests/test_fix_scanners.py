@@ -263,6 +263,39 @@ class TestPersonaReflect:
         assert brain_db.list_learnings(profile="cos") == []
 
 
+class TestGeneratorHelpers:
+    """#49: the shared status and ranking helpers."""
+
+    def test_delivery_status(self):
+        assert generators._delivery_status(2, 2, "x") == "delivered 2/2 msgs (x)"
+        assert generators._delivery_status(1, 2, "x") == "FAILED telegram 1/2 msgs (x)"
+
+    def test_record_status_survives_a_broken_table(self):
+        class Broken:
+            def update_schedule_status(self, *a):
+                raise RuntimeError("db locked")
+
+        generators._record_status(Broken(), "hot_pulse", "ok")  # no raise
+
+    def test_engagement_rank_orders_by_relevance_and_score(self):
+        from reddit_search import RedditPost
+
+        def post(score):
+            return RedditPost(
+                id=str(score),
+                url="u",
+                title="t",
+                subreddit="s",
+                score=score,
+                comments=0,
+                created_utc="2026-01-01T00:00:00+00:00",
+            )
+
+        picks = [(post(1), 1.0), (post(100), 1.0), (post(1), 3.0)]
+        ranked = sorted(picks, key=generators._engagement_rank, reverse=True)
+        assert [(p.score, r) for p, r in ranked] == [(100, 1.0), (1, 3.0), (1, 1.0)]
+
+
 class TestResearchHealthWebChannels:
     """#42: web search runs on OpenRouter :online, so only its key counts."""
 

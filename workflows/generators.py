@@ -63,6 +63,35 @@ _HOT_PULSE_IN_QUIET_HOURS: bool = False
 _is_quiet_hours = tenant_profile.hour_in_window
 
 
+def _record_status(
+    brain_db, schedule_id: str, status: str, when: datetime | None = None
+) -> None:
+    """Write a schedule's last_run/last_status; a failed write only warns.
+
+    APScheduler fires bypass run_schedule_now, so generators record their
+    own status; a broken status table must never abort the run.
+    """
+    try:
+        brain_db.update_schedule_status(
+            schedule_id, (when or datetime.now(UTC)).isoformat(), status
+        )
+    except Exception as exc:
+        logger.warning("%s: could not update schedule status: %s", schedule_id, exc)
+
+
+def _delivery_status(sent: int, total: int, counts: str) -> str:
+    """Status line saying whether every Telegram message landed."""
+    if sent == total:
+        return f"delivered {sent}/{total} msgs ({counts})"
+    return f"FAILED telegram {sent}/{total} msgs ({counts})"
+
+
+def _engagement_rank(pick: tuple[RedditPost, float]) -> float:
+    """Sort key for (post, relevance): relevance scaled by log engagement."""
+    post, rel = pick
+    return rel * (1 + math.log(max(post.score, 1)))
+
+
 def digest_extra_subreddits() -> list[str]:
     """Subreddits added to every digest/pulse scan even when no tracked
     project subscribes to them: the profile's
@@ -543,7 +572,7 @@ async def morning_digest_generator(
         terms = project_list(project, "search_terms")
         # Cap query fan-out: pick top 3 search terms (or fall back to
         # topics) so we don't hammer the Reddit API on every boot.
-        queries = terms[:3] if terms else (topics[:3] if topics else [slug])
+        queries = (terms or topics or [slug])[:3]
 
         for query in queries:
             try:
@@ -616,10 +645,7 @@ async def morning_digest_generator(
     for project in projects:
         slug = project["slug"]
         strict = strict_by_project.get(slug, [])
-        strict.sort(
-            key=lambda pr: pr[1] * (1 + math.log(max(pr[0].score, 1))),
-            reverse=True,
-        )
+        strict.sort(key=_engagement_rank, reverse=True)
         bonus = bonus_by_project.get(slug, [])
         bonus.sort(key=lambda pr: pr[0].score, reverse=True)
         chosen = [(p, False) for p, _ in strict[:top_per_project]]
@@ -675,17 +701,8 @@ async def morning_digest_generator(
         f"{sum(len(v) for v in picks_by_project.values())} reddit picks, "
         f"{len(newly_promoted)} promoted, synthesis {'ok' if synthesis else 'off'}"
     )
-    status = (
-        f"delivered {sent}/{total} msgs ({counts})"
-        if sent == total
-        else f"FAILED telegram {sent}/{total} msgs ({counts})"
-    )
-    try:
-        brain_db.update_schedule_status(
-            "morning_digest", datetime.now(UTC).isoformat(), status
-        )
-    except Exception as exc:
-        logger.warning("morning_digest: could not update schedule status: %s", exc)
+    status = _delivery_status(sent, total, counts)
+    _record_status(brain_db, "morning_digest", status)
 
     if sent < total:
         logger.warning("morning_digest: %s; not marking seen", status)
@@ -753,10 +770,7 @@ async def _discover_emerging(
             emerging.append((post, rel))
 
         if emerging:
-            emerging.sort(
-                key=lambda pr: pr[1] * (1 + math.log(max(pr[0].score, 1))),
-                reverse=True,
-            )
+            emerging.sort(key=_engagement_rank, reverse=True)
             out[slug] = [p for p, _ in emerging[:cap_per_project]]
     return out
 
@@ -915,15 +929,13 @@ async def hot_pulse_generator(
     if in_quiet:
         if not _HOT_PULSE_IN_QUIET_HOURS:
             local_now = now.astimezone(ZoneInfo(quiet_hours_tz)).strftime("%H:%M")
-            try:
-                brain_db.update_schedule_status(
-                    "hot_pulse",
-                    now.isoformat(),
-                    f"quiet hours (entered at {local_now} {quiet_hours_tz}, "
-                    f"resume {quiet_hours_end:02d}:00)",
-                )
-            except Exception as exc:
-                logger.warning("hot_pulse: quiet-hours status update failed: %s", exc)
+            _record_status(
+                brain_db,
+                "hot_pulse",
+                f"quiet hours (entered at {local_now} {quiet_hours_tz}, "
+                f"resume {quiet_hours_end:02d}:00)",
+                when=now,
+            )
             _HOT_PULSE_IN_QUIET_HOURS = True
             logger.info(
                 "hot_pulse: entering quiet hours (%02d:00-%02d:00 %s), "
@@ -944,15 +956,12 @@ async def hot_pulse_generator(
     if _LAST_HOT_PULSE_DELIVERY_AT is not None:
         elapsed_min = (now - _LAST_HOT_PULSE_DELIVERY_AT).total_seconds() / 60.0
         if elapsed_min < min_delivery_interval_minutes:
-            try:
-                brain_db.update_schedule_status(
-                    "hot_pulse",
-                    now.isoformat(),
-                    f"throttled ({elapsed_min:.1f}m of "
-                    f"{min_delivery_interval_minutes}m)",
-                )
-            except Exception as exc:
-                logger.warning("hot_pulse: schedule status update failed: %s", exc)
+            _record_status(
+                brain_db,
+                "hot_pulse",
+                f"throttled ({elapsed_min:.1f}m of {min_delivery_interval_minutes}m)",
+                when=now,
+            )
             logger.info(
                 "hot_pulse: throttled — %.1fm since last delivery (min interval %dm)",
                 elapsed_min,
@@ -979,7 +988,7 @@ async def hot_pulse_generator(
         slug = project["slug"]
         topics = project_list(project, "topics")
         terms = project_list(project, "search_terms")
-        queries = terms[:3] if terms else (topics[:3] if topics else [slug])
+        queries = (terms or topics or [slug])[:3]
 
         for query in queries:
             try:
@@ -1014,10 +1023,7 @@ async def hot_pulse_generator(
     for project, post, rel, query in best_for_post.values():
         by_project.setdefault(project["slug"], []).append((post, rel))
     for slug in list(by_project.keys()):
-        by_project[slug].sort(
-            key=lambda pr: pr[1] * (1 + math.log(max(pr[0].score, 1))),
-            reverse=True,
-        )
+        by_project[slug].sort(key=_engagement_rank, reverse=True)
         by_project[slug] = by_project[slug][:max_per_project]
 
     # Group by project, then by category (the search query that
@@ -1043,16 +1049,13 @@ async def hot_pulse_generator(
     # fires bypass run_schedule_now (which is what normally writes
     # those fields), so without this the schedule looks stale and the
     # operator can't distinguish "scheduler dead" from "no fresh hits".
-    try:
-        brain_db.update_schedule_status(
-            "hot_pulse",
-            datetime.now(UTC).isoformat(),
-            f"reddit outage, 0 picks ({health_note})"
-            if outage
-            else f"ok ({n_picks} picks; {health_note})",
-        )
-    except Exception as exc:
-        logger.warning("hot_pulse: could not update schedule status: %s", exc)
+    _record_status(
+        brain_db,
+        "hot_pulse",
+        f"reddit outage, 0 picks ({health_note})"
+        if outage
+        else f"ok ({n_picks} picks; {health_note})",
+    )
 
     if not any(by_project.values()):
         # Quiet pulse — no Telegram noise. Logged at WARNING level
@@ -1087,11 +1090,7 @@ async def hot_pulse_generator(
         # Sort categories by total pick count desc (most active first).
         sorted_cats = sorted(cat_map.items(), key=lambda kv: len(kv[1]), reverse=True)
         for category, cat_picks in sorted_cats:
-            cat_picks_sorted = sorted(
-                cat_picks,
-                key=lambda pr: pr[1] * (1 + math.log(max(pr[0].score, 1))),
-                reverse=True,
-            )
+            cat_picks_sorted = sorted(cat_picks, key=_engagement_rank, reverse=True)
             lines.append(f'  Category: "{category}"')
             for post, rel in cat_picks_sorted:
                 tier = "📌" if rel >= 1.0 else "◇"
@@ -1110,14 +1109,9 @@ async def hot_pulse_generator(
         logger.warning(
             "hot_pulse: telegram delivered %d/%d msgs; not marking seen", sent, total
         )
-        try:
-            brain_db.update_schedule_status(
-                "hot_pulse",
-                datetime.now(UTC).isoformat(),
-                f"FAILED telegram {sent}/{total} msgs ({n_picks} picks)",
-            )
-        except Exception as exc:
-            logger.warning("hot_pulse: could not update schedule status: %s", exc)
+        _record_status(
+            brain_db, "hot_pulse", _delivery_status(sent, total, f"{n_picks} picks")
+        )
         return
 
     # Cross-project mark_seen: a delivered post is marked seen for ALL
@@ -1358,11 +1352,7 @@ async def crm_digest_generator(
 
     sent, total = await telegram.notify_long(digest)
     if schedule_id:
-        status = (
-            f"delivered {sent}/{total} msgs ({len(queries)} queries)"
-            if sent == total
-            else f"FAILED telegram {sent}/{total} msgs ({len(queries)} queries)"
-        )
+        status = _delivery_status(sent, total, f"{len(queries)} queries")
         brain_db.update_schedule_status(schedule_id, now, status)
     return digest
 
@@ -1611,17 +1601,8 @@ async def homelab_deals_generator(
         f"{len(listings)} listings, {len(clean)} deals, {len(flagged)} flagged, "
         f"{len(leads)} leads, synthesis {'ok' if synthesis else 'off'}"
     )
-    status = (
-        f"delivered {sent}/{total_msgs} msgs ({counts})"
-        if sent == total_msgs
-        else f"FAILED telegram {sent}/{total_msgs} msgs ({counts})"
-    )
-    try:
-        brain_db.update_schedule_status(
-            "homelab_deals", datetime.now(UTC).isoformat(), status
-        )
-    except Exception as exc:
-        logger.warning("homelab_deals: could not update schedule status: %s", exc)
+    status = _delivery_status(sent, total_msgs, counts)
+    _record_status(brain_db, "homelab_deals", status)
     if sent < total_msgs:
         logger.warning("homelab_deals: %s; not marking seen", status)
         return

@@ -25,6 +25,7 @@ import httpx
 
 import github_search
 import llm_proxy
+import tenant_profile
 from brain_db import project_list
 from errors import UpstreamError
 from reddit_search import SearchHealth
@@ -32,17 +33,10 @@ from reddit_search import SearchHealth
 logger = logging.getLogger("clawrange.rundown")
 
 
-def report_tz() -> str:
-    """Timezone for report headers: the operator's, from config (see
-    tenant_profile.operator_timezone); never hard-coded here."""
-    import tenant_profile
-
-    return tenant_profile.operator_timezone()
-
-
 def report_header(title: str, now: datetime, suffix: str = "") -> str:
-    """Bold report title with the local date, then the time (and suffix)."""
-    local = now.astimezone(ZoneInfo(report_tz()))
+    """Bold report title with the local date, then the time (and suffix),
+    in the operator's timezone (tenant_profile.operator_timezone)."""
+    local = now.astimezone(ZoneInfo(tenant_profile.operator_timezone()))
     return f"*{title} — {local:%a %b %d}* ({local:%H:%M %Z}{suffix})"
 
 
