@@ -411,6 +411,43 @@ def _oauth_env(monkeypatch):
         monkeypatch.setenv(var, "x")
 
 
+def _fake_asyncpraw(monkeypatch, fail=(), close_fails=False):
+    """Install a fake asyncpraw whose subreddit search fails for `fail`."""
+    import time
+
+    _oauth_env(monkeypatch)
+
+    class Sub:
+        def __init__(self, name):
+            self.name = name
+
+        async def search(self, *a, **kw):
+            if self.name in fail:
+                raise RuntimeError(f"r/{self.name} 503")
+            yield SimpleNamespace(
+                id=f"{self.name}1",
+                subreddit=self.name,
+                title="t",
+                score=1,
+                num_comments=0,
+                created_utc=time.time(),
+                selftext="",
+            )
+
+    class Reddit:
+        def __init__(self, **kw):
+            pass
+
+        async def subreddit(self, name):
+            return Sub(name)
+
+        async def close(self):
+            if close_fails:
+                raise RuntimeError("close failed")
+
+    monkeypatch.setitem(sys.modules, "asyncpraw", SimpleNamespace(Reddit=Reddit))
+
+
 class TestRedditSearchRaises:
     @pytest.mark.asyncio
     async def test_public_search_all_refused_raises(self, monkeypatch):
@@ -492,6 +529,28 @@ class TestRedditSearchRaises:
         with pytest.raises(UpstreamError, match="invalid_grant"):
             await reddit_search.search_subreddits("x", ["a"], health=health)
         assert health.failures == {"error": 1}
+
+    @pytest.mark.asyncio
+    async def test_oauth_every_subreddit_failing_raises(self, monkeypatch):
+        _fake_asyncpraw(monkeypatch, fail={"a", "b"})
+        health = SearchHealth()
+        with pytest.raises(UpstreamError):
+            await reddit_search.search_subreddits("x", ["a", "b"], health=health)
+        assert health.failures == {"error": 2} and health.ok == 0
+
+    @pytest.mark.asyncio
+    async def test_oauth_partial_failure_returns_results(self, monkeypatch):
+        _fake_asyncpraw(monkeypatch, fail={"a"})
+        health = SearchHealth()
+        out = await reddit_search.search_subreddits("x", ["a", "b"], health=health)
+        assert [p.id for p in out] == ["b1"]
+        assert health.ok == 1
+
+    @pytest.mark.asyncio
+    async def test_oauth_close_failure_keeps_results(self, monkeypatch):
+        _fake_asyncpraw(monkeypatch, close_fails=True)
+        out = await reddit_search.search_subreddits("x", ["b"])
+        assert [p.id for p in out] == ["b1"]
 
     @pytest.mark.asyncio
     async def test_search_all_http_error_raises(self, monkeypatch):

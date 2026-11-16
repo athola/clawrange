@@ -398,12 +398,14 @@ async def search_subreddits(
                 health.record(getattr(exc, "status_code", None) or "error")
                 failed += 1
                 continue
-
-        await reddit.close()
     except Exception as exc:
         logger.warning("Reddit API error: %s", exc)
         health.record("error")
         raise UpstreamError(f"Reddit API error: {exc}") from exc
+    try:
+        await reddit.close()
+    except Exception as exc:  # the searches already ran; keep their results
+        logger.warning("Reddit client close failed: %s", exc)
 
     _raise_if_blind(looked, failed, health)
     results.sort(key=lambda p: p.score, reverse=True)
