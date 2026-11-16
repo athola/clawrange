@@ -7,7 +7,7 @@
 **Author**: the operator (mission: attune full lifecycle)
 **Status**: Approved
 **Branch**: feat/replace-n8n-with-fastapi
-**Artifacts**: docs/multi-tenant-brief.md → docs/multi-tenant-spec.md → docs/multi-tenant-plan.md
+**Artifacts**: docs/archive/multi-tenant-brief.md → docs/archive/multi-tenant-spec.md → docs/archive/multi-tenant-plan.md
 
 ## Problem Statement
 

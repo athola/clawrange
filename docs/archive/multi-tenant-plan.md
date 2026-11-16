@@ -5,7 +5,7 @@
 
 **Date**: 2026-06-07
 **Status**: Approved
-**Spec**: docs/multi-tenant-spec.md
+**Spec**: docs/archive/multi-tenant-spec.md
 
 ## Architecture Components
 

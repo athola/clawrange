@@ -7,7 +7,8 @@ it pulls data from, and what CRM it writes to) lives in a single declarative
 machinery (connectors, CRM adapters, query execution) lives in code and is
 shared by every profile.
 
-Four profiles ship in the box, all free of any real operator's identity:
+Four profiles ship in the box. All but `marketing` are free of any real
+operator's identity; `marketing` is the maintainer's own worked example:
 
 - **`starter`**: the default (`CLAWRANGE_PROFILE` unset → `starter`). A
   generic, identity-free baseline so a fresh clone runs without carrying
@@ -268,10 +269,10 @@ make seed-demo                     # load config/profiles/lead-crm/demo_leads.cs
 `make seed-demo` runs the demo CSV through the real `leads_clean` transform
 and upserts it into the CRM, so `/crm/query` and the `crm_digest` schedule
 work end-to-end without any external service. `make seed-demo` runs on the
-host and writes to `CRM_DB_PATH` from the shell environment (it does not
-read `.env`; default `data/crm/crm.db`). The container reads
+host and writes to `CRM_DB_PATH`: a value on the command line wins, then
+the one in `.env`, then the default `data/crm/crm.db`. The container reads
 `data/brain/crm.db`, so run `CRM_DB_PATH=data/brain/crm.db make seed-demo`
-to seed the database the running stack uses.
+(or set it in `.env`) to seed the database the running stack uses.
 
 ## 8. Outreach and deal policy
 

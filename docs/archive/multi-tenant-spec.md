@@ -1,3 +1,6 @@
+> **Archived.** Implemented; see
+> [docs/multi-tenant-guide.md](../multi-tenant-guide.md) for current behaviour.
+
 # ClawRange Multi-Tenant Template: Specification
 
 **Date**: 2026-06-07
