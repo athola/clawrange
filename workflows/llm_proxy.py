@@ -227,22 +227,21 @@ def _should_notify(tier_name: str) -> bool:
 
 
 def _background_notify(tier_name: str, message: str) -> None:
-    """Log tier events without sending to Telegram.
+    """Log a tier event (rate limit, error, switch). Never sends to Telegram.
 
     Telegram notifications go to the user's conversation chat and look like
-    garbled bot responses. Rate limit events are logged for debugging only.
+    garbled bot responses, so these are log lines only, and every event is
+    logged (no debounce: a dropped line hides the failure being debugged).
     Explicit admin alerts (balance guard) use telegram.notify() directly.
     """
-    if not _should_notify(tier_name):
-        return
     clean = message.replace("*", "").replace("`", "")
-    logger.info("[tier] %s", clean)
+    logger.warning("[tier] %s: %s", tier_name, clean)
 
 
 # ─── Auto-Retry ──────────────────────────────────────────────────
 
 MAX_AUTO_RETRY_WAIT = 30  # seconds — max hold time before returning synthetic response
-PROVIDER_TIMEOUT = 45  # per-provider HTTP timeout (seconds) — was 90
+PROVIDER_TIMEOUT = 45  # per-provider attempt timeout on the chat path (seconds)
 REQUEST_DEADLINE = 60  # hard ceiling for the entire chat request (seconds)
 # Total ceiling for _llm_call across ALL tiers (seconds). The interactive chat
 # path races tiers concurrently under REQUEST_DEADLINE, but the heartbeat path
@@ -250,7 +249,13 @@ REQUEST_DEADLINE = 60  # hard ceiling for the entire chat request (seconds)
 # tries tiers sequentially. Without an aggregate cap a hung provider compounds
 # to PROVIDER_TIMEOUT * len(tiers), blocking the heartbeat past the upstream
 # OpenClaw client timeout and surfacing "LLM request timed out" to Telegram.
-LLM_CALL_DEADLINE = 45  # one full provider attempt; fast failover still fits
+LLM_CALL_DEADLINE = 45
+# One background attempt. Kept well below LLM_CALL_DEADLINE so a hung first
+# tier times out (and counts against its breaker) with time left to try the
+# next free tier.
+BACKGROUND_ATTEMPT_TIMEOUT = 20
+# Breaker key for the background web-search tier (CONFIG["search"]).
+SEARCH_TIER = "search"
 
 
 # ─── Rate Limit Detection ─────────────────────────────────────────
@@ -1037,15 +1042,13 @@ async def _llm_call(
     package the GLM Coding Plan does not unlock, so it's bypassed.
     """
     if web_search:
-        try:
-            return await asyncio.wait_for(
-                _llm_call_search(prompt, max_tokens), timeout=LLM_CALL_DEADLINE
-            )
-        except TimeoutError:
-            logger.warning("Search call exceeded %ss deadline", LLM_CALL_DEADLINE)
-            return None
+        return await _llm_call_search(prompt, max_tokens)
+
+    # The tier being tried, so the overall deadline can charge it.
+    inflight: list[str] = []
 
     async def _try_tiers() -> str | None:
+        deadline_at = time.monotonic() + LLM_CALL_DEADLINE
         for tier in CONFIG["tiers"]:
             tier_name = tier["name"]
             # Background work never spends paid credit: the paid tier is
@@ -1055,7 +1058,7 @@ async def _llm_call(
             provider = tier["provider"]
             if provider not in PROVIDER_URLS:
                 logger.warning(
-                    "tier %s: provider %r has no URL configured — skipping",
+                    "background LLM: skip %s: provider %r has no URL configured",
                     tier_name,
                     provider,
                 )
@@ -1067,44 +1070,37 @@ async def _llm_call(
                 # 402s on every OpenRouter model — go straight to the next
                 # tier instead of burning a doomed provider attempt.
                 if remaining is not None and remaining <= 0:
+                    logger.info(
+                        "background LLM: skip %s: balance %s",
+                        tier_name,
+                        describe_balance(),
+                    )
                     continue
 
-            provider_config = CONFIG["providers"][provider]
-            api_key = os.getenv(provider_config["env_key"], "")
-            if not api_key:
+            env_key = CONFIG["providers"][provider]["env_key"]
+            if not os.getenv(env_key, ""):
+                logger.info(
+                    "background LLM: skip %s: %s is not set", tier_name, env_key
+                )
                 continue
             # Last gate, so a claimed half-open probe is always really used.
             if _circuit_open(tier_name):
+                logger.info("background LLM: skip %s: breaker open", tier_name)
                 continue
 
-            body: dict = {
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": max_tokens,
-                "temperature": 0.7,
-            }
-
-            try:
-                resp = await _call_provider(provider, tier["models"], body, api_key)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    msg = data.get("choices", [{}])[0].get("message", {})
-                    text = (msg.get("content") or "").strip()
-                    if text:
-                        _record_success(tier_name)
-                        return text
-                    _record_failure(tier_name)
-                elif _is_rate_limited(resp):
-                    _record_rate_limit(tier_name)
-                else:
-                    _record_failure(tier_name)
-            except Exception as exc:
-                logger.warning(
-                    "background LLM call failed on tier %s: %s: %s",
-                    tier_name,
-                    type(exc).__name__,
-                    exc,
-                )
-                _record_failure(tier_name)
+            # If the overall deadline fires first instead, the handler below
+            # charges the in-flight tier, so a hang always reaches the breaker.
+            budget = min(BACKGROUND_ATTEMPT_TIMEOUT, deadline_at - time.monotonic())
+            if budget <= 0:
+                logger.warning("background LLM: deadline reached before %s", tier_name)
+                return None
+            inflight[:] = [tier_name]
+            text = await _background_attempt(
+                tier_name, provider, tier["models"], prompt, max_tokens, budget
+            )
+            inflight.clear()
+            if text:
+                return text
         return None
 
     # Cap total time so a hung provider can't compound across tiers and block
@@ -1113,8 +1109,91 @@ async def _llm_call(
     try:
         return await asyncio.wait_for(_try_tiers(), timeout=LLM_CALL_DEADLINE)
     except TimeoutError:
-        logger.warning("LLM call exceeded %ss deadline across tiers", LLM_CALL_DEADLINE)
+        logger.warning(
+            "background LLM: exceeded %ss deadline across tiers (in flight: %s)",
+            LLM_CALL_DEADLINE,
+            inflight or "none",
+        )
+        for tier_name in inflight:
+            _record_failure(tier_name)
         return None
+
+
+def _prompt_body(prompt: str, max_tokens: int) -> dict:
+    """Chat body for a single-prompt background call."""
+    return {
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": 0.7,
+    }
+
+
+async def _background_attempt(
+    tier_name: str,
+    provider: str,
+    models: list[str],
+    prompt: str,
+    max_tokens: int,
+    timeout: float,
+    citations: bool = False,
+) -> str | None:
+    """One background provider call: send, parse, log and update the breaker.
+
+    Returns the reply text, or None after logging why (tier, HTTP status and
+    the first 200 chars of the body). Every failure counts against the
+    tier's breaker; a timeout is a failure too.
+    """
+    api_key = os.getenv(CONFIG["providers"][provider]["env_key"], "")
+    body = _prompt_body(prompt, max_tokens)
+    try:
+        resp = await asyncio.wait_for(
+            _call_provider(provider, models, body, api_key), timeout=timeout
+        )
+    except TimeoutError:
+        logger.warning("background LLM: %s: no reply within %.0fs", tier_name, timeout)
+        _record_failure(tier_name)
+        return None
+    except Exception as exc:
+        logger.warning("background LLM: %s: %s: %s", tier_name, type(exc).__name__, exc)
+        _record_failure(tier_name)
+        return None
+
+    if resp.status_code != 200:
+        if _is_rate_limited(resp):
+            _record_rate_limit(tier_name)
+        else:
+            _record_failure(tier_name)
+        logger.warning(
+            "background LLM: %s: HTTP %s: %s",
+            tier_name,
+            resp.status_code,
+            resp.text[:200],
+        )
+        return None
+    try:
+        msg = resp.json()["choices"][0]["message"]
+        text = (msg.get("content") or "").strip()
+        if citations:
+            refs = _extract_openrouter_citations(msg.get("annotations") or [])
+            if refs:
+                text = f"{text}\n\n{refs}" if text else refs
+    except (ValueError, LookupError, TypeError, AttributeError) as exc:
+        logger.warning(
+            "background LLM: %s: malformed reply (%s): %s",
+            tier_name,
+            type(exc).__name__,
+            resp.text[:200],
+        )
+        _record_failure(tier_name)
+        return None
+    if not text:
+        logger.warning(
+            "background LLM: %s: empty reply: %s", tier_name, resp.text[:200]
+        )
+        _record_failure(tier_name)
+        return None
+    _record_success(tier_name)
+    return text
 
 
 async def _llm_call_search(prompt: str, max_tokens: int) -> str | None:
@@ -1124,43 +1203,40 @@ async def _llm_call_search(prompt: str, max_tokens: int) -> str | None:
     Exa-powered web search before generation and attach url_citation
     annotations to the response. We extract those citations and append them
     to the answer text so Telegram messages include real source links.
+
+    `:online` models are paid, so this obeys the same balance floor as
+    !paid (an unknown balance denies) and has its own breaker (SEARCH_TIER).
     """
     search_cfg = CONFIG.get("search")
     if not search_cfg:
         return None
 
     provider = search_cfg["provider"]
-    models = search_cfg["models"]
-    provider_config = CONFIG["providers"][provider]
-    api_key = os.getenv(provider_config["env_key"], "")
-    if not api_key:
+    env_key = CONFIG["providers"][provider]["env_key"]
+    if not os.getenv(env_key, ""):
+        logger.info("background search: skip: %s is not set", env_key)
         return None
-
-    body = {
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_tokens,
-        "temperature": 0.7,
-    }
-    try:
-        resp = await _call_provider(provider, models, body, api_key)
-        if resp.status_code == 200:
-            data = resp.json()
-            msg = data.get("choices", [{}])[0].get("message", {})
-            text = (msg.get("content") or "").strip()
-            citations = _extract_openrouter_citations(msg.get("annotations") or [])
-            if citations:
-                text = f"{text}\n\n{citations}" if text else citations
-            if text:
-                return text
-        else:
-            print(
-                f"[PROXY] search tier {provider} returned {resp.status_code}: "
-                f"{resp.text[:200]}",
-                flush=True,
+    if provider == "openrouter":
+        remaining = await _check_openrouter_balance()
+        if remaining is None or remaining <= OPENROUTER_BALANCE_FLOOR:
+            logger.warning(
+                "background search: skip: OpenRouter balance %s (floor $%.2f)",
+                describe_balance(),
+                OPENROUTER_BALANCE_FLOOR,
             )
-    except Exception as exc:
-        print(f"[PROXY] search tier exception: {type(exc).__name__}: {exc}", flush=True)
-    return None
+            return None
+    if _circuit_open(SEARCH_TIER):
+        logger.info("background search: skip: breaker open")
+        return None
+    return await _background_attempt(
+        SEARCH_TIER,
+        provider,
+        search_cfg["models"],
+        prompt,
+        max_tokens,
+        LLM_CALL_DEADLINE,
+        citations=True,
+    )
 
 
 def _blocked_citation_patterns() -> list[re.Pattern[str]]:
@@ -1242,19 +1318,26 @@ def _spawn_background(coro) -> asyncio.Task:
 
 
 async def _try_single_tier(
-    tier: dict, body: dict, status_msg_id: int | None = None
+    tier: dict,
+    body: dict,
+    status_msg_id: int | None = None,
+    failures: dict[str, str] | None = None,
 ) -> tuple[JSONResponse | None, tuple[str, int | None] | None]:
     """Attempt one provider tier. Returns (response, rate_limit_info).
 
     On success: (JSONResponse, None)
     On rate limit: (None, (tier_name, reset_seconds))
     On other failure: (None, None)
+
+    When ``failures`` is given, a failed attempt stores a short reason under
+    the tier name, so the caller can say what actually went wrong.
     """
     tier_name = tier["name"]
     provider = tier["provider"]
     models = tier["models"]
     provider_config = CONFIG["providers"][provider]
     api_key = os.getenv(provider_config["env_key"], "")
+    reasons = failures if failures is not None else {}
 
     if status_msg_id:
         _spawn_background(telegram.send_typing())
@@ -1264,7 +1347,16 @@ async def _try_single_tier(
 
     try:
         non_stream_body = {**body, "stream": False}
-        resp = await _call_provider(provider, models, non_stream_body, api_key)
+        try:
+            resp = await asyncio.wait_for(
+                _call_provider(provider, models, non_stream_body, api_key),
+                timeout=PROVIDER_TIMEOUT,
+            )
+        except TimeoutError:
+            _record_failure(tier_name)
+            reasons[tier_name] = f"no reply within {PROVIDER_TIMEOUT}s"
+            _background_notify(tier_name, f"*Timeout* on `{tier_name}`")
+            return None, None
 
         if resp.status_code == 200:
             data = resp.json()
@@ -1304,6 +1396,7 @@ async def _try_single_tier(
                     f"[PROXY] garbled response from {tier_name} — skipping", flush=True
                 )
                 _record_failure(tier_name)
+                reasons[tier_name] = "garbled reply"
                 return None, None
 
             if not first_content.strip():
@@ -1313,6 +1406,7 @@ async def _try_single_tier(
                     flush=True,
                 )
                 _record_failure(tier_name)
+                reasons[tier_name] = "empty reply"
                 return None, None
 
             if _is_non_answer(first_content):
@@ -1324,6 +1418,7 @@ async def _try_single_tier(
                 # Don't _record_failure — the provider worked fine, the content
                 # was just bad. Tripping the circuit breaker would lock out a
                 # working provider and force expensive paid-tier fallback.
+                reasons[tier_name] = "non-answer reply"
                 return None, None
 
             _record_success(tier_name)
@@ -1346,6 +1441,7 @@ async def _try_single_tier(
                 pass
             reset = _get_reset_info(resp)
             detail = _get_rate_limit_detail(resp)
+            reasons[tier_name] = "rate-limited" + (f", resets {reset}" if reset else "")
             _background_notify(
                 tier_name,
                 f"*Rate limited* on `{tier_name}`"
@@ -1355,14 +1451,16 @@ async def _try_single_tier(
             return None, (tier_name, _get_reset_seconds(resp))
 
         _record_failure(tier_name)
+        reasons[tier_name] = f"HTTP {resp.status_code}"
         _background_notify(
             tier_name,
-            f"*Error* on `{tier_name}` (HTTP {resp.status_code})",
+            f"*Error* on `{tier_name}` (HTTP {resp.status_code}): {resp.text[:200]}",
         )
         return None, None
 
     except httpx.HTTPError as exc:
         _record_failure(tier_name)
+        reasons[tier_name] = f"network error ({type(exc).__name__})"
         _background_notify(tier_name, f"*Network error* on `{tier_name}`: {exc}")
         return None, None
     except (ValueError, IndexError, KeyError, TypeError, AttributeError) as exc:
@@ -1375,6 +1473,7 @@ async def _try_single_tier(
             exc,
         )
         _record_failure(tier_name)
+        reasons[tier_name] = "malformed reply"
         return None, None
 
 
@@ -1635,6 +1734,8 @@ async def _handle_non_streaming(
     """
     # Determine which tiers are available right now
     available: list[dict] = []
+    # Why a tier is not answering: skipped here or failed in the race.
+    failures: dict[str, str] = {}
     for tier in CONFIG["tiers"]:
         tier_name = tier["name"]
         if forced_tier and tier_name != forced_tier:
@@ -1663,25 +1764,33 @@ async def _handle_non_streaming(
             continue
         if tier_name == "openrouter-paid":
             remaining = await _check_openrouter_balance()
-            if remaining is not None and remaining <= OPENROUTER_BALANCE_FLOOR:
+            # An unknown balance (lookup never succeeded or failing) denies
+            # paid: the floor exists to protect credit we cannot see.
+            if remaining is None or remaining <= OPENROUTER_BALANCE_FLOOR:
+                failures[tier_name] = (
+                    f"OpenRouter balance {describe_balance()} is not above "
+                    f"the ${OPENROUTER_BALANCE_FLOOR:.2f} paid floor"
+                )
                 continue
         # Last gate: claiming the half-open probe slot must mean the tier
         # really is going to be called.
         if _circuit_open(tier_name):
+            failures[tier_name] = "breaker open after repeated failures"
             continue
         available.append(tier)
 
     if not available:
-        print("[PROXY] no tiers available", flush=True)
+        print(f"[PROXY] no tiers available: {failures}", flush=True)
         return _synthetic_response(
-            "I'm temporarily on pause — no LLM tiers are available right now. "
-            "Try again later."
+            "I'm temporarily on pause — no LLM tiers are available right now"
+            + (f" ({_failure_summary(failures)})" if failures else "")
+            + ". Try again later."
         )
 
     # Race all available tiers concurrently — first success wins
     tasks = {
         asyncio.create_task(
-            _try_single_tier(tier, body, status_msg_id),
+            _try_single_tier(tier, body, status_msg_id, failures),
             name=f"tier:{tier['name']}",
         ): tier["name"]
         for tier in available
@@ -1744,8 +1853,24 @@ async def _handle_non_streaming(
                     status_msg_id=status_msg_id,
                 )
 
-    print("[PROXY] all tiers exhausted — returning synthetic response", flush=True)
-    return _synthetic_response(
-        "I'm temporarily on pause — the free API tiers are rate-limited right now. "
-        "Send !paid or !claude to use the paid tier, or try again later."
+    print(f"[PROXY] all tiers exhausted: {failures}", flush=True)
+    raced = {name: failures.get(name, "failed") for name in tasks.values()}
+    retry = (
+        "Try again later."
+        if forced_tier
+        else "Send !paid or !claude to use the paid tier, or try again later."
     )
+    if all(why.startswith("rate-limited") for why in raced.values()):
+        return _synthetic_response(
+            f"I'm temporarily on pause — the API tiers are rate-limited right now. "
+            f"{retry}"
+        )
+    return _synthetic_response(
+        f"I'm temporarily on pause — no tier answered ({_failure_summary(raced)}). "
+        f"{retry}"
+    )
+
+
+def _failure_summary(failures: dict[str, str]) -> str:
+    """``tier: reason; tier: reason`` for a user-facing failure line."""
+    return "; ".join(f"{name}: {why}" for name, why in failures.items())

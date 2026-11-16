@@ -3379,6 +3379,8 @@ class TestOpenRouterCitationExtraction:
     @patch.dict("os.environ", FAKE_ENV)
     @patch("llm_proxy._call_provider", new_callable=AsyncMock)
     @patch("llm_proxy._circuit_open", return_value=False)
+    # Search is paid: it needs a known balance above the floor (#23).
+    @patch("llm_proxy._check_openrouter_balance", AsyncMock(return_value=50.0))
     def test_openrouter_citations_appended_to_content(self, _cb, mock_call):
         """OpenRouter response with content + annotations merges them."""
         import asyncio
