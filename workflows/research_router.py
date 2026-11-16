@@ -13,17 +13,40 @@ import llm_proxy
 import reddit_search
 import tenant_profile
 from brain_db import project_list
+from errors import UpstreamError
 
 # ─── Marketing Scan Interceptor ──────────────────────────────────
 
+# The generators write "Scan reddit for <slug>: ..." and "traffic snapshot
+# for <owner>/<repo>: ...", so a capture must stop at the colon.
 _MARKETING_SCAN_PATTERNS = {
-    "reddit": re.compile(r"Scan reddit for (\S+)", re.IGNORECASE),
-    "github": re.compile(r"Scan github for (\S+)", re.IGNORECASE),
+    "reddit": re.compile(r"Scan reddit for ([^\s:]+)", re.IGNORECASE),
+    "github": re.compile(r"Scan github for ([^\s:]+)", re.IGNORECASE),
     "traffic": re.compile(
-        r"(?:Weekly )?traffic snapshot for (\S+)/(\S+)", re.IGNORECASE
+        r"(?:Weekly )?traffic snapshot for ([^\s:/]+)/([^\s:]+)", re.IGNORECASE
     ),
-    "awesome": re.compile(r"Awesome-list watch: (\S+) not yet listed", re.IGNORECASE),
+    "awesome": re.compile(
+        r"Awesome-list watch: ([^\s:]+) not yet listed", re.IGNORECASE
+    ),
 }
+
+# Results shown per scan; only these are marked seen, so the rest can
+# surface on the next run.
+_REDDIT_SHOWN = 8
+_GITHUB_SHOWN = 5
+
+
+async def traffic_unavailable(owner: str, repo: str) -> str:
+    """Why get_self_traffic returned None: no PAT, or the API call failed."""
+    if not await github_search.is_configured():
+        return f"{owner}/{repo}: traffic unavailable (needs GITHUB_PAT with repo scope)"
+    return f"{owner}/{repo}: traffic unavailable (GitHub API call failed, see logs)"
+
+
+def _channel_errors(result: dict) -> str:
+    errors = result.get("errors") or {}
+    return "; ".join(f"{ch}: {msg}" for ch, msg in errors.items())
+
 
 ANTI_PATTERN_RULES = """
 ANTI-PATTERNS (do not produce text that violates these):
@@ -64,8 +87,9 @@ async def _try_research_task(description: str) -> str | None:
 
     Returns condensed findings text when the task matches (intent verb +
     external source target), None when it doesn't so the LLM path handles
-    it. A failure inside the orchestrator also returns None — the LLM
-    attempt is a better fallback than a hard error.
+    it. When every channel failed the orchestrator raises UpstreamError,
+    which propagates so the heartbeat marks the task failed. Any other
+    orchestrator error returns None: the LLM attempt is the fallback.
     """
     if not (
         _RESEARCH_INTENT.search(description) and _RESEARCH_TARGET.search(description)
@@ -79,9 +103,9 @@ async def _try_research_task(description: str) -> str | None:
     if description.strip().lower().startswith("content idea for"):
         return None
 
-    # Function-local on purpose (cycle guard): research imports this
-    # module at module scope for _llm_call, so a top-level import here
-    # would be circular.
+    # Function-local on purpose: research imports llm_proxy, which imports
+    # heartbeat and this module, so importing research at module scope
+    # here would be circular.
     import research
 
     try:
@@ -89,12 +113,17 @@ async def _try_research_task(description: str) -> str | None:
             description,
             channels=["discourse", "code", "discourse_web"],
         )
+    except UpstreamError:
+        raise
     except Exception:
         llm_proxy.logger.exception("research router: orchestrator failed")
         return None
 
     findings = result.get("findings", [])
+    failed = _channel_errors(result)
     if not findings:
+        if failed:
+            return f"Research: no findings (failed channels: {failed})."
         return "Research: no findings."
 
     # No description echo: the digest line already prints it above the
@@ -102,6 +131,8 @@ async def _try_research_task(description: str) -> str | None:
     lines = [f"Research findings ({len(findings)}):"]
     for i, f in enumerate(findings[:8], 1):
         lines.append(f"{i}. [{f['channel']}] {f['title'][:90]}\n   {f['url']}")
+    if failed:
+        lines.append(f"Failed channels: {failed}")
     return "\n".join(lines)
 
 
@@ -135,16 +166,16 @@ async def _try_marketing_scan(description: str, brain_db) -> str | None:
             if not results:
                 return f"Reddit scan for {slug}: no new relevant posts found."
 
+            shown = results[:_REDDIT_SHOWN]
             lines = [f"Reddit scan for {slug} ({len(results)} results):\n"]
-            for i, r in enumerate(results[:8], 1):
+            for i, r in enumerate(shown, 1):
                 lines.append(
                     f"{i}. {r.title}\n"
                     f"   r/{r.subreddit} | {r.score}pts | {r.comments} comments\n"
                     f"   {r.url}"
                 )
 
-            # Mark results in scan cache
-            for r in results:
+            for r in shown:
                 brain_db.mark_seen("reddit_post", r.id, slug)
 
             return "\n".join(lines)
@@ -168,9 +199,10 @@ async def _try_marketing_scan(description: str, brain_db) -> str | None:
                 f"GitHub scan for {slug} ({len(repos)} repos, {len(issues)} issues):\n"
             ]
 
-            if repos:
+            shown_repos = repos[:_GITHUB_SHOWN]
+            if shown_repos:
                 lines.append("Adjacent repos:")
-                for i, repo in enumerate(repos[:5], 1):
+                for i, repo in enumerate(shown_repos, 1):
                     lines.append(
                         f"  {i}. {repo.full_name} ({repo.stars}*) — "
                         f"{repo.description or ''}"
@@ -178,11 +210,10 @@ async def _try_marketing_scan(description: str, brain_db) -> str | None:
 
             if issues:
                 lines.append("\nRecent issues:")
-                for i, iss in enumerate(issues[:5], 1):
+                for i, iss in enumerate(issues[:_GITHUB_SHOWN], 1):
                     lines.append(f"  {i}. {iss.title} — {iss.repository}#{iss.number}")
 
-            # Mark in cache
-            for seen_repo in repos:
+            for seen_repo in shown_repos:
                 brain_db.mark_seen("github_repo", str(seen_repo.id), slug)
 
             return "\n".join(lines)
@@ -192,10 +223,12 @@ async def _try_marketing_scan(description: str, brain_db) -> str | None:
 
             traffic = await github_search.get_self_traffic(owner, repo_name)
             if not traffic:
-                return (
-                    f"Traffic for {owner}/{repo_name}: unavailable "
-                    f"(needs GITHUB_PAT with repo scope)"
-                )
+                reason = await traffic_unavailable(owner, repo_name)
+                if not await github_search.is_configured():
+                    return reason
+                # The PAT is set, so the API call itself failed: that is a
+                # failed task, not an answer.
+                raise UpstreamError(reason)
 
             return (
                 f"Traffic for {owner}/{repo_name} (14 days):\n"
