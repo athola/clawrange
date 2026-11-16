@@ -439,6 +439,12 @@ async def _build_work_prompt(task_description: str, web_search: bool = False) ->
 _WEB_SEARCH_KEYWORDS = {
     "reddit",
     "search",
+    # Whole-word matching no longer finds "search" inside these; a task
+    # like "Research competitor pricing" names no research_router target,
+    # so it reaches the LLM and still needs live data.
+    "searching",
+    "research",
+    "researching",
     "rundown",
     "news",
     "trending",
@@ -458,8 +464,8 @@ _WEB_SEARCH_KEYWORDS = {
 
 
 # Whole words only: as substrings, "hn" matched "John" and "technology" and
-# sent them to the paid search tier. Inflections ("searching", "research")
-# no longer match; research-shaped tasks reach the research router first.
+# sent them to the paid search tier. Inflections that should still mean
+# "look it up" ("searching", "research") are listed explicitly above.
 _WEB_SEARCH_RE = re.compile(
     r"\b(?:"
     + "|".join(

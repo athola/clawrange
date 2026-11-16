@@ -77,6 +77,19 @@ class TestWebKeywordsWordBoundary:
     def test_whole_keywords_still_match(self, desc):
         assert heartbeat._task_needs_web(desc) is True
 
+    @pytest.mark.parametrize(
+        "desc",
+        [
+            # No research_router target word, so these reach the LLM; the
+            # substring match used to give them web search via "search".
+            "Research competitor pricing for the homelab NAS",
+            "Keep researching rack options under $300",
+            "Searching for a cheaper UPS",
+        ],
+    )
+    def test_research_inflections_still_need_web(self, desc):
+        assert heartbeat._task_needs_web(desc) is True
+
 
 # ─── #26 / G5: LLM outage re-pends instead of completing ──────────
 
