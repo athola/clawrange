@@ -1,6 +1,6 @@
 # ClawRange Secure Deployment Guide
 
-Node (this machine) + Gateway (DigitalOcean droplet) via Tailscale VPN.
+Node (this machine) and Gateway (DigitalOcean droplet) via Tailscale VPN.
 
 ## Architecture
 
@@ -10,25 +10,31 @@ Internet → Droplet (Caddy + TLS) → Tailscale tunnel → Node (Docker service
 
 | Component | Role | Location |
 |-----------|------|----------|
-| Node machine | Runs OpenClaw + Workflows (FastAPI) + optional DeerFlow | Behind NAT, no public IP needed |
-| DigitalOcean droplet | Gateway — reverse proxy + TLS termination | Public IP, domain pointed here |
+| Node machine | Runs OpenClaw, Workflows (FastAPI), and optional DeerFlow | Behind NAT, no public IP needed |
+| DigitalOcean droplet | Gateway: reverse proxy and TLS termination | Public IP, domain pointed here |
 | Tailscale | Encrypted WireGuard tunnel between them | Mesh VPN, NAT-traversal built in |
 | Caddy | HTTPS reverse proxy on gateway | Auto Let's Encrypt certificates |
 
 ## Security Model
 
-1. **No public ports on the node** — Docker binds to `127.0.0.1` + Tailscale IP only
-2. **Tailscale for transport** — WireGuard encryption, identity-based access, no port forwarding
-3. **TLS termination at gateway** — Caddy handles Let's Encrypt automatically
-4. **UFW on gateway** — only SSH (22), HTTP (80), HTTPS (443), Tailscale (41641/udp)
-5. **Gateway token authentication** — OpenClaw requires `OPENCLAW_GATEWAY_TOKEN` header
-6. **WSL2 NAT isolation** — Windows host NAT provides additional layer
+1. **No public ports on the node**: Docker binds to `127.0.0.1`,
+   `DOCKER_HOST_IP` (the docker0 gateway, for sibling compose projects;
+   defaults to the `127.0.0.2` loopback alias when empty) and the
+   Tailscale IP only
+2. **Tailscale for transport**: WireGuard encryption, identity-based access, no port forwarding
+3. **TLS termination at gateway**: Caddy handles Let's Encrypt automatically
+4. **UFW on gateway**: only SSH (22), HTTP (80), HTTPS (443), Tailscale (41641/udp)
+5. **Gateway token authentication**: OpenClaw requires `OPENCLAW_GATEWAY_TOKEN` header
+6. **Workflows bearer token**: every workflows route needs
+   `Authorization: Bearer $PROXY_AUTH_TOKEN` except the health checks,
+   `GET /tier` and `GET /sched[/{id}]`. An empty token fails closed (401)
+7. **WSL2 NAT isolation**: Windows host NAT provides additional layer
 
 ## Prerequisites
 
 - [ ] Node machine: Docker, Docker Compose, Tailscale installed and running
 - [ ] DigitalOcean account
-- [ ] Domain name (for TLS — can use a subdomain like `ai.yourdomain.com`)
+- [ ] Domain name (for TLS, can use a subdomain like `ai.yourdomain.com`)
 - [ ] Tailscale account
 - [ ] OpenRouter API key with balance
 
@@ -39,7 +45,7 @@ Internet → Droplet (Caddy + TLS) → Tailscale tunnel → Node (Docker service
 ```bash
 tailscale status
 tailscale ip -4
-# Note your Tailscale IP — you'll need it for TAILSCALE_IP in .env
+# Note your Tailscale IP (you'll need it for TAILSCALE_IP in .env)
 ```
 
 ### 1.2 Configure environment
@@ -55,15 +61,21 @@ cp .env.example .env
 #   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID=<for tier alerts and task delivery>
 ```
 
+`PROXY_AUTH_TOKEN` ships empty in `.env.example`. `make start-prod`
+(through `scripts/start.sh --ensure-soul`) exits with an error until it
+is set, and renders `openclaw/soul.md` from the active profile if it is
+missing.
+
 ### 1.3 Start services in production mode
 
 ```bash
-# Production mode binds to 127.0.0.1 + Tailscale IP only
+# Production mode binds to 127.0.0.1 and Tailscale IP only
 make start-prod
 
 # Verify ports are bound correctly
 ss -tlnp | grep -E '3000|5678'
-# Should show 127.0.0.1:3000 and <your-ts-ip>:3000 — NOT 0.0.0.0:3000
+# Should show 127.0.0.1:3000, <DOCKER_HOST_IP or 127.0.0.2>:3000 and
+# <your-ts-ip>:3000 (NOT 0.0.0.0:3000)
 ```
 
 ### 1.4 Verify services are accessible via Tailscale
@@ -78,6 +90,12 @@ curl -s http://<your-tailscale-ip>:3000/healthz
 curl -s http://<your-tailscale-ip>:5678/healthz
 ```
 
+The workflows `/healthz` always answers 200 while the process serves.
+Read its `status`: `degraded` means something is broken, and `problems`
+names it (`db`, `vector_search`, `scheduler`, `profile`). Without the
+bearer token you get the names only; add
+`-H "Authorization: Bearer $PROXY_AUTH_TOKEN"` for the error detail.
+
 ## Part 2: Gateway Setup (DigitalOcean Droplet)
 
 ### 2.1 Create the droplet
@@ -85,7 +103,7 @@ curl -s http://<your-tailscale-ip>:5678/healthz
 1. Go to [DigitalOcean](https://cloud.digitalocean.com/)
 2. Create Droplet:
    - **Image**: Ubuntu 24.04 LTS
-   - **Plan**: Basic $6/mo (1 vCPU, 1GB RAM) — gateway is just proxying
+   - **Plan**: Basic $6/mo (1 vCPU, 1GB RAM). Gateway is just proxying
    - **Region**: Choose closest to your node's location
    - **Auth**: SSH key (strongly recommended over password)
    - **Hostname**: `clawrange-gateway`
@@ -120,7 +138,7 @@ The script will:
 1. Update system packages
 2. Install Tailscale (prompts for auth key)
 3. Install Caddy
-4. Configure UFW (SSH + HTTP + HTTPS + Tailscale only)
+4. Configure UFW (SSH, HTTP, HTTPS, and Tailscale only)
 5. Create a Caddyfile with your node IP baked in
 
 ### 2.4 Get a Tailscale auth key (for headless droplet)
@@ -155,10 +173,10 @@ systemctl reload caddy
 ### 2.6 Verify end-to-end
 
 ```bash
-# From the droplet — test Tailscale tunnel to node
+# From the droplet: test Tailscale tunnel to node
 curl -s http://<node-tailscale-ip>:3000/healthz
 
-# From anywhere — test public HTTPS
+# From anywhere: test public HTTPS
 curl -s https://ai.yourdomain.com/healthz
 
 # Test a chat completion
@@ -173,7 +191,9 @@ curl -s https://ai.yourdomain.com/v1/chat/completions \
 ## Part 3: Tailscale ACLs (Optional but Recommended)
 
 Lock down which devices can talk to what. Go to
-https://login.tailscale.com/admin/acls and add:
+https://login.tailscale.com/admin/acls and add the policy below (also
+available paste-ready, with tagging instructions, as
+[tailscale-acls.json](tailscale-acls.json)):
 
 ```json
 {
@@ -213,18 +233,22 @@ Your personal devices can still reach everything as the tailnet owner.
 
 ### Node
 
-- [ ] Docker ports bound to 127.0.0.1 + Tailscale IP only (`make start-prod`)
+- [ ] Docker ports bound to 127.0.0.1, `DOCKER_HOST_IP` and the Tailscale
+  IP only (`make start-prod`)
 - [ ] `OPENCLAW_GATEWAY_TOKEN` set to random value
-- [ ] `PROXY_AUTH_TOKEN` set to random value (gates the workflows LLM proxy)
-- [ ] `OPENROUTER_API_KEY` set in `.env`; `OPENROUTER_CREDIT_BALANCE` reflects actual deposit
-- [ ] Pin Docker images to specific versions before production
-  (e.g. `ghcr.io/openclaw/openclaw:2026.3.24`)
-- [ ] Workflows runs single uvicorn worker (default — do not raise)
+- [ ] `PROXY_AUTH_TOKEN` set to random value (gates every workflows route
+  except the health checks, `GET /tier` and `GET /sched[/{id}]`, not just
+  the LLM proxy)
+- [ ] `OPENROUTER_API_KEY` set in `.env`; balance is read live from the
+  OpenRouter credits API (`/api/v1/credits`)
+- [ ] Docker images stay pinned (`docker-compose.yml` ships
+  `ghcr.io/openclaw/openclaw:2026.11.3`)
+- [ ] Workflows runs single uvicorn worker (default: do not raise)
 - [ ] Brain DB at `data/brain/brain.db` is included in your backup plan
 
 ### Gateway (droplet)
 
-- [ ] UFW enabled (SSH + HTTP/S + Tailscale only)
+- [ ] UFW enabled (SSH, HTTP/S, and Tailscale only)
 - [ ] Caddy configured with real domain
 - [ ] TLS certificate obtained (automatic with Caddy)
 - [ ] Tailscale connected and node reachable
@@ -268,9 +292,15 @@ ufw status                        # Firewall status
 | Gateway can't reach node | `tailscale ping <node-ts-ip>` from droplet |
 | TLS cert not issued | DNS A record points to droplet? `dig ai.yourdomain.com` |
 | 502 Bad Gateway | Node services running? `make health` on node |
-| Slow responses | Tailscale using relay? `tailscale status` — look for "relay" vs "direct" |
+| Slow responses | Tailscale using relay? `tailscale status`: look for "relay" vs "direct" |
 | Workflows endpoints failing | Tool URL in `openclaw/config/openclaw.json` should use Docker service name (`workflows`), not Tailscale IP |
 | DeerFlow not reachable | Started with `--with-deerflow`? Connected to `msp-network`? |
+| Workflows routes return 401 | `PROXY_AUTH_TOKEN` empty or not sent. Every route except the health checks, `GET /tier` and `GET /sched[/{id}]` needs `Authorization: Bearer $PROXY_AUTH_TOKEN` |
+| `/docs` or `/openapi.json` returns 404 | Expected: the interactive docs are turned off. Routes are listed in `CLAUDE.md` and `workflows/app.py` |
+| `/scan/*` or `/research` returns 502 | The upstream (Reddit, GitHub, the search tier) failed; `detail` carries the reason. Not an empty result |
+| OpenClaw container unhealthy, heartbeats never reach the proxy | `docker inspect --format '{{json .State.Health}}' msp-openclaw`: a `heartbeat sync failed: ...` line means `sync-heartbeat.sh` could not load `HEARTBEAT.md` into the heartbeat monitors and wrote `/run/sync-heartbeat.failed`. The script's output is in `docker logs msp-openclaw`; restart the container to retry |
+| A task stays `active` | A worker claimed it and died. The heartbeat fails it after `HEARTBEAT_ACTIVE_REAP_HOURS` (default 6) with a digest line; re-create it to retry |
+| Heartbeat tasks fail with the LLM down | During an outage a task goes back to pending each heartbeat and is failed on its 6th outage cycle (about an hour), so it cannot block the queue |
 
 ## Cost Estimate
 

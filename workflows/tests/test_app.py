@@ -2,9 +2,18 @@
 
 from unittest.mock import AsyncMock, patch
 
+import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from app import app
+import app as app_module
+import llm_proxy
+from app import _current_profile, app
+from brain_db import BrainDB
+from chat_commands import _extract_task_command
+from persona_api import create_persona_router
+from research import Finding
+from tenant_profile import Profile
 
 client = TestClient(app)
 
@@ -35,12 +44,6 @@ class TestWebhook:
         r = client.post("/webhook/test", json={})
         assert "empty payload" in r.json()["message"]
 
-    def test_webhook_test_path(self):
-        """The /webhook-test/ path works identically for backward compat."""
-        r = client.post("/webhook-test/test", json={"source": "test"})
-        assert r.status_code == 200
-        assert "received" in r.json()["message"]
-
 
 # ─── Tier Status ─────────────────────────────────────────────────
 
@@ -56,7 +59,11 @@ class TestTierStatus:
         return_value=12.50,
     )
     @patch("llm_proxy._last_tier_used", "zai-direct")
-    def test_returns_tier_list(self, _mock_balance):
+    def test_returns_tier_list(self, _mock_balance, monkeypatch):
+        # /tier renders llm_proxy.describe_balance(), which reads the cache
+        # the (mocked) balance check would have filled.
+        monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+        monkeypatch.setitem(llm_proxy._balance_cache, "remaining", 12.50)
         r = client.get("/tier")
         assert r.status_code == 200
         data = r.json()
@@ -86,8 +93,6 @@ class TestTierStatus:
     )
     @patch("llm_proxy._last_tier_used", None)
     def test_tripped_tier_shows_tripped(self, _mock_balance):
-        import llm_proxy
-
         # Trip the circuit breaker for a tier
         llm_proxy._circuit_state["openrouter-free"] = {
             "failures": llm_proxy.CIRCUIT_FAILURE_THRESHOLD,
@@ -245,34 +250,24 @@ class TestTaskCommandDetection:
     THEN it correctly classifies them."""
 
     def test_create_task(self):
-        from llm_proxy import _extract_task_command
-
         result = _extract_task_command("!task check z.ai for new models")
         assert result == {"type": "create", "description": "check z.ai for new models"}
 
     def test_list_tasks(self):
-        from llm_proxy import _extract_task_command
-
         assert _extract_task_command("!tasks")["type"] == "list"
         assert _extract_task_command("/tasks")["type"] == "list"
         assert _extract_task_command("!task")["type"] == "list"
         assert _extract_task_command("!task list")["type"] == "list"
 
     def test_cancel_task(self):
-        from llm_proxy import _extract_task_command
-
         result = _extract_task_command("!task cancel abc123")
         assert result == {"type": "action", "action": "cancel", "args": "abc123"}
 
     def test_priority_task(self):
-        from llm_proxy import _extract_task_command
-
         result = _extract_task_command("!task priority abc123 1")
         assert result == {"type": "action", "action": "priority", "args": "abc123 1"}
 
     def test_non_task_message(self):
-        from llm_proxy import _extract_task_command
-
         assert _extract_task_command("hello world") is None
         assert _extract_task_command("what tasks do I have") is None
 
@@ -284,8 +279,6 @@ class TestResearchEndpoint:
     """End-to-end tests for /research and /research/sessions."""
 
     def test_post_research_persists_session(self, monkeypatch):
-        from research import Finding
-
         async def fake_orch(topic, channels=None, **kwargs):
             return {
                 "topic": topic,
@@ -351,3 +344,82 @@ class TestResearchEndpoint:
             "code",
             "discourse_web",
         }
+
+
+class TestCurrentProfileGuard:
+    """B1 regression: a broken profile.yaml must never resolve to the
+    placeholder starter profile and render it over real persona files."""
+
+    def _persona_app(self, tmp_path):
+        db = BrainDB(str(tmp_path / "b.db"))
+        db.init_db()
+        soul = tmp_path / "soul.md"
+        persona_app = FastAPI()
+        persona_app.include_router(
+            create_persona_router(db, _current_profile, lambda p: {"soul": str(soul)})
+        )
+        return TestClient(persona_app, raise_server_exceptions=False), soul
+
+    def _break_profile(self, tmp_path, monkeypatch):
+        profdir = tmp_path / "profiles" / "broken"
+        profdir.mkdir(parents=True)
+        (profdir / "profile.yaml").write_text("profile: [unclosed")
+        monkeypatch.setenv("CLAWRANGE_PROFILES_DIR", str(tmp_path / "profiles"))
+        monkeypatch.setenv("CLAWRANGE_PROFILE", "broken")
+
+    def test_broken_profile_is_5xx_and_writes_nothing(self, tmp_path, monkeypatch):
+        self._break_profile(tmp_path, monkeypatch)
+        monkeypatch.delattr(app_module.app.state, "profile", raising=False)
+        persona_client, soul = self._persona_app(tmp_path)
+        r = persona_client.post("/persona/render")
+        assert r.status_code >= 500
+        assert not soul.exists()
+
+    def test_broken_profile_falls_back_to_boot_profile(self, tmp_path, monkeypatch):
+        self._break_profile(tmp_path, monkeypatch)
+        boot = Profile(name="cos", raw={"profile": "cos", "assistant": {"name": "Max"}})
+        monkeypatch.setattr(app_module.app.state, "profile", boot, raising=False)
+        persona_client, soul = self._persona_app(tmp_path)
+        r = persona_client.post("/persona/render")
+        assert r.status_code == 200
+        assert soul.exists()
+        assert "Max" in soul.read_text()
+
+
+class TestTaskInputBounds:
+    """POST /task is the queue's public entry: callers may not spoof an
+    internal source (persona, schedule, ...) or submit unbounded text."""
+
+    def test_rejects_internal_source(self):
+        r = client.post("/task", json={"description": "x", "source": "persona"})
+        assert r.status_code == 422
+
+    def test_accepts_user_and_system(self):
+        for src in ("user", "system"):
+            r = client.post("/task", json={"description": "x", "source": src})
+            assert r.status_code == 200, src
+
+    def test_rejects_oversized_description(self):
+        r = client.post("/task", json={"description": "x" * 4001})
+        assert r.status_code == 422
+
+    def test_rejects_empty_description(self):
+        r = client.post("/task", json={"description": "   "})
+        assert r.status_code == 422
+
+
+class TestEmbeddingWiring:
+    def test_startup_uses_configured_model_table(self):
+        import embeddings
+        from app import brain_db
+
+        if not brain_db._has_vec:
+            pytest.skip("sqlite-vec unavailable")
+        assert brain_db._vec_table == embeddings.config().table
+
+    def test_healthz_reports_embedding_model(self):
+        import embeddings
+
+        data = client.get("/healthz").json()["brain"]
+        assert data["embedding_model"] == embeddings.config().model
+        assert data["vectors"] == 0

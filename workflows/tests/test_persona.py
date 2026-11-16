@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import pathlib
 
+from persona import (
+    compose_persona,
+    render_all,
+    render_identity,
+    render_persona,
+)
 from tenant_profile import Profile, load_profile
-from persona import render_persona, write_soul
 
 
 def _real_profiles_dir():
@@ -88,14 +93,91 @@ def test_marketing_render_contains_john117():
     assert "John-117" in out
 
 
-def test_write_soul_round_trips(tmp_path):
+def test_render_identity_fills_fields_and_defaults_name():
     p = Profile(
-        "acme",
-        {
-            "profile": "acme",
-            "assistant": {"name": "Acme Bot", "role": "assistant", "capabilities": []},
+        name="t",
+        raw={
+            "profile": "t",
+            "assistant": {
+                "name": "Max",
+                "identity": {
+                    "creature": "Chief of Staff",
+                    "vibe": "sharp",
+                    "emoji": "🎯",
+                },
+            },
         },
     )
-    dest = tmp_path / "soul.md"
-    write_soul(p, dest)
-    assert dest.read_text() == render_persona(p)
+    out = render_identity(p)
+    assert "**Name:** Max" in out  # defaults to assistant.name
+    assert "**Creature:** Chief of Staff" in out
+    assert "🎯" in out
+
+
+def test_compose_appends_learned_region_and_is_non_destructive():
+    p = Profile(name="t", raw={"profile": "t", "assistant": {"name": "Max"}})
+    learnings = [
+        {
+            "kind": "persona",
+            "target": "Communication",
+            "content": "Lead with the recommendation.",
+        }
+    ]
+    out = compose_persona(p, learnings)
+    assert "## Learned" in out
+    assert "Communication" in out and "Lead with the recommendation." in out
+    # base persona still present
+    assert "Max" in out
+    # no learnings -> no Learned region
+    assert "## Learned" not in compose_persona(p, [])
+
+
+def test_render_all_writes_targets(tmp_path):
+    # Identity is rendered only for a profile that declares an identity block.
+    p = Profile(
+        name="t",
+        raw={"profile": "t", "assistant": {"name": "Max", "identity": {"vibe": "v"}}},
+    )
+    soul = tmp_path / "soul.md"
+    ident = tmp_path / "IDENTITY.md"
+    res = render_all(p, {"soul": str(soul), "identity": str(ident)}, [])
+    assert res == {"soul": True, "identity": True}
+    assert "Max" in soul.read_text() and "Name:** Max" in ident.read_text()
+
+
+def test_render_all_unwritable_target_returns_false(tmp_path):
+    """render_all's no-raise contract: an unwritable target reports False
+    instead of raising, so approve never 500s after committing DB status."""
+
+    p = Profile("x", {"profile": "x", "assistant": {"name": "Max"}})
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    target = blocker / "soul.md"  # parent is a file -> OSError on write
+    result = render_all(p, {"soul": str(target)}, [])
+    assert result == {"soul": False}
+
+
+def test_learned_region_flattens_stored_multiline_content():
+    """Defense in depth: rows that predate input validation (or arrive via a
+    hand-edited learned.yaml) still render as a single bullet."""
+    p = Profile(name="t", raw={"profile": "t", "assistant": {"name": "Max"}})
+    evil = [{"kind": "persona", "target": "A\nB", "content": "x\n## Injected\ny"}]
+    out = compose_persona(p, evil)
+    # Mid-line "##" is inert text; only a line *starting* with it is a heading.
+    assert not any(line.startswith("## Injected") for line in out.splitlines())
+    assert "- **A B:** x ## Injected y" in out
+
+
+def test_render_all_logs_unwritable_target(tmp_path, caplog):
+    p = Profile("x", {"profile": "x", "assistant": {"name": "Max"}})
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    with caplog.at_level("WARNING", logger="clawrange.persona"):
+        render_all(p, {"soul": str(blocker / "soul.md")}, [])
+    assert "soul.md" in caplog.text
+
+
+def test_render_all_leaves_no_temp_files(tmp_path):
+    p = Profile("x", {"profile": "x", "assistant": {"name": "Max"}})
+    render_all(p, {"soul": str(tmp_path / "soul.md")}, [])
+    assert sorted(f.name for f in tmp_path.iterdir()) == ["soul.md"]

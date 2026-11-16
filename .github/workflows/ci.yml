@@ -11,28 +11,40 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: ShellCheck
-        uses: ludeeus/action-shellcheck@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          scandir: scripts
+          # Full history so gitleaks can scan every commit in the push/PR.
+          fetch-depth: 0
+
+      # The whole repo, not just scripts/: openclaw/sync-heartbeat.sh and
+      # workflows/entrypoint.sh run in the containers.
+      - name: ShellCheck
+        uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38  # 2.0.0
+        with:
+          scandir: "."
           severity: warning
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7  # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Validate YAML
         run: |
-          pip install --quiet yamllint
-          yamllint -d relaxed docker-compose.yml deerflow/config.yaml
+          pip install --quiet yamllint==1.38.0
+          yamllint -d relaxed docker-compose.yml docker-compose.prod.yml deerflow/config.yaml
 
       - name: Validate JSON
         run: |
-          for f in n8n/workflows/*.json openclaw/config/openclaw.json; do
+          for f in openclaw/config/openclaw.json; do
             python3 -m json.tool "$f" > /dev/null && echo "OK: $f" || { echo "FAIL: $f"; exit 1; }
           done
 
       - name: Validate Docker Compose
         run: |
           docker compose -f docker-compose.yml config --quiet
+          # The prod override requires TAILSCALE_IP; any address will do here.
+          TAILSCALE_IP=100.64.0.1 docker compose -f docker-compose.yml -f docker-compose.prod.yml config --quiet
 
       - name: Scan for secrets
         run: |
@@ -47,19 +59,42 @@ jobs:
           echo "OK: No secrets detected"
 
   python-tests:
-    name: Python validation suite
+    name: Python lint, types and tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: actions/setup-python@v5
+      # uv installs the Python and the exact tool and runtime versions from
+      # uv.lock, so CI runs what pre-push and the Docker image run.
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
         with:
+          version: "0.13.8"
           python-version: "3.12"
+          enable-cache: true
+
+      - name: Sync locked environment
+        run: uv sync --locked
+
+      # Same hook as the local commit gate: rendered personas and local-*
+      # profiles hold operator identity and must never be committed.
+      - name: Operator-private files not committed
+        run: uvx --from pre-commit==4.4.0 pre-commit run forbid-operator-private --all-files
+
+      - name: requirements.txt matches uv.lock
+        run: |
+          uv export --no-dev --no-emit-project --format requirements-txt -o workflows/requirements.txt -q
+          git diff --exit-code workflows/requirements.txt
+
+      - name: Ruff
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Mypy
+        run: uv run mypy workflows scripts tests
 
       - name: Run validation suite
-        run: python3 tests/validate_stack.py
+        run: uv run python tests/validate_stack.py
 
-      - name: Run unit tests
-        run: |
-          pip install --quiet pytest
-          python3 -m pytest tests/test_validate_stack.py -v
+      - name: Run test suite
+        run: uv run pytest -q -rf

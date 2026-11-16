@@ -1,0 +1,95 @@
+[project]
+name = "clawrange"
+version = "0.2.0"
+description = "ClawRange: personal AI ops stack (OpenClaw assistant + FastAPI workflows service)"
+requires-python = ">=3.12"
+# workflows/requirements.txt (the Docker image's install source) is generated
+# from uv.lock by the uv-export pre-commit hook; never edit it by hand.
+dependencies = [
+    "fastapi==0.163.1",
+    "uvicorn[standard]==0.54.0",
+    "httpx==0.28.1",
+    "sqlite-vec==0.1.9",
+    "apscheduler>=3.11.3,<4",
+    "asyncpraw>=8.0.3",
+    "githubkit>=0.17.1",
+    # githubkit deprecated its httpx transport; httpx2 is the supported one.
+    "httpx2>=2.16.0",
+    "hishel[async,httpx2]>=1.4.0",
+    "pytimeparse>=1.1.10",
+    "pyyaml==6.0.3",
+]
+
+[dependency-groups]
+# Dev tooling: pinned exactly by uv.lock. `uv sync` materializes .venv with both
+# the runtime deps above and this dev group, so `uv run pytest|ruff|mypy` work.
+dev = [
+    "ruff",
+    "mypy",
+    "pytest",
+    "pre-commit",
+    "pytest-asyncio>=1.5.0",
+    "pytest-cov>=7.1.0",
+]
+
+[tool.uv]
+# The lock file format follows the uv version; keep everyone on one.
+required-version = ">=0.13.8"
+# ClawRange is a collection of scripts run inside Docker, not an importable
+# distribution. Tell uv not to build/install the project root.
+package = false
+
+# ─── ruff (lint + format) ──────────────────────────────────────────
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+src = ["workflows", "scripts", "tests"]
+exclude = [
+    "data",
+    # Code blocks in docs are illustrative; ruff 0.17 would reformat them.
+    "docs",
+    ".venv",
+    "deer-flow",
+    "deerflow",
+    ".mypy_cache",
+    ".ruff_cache",
+    "build",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = []
+
+# ─── mypy (typecheck) ──────────────────────────────────────────────
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+show_error_codes = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+# Non-strict baseline: the codebase is ~21% return-annotated. We gate on the
+# real inconsistencies (return-value / arg-type / valid-type) without requiring
+# a full annotation pass. Tighten incrementally from here.
+exclude = [
+    "data/",
+    "\\.venv/",
+    "deer-flow/",
+    "deerflow/",
+    "\\.mypy_cache/",
+    "\\.ruff_cache/",
+    "build/",
+]
+
+# ─── pytest ────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+# workflows/ has no __init__.py on purpose: the app modules use flat imports
+# (from app import app, from tenant_profile import ...). Put workflows/ on the
+# path explicitly rather than introducing a package boundary.
+pythonpath = ["workflows"]
+testpaths = ["workflows/tests", "tests"]
+
+# ─── coverage (make coverage) ──────────────────────────────────────
+# Source-only: measure the workflows service, not the tests that exercise it.
+[tool.coverage.run]
+source = ["workflows"]
+omit = ["workflows/tests/*"]

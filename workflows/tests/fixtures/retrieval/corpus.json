@@ -1,0 +1,185 @@
+{
+  "description": "Synthetic, operator-neutral brain pages for retrieval evaluation. Pages come in clusters of three that share vocabulary, so a query must separate near neighbours. Long pages put some facts past the first chunk, where the page title is absent.",
+  "pages": [
+    {
+      "slug": "nas/zfs-mirror-build",
+      "title": "Four-bay ZFS mirror NAS build",
+      "page_type": "system",
+      "compiled": "The main storage box is a four-bay tower running TrueNAS SCALE on an i3-12100 with 32 GB of ECC memory on a W680 board. Two pairs of 12 TB drives form two mirrored vdevs in one pool, which gives 24 TB usable and lets a single disk in each pair fail without data loss.\n\nI chose mirrors over RAIDZ2 because resilvering a mirror only reads the surviving partner, so a rebuild finishes in roughly nine hours instead of a day or more, and the pool can grow two disks at a time instead of replacing all six.\n\nDatasets are split by purpose: documents with compression set to zstd and hourly snapshots kept for two days, photos with daily snapshots kept for a year, and a scratch dataset with no snapshots at all. Snapshot retention is handled by the built-in periodic tasks, not cron.\n\nThe boot device is a mirrored pair of small SATA SSDs. An earlier build booted from a USB stick, which died after eight months of constant log writes; never again.\n\nScrubs run on the first Sunday of every month at 02:00. The last scrub repaired 0 bytes and took 6 hours 40 minutes. SMART short tests run nightly and long tests weekly, and failures page through the alerting bot.\n\nNetwork: a dual-port 10GbE Intel X520 card with one port on the storage VLAN for the hypervisor and one on the main LAN. Jumbo frames are enabled only on the storage VLAN, because mixing MTU sizes on the main LAN broke the printer and two smart plugs.\n\nPower draw at idle with all disks spinning is 58 W. Spinning the disks down saved about 20 W but caused a 15-second stall whenever anything touched the pool, so spindown stays off.\n\nThe replacement plan: keep one cold-spare 12 TB drive in the closet, already burned in with a full badblocks pass, so a failed disk can be swapped the same evening."
+    },
+    {
+      "slug": "nas/media-server-box",
+      "title": "Media server box",
+      "page_type": "system",
+      "compiled": "A separate small box serves movies and music so transcoding never competes with the storage pool. It runs Jellyfin in Docker on an Intel N100 mini PC with Quick Sync hardware transcoding, which handles three simultaneous 4K to 1080p streams at under 15 W.\n\nMedia files live on the NAS and are mounted read-only over NFS. The library scan runs nightly; the arr apps that fetch subtitles and metadata run on the same box.\n\nRemote viewing goes through the tailnet only. Nothing on this box is exposed to the public internet, and there is no port forwarding on the router."
+    },
+    {
+      "slug": "nas/offsite-backup-target",
+      "title": "Offsite backup target at a relative's house",
+      "page_type": "system",
+      "compiled": "An old two-bay appliance with two 8 TB drives sits at a relative's house three hours away and receives encrypted backups over the tailnet every night at 03:30.\n\nIt only holds the irreplaceable datasets: documents and photos. Media is not backed up offsite, because it can be re-ripped or re-downloaded.\n\nThe appliance has no inbound ports open. It pulls from the main NAS rather than the main NAS pushing to it, so a compromised main NAS cannot delete the offsite copy. Retention there is 30 daily, 12 monthly and 5 yearly copies."
+    },
+    {
+      "slug": "hardware/unified-memory-mini-pc",
+      "title": "Unified-memory mini PC for local models",
+      "page_type": "note",
+      "compiled": "Shortlisted for running local language models: mini PCs built on AMD's Ryzen AI Max+ 395 with 128 GB of unified LPDDR5X memory. Up to 96 GB can be assigned to the integrated GPU, which is enough to hold a 70B model at 4-bit quantization entirely in memory.\n\nMeasured on a review unit: about 5 tokens per second generating with a 70B Q4 model and around 40 tokens per second with an 8B model. Prompt processing is the weak spot, roughly an order of magnitude slower than a desktop GPU with dedicated VRAM.\n\nPrices seen so far range from 1,700 to 2,300 dollars depending on the vendor and the bundled storage. The memory is soldered, so the 128 GB configuration is the only sensible one to buy; the 64 GB models cannot be upgraded later.\n\nPower is the main appeal. The whole box draws about 120 W under sustained generation, compared with 350 W or more for a single high-end discrete card plus its host.\n\nCooling noise matters because it would live in the office. Two reviewers reported fan noise around 38 dBA under load, which is tolerable but not silent.\n\nSoftware support: llama.cpp with the Vulkan backend works out of the box. ROCm support for this integrated GPU arrived later and is still rougher than on discrete cards, so the Vulkan path is the default.\n\nDecision rule for buying: wait for a listing at or under 1,800 dollars with the 128 GB memory option and at least a 2 TB SSD, from a seller that accepts returns for 30 days.\n\nStorage on the review units was a single M.2 slot with a second slot left empty, so model files can live on a separate drive from the operating system. Loading a 40 GB model file from a fast NVMe drive took about 25 seconds.\n\nThe network port is 2.5GbE, which is fine for serving an API to the rest of the house but slow for copying large model files from the NAS; plan on pulling models directly from the internet instead.\n\nThe BIOS setting that controls how much memory the GPU may claim differs between vendors. On one unit it was buried under an advanced chipset menu and defaulted to only 512 MB, which made the first benchmarks look terrible until it was changed.\n\nFor a fair comparison, every candidate is benchmarked with the same three prompts: a short question, a 4,000-token document summary and a code completion task, all at the same quantization."
+    },
+    {
+      "slug": "hardware/used-gpu-rig",
+      "title": "Used dual-GPU inference rig",
+      "page_type": "note",
+      "compiled": "The alternative to a unified-memory box is a used workstation with two second-hand 24 GB graphics cards. Two cards give 48 GB of VRAM, enough for a 70B model at 4-bit with a short context.\n\nUsed cards sell for about 700 dollars each. A suitable host with a 1000 W power supply and enough PCIe lanes adds another 600 to 800 dollars.\n\nGeneration speed with both cards is roughly 15 to 18 tokens per second on a 70B model, three times faster than the unified-memory option. The costs are heat, about 700 W under load, and noise that would force it into the garage."
+    },
+    {
+      "slug": "hardware/apple-silicon-desktop",
+      "title": "Apple silicon desktop as an inference box",
+      "page_type": "note",
+      "compiled": "A compact Apple desktop with 64 GB of unified memory can run 30B-class models comfortably with MLX. A 70B model does not fit at a usable quantization in 64 GB once the operating system takes its share.\n\nIt is the quietest option by far and idles under 10 W. The downside is price per gigabyte of memory: the high-memory configurations cost far more than the AMD equivalent, and memory cannot be added later."
+    },
+    {
+      "slug": "network/iot-vlan-isolation",
+      "title": "IoT VLAN isolation",
+      "page_type": "system",
+      "compiled": "Smart plugs, cameras and the TV live on VLAN 30. That VLAN can reach the internet and the home automation server, and nothing else. Firewall rules drop any connection the IoT devices start toward the main LAN.\n\nmDNS reflection is enabled between the main LAN and VLAN 30 only for the TV and the speakers, so casting still works from phones.\n\nThe cameras are on their own VLAN 31 with no internet access at all. They record to the network video recorder, and the recorder is the only thing allowed to talk to them."
+    },
+    {
+      "slug": "network/tailnet-subnet-router",
+      "title": "Tailnet subnet router",
+      "page_type": "system",
+      "compiled": "One small always-on box advertises the home LAN subnet to the tailnet, so a laptop away from home can reach the printer, the NAS web interface and the hypervisor without installing the client on every device.\n\nAccess control lists limit which tailnet users can use the subnet route. Only the admin group can reach the hypervisor management port.\n\nKey expiry is disabled for the router node only. It is tagged, so it does not belong to a personal account that might be removed."
+    },
+    {
+      "slug": "network/edge-firewall",
+      "title": "Edge firewall appliance",
+      "page_type": "system",
+      "compiled": "The edge firewall is OPNsense on a fanless four-port box with Intel i226 network controllers. It does DHCP, DNS through Unbound with DNS-over-TLS upstream, and inter-VLAN routing.\n\nThe ISP modem is in bridge mode, so the firewall holds the public address. No ports are forwarded; anything that needs remote access goes through the tailnet.\n\nConfiguration is exported to the NAS after every change, and the last three exports are kept. Restoring onto a spare box was tested once and took twenty minutes."
+    },
+    {
+      "slug": "decisions/backup-strategy",
+      "title": "Backup strategy decision",
+      "page_type": "decision",
+      "compiled": "Decision: follow the 3-2-1 rule for everything irreplaceable. Three copies, on two kinds of media, with one copy offsite.\n\nCopy one is the live data on the NAS pool. Copy two is a nightly restic backup to a USB hard drive that is swapped weekly. Copy three is the offsite appliance at a relative's house, plus an object-storage bucket for the documents dataset only.\n\nWhy restic: deduplication keeps the nightly runs small, every snapshot is encrypted before it leaves the machine, and restoring a single file does not require restoring the whole archive.\n\nWhat is deliberately excluded: the media library, container images, and anything that can be rebuilt from configuration in git.\n\nRestore drills happen every quarter. A drill picks three random files and one whole folder from a snapshot at least a month old and restores them to a scratch location, then compares checksums. A backup that has never been restored is treated as a hope rather than a backup.\n\nThe drill in the last quarter found that the object-storage credentials on the backup host had expired two weeks earlier, and the job had been failing silently. Since then, each backup job sends a heartbeat to the monitoring system and a missed heartbeat raises an alert within one hour.\n\nCost: the bucket holds about 180 GB and costs a little over one dollar a month. The swapped USB drives cost 90 dollars each and are replaced every four years.\n\nAlternatives that were considered and rejected: a second NAS in the same house, which protects against disk failure but not against fire or theft; and a consumer cloud backup service with unlimited storage, which would not back up network shares and could not be scripted.\n\nThe backup host itself is just a container on the hypervisor with read-only access to the datasets it backs up. It cannot delete anything on the NAS, and its repository passwords live in the secrets file rather than in the compose file.\n\nWhen the documents dataset grows past 500 GB, the bucket costs should be checked again, because the provider's price tier changes there.\n\nThe last full restore test pulled the entire documents dataset from the offsite appliance in 11 hours over the tailnet, which sets the realistic recovery time for a total loss at about half a day."
+    },
+    {
+      "slug": "incidents/backup-repo-corruption",
+      "title": "Backup repository corruption incident",
+      "page_type": "incident",
+      "compiled": "What happened: the weekly integrity check on the USB backup repository reported 14 damaged pack files. The drive itself passed its SMART tests.\n\nCause: the drive had been unplugged in the middle of a backup run during the weekly swap, which left partially written pack files behind.\n\nFix: ran the repair command to drop the damaged packs, then forced a fresh full backup so the missing data was written again. Swaps now happen only after checking that no backup job is running, and the job takes a lock file that the swap checklist looks for."
+    },
+    {
+      "slug": "systems/object-storage-sync",
+      "title": "Object storage sync",
+      "page_type": "system",
+      "compiled": "The documents dataset is copied to an object-storage bucket every night at 04:00 with rclone, using a crypt remote so file names and contents are encrypted before upload.\n\nThe bucket has object lock enabled with a 30-day retention, so even a stolen key cannot delete recent versions.\n\nEgress is the hidden cost: downloading the whole bucket during a full restore would cost more than a year of storage, so a full restore is planned from the offsite appliance first."
+    },
+    {
+      "slug": "incidents/failing-disk-alert",
+      "title": "Failing disk alert",
+      "page_type": "incident",
+      "compiled": "The nightly SMART check reported a rising reallocated sector count on one 12 TB drive in the first mirror: 8 sectors on Monday, 64 by Thursday.\n\nThe cold spare was swapped in the same evening and the mirror resilvered in nine hours with no errors. The failed drive was still under warranty and went back for replacement; the replacement became the new cold spare after a full burn-in."
+    },
+    {
+      "slug": "incidents/power-outage-ups",
+      "title": "Power outage and UPS shutdown",
+      "page_type": "incident",
+      "compiled": "A two-hour power cut drained the UPS. The NAS received the low-battery signal over USB and shut down cleanly, but the hypervisor did not, because it was never configured as a network UPS client.\n\nTwo virtual machines needed filesystem checks after the hard power loss. Now the NAS runs the UPS server and the hypervisor and firewall are network clients that shut down at 40 percent battery.\n\nThe UPS battery was also four years old and held only 11 minutes instead of the rated 25. It was replaced."
+    },
+    {
+      "slug": "incidents/expired-certificate",
+      "title": "Expired certificate outage",
+      "page_type": "incident",
+      "compiled": "Internal dashboards stopped loading with a certificate error on a Saturday morning. The wildcard certificate for the internal domain had expired because the DNS challenge credentials for the renewal job had been rotated and the job was never updated.\n\nRenewal was fixed and the certificate reissued within an hour. Certificate expiry is now monitored, with a warning 21 days before expiry and a critical alert at 7 days."
+    },
+    {
+      "slug": "projects/cli-tool-launch",
+      "title": "Command-line tool launch plan",
+      "page_type": "project",
+      "compiled": "Goal: get the first 500 real users for the open-source command-line tool within three months of the 1.0 release, without paid advertising.\n\nAudience: developers who maintain several small repositories and are tired of copying the same configuration between them.\n\nLaunch sequence: a short demo GIF in the README first, then a write-up of the design trade-offs on a personal blog, then a Show HN post on a weekday morning US time, then posts in two relevant subreddits a week apart rather than on the same day.\n\nWhat not to do: no posting the same link to many communities at once, no asking friends to upvote, and no replying to criticism defensively. Every reply should answer the question that was asked.\n\nSuccess measures: weekly unique cloners from the repository traffic page, stars as a secondary signal only, and the number of issues opened by people who are not already contributors.\n\nAfter launch: a changelog entry for every release, a roadmap issue pinned to the top of the tracker, and a monthly digest of what changed for people who starred but do not follow releases.\n\nRisks: the tool overlaps with an established project, so the write-up must say plainly when to use the other project instead. Being honest about that boundary earned more goodwill on the last launch than any feature did.\n\nBudget: zero dollars for promotion, about six hours a week of time for the first two months, mostly spent answering issues within one day.\n\nThe demo GIF should show one complete task in under 20 seconds: installing the tool, running it against a sample repository and seeing the result. Longer demos lost viewers before the payoff in the last launch.\n\nDocumentation before launch: a quick start that works when copied and pasted line by line, a page of real examples, and a short comparison table against the established alternative. The quick start is tested on a clean virtual machine before every release.\n\nFeedback handling: every issue gets a first reply within one working day, even if the reply is only a label and a question. Feature requests that do not fit are closed with an explanation rather than left open forever.\n\nThe release itself is tagged on a Tuesday so there are working days left in the week to fix anything urgent before the weekend."
+    },
+    {
+      "slug": "notes/community-comment-playbook",
+      "title": "Community comment playbook",
+      "page_type": "note",
+      "compiled": "Rules for commenting in developer forums: answer the question first and completely, as if no product existed. Mention your own project only when it directly solves the asker's problem, and say that you made it.\n\nNever paste the same comment into several threads. Read the community rules about self-promotion before the first post; several communities allow it only in a weekly thread.\n\nEvery draft goes into the review queue and is approved by a human before posting. Nothing is posted automatically."
+    },
+    {
+      "slug": "notes/newsletter-growth",
+      "title": "Newsletter growth notes",
+      "page_type": "note",
+      "compiled": "The monthly newsletter has 340 subscribers. Growth came mostly from a sign-up link at the end of long blog posts, which converts at about 2 percent of readers, versus almost nothing from the site footer.\n\nThe issues that got the most replies were short and covered one problem with a worked example. Link roundups got the most unsubscribes and were dropped."
+    },
+    {
+      "slug": "companies/dental-clinic-client",
+      "title": "Dental clinic IT support client",
+      "page_type": "client",
+      "compiled": "A three-chair dental practice pays a monthly retainer for IT support: twelve workstations, one imaging server and the front-desk scheduling software.\n\nThe imaging server must stay on a supported operating system for the imaging vendor's warranty, so upgrades wait for the vendor's approval. Backups of patient images run nightly to an encrypted local appliance and weekly to the cloud.\n\nThe office manager is the main contact and prefers phone calls over email. Patching happens on Thursday evenings after closing."
+    },
+    {
+      "slug": "companies/logistics-firm-client",
+      "title": "Logistics firm client",
+      "page_type": "client",
+      "compiled": "A regional freight company with forty staff across a warehouse and an office. The engagement covers the network, the warehouse handheld scanners and the shared drives.\n\nThe warehouse wifi was redesigned last spring: six access points on a dedicated SSID for scanners, with roaming tuned so a scanner does not drop its session while moving between aisles.\n\nThey are evaluating a move from their on-premises file server to a cloud drive, and the decision is due next quarter."
+    },
+    {
+      "slug": "people/ops-contact-sam",
+      "title": "Sam, operations manager at the logistics firm",
+      "page_type": "person",
+      "compiled": "Sam runs operations at the logistics firm and approves all IT spending above 500 dollars. Prefers a one-page written proposal with a clear price over a meeting.\n\nSam cares most about the warehouse scanners staying up during the early shift, which starts at 05:00. Any change that could affect the scanners must be scheduled for a Sunday."
+    },
+    {
+      "slug": "decisions/sqlite-over-postgres",
+      "title": "SQLite instead of Postgres for the knowledge service",
+      "page_type": "decision",
+      "compiled": "Decision: the knowledge service stores everything in a single SQLite file in write-ahead-log mode instead of running a Postgres server.\n\nReasons: one process writes, the data is a few hundred megabytes at most, and a single file is trivial to back up and copy. Full-text search and vector search both come from extensions, so there is no second database to run.\n\nRevisit if more than one service needs to write at the same time, or if the file passes 10 GB."
+    },
+    {
+      "slug": "decisions/compose-over-kubernetes",
+      "title": "Docker Compose instead of Kubernetes at home",
+      "page_type": "decision",
+      "compiled": "Decision: the home services run under Docker Compose on one host, not on a lightweight Kubernetes cluster.\n\nA three-node cluster was tried for two months. It spent more time on its own upgrades, certificates and storage drivers than on running the services, and one control-plane upgrade took down every service for an evening.\n\nCompose files live in git, each service has a health check, and a single make target brings everything up. Revisit only if there is a real need for failover across machines."
+    },
+    {
+      "slug": "decisions/no-self-hosted-email",
+      "title": "Not self-hosting email",
+      "page_type": "decision",
+      "compiled": "Decision: do not run a personal mail server. Outbound mail from a residential address lands in spam no matter how carefully the sender records are set up, and the work of keeping reputation clean never ends.\n\nMail stays with a hosted provider on a custom domain. The domain's DNS is managed separately, so switching providers only means changing the mail exchanger records."
+    },
+    {
+      "slug": "notes/homelab-power-budget",
+      "title": "Homelab power budget",
+      "page_type": "note",
+      "compiled": "Target: the whole rack under 150 W at idle. Current measurement from the smart plug on the UPS input is 131 W.\n\nThe biggest single draw is the NAS at 58 W with disks spinning, then the hypervisor at 35 W, the firewall at 12 W, the switch at 18 W and small boxes making up the rest.\n\nAt the local rate of 0.31 per kilowatt hour that is about 29 a month. Every 10 W saved around the clock is worth roughly 27 a year."
+    },
+    {
+      "slug": "hardware/low-power-mini-pc",
+      "title": "Low-power mini PC for always-on services",
+      "page_type": "note",
+      "compiled": "The always-on services such as DNS, the tailnet router and home automation moved from an old desktop to an Intel N100 mini PC with 16 GB of memory and a 500 GB SSD. It idles at 6 W, down from 45 W for the old desktop, and paid for itself in under two years.\n\nThe only downside is a single network port, so VLAN-tagged traffic for the IoT network shares that port with everything else."
+    },
+    {
+      "slug": "notes/electricity-tracking",
+      "title": "Electricity cost tracking",
+      "page_type": "note",
+      "compiled": "Smart plugs with energy metering on each major device report to the home automation server every minute, and a dashboard shows daily kilowatt hours per device.\n\nThe first month showed that the old desktop used as a server cost more to run than the NAS, which prompted its replacement. The meters have been accurate to within 3 percent of a dedicated meter."
+    },
+    {
+      "slug": "systems/status-page-monitor",
+      "title": "Status page monitor",
+      "page_type": "system",
+      "compiled": "An uptime monitor checks every service every 60 seconds over HTTP, TCP or ping, and keeps 90 days of history. It runs on the low-power mini PC rather than on the hypervisor, so it keeps reporting when the hypervisor is down.\n\nIt also receives push heartbeats from cron jobs and backups: a job that does not report within its window is marked down."
+    },
+    {
+      "slug": "systems/metrics-and-dashboards",
+      "title": "Metrics and dashboards",
+      "page_type": "system",
+      "compiled": "Metrics are collected by Prometheus scraping node exporters on every host every 30 seconds, with 30 days of local retention. Grafana reads from it and holds the dashboards, which are stored as JSON in git rather than edited by hand in the interface.\n\nThe main dashboard shows CPU, memory, disk usage and temperature for each host, pool health and capacity for the NAS, and power draw from the smart plugs.\n\nAlert rules live in Prometheus, not Grafana, so alerting keeps working when the dashboard server is down. Each alert has a severity label: warning alerts go into a daily digest, critical alerts go out immediately.\n\nThe rules that have actually fired in the last year: pool capacity over 80 percent, a host over 85 degrees during a summer heatwave, and a node exporter that stopped reporting after an operating system upgrade changed its service name.\n\nRetention is deliberately short. Anything worth keeping longer is summarized monthly into a single row per host in a spreadsheet: average power, peak temperature and disk growth.\n\nCardinality was a problem once: a container exporter added a label for every container ID, and memory use on the metrics server tripled in a week. Labels that hold unbounded values are now dropped at scrape time.\n\nBackups of the metrics database are not taken. The dashboards and rules are in git, and losing thirty days of graphs is acceptable.\n\nExporters in use: node exporter on every host, a SMART exporter on the NAS, the UPS exporter for battery charge and load, and a blackbox exporter that probes the public endpoints from inside the network.\n\nDashboards are provisioned from files at start-up, so rebuilding the dashboard server from scratch gives back every dashboard without any manual import. Editing in the web interface is allowed only for experiments; anything worth keeping is exported back to git.\n\nThe recording rules precompute the expensive queries, such as per-host power averaged over a day, so the main dashboard loads in under a second.\n\nTime zones caused one confusing week: the metrics server ran in UTC while the dashboards displayed local time, and a daily digest computed its day boundaries in UTC, which split evenings across two days. Everything now uses local time for day boundaries."
+    },
+    {
+      "slug": "systems/chat-alert-bot",
+      "title": "Chat alert bot",
+      "page_type": "system",
+      "compiled": "Critical alerts reach a phone through a chat bot that posts to a private channel. Messages are short: what is wrong, which host, and a link to the relevant dashboard.\n\nQuiet hours run from 22:00 to 07:00, during which only critical alerts are delivered and everything else waits for the morning digest. The bot token is stored in the secrets file, never in the compose file."
+    }
+  ]
+}

@@ -16,19 +16,23 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from pytimeparse import parse as _parse_duration
 
 logger = logging.getLogger("clawrange.crm.query")
 
 
-def _since(duration: str) -> str:
+def _since(duration: object) -> str:
     """ISO timestamp for ``now - duration`` (e.g. '7d', '24h', '30m')."""
     seconds = _parse_duration(str(duration))
     if seconds is None:
         raise ValueError(f"invalid duration: {duration!r}")
-    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+    try:
+        return (datetime.now(UTC) - timedelta(seconds=seconds)).isoformat()
+    except OverflowError as exc:
+        # Callers map ValueError to a 400; a huge window is a bad parameter.
+        raise ValueError(f"duration out of range: {duration!r}") from exc
 
 
 def coerce_params(template: dict, raw: dict | None) -> dict:
@@ -38,7 +42,8 @@ def coerce_params(template: dict, raw: dict | None) -> dict:
       - ``duration``: binds ``since`` (or ``bind``) to now-minus-duration ISO.
       - ``enum``: validates membership; an optional ``map`` translates the
         chosen value (e.g. day -> '%Y-%m-%d'); binds to ``bind`` or the name.
-      - ``string``: binds ``q`` and ``like`` (``%value%``); required.
+      - ``string``: binds ``q`` and ``like`` (``%value%``, with ``%``/``_``
+        escaped: the SQL must say ``LIKE :like ESCAPE '\\'``); required.
       - anything else: binds the value under its name.
     """
     raw = raw or {}
@@ -59,12 +64,20 @@ def coerce_params(template: dict, raw: dict | None) -> dict:
                     f"param '{name}' must be one of {allowed}, got {value!r}"
                 )
             mapping = spec.get("map")
+            if mapping and value not in mapping:
+                raise ValueError(
+                    f"param '{name}': template map has no entry for {value!r}"
+                )
             binds[bind] = mapping[value] if mapping else value
         elif ptype == "string":
             if value in (None, ""):
                 raise ValueError(f"param '{name}' is required")
             binds["q"] = value
-            binds["like"] = f"%{value}%"
+            # Escape LIKE wildcards; templates must declare ESCAPE '\\'.
+            escaped = (
+                str(value).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            )
+            binds["like"] = f"%{escaped}%"
         else:
             binds[bind] = value
     return binds
@@ -125,7 +138,9 @@ async def route_nl(prompt: str, templates: list[dict], *, llm=_default_llm) -> d
 
     The LLM only *selects* a template name and fills params — it never
     writes SQL. A malformed or off-catalog reply yields ``template=None``
-    (the caller renders a safe fallback) rather than raising.
+    (the caller renders a safe fallback) rather than raising. When the LLM
+    itself is unreachable (it raised or returned nothing) the result also
+    carries ``llm_unavailable=True`` so the reply can say so.
     """
     instruction = (
         "You translate a question into ONE of the available CRM report "
@@ -138,6 +153,14 @@ async def route_nl(prompt: str, templates: list[dict], *, llm=_default_llm) -> d
     )
     try:
         raw = await llm(instruction)
+    except Exception as exc:
+        logger.warning("route_nl: LLM call failed: %s", exc)
+        return {"template": None, "params": {}, "llm_unavailable": True}
+    if not raw:
+        # _default_llm turns an outage into "": not a reply to parse.
+        logger.warning("route_nl: LLM returned no reply")
+        return {"template": None, "params": {}, "llm_unavailable": True}
+    try:
         parsed = _extract_json(raw)
     except Exception as exc:
         logger.warning("route_nl: could not parse LLM response: %s", exc)
@@ -176,8 +199,15 @@ async def answer(
     template = find_template(templates, route["template"])
     if template is None:
         names = ", ".join(t["name"] for t in templates) or "(none configured)"
+        if route.get("llm_unavailable"):
+            text = (
+                "The language model is unavailable right now, so I can't "
+                f"interpret questions. Run a report directly instead: {names}."
+            )
+        else:
+            text = f"I couldn't map that to a known report. Available: {names}."
         return {
-            "answer": f"I couldn't map that to a known report. Available: {names}.",
+            "answer": text,
             "template": None,
             "params": {},
             "rows": [],

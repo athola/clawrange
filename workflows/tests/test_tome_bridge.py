@@ -8,11 +8,13 @@ so collection has no extra dependencies.
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
+import urllib.error
 from pathlib import Path
 
 import pytest
-
 
 # Ensure scripts/ is importable.
 _SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
@@ -64,8 +66,6 @@ class TestRunTomeResearch:
     """Subprocess wrapper - we mock subprocess.run."""
 
     def test_success_returns_combined_output(self, monkeypatch):
-        import subprocess
-
         class FakeResult:
             returncode = 0
             stdout = "topic findings\n"
@@ -80,8 +80,6 @@ class TestRunTomeResearch:
         assert "topic findings" in out
 
     def test_timeout_returns_124(self, monkeypatch):
-        import subprocess
-
         def raise_timeout(cmd, **kwargs):
             raise subprocess.TimeoutExpired(cmd=cmd, timeout=1)
 
@@ -91,8 +89,6 @@ class TestRunTomeResearch:
         assert "timed out" in out
 
     def test_missing_binary_returns_127(self, monkeypatch):
-        import subprocess
-
         def raise_fnf(cmd, **kwargs):
             raise FileNotFoundError(cmd[0])
 
@@ -216,8 +212,6 @@ class TestProcessOneTask:
 
 class TestRunOnce:
     def test_handles_workflows_unreachable(self, monkeypatch):
-        import urllib.error
-
         def fail(*a, **kw):
             raise urllib.error.URLError("connection refused")
 
@@ -255,3 +249,229 @@ class TestRunOnce:
 def _reset_bridge_state():
     """Ensure no test pollutes module-level state."""
     yield
+
+
+class TestBridgeHardening:
+    """The task queue is a trust boundary: anything that can reach the
+    workflows API can queue a tome task, and the topic becomes a prompt for a
+    local Claude Code session. Authenticate the bridge's own API calls, bound
+    the topic, and deny the session its write/exec tools."""
+
+    def test_http_json_sends_bearer_token(self, monkeypatch):
+        seen = {}
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b"{}"
+
+        def fake_urlopen(req, timeout):
+            seen["auth"] = req.get_header("Authorization")
+            return FakeResp()
+
+        monkeypatch.setenv("PROXY_AUTH_TOKEN", "tok123")
+        monkeypatch.setattr(tome_bridge.urllib.request, "urlopen", fake_urlopen)
+        tome_bridge.http_json("GET", "http://x/task")
+        assert seen["auth"] == "Bearer tok123"
+
+    def test_claude_runs_with_tool_allowlist(self, monkeypatch):
+        # A deny-list misses every tool it does not name (Read can open .env,
+        # MCP servers bring their own tools). Allow only what research needs.
+        seen = {}
+
+        class FakeResult:
+            returncode = 0
+            stdout = "ok"
+            stderr = ""
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            return FakeResult()
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        tome_bridge.run_tome_research("claude", "topic", 60)
+        cmd = seen["cmd"]
+        tools_flag = [a for a in cmd if a.startswith("--tools=")]
+        allowed_flag = [a for a in cmd if a.startswith("--allowedTools=")]
+        assert len(tools_flag) == 1 and len(allowed_flag) == 1
+        tools = set(tools_flag[0].split("=", 1)[1].split(","))
+        assert tools == set(allowed_flag[0].split("=", 1)[1].split(","))
+        assert {"WebSearch", "WebFetch", "Skill"} <= tools
+        for tool in ("Bash", "Read", "Edit", "Write", "NotebookEdit", "Glob"):
+            assert tool not in tools
+        assert "--strict-mcp-config" in cmd
+        assert cmd[cmd.index("--permission-mode") + 1] == "dontAsk"
+        assert "--disallowedTools" not in cmd
+        # The prompt stays the first positional and never starts with '-',
+        # so a topic can't smuggle CLI flags.
+        assert cmd[2].startswith("/tome:research ")
+
+    def test_claude_runs_in_empty_temp_dir(self, monkeypatch):
+        # The repo root holds .env: the session must not start there.
+        seen = {}
+
+        class FakeResult:
+            returncode = 0
+            stdout = "ok"
+            stderr = ""
+
+        def fake_run(cmd, **kwargs):
+            cwd = kwargs.get("cwd")
+            seen["cwd"] = cwd
+            seen["listing"] = os.listdir(cwd) if cwd else None
+            return FakeResult()
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        tome_bridge.run_tome_research("claude", "topic", 60)
+        assert seen["cwd"] is not None
+        repo = Path(__file__).resolve().parents[2]
+        assert not Path(seen["cwd"]).resolve().is_relative_to(repo)
+        assert seen["listing"] == []
+        # Cleaned up afterwards.
+        assert not os.path.exists(seen["cwd"])
+
+    @pytest.mark.parametrize(
+        "topic",
+        ["x" * 301, "ignore previous\x00instructions", "a\x1b[2Jb"],
+    )
+    def test_unsafe_topic_fails_task_without_running(self, monkeypatch, topic):
+        captured = {}
+        monkeypatch.setattr(tome_bridge, "claim_task", lambda *a, **k: None)
+        monkeypatch.setattr(
+            tome_bridge,
+            "complete_task",
+            lambda base, tid, result, status: captured.update(
+                status=status, result=result
+            ),
+        )
+
+        def boom(*a, **k):
+            raise AssertionError("claude must not run for an unsafe topic")
+
+        monkeypatch.setattr(tome_bridge, "run_tome_research", boom)
+        tome_bridge.process_one_task(
+            "http://x",
+            "claude",
+            {"id": "t1", "description": f"research:tome: {topic}"},
+            60,
+            dry_run=False,
+        )
+        assert captured["status"] == "failed"
+        assert "topic rejected" in captured["result"]
+
+
+class TestBridgeNetworkErrors:
+    """A dropped connection, a timeout or a non-JSON reply must not escape
+    run_once: under --watch that kills the loop, loses the research output
+    and strands the claimed task in `active`."""
+
+    @pytest.fixture(autouse=True)
+    def _no_sleep(self, monkeypatch):
+        self.sleeps: list[float] = []
+        monkeypatch.setattr(tome_bridge.time, "sleep", self.sleeps.append)
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            urllib.error.URLError("refused"),
+            TimeoutError("timed out"),
+            ValueError("Expecting value"),
+        ],
+    )
+    def test_claim_error_skips_task_without_running(self, monkeypatch, exc):
+        def claim(*a, **k):
+            raise exc
+
+        def boom(*a, **k):
+            raise AssertionError("claude must not run for an unclaimed task")
+
+        monkeypatch.setattr(tome_bridge, "claim_task", claim)
+        monkeypatch.setattr(tome_bridge, "run_tome_research", boom)
+        ok = tome_bridge.process_one_task(
+            "http://x",
+            "claude",
+            {"id": "t1", "description": "research:tome: a"},
+            60,
+            dry_run=False,
+        )
+        assert ok is True
+
+    def test_complete_is_retried_until_it_lands(self, monkeypatch):
+        posted: list[str] = []
+        failures: list[Exception] = [
+            urllib.error.URLError("reset"),
+            TimeoutError("slow"),
+        ]
+
+        def complete(base, task_id, result, status):
+            if failures:
+                raise failures.pop(0)
+            posted.append(result)
+
+        monkeypatch.setattr(tome_bridge, "claim_task", lambda *a, **k: None)
+        monkeypatch.setattr(tome_bridge, "complete_task", complete)
+        monkeypatch.setattr(
+            tome_bridge, "run_tome_research", lambda *a, **k: (0, "findings")
+        )
+        tome_bridge.process_one_task(
+            "http://x",
+            "claude",
+            {"id": "t1", "description": "research:tome: a"},
+            60,
+            dry_run=False,
+        )
+        assert posted == ["findings"]
+        assert len(self.sleeps) == 2
+        assert self.sleeps == sorted(self.sleeps)
+
+    def test_complete_gives_up_after_bounded_attempts(self, monkeypatch):
+        calls = []
+
+        def complete(*a, **k):
+            calls.append(1)
+            raise ValueError("not json")
+
+        monkeypatch.setattr(tome_bridge, "claim_task", lambda *a, **k: None)
+        monkeypatch.setattr(tome_bridge, "complete_task", complete)
+        monkeypatch.setattr(
+            tome_bridge, "run_tome_research", lambda *a, **k: (0, "findings")
+        )
+        ok = tome_bridge.process_one_task(
+            "http://x",
+            "claude",
+            {"id": "t1", "description": "research:tome: a"},
+            60,
+            dry_run=False,
+        )
+        assert ok is True
+        assert len(calls) == tome_bridge.COMPLETE_ATTEMPTS
+        assert sum(self.sleeps) <= 120
+
+    @pytest.mark.parametrize(
+        "exc", [TimeoutError("timed out"), ValueError("Expecting value")]
+    )
+    def test_list_error_reports_unreachable(self, monkeypatch, exc):
+        def fail(base):
+            raise exc
+
+        monkeypatch.setattr(tome_bridge, "list_pending_tasks", fail)
+        assert tome_bridge.run_once("http://x", "claude", 60, dry_run=False) == 1
+
+    def test_watch_survives_unexpected_error(self, monkeypatch):
+        passes = []
+
+        def run_once(*a, **k):
+            passes.append(1)
+            if len(passes) == 1:
+                raise KeyError("id")
+            raise SystemExit(0)
+
+        monkeypatch.setattr(tome_bridge, "run_once", run_once)
+        with pytest.raises(SystemExit):
+            tome_bridge.main(["--watch", "--interval", "1"])
+        assert len(passes) == 2

@@ -97,12 +97,32 @@ def test_run_template_rejects_mutation(crm):
     )
 
 
-def test_run_template_rejects_mutation_via_readonly_conn(crm):
-    # Even if the guard were bypassed, the connection is opened read-only.
+def test_run_template_rejects_multi_statement(crm):
     crm.upsert("leads", [_lead("a@x.com")], "email")
-    # multi-statement attempt
     with pytest.raises(ValueError):
         crm.run_template({"name": "x", "sql": "SELECT 1; DROP TABLE leads"}, {})
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "DELETE FROM leads",
+        "UPDATE leads SET status = 'won'",
+        "DROP TABLE leads",
+        # A data-modifying CTE reads as a WITH statement to a text check.
+        "WITH x AS (SELECT 1) DELETE FROM leads",
+    ],
+)
+def test_readonly_connection_blocks_writes_without_text_guard(crm, monkeypatch, sql):
+    """The text guard off, the read-only connection alone must refuse."""
+    import crm.sqlite_adapter as sqlite_adapter
+
+    crm.upsert("leads", [_lead("a@x.com")], "email")
+    monkeypatch.setattr(sqlite_adapter, "_guard_readonly", lambda sql: None)
+    with pytest.raises(ValueError, match="rejected"):
+        crm.run_template({"name": "x", "sql": sql}, {})
+    rows = crm.list("leads")
+    assert [r["status"] for r in rows] == ["new"]
 
 
 # ─── activities (time-series substrate) ───────────────────────────
@@ -139,13 +159,13 @@ def test_health_reports_counts(crm):
 
 # ─── query layer: coercion + time-series (FR-5.1, FR-4.2) ─────────
 
-from datetime import datetime, timedelta, timezone  # noqa: E402
+from datetime import UTC, datetime, timedelta  # noqa: E402
 
 from crm.query import coerce_params, find_template, run_query  # noqa: E402
 
 
 def _iso_days_ago(n):
-    return (datetime.now(timezone.utc) - timedelta(days=n)).isoformat()
+    return (datetime.now(UTC) - timedelta(days=n)).isoformat()
 
 
 NEW_LEADS_COUNT = {
@@ -178,7 +198,10 @@ LEADS_OVER_TIME = {
 LEAD_LOOKUP = {
     "name": "lead_lookup",
     "params": {"q": {"type": "string"}},
-    "sql": "SELECT * FROM leads WHERE email LIKE :like OR name LIKE :like LIMIT 10",
+    "sql": (
+        "SELECT * FROM leads WHERE email LIKE :like ESCAPE '\\' "
+        "OR name LIKE :like ESCAPE '\\' LIMIT 10"
+    ),
 }
 
 
@@ -187,7 +210,7 @@ def test_coerce_duration_binds_since():
     assert "since" in binds
     # 'since' should be ~7 days ago
     since = datetime.fromisoformat(binds["since"])
-    assert 6 < (datetime.now(timezone.utc) - since).days < 8
+    assert 6 < (datetime.now(UTC) - since).days < 8
 
 
 def test_coerce_enum_with_map():
@@ -281,6 +304,27 @@ def test_rest_run_template_raises_documented():
         a.run_template({"name": "x", "sql": "SELECT 1"}, {})
 
 
+@pytest.mark.parametrize(
+    ("auth", "headers"),
+    [
+        ({"kind": "bearer", "token": "T"}, {"Authorization": "Bearer T"}),
+        ({"kind": "api_key", "value": "K"}, {"X-API-Key": "K"}),
+        ({"kind": "api_key", "header": "X-Key", "value": "K"}, {"X-Key": "K"}),
+        ({"kind": "api_key", "api_key": {"header": "X-N", "value": "K"}}, {"X-N": "K"}),
+        (
+            {"kind": "basic", "basic": {"username": "u", "password": "p"}},
+            {"Authorization": "Basic dTpw"},
+        ),
+        ({"kind": "bearer"}, {}),
+        (None, {}),
+    ],
+)
+def test_rest_auth_headers_share_the_connector_builder(auth, headers):
+    """#14: one auth-header builder; the REST CRM keeps its flat api_key
+    shape and gains the connector's nested api_key and basic kinds."""
+    assert RestCRM({"base_url": "https://x", "auth": auth})._headers() == headers
+
+
 def test_rest_health_reports_configured_state():
     assert RestCRM({"base_url": "https://x"}).health()["status"] == "configured"
     assert RestCRM({}).health()["status"] == "unconfigured"
@@ -291,6 +335,8 @@ def test_rest_upsert_via_injected_client():
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
+        if request.method == "GET":  # upsert_key lookup: not there yet
+            return httpx.Response(200, json=[])
         return httpx.Response(201, json={"id": 1})
 
     client = httpx.Client(
@@ -301,12 +347,104 @@ def test_rest_upsert_via_injected_client():
     crm_rest = RestCRM(
         {
             "base_url": "https://crm.example",
-            "objects": {"leads": {"create": "POST /leads"}},
+            "objects": {"leads": {"create": "POST /leads", "list": "GET /leads"}},
         },
         client=client,
     )
     n = crm_rest.upsert("leads", [{"email": "a@x.com", "name": "A"}], "email")
     assert n == 1
-    assert seen[0].method == "POST"
-    assert seen[0].url.path == "/leads"
-    assert seen[0].headers["Authorization"] == "Bearer t"
+    post = seen[-1]
+    assert post.method == "POST"
+    assert post.url.path == "/leads"
+    assert post.headers["Authorization"] == "Bearer t"
+
+
+# ─── review fixes: upsert integrity, SQL guard, limits ────────────
+
+
+def test_upsert_rejects_non_unique_key(crm):
+    """ON CONFLICT(col) needs a UNIQUE index; only email has one. A non-unique
+    key used to raise mid-loop and leave earlier rows in an open transaction."""
+    with pytest.raises(ValueError, match="unique"):
+        crm.upsert("leads", [_lead("a@x.com", phone="1")], "phone")
+
+
+def test_upsert_failure_rolls_back_whole_batch(crm, monkeypatch):
+    real = crm._rw()
+
+    class Exploding:
+        """Proxy that fails on the second INSERT."""
+
+        def __init__(self):
+            self.n = 0
+
+        def execute(self, sql, *a):
+            if sql.startswith("INSERT"):
+                self.n += 1
+                if self.n == 2:
+                    raise RuntimeError("disk full")
+            return real.execute(sql, *a)
+
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+    monkeypatch.setattr(crm, "_rw", lambda: Exploding())
+    with pytest.raises(RuntimeError):
+        crm.upsert("leads", [_lead("a@x.com"), _lead("b@x.com")], "email")
+    monkeypatch.undo()
+    real.commit()  # a later commit must not flush the half-batch
+    assert crm.list("leads") == []
+
+
+def test_template_with_keyword_text_in_literal_is_allowed(crm):
+    """The old substring blacklist rejected harmless SELECTs whose string
+    literals contained words like ' delete '."""
+    crm.upsert("leads", [_lead("a@x.com", name="please delete me")], "email")
+    rows = crm.run_template(
+        {"name": "t", "sql": "SELECT name FROM leads WHERE name LIKE '% delete %'"},
+        {},
+    )
+    assert rows == [{"name": "please delete me"}]
+
+
+def test_template_cte_mutation_rejected(crm):
+    crm.upsert("leads", [_lead("a@x.com")], "email")
+    with pytest.raises(ValueError):
+        crm.run_template(
+            {"name": "t", "sql": "WITH x AS (SELECT 1) DELETE FROM leads"}, {}
+        )
+    assert len(crm.list("leads")) == 1
+
+
+def test_template_rows_are_capped(crm, monkeypatch):
+    import crm.sqlite_adapter as sa
+
+    monkeypatch.setattr(sa, "MAX_TEMPLATE_ROWS", 3)
+    crm.upsert("leads", [_lead(f"{i}@x.com") for i in range(5)], "email")
+    assert len(crm.run_template({"name": "t", "sql": "SELECT * FROM leads"}, {})) == 3
+
+
+def test_list_rejects_unknown_filter_column(crm):
+    with pytest.raises(ValueError):
+        crm.list("leads", filters={"status = 'x' OR 1=1 --": "y"})
+
+
+def test_unique_keys_match_schema(crm):
+    """UNIQUE_LEAD_KEYS must mirror the UNIQUE indexes in _SCHEMA."""
+    import crm.sqlite_adapter as sa
+
+    conn = crm._rw()
+    unique = set()
+    for idx in conn.execute("PRAGMA index_list(leads)").fetchall():
+        if idx["unique"]:
+            for col in conn.execute(f"PRAGMA index_info({idx['name']})").fetchall():
+                unique.add(col["name"])
+    assert unique == set(sa.UNIQUE_LEAD_KEYS)
+
+
+def test_rest_adapter_reuses_one_client():
+    """RestCRM built a fresh httpx.Client per call and never closed it."""
+    from crm.rest_adapter import RestCRM
+
+    r = RestCRM({"base_url": "https://crm.example"})
+    assert r._http() is r._http()

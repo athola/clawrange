@@ -15,6 +15,11 @@ OPENCLAW_PORT="${OPENCLAW_PORT:-3000}"
 WORKFLOWS_PORT="${WORKFLOWS_PORT:-5678}"
 DEERFLOW_PORT="${DEERFLOW_PORT:-2026}"
 
+# Protected workflows routes need the bearer token (see workflows_auth.sh).
+# shellcheck source=scripts/workflows_auth.sh
+. ./scripts/workflows_auth.sh
+workflows_auth_init || exit 1
+
 # POSIX-compatible results tracking (no arrays)
 RESULTS=""
 PASSED=0
@@ -35,7 +40,7 @@ echo "Test 1 — Stack Health"
 
 T1_OK=true
 
-printf "  OpenClaw (localhost:${OPENCLAW_PORT}): "
+printf "  OpenClaw (localhost:%s): " "${OPENCLAW_PORT}"
 if curl -sf --connect-timeout 5 --max-time 10 "http://localhost:${OPENCLAW_PORT}/healthz" >/dev/null 2>&1; then
   echo "UP"
 else
@@ -43,7 +48,7 @@ else
   T1_OK=false
 fi
 
-printf "  Workflows (localhost:${WORKFLOWS_PORT}): "
+printf "  Workflows (localhost:%s): " "${WORKFLOWS_PORT}"
 if curl -sf --connect-timeout 5 --max-time 10 "http://localhost:${WORKFLOWS_PORT}/healthz" >/dev/null 2>&1; then
   echo "UP"
 else
@@ -51,8 +56,8 @@ else
   T1_OK=false
 fi
 
-printf "  DeerFlow (localhost:${DEERFLOW_PORT}): "
-if curl -sf --connect-timeout 5 --max-time 10 "http://localhost:${DEERFLOW_PORT}/api/health" >/dev/null 2>&1; then
+printf "  DeerFlow (localhost:%s): " "${DEERFLOW_PORT}"
+if curl -sf --connect-timeout 5 --max-time 10 "http://localhost:${DEERFLOW_PORT}/health" >/dev/null 2>&1; then
   echo "UP"
 else
   echo "DOWN (optional)"
@@ -83,7 +88,8 @@ echo ""
 
 # ─── Test 3: Webhook Roundtrip ─────────────────────────────────────
 echo "Test 3 — Webhook Roundtrip"
-RESPONSE=$(curl -sf --connect-timeout 5 --max-time 15 -X POST "http://localhost:${WORKFLOWS_PORT}/webhook-test/test" \
+RESPONSE=$(curl -sf --connect-timeout 5 --max-time 15 -X POST "http://localhost:${WORKFLOWS_PORT}/webhook/test" \
+  -H @"$WF_AUTH_HEADER" \
   -H "Content-Type: application/json" \
   -d '{"message": "ping", "source": "openclaw-test"}' 2>/dev/null) || RESPONSE=""
 
@@ -97,11 +103,12 @@ fi
 echo ""
 
 # ─── Test 4: Task Queue Lifecycle ──────────────────────────────────
-# Validates the core FastAPI surface that replaced n8n: create a task,
+# Validates the core FastAPI surface: create a task,
 # read it back, then cancel it. Round-trips the brain DB.
 echo "Test 4 — Task Queue Lifecycle"
 TASK_DESC="stack-validation probe $(date +%s)"
 CREATE_RESPONSE=$(curl -sf --connect-timeout 5 --max-time 15 -X POST "http://localhost:${WORKFLOWS_PORT}/task" \
+  -H @"$WF_AUTH_HEADER" \
   -H "Content-Type: application/json" \
   -d "{\"description\": \"${TASK_DESC}\", \"priority\": 5}" 2>/dev/null) || CREATE_RESPONSE=""
 
@@ -112,9 +119,9 @@ if [ -z "$TASK_ID" ]; then
   fail
   echo "  POST /task did not return an id. Check: docker compose logs workflows"
 else
-  GET_RESPONSE=$(curl -sf --connect-timeout 5 --max-time 10 "http://localhost:${WORKFLOWS_PORT}/task/${TASK_ID}" 2>/dev/null) || GET_RESPONSE=""
+  GET_RESPONSE=$(curl -sf --connect-timeout 5 --max-time 10 -H @"$WF_AUTH_HEADER" "http://localhost:${WORKFLOWS_PORT}/task/${TASK_ID}" 2>/dev/null) || GET_RESPONSE=""
   echo "  Read response: $(echo "$GET_RESPONSE" | head -c 160)"
-  curl -sf --connect-timeout 5 --max-time 10 -X DELETE "http://localhost:${WORKFLOWS_PORT}/task/${TASK_ID}" >/dev/null 2>&1 || true
+  curl -sf --connect-timeout 5 --max-time 10 -X DELETE -H @"$WF_AUTH_HEADER" "http://localhost:${WORKFLOWS_PORT}/task/${TASK_ID}" >/dev/null 2>&1 || true
   if echo "$GET_RESPONSE" | grep -qF "$TASK_DESC"; then
     pass
   else
@@ -141,22 +148,36 @@ fi
 echo ""
 
 # ─── Test 6: DeerFlow Research ──────────────────────────────────────
+# DeerFlow's gateway rejects anonymous /api calls. Upstream deploy.sh writes an
+# internal service token into the clone; send it via curl -K on stdin so the
+# token never appears in argv (ps). POSTs also need the CSRF double-submit
+# pair: the same random value as cookie and header.
+DF_TOKEN_FILE="deer-flow/backend/.deer-flow/.internal-auth-token"
+df_curl() {
+  if [ -r "$DF_TOKEN_FILE" ]; then
+    df_csrf=$(openssl rand -hex 16)
+    printf 'header = "X-DeerFlow-Internal-Token: %s"\nheader = "X-CSRF-Token: %s"\ncookie = "csrf_token=%s"\n' \
+      "$(cat "$DF_TOKEN_FILE")" "$df_csrf" "$df_csrf" | curl -K - "$@"
+  else
+    curl "$@"
+  fi
+}
 echo "Test 6 — DeerFlow Research (optional)"
-if ! curl -sf --connect-timeout 5 --max-time 10 "http://localhost:${DEERFLOW_PORT}/api/health" >/dev/null 2>&1; then
+if ! curl -sf --connect-timeout 5 --max-time 10 "http://localhost:${DEERFLOW_PORT}/health" >/dev/null 2>&1; then
   echo "  DeerFlow is not running. Skipping."
   skip
 else
-  RESPONSE=$(curl -sf --connect-timeout 5 --max-time 120 -X POST "http://localhost:${DEERFLOW_PORT}/api/langgraph/runs" \
+  RESPONSE=$(df_curl -sf --connect-timeout 5 --max-time 120 -X POST "http://localhost:${DEERFLOW_PORT}/api/langgraph/runs/wait" \
     -H "Content-Type: application/json" \
     -d '{
       "input": {
-        "messages": [{"role": "user", "content": "What are the top 3 manufactured home lenders in Texas for FHA loans?"}]
+        "messages": [{"role": "user", "content": "What are three common causes of slow PostgreSQL queries?"}]
       },
       "config": {}
     }' 2>&1) || RESPONSE=""
 
   echo "  Response: $(echo "$RESPONSE" | head -c 200)"
-  if echo "$RESPONSE" | grep -qiE "lender|FHA|Texas|mortgage|manufactured"; then
+  if echo "$RESPONSE" | grep -qiE "postgres|index|query|vacuum|planner"; then
     pass
   else
     fail

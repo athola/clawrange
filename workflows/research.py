@@ -1,18 +1,22 @@
 """Multi-source research orchestrator.
 
 Ports a focused subset of `tome`'s synthesis logic into the
-workflows service so John-117 can call a single endpoint and get
+workflows service so the assistant can call a single endpoint and get
 ranked, deduplicated, citation-bearing findings across Reddit,
-GitHub, and GLM web search. The shape of `Finding`, the dedup
-rules, the authority bonuses, and the triangulation bonus all
-mirror the tome plugin so future cross-pollination is cheap.
+GitHub, web search, academic indexes and TRIZ analogies. The shape of
+`Finding`, the dedup rules, the authority bonuses, and the
+triangulation bonus all mirror the tome plugin so future
+cross-pollination is cheap.
 
-Channels:
-- code: GitHub repos and issues
-- discourse: Reddit, HN, blogs (via GLM web search)
-- academic: stub for future arXiv/Semantic Scholar work
+Channels (the default request runs the first three):
+- discourse: Reddit subreddits
+- code: GitHub repos
+- discourse_web (alias 'web'): web search via the proxy's OpenRouter
+  `:online` tier
+- academic: arXiv and Semantic Scholar
+- triz: cross-domain analogies via the same web-search tier
 
-The orchestrator runs all eligible channel fetchers in parallel,
+The orchestrator runs the requested channel fetchers in parallel,
 compresses each channel into Finding lists, merges, ranks, and
 returns a single ordered list with confidence flags.
 """
@@ -21,18 +25,32 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
+import sys
+import xml.etree.ElementTree as ET
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
-from typing import Any
+from datetime import UTC, datetime
+from typing import Any, Literal
+
+import httpx
+
+import llm_proxy
+import tenant_profile
+from errors import UpstreamError
+from github_search import search_repos
+from reddit_search import search_subreddits
 
 logger = logging.getLogger("clawrange.research")
 
-_CURRENT_YEAR = datetime.now(tz=timezone.utc).year
+
+def _current_year() -> int:
+    return datetime.now(tz=UTC).year
+
 
 # Same thresholds as tome.synthesis.merger
 _PUNCTUATION_RE = re.compile(r"[^\w\s]")
-_JACCARD_THRESHOLD_SAME_CHANNEL = 0.8
 _JACCARD_THRESHOLD_CROSS_CHANNEL = 0.6
 _TRIANGULATION_CAP = 0.15
 _TRIANGULATION_PER_CHANNEL = 0.05
@@ -62,18 +80,6 @@ class Finding:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> Finding:
-        return cls(
-            source=d["source"],
-            channel=d["channel"],
-            title=d["title"],
-            url=d["url"],
-            relevance=float(d["relevance"]),
-            summary=d.get("summary", ""),
-            metadata=dict(d.get("metadata", {})),
-        )
-
 
 # ─── Deduplication ────────────────────────────────────────────────
 
@@ -101,58 +107,6 @@ def deduplicate(findings: list[Finding]) -> list[Finding]:
             out.append(f)
     out.extend(no_url)
     return out
-
-
-def _normalize_title(title: str) -> str:
-    if not title:
-        return ""
-    stripped = _PUNCTUATION_RE.sub("", title.lower())
-    return " ".join(sorted(stripped.split()))
-
-
-def _jaccard(a: str, b: str) -> float:
-    sa, sb = set(a.split()), set(b.split())
-    if not sa and not sb:
-        return 1.0
-    if not sa or not sb:
-        return 0.0
-    return len(sa & sb) / len(sa | sb)
-
-
-def fuzzy_deduplicate(
-    findings: list[Finding], cross_channel: bool = False
-) -> list[Finding]:
-    """Drop near-duplicate titles, keeping higher-relevance.
-
-    Within the same channel, similarity >= 0.8 collapses. Across
-    channels (when `cross_channel=True`), threshold drops to 0.6.
-    """
-    if not findings:
-        return []
-    normals = [_normalize_title(f.title) for f in findings]
-    removed: set[int] = set()
-
-    for i in range(len(findings)):
-        if i in removed:
-            continue
-        for j in range(i + 1, len(findings)):
-            if j in removed:
-                continue
-            same = findings[i].channel == findings[j].channel
-            if not cross_channel and not same:
-                continue
-            threshold = (
-                _JACCARD_THRESHOLD_SAME_CHANNEL
-                if same
-                else _JACCARD_THRESHOLD_CROSS_CHANNEL
-            )
-            if _jaccard(normals[i], normals[j]) >= threshold:
-                if findings[i].relevance >= findings[j].relevance:
-                    removed.add(j)
-                else:
-                    removed.add(i)
-                    break
-    return [f for idx, f in enumerate(findings) if idx not in removed]
 
 
 def merge_findings(channel_results: list[list[Finding]]) -> list[Finding]:
@@ -207,7 +161,7 @@ def compute_relevance_score(f: Finding) -> float:
             score += 0.05
 
     year = meta.get("year")
-    if year is not None and (_CURRENT_YEAR - int(year or 0)) <= 2:
+    if year is not None and (_current_year() - int(year or 0)) <= 2:
         score += 0.05
 
     return min(score, 1.0)
@@ -280,7 +234,6 @@ def channel_health() -> dict[str, dict[str, Any]]:
     GITHUB_PAT not set) so they can fix the actual gap rather than
     chase phantom logic bugs.
     """
-    import os
 
     report: dict[str, dict[str, Any]] = {}
 
@@ -309,14 +262,24 @@ def channel_health() -> dict[str, dict[str, Any]]:
     if not github_configured:
         report["code"]["reason"] = "GITHUB_PAT not set"
 
-    # discourse_web / GLM via proxy
-    web_configured = bool(os.getenv("ZAI_API_KEY") or os.getenv("OPENROUTER_API_KEY"))
+    # discourse_web: the proxy's search tier (OpenRouter `:online`). Z.AI's
+    # web search is not used, so ZAI_API_KEY alone does not enable it.
+    web_configured = bool(os.getenv("OPENROUTER_API_KEY"))
+    web_reason = "OPENROUTER_API_KEY not set (web search uses OpenRouter :online)"
     report["discourse_web"] = {
-        "source": "glm-web",
+        "source": "openrouter-online",
         "configured": web_configured,
     }
     if not web_configured:
-        report["discourse_web"]["reason"] = "ZAI_API_KEY or OPENROUTER_API_KEY not set"
+        report["discourse_web"]["reason"] = web_reason
+
+    # academic: public arXiv + Semantic Scholar APIs, no key needed.
+    report["academic"] = {"source": "arxiv+semantic_scholar", "configured": True}
+
+    # triz: a web-search call through the proxy, so the same key.
+    report["triz"] = {"source": "openrouter-online", "configured": web_configured}
+    if not web_configured:
+        report["triz"]["reason"] = web_reason
 
     return report
 
@@ -326,9 +289,8 @@ def channel_health() -> dict[str, dict[str, Any]]:
 
 async def _fetch_reddit(topic: str, **kwargs: Any) -> list[Finding]:
     """Wrap reddit_search.search_subreddits and emit Findings."""
-    from reddit_search import search_subreddits
 
-    subreddits = kwargs.get("subreddits", ["ClaudeAI", "LocalLLaMA", "SideProject"])
+    subreddits = kwargs.get("subreddits") or tenant_profile.default_subreddits()
     posts = await search_subreddits(
         topic,
         subreddits,
@@ -342,7 +304,7 @@ async def _fetch_reddit(topic: str, **kwargs: Any) -> list[Finding]:
             title=p.title,
             url=p.url,
             relevance=0.5,
-            summary=getattr(p, "summary", "") or getattr(p, "selftext", "")[:300],
+            summary=(p.snippet or "")[:300],
             metadata={"score": getattr(p, "score", 0)},
         )
         for p in posts
@@ -351,7 +313,6 @@ async def _fetch_reddit(topic: str, **kwargs: Any) -> list[Finding]:
 
 async def _fetch_github(topic: str, **kwargs: Any) -> list[Finding]:
     """Wrap github_search.search_repos and emit Findings."""
-    from github_search import search_repos
 
     repos = await search_repos(
         topic,
@@ -375,24 +336,22 @@ async def _fetch_github(topic: str, **kwargs: Any) -> list[Finding]:
 
 _ARXIV_API = "http://export.arxiv.org/api/query"
 _S2_API = "https://api.semanticscholar.org/graph/v1/paper/search"
+_ACADEMIC_TIMEOUT_S = 10.0  # per request, arXiv and Semantic Scholar
 
 
 async def _fetch_academic(topic: str, **kwargs: Any) -> list[Finding]:
     """Query arXiv (Atom) and Semantic Scholar (JSON) in parallel.
 
-    Both endpoints are public/no-key. Empty/error results never
-    raise — the orchestrator already handles partial failures, but
-    individual academic-channel failures should not bubble out and
-    cause the whole channel to be marked as a triangulation hole.
+    Both endpoints are public/no-key. One source failing is logged and
+    the other's findings are returned; UpstreamError is raised only when
+    both failed, so the orchestrator reports the channel as an error.
     """
-    import httpx
-    import xml.etree.ElementTree as ET
 
     limit = int(kwargs.get("limit", 5))
 
     async def _arxiv() -> list[Finding]:
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=_ACADEMIC_TIMEOUT_S) as client:
                 resp = await client.get(
                     _ARXIV_API,
                     params={
@@ -406,8 +365,8 @@ async def _fetch_academic(topic: str, **kwargs: Any) -> list[Finding]:
                 resp.raise_for_status()
                 root = ET.fromstring(resp.text)
         except Exception as exc:
-            logger.info("academic.arxiv: %s", exc)
-            return []
+            logger.warning("academic.arxiv failed: %s", exc)
+            raise UpstreamError(f"arxiv: {exc}") from exc
 
         ns = {"atom": "http://www.w3.org/2005/Atom"}
         out: list[Finding] = []
@@ -442,7 +401,7 @@ async def _fetch_academic(topic: str, **kwargs: Any) -> list[Finding]:
 
     async def _semantic_scholar() -> list[Finding]:
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=_ACADEMIC_TIMEOUT_S) as client:
                 resp = await client.get(
                     _S2_API,
                     params={
@@ -454,8 +413,8 @@ async def _fetch_academic(topic: str, **kwargs: Any) -> list[Finding]:
                 resp.raise_for_status()
                 data = resp.json()
         except Exception as exc:
-            logger.info("academic.s2: %s", exc)
-            return []
+            logger.warning("academic.s2 failed: %s", exc)
+            raise UpstreamError(f"semantic_scholar: {exc}") from exc
 
         out: list[Finding] = []
         for item in data.get("data", []):
@@ -479,24 +438,31 @@ async def _fetch_academic(topic: str, **kwargs: Any) -> list[Finding]:
         return out
 
     results = await asyncio.gather(
-        _arxiv(), _semantic_scholar(), return_exceptions=False
+        _arxiv(), _semantic_scholar(), return_exceptions=True
     )
     flat: list[Finding] = []
+    failures: list[str] = []
     for r in results:
+        if isinstance(r, BaseException):
+            if not isinstance(r, Exception):
+                raise r  # cancellation and the like are not source failures
+            failures.append(str(r))
+            continue
         flat.extend(r)
+    if len(failures) == len(results):
+        raise UpstreamError("; ".join(failures))
     return flat
 
 
 async def _fetch_triz(topic: str, **kwargs: Any) -> list[Finding]:
     """Cross-domain analogical reasoning channel.
 
-    Asks the GLM proxy to find solutions in adjacent fields
-    (queueing theory, biology, economics, control systems, etc.)
-    that map onto the topic's contradiction. Returns up to one
-    synthesized finding; the prompt steers GLM toward concrete
-    analogies with a domain-bridge mapping.
+    Asks the proxy's web-search tier (OpenRouter `:online`) to find
+    solutions in adjacent fields (queueing theory, biology, economics,
+    control systems, etc.) that map onto the topic's contradiction.
+    Returns one synthesized finding; the prompt steers the model toward
+    concrete analogies with a domain-bridge mapping.
     """
-    from llm_proxy import _llm_call
 
     prompt = (
         f"TRIZ-style cross-domain analysis for: {topic}\n\n"
@@ -506,9 +472,9 @@ async def _fetch_triz(topic: str, **kwargs: Any) -> list[Finding]:
         "analogy in one sentence, and explain the bridge mapping in "
         "one sentence. Be specific."
     )
-    text = await _llm_call(prompt, max_tokens=600, web_search=True)
+    text = await llm_proxy._llm_call(prompt, max_tokens=600, web_search=True)
     if not text:
-        return []
+        raise UpstreamError("triz: web search tier returned nothing")
     return [
         Finding(
             source="triz",
@@ -523,22 +489,22 @@ async def _fetch_triz(topic: str, **kwargs: Any) -> list[Finding]:
 
 
 async def _fetch_web(topic: str, **kwargs: Any) -> list[Finding]:
-    """Use the GLM web-search proxy for general discourse coverage.
+    """Use the proxy's web-search tier (OpenRouter `:online`) for general
+    discourse coverage.
 
-    Returns at most one synthesized Finding per call — GLM responses
-    are already a synthesis. The caller should treat this as a
-    summary, not a list of pages.
+    Returns one synthesized Finding per call; the reply is already a
+    synthesis. The caller should treat this as a summary, not a list
+    of pages.
     """
-    from llm_proxy import _llm_call
 
     prompt = (
         f"Web research request: {topic}\n\n"
         "Return a tight summary with the top 3 sources. For each, "
         "include the URL."
     )
-    text = await _llm_call(prompt, max_tokens=800, web_search=True)
+    text = await llm_proxy._llm_call(prompt, max_tokens=800, web_search=True)
     if not text:
-        return []
+        raise UpstreamError("web: web search tier returned nothing")
     return [
         Finding(
             source="web",
@@ -557,6 +523,12 @@ async def _fetch_web(topic: str, **kwargs: Any) -> list[Finding]:
 
 _DEFAULT_CHANNELS = ("discourse", "code", "discourse_web")
 
+# Channels a request may name ('web' is shorthand for 'discourse_web').
+# Typed so FastAPI rejects a typo with 422 instead of silently dropping it.
+ResearchChannel = Literal[
+    "discourse", "code", "discourse_web", "web", "academic", "triz"
+]
+
 # Channel-to-fetcher-name lookup. Resolved dynamically at call time
 # via module globals so monkeypatch can swap fetchers in tests.
 _CHANNEL_FETCHER_NAMES = {
@@ -570,16 +542,18 @@ _CHANNEL_FETCHER_NAMES = {
 
 async def orchestrate_research(
     topic: str,
-    channels: list[str] | None = None,
+    channels: Sequence[str] | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
     """Run a multi-source research session and return ranked findings.
 
-    Channels (default: all):
+    Channels (default: discourse, code, discourse_web):
     - 'discourse'      -> Reddit subreddits via `_fetch_reddit`
     - 'code'           -> GitHub repos via `_fetch_github`
-    - 'discourse_web'  -> GLM web search summary via `_fetch_web`
-      (also accepted as the shorthand 'web')
+    - 'discourse_web'  -> web search summary (OpenRouter `:online`) via
+      `_fetch_web` (also accepted as the shorthand 'web')
+    - 'academic'       -> arXiv and Semantic Scholar via `_fetch_academic`
+    - 'triz'           -> cross-domain analogies via `_fetch_triz`
 
     Returns:
         {
@@ -589,14 +563,16 @@ async def orchestrate_research(
           "errors": dict[str, str], # channel -> error message
           "total": int,
         }
+
+    A failed channel lands in ``errors`` and the rest still report.
+    Raises UpstreamError when every requested channel failed, so a full
+    outage never reads as "no findings".
     """
     if not topic or not topic.strip():
         raise ValueError("topic is required")
 
     selected = channels or list(_DEFAULT_CHANNELS)
     selected = ["discourse_web" if c == "web" else c for c in selected]
-
-    import sys
 
     mod = sys.modules[__name__]
 
@@ -617,11 +593,16 @@ async def orchestrate_research(
     channel_findings: list[list[Finding]] = []
     for ch, result in zip(used_channels, raw):
         if isinstance(result, BaseException):
-            short = ch.split("_")[0]
-            errors[short] = str(result)
+            if not isinstance(result, Exception):
+                raise result  # cancellation is not a channel failure
+            errors[ch] = str(result) or type(result).__name__
             channel_findings.append([])
             continue
         channel_findings.append(result)
+
+    if used_channels and len(errors) == len(used_channels):
+        detail = "; ".join(f"{ch}: {msg}" for ch, msg in errors.items())
+        raise UpstreamError(f"every research channel failed ({detail})")
 
     merged = merge_findings(channel_findings)
     ranked = rank_findings(merged)

@@ -167,3 +167,86 @@ async def test_crm_digest_generator_formats_and_delivers(crm, monkeypatch):
     assert sent and sent[0] == digest
     assert "new_leads_count" in digest
     assert "won" in digest  # leads_by_status row rendered
+
+
+@pytest.mark.asyncio
+async def test_pipeline_runs_connector_off_the_event_loop(crm, monkeypatch):
+    import threading
+
+    seen = {}
+    real = generators.run_connector
+
+    def spy(spec, adapter, http_client=None):
+        seen["thread"] = threading.current_thread()
+        return real(spec, adapter, http_client=http_client)
+
+    monkeypatch.setattr(generators, "run_connector", spy)
+
+    async def ok(msg):
+        return True
+
+    monkeypatch.setattr(telegram, "notify", ok)
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, text=CSV))
+    )
+    await generators.pipeline_generator(
+        FakeBrain(),
+        connector="portal-leads",
+        profile=_profile(),
+        crm=crm,
+        http_client=client,
+    )
+    assert seen["thread"] is not threading.main_thread()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_status_records_failed_delivery(crm, monkeypatch):
+    async def down(msg):
+        return False
+
+    async def no_sleep(_):
+        return None
+
+    monkeypatch.setattr(telegram, "notify", down)
+    monkeypatch.setattr("asyncio.sleep", no_sleep)
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, text=CSV))
+    )
+    fb = FakeBrain()
+    await generators.pipeline_generator(
+        fb,
+        connector="portal-leads",
+        profile=_profile(),
+        crm=crm,
+        schedule_id="lead-sync",
+        http_client=client,
+    )
+    assert "telegram FAILED 0/1" in fb.status[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_crm_digest_splits_and_records_delivery(crm, monkeypatch):
+    sent = []
+
+    async def fake_notify(msg):
+        sent.append(msg)
+        return len(sent) == 1  # first chunk lands, the rest fail
+
+    async def no_sleep(_):
+        return None
+
+    monkeypatch.setattr(telegram, "notify", fake_notify)
+    monkeypatch.setattr("asyncio.sleep", no_sleep)
+    monkeypatch.setattr(
+        "crm.query._format_rows", lambda t, r: "row " * 1500, raising=True
+    )
+    fb = FakeBrain()
+    await generators.crm_digest_generator(
+        fb,
+        queries=["new_leads_count"],
+        profile=_profile(),
+        crm=crm,
+        schedule_id="crm-digest",
+    )
+    assert all(len(m) <= 4096 for m in sent)
+    assert fb.status[-1][1].startswith("FAILED telegram 1/")

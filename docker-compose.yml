@@ -12,15 +12,24 @@ services:
   # Web UI + API at http://localhost:3000
   #
   # SANDBOX: Container filesystem is read-only. Writes only to:
-  #   - ./data/openclaw-state/ (persistent state, sessions, config)
+  #   - ${OPENCLAW_STATE_DIR:-./data/openclaw-state}/ (state, sessions, config)
   #   - ./data/openclaw-tmp/   (ephemeral logs, locks)
-  # Host reads allowed via :ro mounts. No writes outside ~/clawrange.
+  # Host reads allowed via :ro mounts.
   openclaw:
-    image: ghcr.io/openclaw/openclaw:2026.3.24
+    image: ghcr.io/openclaw/openclaw:2026.11.3
     container_name: msp-openclaw
+    # Reaps the backgrounded sync-heartbeat.sh once node is PID 1.
+    init: true
     read_only: true
+    # Loopback plus the docker0 gateway only, never 0.0.0.0: under WSL
+    # mirrored networking a wildcard bind is reachable from the LAN.
+    # DOCKER_HOST_IP is the docker0 address that host.docker.internal
+    # resolves to (other compose projects, such as a homepage dashboard,
+    # reach the stack through it). It defaults to 127.0.0.2, a harmless
+    # loopback alias, because Docker rejects two identical bindings.
     ports:
-      - "${BIND_ADDR:-0.0.0.0}:${OPENCLAW_PORT:-3000}:18789"
+      - "127.0.0.1:${OPENCLAW_PORT:-3000}:18789"
+      - "${DOCKER_HOST_IP:-127.0.0.2}:${OPENCLAW_PORT:-3000}:18789"
     # WSL2 networking: pin Telegram API to IPv4 and use reliable DNS.
     # WSL2's NAT drops idle TCP connections before Linux's default 2-hour
     # keepalive detects it, causing Telegram long-polling to hang silently.
@@ -34,26 +43,43 @@ services:
       - net.ipv4.tcp_keepalive_intvl=10
       - net.ipv4.tcp_keepalive_probes=3
     volumes:
-      # Persistent state — bind mount to ~/clawrange/data/ (not a Docker volume)
-      - ./data/openclaw-state:/home/node/.openclaw
+      # Persistent state: a bind mount (not a Docker volume). OPENCLAW_STATE_DIR
+      # in .env relocates it; workflows mounts the same host directory.
+      - ${OPENCLAW_STATE_DIR:-./data/openclaw-state}:/home/node/.openclaw
       # Ephemeral scratch space — stays in ~/clawrange/data/
       - ./data/openclaw-tmp:/tmp
-      # Config templates — read-only
+      # Config templates — read-only. openclaw/identity.md is deliberately
+      # NOT mounted: it is a human-readable render artifact only; the agent
+      # reads IDENTITY.md from its workspace under data/openclaw-state.
       - ./openclaw/soul.md:/home/node/.openclaw/soul.md:ro
-      - ./openclaw/soul-ops.md:/home/node/.openclaw/soul-ops.md:ro
-      - ./openclaw/HEARTBEAT.md:/home/node/.openclaw/HEARTBEAT.md:ro
+      # 2026.8+ no longer reads HEARTBEAT.md: sync-heartbeat.sh loads it into
+      # each heartbeat's monitor scratch once the gateway is up.
+      - ./openclaw/HEARTBEAT.md:/opt/HEARTBEAT.md:ro
+      - ./openclaw/sync-heartbeat.sh:/opt/sync-heartbeat.sh:ro
       - ./openclaw/config/openclaw.json:/opt/openclaw.json.template:ro
+      - ./openclaw/render-config.js:/opt/render-config.js:ro
       # Host home — read-only access for agent file reads
       - ${HOME}:/mnt/host-home:ro
-      # Healthcheck script — detects stuck Telegram polling
+      # Healthcheck script: gateway /healthz plus the heartbeat-sync failure
+      # marker. It cannot detect stuck Telegram polling (see the script).
       - ./scripts/healthcheck-openclaw.sh:/opt/healthcheck.sh:ro
+    tmpfs:
+      # Root-owned (0755) and unwritable by node: holds the heartbeat-sync
+      # failure marker that root writes and the healthcheck reads.
+      - /run:size=1M,mode=0755
     environment:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
-      - OPENCLAW_TZ=${TIMEZONE:-America/Chicago}
+      # OpenClaw only reads agents.defaults.userTimezone from openclaw.json,
+      # so the startup step below renders it from SCHEDULER_TZ (UTC if
+      # unset). OpenClaw cannot read the tenant profile: keep SCHEDULER_TZ
+      # in .env equal to the profile's assistant.timezone.
       - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
       - PROXY_AUTH_TOKEN=${PROXY_AUTH_TOKEN}
+      - OPENCLAW_TZ=${SCHEDULER_TZ:-UTC}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      # The rootfs is read-only; 2026.8+ stages SQLite snapshots in the cache dir.
+      - XDG_CACHE_HOME=/tmp/.cache
     user: "0:0"
     security_opt:
       - no-new-privileges:true
@@ -61,11 +87,16 @@ services:
       - "sh"
       - "-c"
       - |
+        # Stop on the first failure: a failed render must not start the
+        # gateway on a stale or missing openclaw.json.
+        set -e
         chown 1000:1000 /home/node/.openclaw /tmp
-        if [ ! -f /home/node/.openclaw/openclaw.json ] || grep -q 'PROXY_AUTH_TOKEN' /home/node/.openclaw/openclaw.json; then
-          sed "s|\$${PROXY_AUTH_TOKEN}|${PROXY_AUTH_TOKEN}|g" /opt/openclaw.json.template > /home/node/.openclaw/openclaw.json
-          chown 1000:1000 /home/node/.openclaw/openclaw.json
-        fi
+        # Re-render on every start (rotated token / new SCHEDULER_TZ take
+        # effect) while keeping keys OpenClaw wrote at runtime: see
+        # openclaw/render-config.js.
+        node /opt/render-config.js /opt/openclaw.json.template /home/node/.openclaw/openclaw.json
+        chown 1000:1000 /home/node/.openclaw/openclaw.json
+        sh /opt/sync-heartbeat.sh /opt/HEARTBEAT.md &
         exec runuser -u node -- node --max-old-space-size=1536 dist/index.js gateway --bind lan --port 18789
     restart: unless-stopped
     healthcheck:
@@ -86,61 +117,113 @@ services:
 
   # ─── Workflows: Webhook + CRM Service ─────────────────────────────
   # Handles webhooks, lead lookups, morning briefings.
-  # Replaces n8n with testable Python endpoints.
   # API at http://localhost:5678
   #
-  # SANDBOX: Read-only container. No host mounts. Network-only service.
+  # SANDBOX: read-only root filesystem. Host mounts: the source tree (dev
+  # only), tenant profiles and soul.md read-only; data/brain and the
+  # OpenClaw state directory read-write. /tmp is a small tmpfs.
   workflows:
     build: ./workflows
     container_name: msp-workflows
     read_only: true
+    # Same binding policy as openclaw above.
     ports:
-      - "${BIND_ADDR:-0.0.0.0}:${WORKFLOWS_PORT:-5678}:5678"
+      - "127.0.0.1:${WORKFLOWS_PORT:-5678}:5678"
+      - "${DOCKER_HOST_IP:-127.0.0.2}:${WORKFLOWS_PORT:-5678}:5678"
     volumes:
-      # Dev hot-reload — mount source so uvicorn --reload picks up changes
-      - ./workflows/app.py:/app/app.py:ro
-      - ./workflows/brain.py:/app/brain.py:ro
-      - ./workflows/brain_db.py:/app/brain_db.py:ro
-      - ./workflows/telegram.py:/app/telegram.py:ro
-      - ./workflows/llm_proxy.py:/app/llm_proxy.py:ro
-      - ./workflows/models.json:/app/models.json:ro
-      - ./workflows/scheduler.py:/app/scheduler.py:ro
-      - ./workflows/generators.py:/app/generators.py:ro
-      - ./workflows/reddit_search.py:/app/reddit_search.py:ro
-      - ./workflows/github_search.py:/app/github_search.py:ro
-      # Multi-tenant + research modules (added in the n8n->FastAPI merge).
-      # Must be mounted: the image only bakes app/telegram/llm_proxy/models,
-      # so an absent module here crashes uvicorn --reload on the next reload.
-      - ./workflows/research.py:/app/research.py:ro
-      - ./workflows/tenant_profile.py:/app/tenant_profile.py:ro
-      - ./workflows/persona.py:/app/persona.py:ro
-      - ./workflows/crm_api.py:/app/crm_api.py:ro
-      - ./workflows/connectors:/app/connectors:ro
-      - ./workflows/crm:/app/crm:ro
+      # Dev hot-reload: the whole package, so a new module never needs its
+      # own mount line (a missing one crashed the reloader). The prod
+      # override drops this and runs the baked image without --reload.
+      - ./workflows:/app:ro
       # Tenant profiles — load_profile() resolves CLAWRANGE_PROFILE here.
       - ./config/profiles:/config/profiles:ro
-      # Soul — gives Max its persona context for self-directed tasks
-      - ./openclaw/soul.md:/app/soul.md:ro
+      # Soul: gives the assistant its persona context for self-directed tasks
+      - ./openclaw/soul.md:/opt/soul.md:ro
       # Brain — persistent knowledge storage
       - ./data/brain:/data
+      # OpenClaw workspace state — writable so runtime persona re-render
+      # (on learning approval) can update the agent's SOUL.md / IDENTITY.md.
+      # Mounted as a whole directory rather than spec §7's narrow per-file
+      # mount because render_all writes atomically via os.replace, which
+      # breaks single-file bind mounts (the bind pins the old inode).
+      # The host side honours OPENCLAW_STATE_DIR from .env.
+      - ${OPENCLAW_STATE_DIR:-./data/openclaw-state}:/openclaw-state
     tmpfs:
       - /tmp:size=32M
     environment:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - ZAI_API_KEY=${ZAI_API_KEY}
+      # Embedding model for brain search and /v1/embeddings (OpenRouter).
+      - EMBED_MODEL=${EMBED_MODEL:-openai/text-embedding-3-small}
+      - EMBED_DIM=${EMBED_DIM:-1536}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
       - PROXY_AUTH_TOKEN=${PROXY_AUTH_TOKEN}
-      - OPENROUTER_CREDIT_BALANCE=${OPENROUTER_CREDIT_BALANCE:-0}
       - REDDIT_CLIENT_ID=${REDDIT_CLIENT_ID:-}
       - REDDIT_CLIENT_SECRET=${REDDIT_CLIENT_SECRET:-}
       - REDDIT_USERNAME=${REDDIT_USERNAME:-}
       - REDDIT_PASSWORD=${REDDIT_PASSWORD:-}
       - REDDIT_USER_AGENT=${REDDIT_USER_AGENT:-clawrange-marketing-bot/0.1}
+      # Empty -> the scanner's built-in agent for the keyless Atom fallback.
+      - REDDIT_FEED_USER_AGENT=${REDDIT_FEED_USER_AGENT:-}
       - GITHUB_PAT=${GITHUB_PAT:-}
-      - SCHEDULER_TZ=${SCHEDULER_TZ:-America/Chicago}
+      # Homelab deal rundown: eBay Browse API keys and the operator's gear
+      # description for the buy read (both optional).
+      - EBAY_CLIENT_ID=${EBAY_CLIENT_ID:-}
+      - EBAY_CLIENT_SECRET=${EBAY_CLIENT_SECRET:-}
+      - HOMELAB_CURRENT_SETUP=${HOMELAB_CURRENT_SETUP:-}
+      # How prompts name the operator (profile assistant.owner.name).
+      - OPERATOR_NAME=${OPERATOR_NAME:-}
+      - OPERATOR_ORG=${OPERATOR_ORG:-}
+      - OPERATOR_LOCATION=${OPERATOR_LOCATION:-}
+      # Empty -> the profile's assistant.timezone (UTC if unset).
+      - SCHEDULER_TZ=${SCHEDULER_TZ:-}
       # Which tenant profile to load (defaults to the identity-free starter).
       - CLAWRANGE_PROFILE=${CLAWRANGE_PROFILE:-starter}
+      # Where the OpenClaw workspace state is mounted (runtime persona render).
+      # Fixed: this is the container path. .env's OPENCLAW_STATE_DIR is the
+      # host path and only changes the mount source above.
+      - OPENCLAW_STATE_DIR=/openclaw-state
+      # Telegram digest window for heartbeat reporting (seconds). Independent
+      # of the heartbeat cadence (every 10m, set in openclaw.json).
+      - HEARTBEAT_DIGEST_INTERVAL=${HEARTBEAT_DIGEST_INTERVAL:-3600}
+      # 0 stops the heartbeat inventing its own research tasks.
+      - HEARTBEAT_LLM_SUGGEST=${HEARTBEAT_LLM_SUGGEST:-1}
+      # Heartbeat and watchdog tunables. Defaults repeat the code's own:
+      # digest.py and watchdog.py parse several at import, so an empty value
+      # would stop the service booting (tests/test_compose_env.py).
+      - HEARTBEAT_WORK_DEADLINE=${HEARTBEAT_WORK_DEADLINE:-}
+      - HEARTBEAT_ACTIVE_REAP_HOURS=${HEARTBEAT_ACTIVE_REAP_HOURS:-}
+      - HEARTBEAT_DIGEST_MAX_MESSAGES=${HEARTBEAT_DIGEST_MAX_MESSAGES:-20}
+      - HEARTBEAT_DIGEST_RESULT_LIMIT=${HEARTBEAT_DIGEST_RESULT_LIMIT:-3500}
+      - HEARTBEAT_DIGEST_MAX_LINES=${HEARTBEAT_DIGEST_MAX_LINES:-200}
+      - HEARTBEAT_WATCH_TZ=${HEARTBEAT_WATCH_TZ:-}
+      - HEARTBEAT_WATCH_ACTIVE=${HEARTBEAT_WATCH_ACTIVE:-8-20}
+      - HEARTBEAT_WATCH_STALL_SECS=${HEARTBEAT_WATCH_STALL_SECS:-900}
+      - HEARTBEAT_WATCH_REALERT_SECS=${HEARTBEAT_WATCH_REALERT_SECS:-7200}
+      # Non-empty enables the flagged outcome-signal persona proposals.
+      - PERSONA_SIGNAL_LEARNING=${PERSONA_SIGNAL_LEARNING:-}
+      # Lead-CRM profile connector credentials (unset -> connector disabled).
+      # Passed one by one, never via env_file: that would hand every secret
+      # in .env to the container. tests/validate_stack.py checks that each
+      # ${VAR} a shipped profile references is listed here.
+      - PORTAL_EXPORT_URL=${PORTAL_EXPORT_URL:-}
+      - PORTAL_API_KEY=${PORTAL_API_KEY:-}
+      - PORTAL_TOKEN=${PORTAL_TOKEN:-}
+      - PORTAL_USERNAME=${PORTAL_USERNAME:-}
+      - PORTAL_PASSWORD=${PORTAL_PASSWORD:-}
+      - PORTAL_LOGIN_URL=${PORTAL_LOGIN_URL:-}
+      # The SQLite CRM lives next to the brain on the /data mount. .env's
+      # CRM_DB_PATH is a host path (make seed-demo) and would not resolve
+      # inside the container, so it is pinned here.
+      - CRM_DB_PATH=/data/crm.db
+      # REST CRM adapter (profile crm.adapter: rest).
+      - CRM_BASE_URL=${CRM_BASE_URL:-}
+      - CRM_TOKEN=${CRM_TOKEN:-}
+      # uvicorn --reload against the mounted source (dev). Prod sets 0.
+      - UVICORN_RELOAD=${UVICORN_RELOAD:-1}
+      # Bundled persona template (outside /app, which is a read-only mount).
+      - SOUL_MD_PATH=/opt/soul.md
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped

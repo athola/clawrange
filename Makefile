@@ -8,6 +8,10 @@
 
 .DEFAULT_GOAL := help
 
+# make does not read .env. Recipes that resolve profile ${VAR}s or call the
+# bearer-protected API source it first (values are never echoed).
+LOAD_ENV = if [ -f .env ]; then set -a; . ./.env; set +a; fi
+
 # ─── Stack Lifecycle ──────────────────────────────────────────────
 
 .PHONY: start start-full stop stop-clean restart reset
@@ -34,23 +38,31 @@ PROD_COMPOSE := -f docker-compose.yml -f docker-compose.prod.yml
 
 .PHONY: start-prod start-prod-full stop-prod
 
+# Same soul.md render guard as make start: a missing bind source would make
+# Docker create it as a root-owned directory.
 start-prod: ## Start core stack bound to Tailscale + localhost only
-	@BIND_ADDR=127.0.0.1 docker compose $(PROD_COMPOSE) up -d --build
-	@echo "Services bound to 127.0.0.1 + $${TAILSCALE_IP} (Tailscale)"
+	@./scripts/start.sh --ensure-soul
+	@docker compose $(PROD_COMPOSE) up -d --build
+	@$(LOAD_ENV); \
+	echo "Services bound to 127.0.0.1 + $${TAILSCALE_IP:-<TAILSCALE_IP unset>} (Tailscale)"
 
 start-prod-full: ## Start full stack (prod mode) including DeerFlow
-	@BIND_ADDR=127.0.0.1 docker compose $(PROD_COMPOSE) up -d --build
+	@./scripts/start.sh --ensure-soul
+	@docker compose $(PROD_COMPOSE) up -d --build
 	@./scripts/start.sh --with-deerflow --skip-core
 
 stop-prod: ## Stop production stack
 	@docker compose $(PROD_COMPOSE) down
 
-reset: ## Wipe all data and start fresh (interactive confirmation)
+reset: ## Stop, drop containers and the DeerFlow clone; keeps data/ (asks first)
 	@./scripts/reset.sh
 
 # ─── Testing ──────────────────────────────────────────────────────
 
-.PHONY: test test-openclaw test-workflows test-deerflow test-ollama test-unit validate
+.PHONY: test test-openclaw test-workflows test-deerflow test-ollama test-research \
+	test-unit coverage validate tome-bridge tome-bridge-watch \
+	retrieval-eval retrieval-eval-refresh retrieval-harvest retrieval-eval-brain \
+	models-check
 
 test: ## Run full validation suite (6 tests)
 	@./scripts/test_all.sh
@@ -70,31 +82,71 @@ test-ollama: ## Test local Ollama inference
 test-research: ## Smoke test the /research endpoint with a live topic
 	@./scripts/test_research.sh "$(TOPIC)"
 
+# The task queue API requires a bearer token: export PROXY_AUTH_TOKEN from
+# .env (never printed) and refuse to run without it. The old .env.example
+# placeholder counts as unset (the API rejects it too, see workflows/auth.py).
+TOME_BRIDGE_ENV = $(LOAD_ENV); \
+	if [ -z "$${PROXY_AUTH_TOKEN:-}" ] || [ "$${PROXY_AUTH_TOKEN}" = "generate-a-token-here" ]; then \
+		echo "PROXY_AUTH_TOKEN is empty or a placeholder: set a real token in .env (the task queue API requires it)." >&2; \
+		exit 1; \
+	fi
+
 tome-bridge: ## Run one bridge pass for research:tome tasks
-	@python3 scripts/tome_bridge.py
+	@$(TOME_BRIDGE_ENV); uv run python scripts/tome_bridge.py
 
 tome-bridge-watch: ## Watch task queue for research:tome tasks
-	@python3 scripts/tome_bridge.py --watch --interval 60
+	@$(TOME_BRIDGE_ENV); uv run python scripts/tome_bridge.py --watch --interval 60
+
+persona-export: ## Export approved persona learnings to learned.yaml (PROFILE=<name>)
+	@test -n "$(PROFILE)" || { echo "usage: make persona-export PROFILE=<name>"; exit 1; }
+	@$(LOAD_ENV); uv run python workflows/scripts/persona_export.py "$(PROFILE)"
+
+# PROFILE is passed as argv, never interpolated into the Python source.
+# Renders brain approvals plus learned.yaml (overlay only, with a warning,
+# when data/brain/brain.db is missing).
+persona: ## Render soul.md + identity.md from a profile, brain approvals and learned overlay (PROFILE=<name>)
+	@test -n "$(PROFILE)" || { echo "usage: make persona PROFILE=<name>"; exit 1; }
+	@$(LOAD_ENV); uv run python workflows/scripts/persona_render.py "$(PROFILE)"
+
+persona-demo: ## Offline walkthrough of the persona meta-learning loop (PROFILE=<name>)
+	@uv run python workflows/scripts/persona_demo.py "$${PROFILE:-chief-of-staff}"
 
 test-unit: ## Run Python unit tests (no containers needed)
-	@python3 -m pytest workflows/tests/ -v
+	@uv run pytest workflows/tests/ -v
+
+# Source and omit live in [tool.coverage.run] (pyproject.toml): workflows/
+# only, tests excluded. Fails under 85%, the project's coverage target.
+coverage: ## Unit tests with a source-only coverage report over workflows/
+	@uv run pytest workflows/tests/ -q --cov --cov-report=term-missing:skip-covered --cov-fail-under=85
+
+retrieval-eval: ## Compare search configs on the fixture golden set (offline)
+	@cd workflows && uv run python retrieval_eval.py
+
+retrieval-eval-refresh: ## Embed fixture cache misses via OpenRouter, then compare
+	@$(LOAD_ENV); \
+	cd workflows && uv run python retrieval_eval.py --refresh --check-truncation
+
+retrieval-harvest: ## Add the assistant's real brain searches to data/retrieval/golden.json (unlabelled)
+	@cd workflows && uv run python retrieval_eval.py --brain ../data/brain/brain.db --harvest
+
+retrieval-eval-brain: ## Compare search configs on the real brain with your labelled queries
+	@$(LOAD_ENV); \
+	cd workflows && uv run python retrieval_eval.py --brain ../data/brain/brain.db --refresh
+
+models-check: ## Check configured OpenRouter model ids against the live catalog
+	@uv run python scripts/check_models.py
 
 validate: ## Validate config files and project structure
-	@python3 tests/validate_stack.py
-	@if command -v pytest >/dev/null 2>&1; then \
-		python3 -m pytest tests/test_validate_stack.py -q; \
-	fi
+	@uv run python tests/validate_stack.py
+	@uv run pytest tests/ -q
 
 # ─── Tenant Profiles (multi-tenant template) ──────────────────────
 
-.PHONY: profile seed-demo
+.PHONY: profile persona persona-demo seed-demo persona-export
 
-profile: ## Render openclaw/soul.md from a profile + set it in .env (PROFILE=<name>)
+profile: ## Render a profile's persona files (as make persona) + set it in .env (PROFILE=<name>)
 	@test -n "$(PROFILE)" || { echo "usage: make profile PROFILE=<name>"; exit 1; }
-	@python3 -c "import sys; sys.path.insert(0,'workflows'); \
-from persona import write_soul; from tenant_profile import load_profile; \
-p=write_soul(load_profile('$(PROFILE)'), 'openclaw/soul.md'); \
-print('rendered persona ->', p)"
+	@$(LOAD_ENV); uv run python workflows/scripts/persona_render.py "$(PROFILE)"
 	@if [ -f .env ]; then \
 		if grep -q '^CLAWRANGE_PROFILE=' .env; then \
 			sed -i.bak 's/^CLAWRANGE_PROFILE=.*/CLAWRANGE_PROFILE=$(PROFILE)/' .env && rm -f .env.bak; \
@@ -102,8 +154,9 @@ print('rendered persona ->', p)"
 		echo "set CLAWRANGE_PROFILE=$(PROFILE) in .env"; \
 	else echo "no .env yet — run 'make setup' first (CLAWRANGE_PROFILE not set)"; fi
 
-seed-demo: ## Load the lead-crm demo leads into the CRM for an offline demo
-	@CRM_DB_PATH=$${CRM_DB_PATH:-data/crm/crm.db} python3 scripts/seed_demo.py
+seed-demo: ## Load the lead-crm demo leads into the CRM (CRM_DB_PATH: command line, then .env, then data/crm/crm.db)
+	@cli_db="$${CRM_DB_PATH:-}"; $(LOAD_ENV); \
+	CRM_DB_PATH="$${cli_db:-$${CRM_DB_PATH:-data/crm/crm.db}}" uv run python scripts/seed_demo.py
 
 # ─── Docker Inspection ────────────────────────────────────────────
 
@@ -111,8 +164,8 @@ seed-demo: ## Load the lead-crm demo leads into the CRM for an offline demo
 
 ps: ## Show running containers
 	@docker compose ps 2>/dev/null; \
-	if [ -d deerflow ]; then \
-		(cd deer-flow 2>/dev/null && COMPOSE_FILE=docker/docker-compose.yaml docker compose ps 2>/dev/null) || true; \
+	if [ -f deer-flow/docker/docker-compose.yaml ]; then \
+		docker ps -a --filter label=com.docker.compose.project=deer-flow; \
 	fi
 
 logs: ## Tail logs from all services
@@ -130,40 +183,74 @@ health: ## Quick health check (no test logic, just curl)
 	@[ -f .env ] && set -a && . ./.env && set +a || true; \
 	printf "Workflows: "; curl -sf --connect-timeout 5 http://localhost:$${WORKFLOWS_PORT:-5678}/healthz && echo " OK" || echo "DOWN"
 	@[ -f .env ] && set -a && . ./.env && set +a || true; \
-	printf "DeerFlow:  "; curl -sf --connect-timeout 5 http://localhost:$${DEERFLOW_PORT:-2026}/api/health && echo " OK" || echo "DOWN (optional)"
+	printf "DeerFlow:  "; curl -sf --connect-timeout 5 http://localhost:$${DEERFLOW_PORT:-2026}/health && echo " OK" || echo "DOWN (optional)"
 
 # ─── Linting ─────────────────────────────────────────────────────
 
-.PHONY: lint format
+.PHONY: lint format format-fix typecheck py-lint
 
-lint: ## Run ShellCheck on scripts
-	@if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck scripts/*.sh && echo "All scripts pass ShellCheck"; \
+# Python tooling (ruff + mypy + pytest) is managed by uv via pyproject.toml +
+# uv.lock. `uv run` resolves the synced .venv automatically, so no manual
+# activation is needed and versions stay pinned to the lockfile.
+
+py-lint: ## Lint Python with ruff (uv managed)
+	@uv run ruff check .
+
+typecheck: ## Typecheck Python with mypy (uv managed)
+	@uv run mypy workflows scripts tests
+
+# Mirrors the commit gate: the pre-commit shellcheck hook (warning severity),
+# then ruff and mypy from uv.lock. A missing shellcheck is a failure, not a skip.
+lint: ## Run all linters: ShellCheck (scripts) + ruff + mypy (Python)
+	@command -v shellcheck >/dev/null 2>&1 || { \
+		echo "ERROR: shellcheck not installed (apt install shellcheck / brew install shellcheck)" >&2; \
+		exit 1; }
+	@shellcheck --severity=warning scripts/*.sh workflows/*.sh && echo "All scripts pass ShellCheck"
+	@uv run ruff check .
+	@uv run ruff format --check .
+	@uv run mypy workflows scripts tests
+
+format: ## Check formatting: YAML/JSON + ruff format (does not modify files)
+	@if command -v yamllint >/dev/null 2>&1; then \
+		yamllint -d relaxed docker-compose.yml deerflow/config.yaml; \
 	else \
-		echo "shellcheck not installed (skipping — install with: apt install shellcheck)"; \
+		echo "yamllint not installed (skipping YAML style check; check-yaml runs in pre-commit)"; \
 	fi
+	@rc=0; for f in openclaw/config/openclaw.json; do \
+		if python3 -m json.tool "$$f" > /dev/null; then echo "OK: $$f"; \
+		else echo "FAIL: $$f"; rc=1; fi; \
+	done; exit $$rc
+	@uv run ruff format --check .
 
-format: ## Check YAML/JSON formatting
-	@command -v yamllint >/dev/null 2>&1 && yamllint -d relaxed docker-compose.yml deerflow/config.yaml || echo "yamllint not installed (skipping)"
-	@for f in openclaw/config/openclaw.json; do \
-		python3 -m json.tool "$$f" > /dev/null && echo "OK: $$f" || echo "FAIL: $$f"; \
-	done
+format-fix: ## Apply ruff formatting + safe auto-fixes
+	@uv run ruff format .
+	@uv run ruff check --fix .
 
 # ─── Setup ────────────────────────────────────────────────────────
 
-.PHONY: setup env-check
+.PHONY: setup env-check hooks
 
-setup: .env ## One-time setup: create .env and generate gateway token
+hooks: ## Install git hooks (pre-commit + pre-push) via pre-commit
+	@uv run pre-commit install -t pre-commit -t pre-push
+	@echo "Git hooks installed: pre-commit (ruff/mypy/format) + pre-push (pytest)."
+
+setup: .env hooks ## One-time setup: .env + gateway token + git hooks
 	@echo "Setup complete. Fill in OPENROUTER_API_KEY in .env, then run: make start"
 
+# Single recipe line on purpose: an existing .env (even one older than
+# .env.example) is never overwritten, and setup continues on to `hooks`.
 .env: .env.example
-	@if [ -f .env ]; then echo ".env already exists. Remove it first to regenerate."; exit 1; fi
-	@cp .env.example .env
-	@TOKEN=$$(openssl rand -base64 32 | tr -d '/+=' | head -c 40) && \
+	@if [ -f .env ]; then \
+		echo "NOTE: .env already exists (older than .env.example?) — leaving it untouched."; \
+		echo "      Diff it against .env.example for new keys; remove it to regenerate."; \
+	else \
+		cp .env.example .env && \
+		TOKEN=$$(openssl rand -base64 32 | tr -d '/+=' | head -c 40) && \
 		sed "s/^OPENCLAW_GATEWAY_TOKEN=.*/OPENCLAW_GATEWAY_TOKEN=$${TOKEN}/" .env > .env.tmp && \
-		mv .env.tmp .env
-	@echo "Created .env with generated OPENCLAW_GATEWAY_TOKEN."
-	@echo "Edit .env and add your OPENROUTER_API_KEY."
+		mv .env.tmp .env && \
+		echo "Created .env with generated OPENCLAW_GATEWAY_TOKEN." && \
+		echo "Edit .env and add your OPENROUTER_API_KEY."; \
+	fi
 
 env-check: ## Validate .env has required values
 	@if [ ! -f .env ]; then echo "FAIL: .env not found. Run: make setup"; exit 1; fi

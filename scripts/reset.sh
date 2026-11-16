@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Wipe all data and start fresh.
-# WARNING: This destroys all n8n workflows, DeerFlow output, and Docker volumes.
+# WARNING: This removes the DeerFlow clone and output and prunes project
+# containers. The brain database (data/brain/) is left in place.
 # Usage: ./scripts/reset.sh [--force|-f]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 echo "=== AI MSP Testbed Reset ==="
-echo "This will destroy all persistent data (n8n workflows, volumes, DeerFlow output)."
+echo "This will remove the DeerFlow clone and output and prune project containers."
 
 if [ "${1:-}" = "--force" ] || [ "${1:-}" = "-f" ]; then
   confirm="y"
@@ -26,7 +27,13 @@ fi
 # Remove DeerFlow clone
 if [ -d deer-flow ]; then
   echo "Removing DeerFlow clone..."
-  rm -rf deer-flow
+  if ! rm -rf deer-flow 2>/dev/null; then
+    # DeerFlow's containers write root-owned runtime data under
+    # backend/.deer-flow; delete that as root in a throwaway container.
+    docker run --rm -v "$PWD/deer-flow/backend:/backend" alpine:3.20 \
+      rm -rf /backend/.deer-flow
+    rm -rf deer-flow
+  fi
 fi
 
 # Remove DeerFlow output

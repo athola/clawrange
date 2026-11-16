@@ -10,9 +10,10 @@ Tests the edge cases fixed in the review:
 Run with: pytest tests/test_validate_stack.py -v
 """
 
-import os
 import json
+import os
 import sys
+
 import pytest
 
 # Add project root so validate_stack can find PROJECT_ROOT correctly
@@ -33,27 +34,7 @@ def project_tree(tmp_path):
 
 def _create_minimal_project(root):
     """Scaffold the minimum files so check_required_files passes."""
-    required = [
-        "docker-compose.yml",
-        ".env.example",
-        ".gitignore",
-        "Makefile",
-        "openclaw/soul.template.md",
-        "openclaw/config/openclaw.json",
-        "deerflow/config.yaml",
-        "workflows/app.py",
-        "workflows/Dockerfile",
-        "workflows/requirements.txt",
-        "scripts/start.sh",
-        "scripts/stop.sh",
-        "scripts/reset.sh",
-        "scripts/test_all.sh",
-        "scripts/test_openclaw.sh",
-        "scripts/test_workflows.sh",
-        "scripts/test_deerflow.sh",
-        "scripts/test_ollama.sh",
-    ]
-    for f in required:
+    for f in validate_stack.REQUIRED_FILES:
         path = root / f
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()
@@ -242,7 +223,7 @@ class TestCheckOpenclawConfig:
     """Tests for OpenClaw config validation."""
 
     def test_pass_with_valid_config(self, project_tree):
-        """GIVEN a valid openclaw.json with v2026.3 schema
+        """GIVEN a valid openclaw.json with v2026.8+ schema
         THEN the check should pass."""
         config_dir = project_tree / "openclaw" / "config"
         config_dir.mkdir(parents=True, exist_ok=True)
@@ -319,22 +300,24 @@ class TestCheckEnvExample:
             "OPENROUTER_API_KEY=test\n"
             "OPENCLAW_GATEWAY_TOKEN=test\n"
             "WORKFLOWS_PORT=5678\n"
-            "TIMEZONE=America/Chicago\n"
+            "PROXY_AUTH_TOKEN=test\n"
+            "SCHEDULER_TZ=America/Chicago\n"
         )
         result = validate_stack.check_env_example()
         assert result.passed is True
 
     def test_fail_with_missing_key(self, project_tree):
-        """GIVEN .env.example is missing TIMEZONE
+        """GIVEN .env.example is missing SCHEDULER_TZ
         THEN the check should fail."""
         (project_tree / ".env.example").write_text(
             "OPENROUTER_API_KEY=test\n"
             "OPENCLAW_GATEWAY_TOKEN=test\n"
             "WORKFLOWS_PORT=5678\n"
+            "PROXY_AUTH_TOKEN=test\n"
         )
         result = validate_stack.check_env_example()
         assert result.passed is False
-        assert "TIMEZONE" in result.message
+        assert "SCHEDULER_TZ" in result.message
 
     def test_fail_when_file_missing(self, project_tree):
         """GIVEN .env.example does not exist
@@ -378,6 +361,17 @@ class TestCheckScriptsExecutable:
         assert result.passed is False
         assert "stop.sh" in result.message
 
+    def test_sourced_library_without_shebang_is_exempt(self, project_tree):
+        """GIVEN a .sh file with no shebang (a library meant to be sourced)
+        THEN it needn't be executable."""
+        scripts_dir = project_tree / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        lib = scripts_dir / "workflows_auth.sh"
+        lib.write_text("# shellcheck shell=bash\nWF_AUTH_HEADER=x\n")
+        lib.chmod(0o644)
+        result = validate_stack.check_scripts_executable()
+        assert result.passed is True
+
     def test_ignores_non_sh_files(self, project_tree):
         """GIVEN scripts/ contains a non-.sh file without execute permission
         THEN the check should still pass (only .sh files matter)."""
@@ -393,10 +387,10 @@ class TestCheckScriptsExecutable:
         assert result.passed is True
 
 
-# ─── check_n8n_workflows (now checks workflow service) ───────────
+# ─── check_workflow_service ───────────
 
 
-class TestCheckN8nWorkflows:
+class TestCheckWorkflowService:
     """Tests for workflow service validation."""
 
     def test_pass_with_valid_service(self, project_tree):
@@ -408,7 +402,7 @@ class TestCheckN8nWorkflows:
             '"/webhook/test"\n"/healthz"\n"/brain"\n"/task"\n"/tier"\n'
         )
         (wf_dir / "Dockerfile").write_text("FROM python:3.12-slim\n")
-        result = validate_stack.check_n8n_workflows()
+        result = validate_stack.check_workflow_service()
         assert result.passed is True
 
     def test_fail_with_missing_endpoint(self, project_tree):
@@ -418,7 +412,7 @@ class TestCheckN8nWorkflows:
         wf_dir.mkdir(parents=True, exist_ok=True)
         (wf_dir / "app.py").write_text('"/webhook/test"\n"/healthz"\n')
         (wf_dir / "Dockerfile").write_text("FROM python:3.12-slim\n")
-        result = validate_stack.check_n8n_workflows()
+        result = validate_stack.check_workflow_service()
         assert result.passed is False
         assert "brain" in result.message
 
@@ -428,7 +422,7 @@ class TestCheckN8nWorkflows:
         wf_dir = project_tree / "workflows"
         wf_dir.mkdir(parents=True, exist_ok=True)
         (wf_dir / "Dockerfile").write_text("FROM python:3.12-slim\n")
-        result = validate_stack.check_n8n_workflows()
+        result = validate_stack.check_workflow_service()
         assert result.passed is False
         assert "app.py" in result.message
 
@@ -440,7 +434,7 @@ class TestCheckN8nWorkflows:
         (wf_dir / "app.py").write_text(
             '"/webhook/test"\n"/healthz"\n"/brain"\n"/task"\n"/tier"\n'
         )
-        result = validate_stack.check_n8n_workflows()
+        result = validate_stack.check_workflow_service()
         assert result.passed is False
         assert "Dockerfile" in result.message
 
@@ -496,3 +490,75 @@ class TestCheckSoulTemplate:
         result = validate_stack.check_soul_template()
         assert result.passed is False
         assert "not found" in result.message
+
+
+# ─── check_profile_env_passthrough ────────────────────────────────
+
+
+class TestCheckProfileEnvPassthrough:
+    """Every ${VAR} a shipped profile references must reach the workflows
+    container: compose passes variables explicitly (no env_file), so a
+    missing line silently resolves the profile field to ""."""
+
+    def _write(self, root, compose, profiles):
+        (root / "docker-compose.yml").write_text(compose)
+        for name, text in profiles.items():
+            d = root / "config" / "profiles" / name
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "profile.yaml").write_text(text)
+
+    def test_pass_when_every_var_is_passed(self, project_tree):
+        self._write(
+            project_tree,
+            "services:\n  workflows:\n    environment:\n"
+            "      - PORTAL_TOKEN=${PORTAL_TOKEN:-}\n"
+            "      - OPERATOR_NAME=${OPERATOR_NAME:-}\n",
+            {
+                "a": "source:\n  token: ${PORTAL_TOKEN}\n",
+                "b": "owner:\n  name: ${OPERATOR_NAME}\n",
+            },
+        )
+        result = validate_stack.check_profile_env_passthrough()
+        assert result.passed is True, result.message
+
+    def test_fail_names_missing_var_and_profile(self, project_tree):
+        self._write(
+            project_tree,
+            "services:\n  workflows:\n    environment:\n"
+            "      - OPERATOR_NAME=${OPERATOR_NAME:-}\n",
+            {"lead": "crm:\n  rest:\n    base_url: ${CRM_BASE_URL}\n"},
+        )
+        result = validate_stack.check_profile_env_passthrough()
+        assert result.passed is False
+        assert "CRM_BASE_URL" in result.message
+        assert "lead" in result.message
+
+    def test_mapping_style_environment(self, project_tree):
+        self._write(
+            project_tree,
+            "services:\n  workflows:\n    environment:\n"
+            "      CRM_TOKEN: ${CRM_TOKEN:-}\n",
+            {"lead": 'items: ["Bearer ${CRM_TOKEN}"]\n'},
+        )
+        result = validate_stack.check_profile_env_passthrough()
+        assert result.passed is True, result.message
+
+    def test_commented_placeholders_are_ignored(self, project_tree):
+        self._write(
+            project_tree,
+            "services:\n  workflows:\n    environment: []\n",
+            {"starter": "# ${VAR} tokens resolve from the environment\nname: x\n"},
+        )
+        result = validate_stack.check_profile_env_passthrough()
+        assert result.passed is True, result.message
+
+    def test_fail_when_workflows_service_missing(self, project_tree):
+        self._write(project_tree, "services: {}\n", {})
+        result = validate_stack.check_profile_env_passthrough()
+        assert result.passed is False
+        assert "workflows" in result.message
+
+    def test_shipped_repo_passes(self):
+        """The real compose file covers the real profiles."""
+        result = validate_stack.check_profile_env_passthrough()
+        assert result.passed is True, result.message

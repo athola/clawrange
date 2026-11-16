@@ -1,15 +1,32 @@
-# Production override — binds services to Tailscale + localhost only.
+# Production override: binds services to localhost, docker0 and Tailscale.
 # Usage: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#        (or `make start-prod`)
 #
 # Set TAILSCALE_IP in .env to your node's Tailscale IP (run: tailscale ip -4).
-# Result: services listen on 127.0.0.1 + $TAILSCALE_IP only.
+# Result: services listen on 127.0.0.1, $DOCKER_HOST_IP and $TAILSCALE_IP only.
 # NOT reachable from LAN or public internet.
+#
+# `!override` replaces the base file's port list. Without it compose appends,
+# and the merged config would keep every base binding.
 
 services:
   openclaw:
-    ports:
+    ports: !override
+      - "127.0.0.1:${OPENCLAW_PORT:-3000}:18789"
+      - "${DOCKER_HOST_IP:-127.0.0.2}:${OPENCLAW_PORT:-3000}:18789"
       - "${TAILSCALE_IP:?Set TAILSCALE_IP in .env}:${OPENCLAW_PORT:-3000}:18789"
 
   workflows:
-    ports:
-      - "${TAILSCALE_IP}:${WORKFLOWS_PORT:-5678}:5678"
+    ports: !override
+      - "127.0.0.1:${WORKFLOWS_PORT:-5678}:5678"
+      - "${DOCKER_HOST_IP:-127.0.0.2}:${WORKFLOWS_PORT:-5678}:5678"
+      - "${TAILSCALE_IP:?Set TAILSCALE_IP in .env}:${WORKFLOWS_PORT:-5678}:5678"
+    # Run the baked image: no source mounts, no --reload. Rebuild to deploy
+    # code (`make start-prod` passes --build). Data and config mounts only.
+    volumes: !override
+      - ./config/profiles:/config/profiles:ro
+      - ./openclaw/soul.md:/opt/soul.md:ro
+      - ./data/brain:/data
+      - ${OPENCLAW_STATE_DIR:-./data/openclaw-state}:/openclaw-state
+    environment:
+      - UVICORN_RELOAD=0

@@ -10,6 +10,21 @@ if [ -f .env ]; then
   set +a
 fi
 
+# DeerFlow's gateway rejects anonymous /api calls. Upstream deploy.sh writes an
+# internal service token into the clone; send it via curl -K on stdin so the
+# token never appears in argv (ps). POSTs also need the CSRF double-submit
+# pair: the same random value as cookie and header.
+DF_TOKEN_FILE="deer-flow/backend/.deer-flow/.internal-auth-token"
+df_curl() {
+  if [ -r "$DF_TOKEN_FILE" ]; then
+    df_csrf=$(openssl rand -hex 16)
+    printf 'header = "X-DeerFlow-Internal-Token: %s"\nheader = "X-CSRF-Token: %s"\ncookie = "csrf_token=%s"\n' \
+      "$(cat "$DF_TOKEN_FILE")" "$df_csrf" "$df_csrf" | curl -K - "$@"
+  else
+    curl "$@"
+  fi
+}
+
 PORT="${DEERFLOW_PORT:-2026}"
 BASE="http://localhost:${PORT}"
 PASS=0
@@ -23,7 +38,7 @@ echo "=== DeerFlow Tests ==="
 # Test 1: Health check
 echo ""
 echo "Test 1: Health check"
-if curl -sf --connect-timeout 5 --max-time 10 "${BASE}/api/health" >/dev/null 2>&1; then
+if curl -sf --connect-timeout 5 --max-time 10 "${BASE}/health" >/dev/null 2>&1; then
   pass "DeerFlow is healthy at ${BASE}"
 else
   fail "DeerFlow health check failed at ${BASE}"
@@ -34,7 +49,7 @@ fi
 # Test 2: Models endpoint
 echo ""
 echo "Test 2: Available models"
-RESPONSE=$(curl -sf --connect-timeout 5 --max-time 10 "${BASE}/api/models" 2>/dev/null) || RESPONSE=""
+RESPONSE=$(df_curl -sf --connect-timeout 5 --max-time 10 "${BASE}/api/models" 2>/dev/null) || RESPONSE=""
 if [ -n "$RESPONSE" ] && echo "$RESPONSE" | grep -qi "openrouter\|researcher\|writer"; then
   pass "Models endpoint returned OpenRouter-configured models"
 else
@@ -45,16 +60,16 @@ fi
 # Test 3: Research request
 echo ""
 echo "Test 3: Research request (may take 30-60 seconds)"
-RESPONSE=$(curl -sf --connect-timeout 5 --max-time 120 -X POST "${BASE}/api/langgraph/runs" \
+RESPONSE=$(df_curl -sf --connect-timeout 5 --max-time 120 -X POST "${BASE}/api/langgraph/runs/wait" \
   -H "Content-Type: application/json" \
   -d '{
     "input": {
-      "messages": [{"role": "user", "content": "What are the top 3 manufactured home lenders in Texas for FHA loans?"}]
+      "messages": [{"role": "user", "content": "What are three common causes of slow PostgreSQL queries?"}]
     },
     "config": {}
   }' 2>/dev/null) || RESPONSE=""
 
-if echo "$RESPONSE" | grep -qiE "lender|FHA|Texas|mortgage|manufactured"; then
+if echo "$RESPONSE" | grep -qiE "postgres|index|query|vacuum|planner"; then
   pass "Research request returned relevant results"
   echo "  Response preview: $(echo "$RESPONSE" | head -c 300)"
 else
