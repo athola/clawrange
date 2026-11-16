@@ -111,6 +111,22 @@ class TestPersonaInProcess:
         assert r.status_code == 200
         assert "not queued" in _reply(r).lower()
 
+    @pytest.mark.parametrize("text", ["!personality test", "!learning plan"])
+    def test_longer_word_is_not_the_command(self, authed_app, text):
+        """Only the whole first word triggers the command (K2 S6/S7 class)."""
+        client, db = authed_app
+        before = len(db.list_learnings())
+        with (
+            patch.object(llm_proxy, "_handle_persona_command", AsyncMock()) as handler,
+            _balance(50.0),
+        ):
+            with patch.object(
+                llm_proxy, "_call_provider", AsyncMock(return_value=_ok())
+            ):
+                _chat(client, text)
+        assert not handler.called
+        assert len(db.list_learnings()) == before
+
     def test_reflect_failure_is_reported(self, authed_app, monkeypatch):
         import persona_api
 
@@ -309,8 +325,60 @@ class TestFailureReporting:
             text = _text(asyncio.run(llm_proxy._handle_non_streaming(BODY)))
         assert "rate-limited" in text
 
+    def test_chat_reply_lists_reasons_end_to_end(self, keys, monkeypatch):
+        monkeypatch.setattr(llm_proxy, "PROXY_AUTH_TOKEN", TOKEN)
+        call = AsyncMock(return_value=httpx.Response(404, text="no such model"))
+        with _balance(50.0), patch.object(llm_proxy, "_call_provider", call):
+            import app as app_module
+
+            r = _chat(TestClient(app_module.app), "hello")
+        assert "HTTP 404" in _reply(r)
+
     def test_background_notify_logs_every_event(self, caplog):
         caplog.set_level(logging.INFO, logger="clawrange.llm_proxy")
         llm_proxy._background_notify("zai-direct", "*Error* on `zai-direct` (HTTP 500)")
         llm_proxy._background_notify("zai-direct", "*Error* on `zai-direct` (HTTP 502)")
         assert "HTTP 500" in caplog.text and "HTTP 502" in caplog.text
+
+
+# ─── #31: history cleanup never orphans a tool result ────────────────
+
+
+class TestToolCallHistory:
+    def test_assistant_tool_call_turn_survives_cleanup(self, keys, monkeypatch):
+        monkeypatch.setattr(llm_proxy, "PROXY_AUTH_TOKEN", TOKEN)
+        preamble = "Let me search the web for that first, then I'll gather context."
+        assert llm_proxy._is_non_answer(preamble)  # would be stripped as a deferral
+        messages = [
+            {"role": "user", "content": "What changed in the release?"},
+            {
+                "role": "assistant",
+                "content": preamble,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "web_search", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "release notes"},
+            {"role": "user", "content": "So?"},
+        ]
+        sent: list[list[dict]] = []
+
+        async def capture(provider, models, body, api_key):
+            sent.append(body["messages"])
+            return _ok()
+
+        import app as app_module
+
+        with _balance(50.0), patch.object(llm_proxy, "_call_provider", capture):
+            r = TestClient(app_module.app).post(
+                "/v1/chat/completions", json={"messages": messages}, headers=GOOD
+            )
+        assert r.status_code == 200
+        assert sent
+        roles = [m["role"] for m in sent[0]]
+        assert roles[:4] == ["user", "assistant", "tool", "user"]
+        assert sent[0][1].get("tool_calls")

@@ -719,6 +719,9 @@ async def _call_provider(
 # the /persona routes use. A loopback HTTP call would need the API bearer
 # token and could only fail in ways the user can't act on.
 
+# !learn is the spec §6 alias for !persona.
+_PERSONA_COMMANDS = frozenset({"!persona", "!learn"})
+
 
 def _persona_context():
     """(brain_db, profile name) the /persona routes use (function-local: cycle)."""
@@ -1616,9 +1619,10 @@ async def chat_completions(
 
     # Intercept !persona / !learn (spec §6 alias) — explicit feedback and
     # on-demand reflection
-    if msg_lower.startswith(("!persona", "!learn")):
-        prefix = "!persona" if msg_lower.startswith("!persona") else "!learn"
-        args = last_user_msg.strip()[len(prefix) :]
+    # Whole first word only, so "!personality" is not the command.
+    first_word = (msg_lower.split(None, 1) or [""])[0]
+    if first_word in _PERSONA_COMMANDS:
+        args = last_user_msg.strip()[len(first_word) :]
         resp = await _handle_persona_command(args)
         return _wrap_json_as_sse(resp) if is_stream else resp
 
@@ -1634,11 +1638,14 @@ async def chat_completions(
         "[[exec",
         "<tool_call",
     )
+    # Never drop an assistant turn that carries tool_calls: its tool results
+    # would be left orphaned and providers reject that history with a 400.
     messages = [
         msg
         for msg in messages
         if not (
             msg.get("role") == "assistant"
+            and not msg.get("tool_calls")
             and isinstance(msg.get("content"), str)
             and (
                 any(marker in msg["content"] for marker in _POISON_MARKERS)
