@@ -1,10 +1,14 @@
 """Chat commands answered inside the proxy.
 
 Covers /tier, !help, !task, /sched, /scan and /projects. Each returns a
-synthetic response and never reaches a provider. The /persona command stays
+synthetic response and never reaches a provider. The !persona command stays
 in `llm_proxy` with its persona helpers. Shared helpers and state are read
 from `llm_proxy` at call time, so this module never touches `llm_proxy` at
 import time.
+
+The two dispatchers llm_proxy calls (`_dispatch_task_command`,
+`_dispatch_marketing_command`) take `is_stream` and wrap the reply as SSE
+exactly once; every handler below them returns plain text.
 """
 
 import hashlib
@@ -16,8 +20,16 @@ import github_search
 import heartbeat
 import llm_proxy
 import reddit_search
+import research_router
 import tenant_profile
-from brain_db import project_list
+from brain_db import TaskStatus, project_list
+from errors import UpstreamError
+
+
+def _reply(text: str, is_stream: bool) -> JSONResponse | StreamingResponse:
+    """The one place a chat command's text becomes a response."""
+    resp = llm_proxy._synthetic_response(text)
+    return llm_proxy._wrap_json_as_sse(resp) if is_stream else resp
 
 
 async def _handle_tier_command() -> JSONResponse:
@@ -26,15 +38,13 @@ async def _handle_tier_command() -> JSONResponse:
     for t in llm_proxy.tier_snapshot():
         lines.append(f"  [{t['status']}] {t['name']} — {t['description']}")
 
-    remaining = await llm_proxy._check_openrouter_balance()
+    # Refresh the cache (rate-limited inside), then display what is known.
+    await llm_proxy._check_openrouter_balance()
     lines.append("")
-    if remaining is not None:
-        lines.append(
-            f"OpenRouter balance: ${remaining:.2f} remaining "
-            f"(floor: ${llm_proxy.OPENROUTER_BALANCE_FLOOR:.2f})"
-        )
-    else:
-        lines.append("OpenRouter balance: not configured (set OPENROUTER_API_KEY)")
+    lines.append(
+        f"OpenRouter balance: {llm_proxy.describe_balance()} "
+        f"(floor: ${llm_proxy.OPENROUTER_BALANCE_FLOOR:.2f})"
+    )
 
     if llm_proxy._last_tier_used:
         lines.append(f"Last used: {llm_proxy._last_tier_used}")
@@ -56,17 +66,9 @@ TASK MANAGEMENT
   !task <description>      Create a new task (priority 3)
   !tasks                   Show current task queue
   !task list               Same as !tasks
-  !task tail               Show recently completed tasks
+  !task tail               Show recently finished tasks (newest first)
   !task cancel <id>        Cancel a pending/active task
   !task priority <id> <1-5> Change priority (1=urgent, 5=low)
-
-BRAIN (Knowledge)
-  !remember <slug> <info>  Append info to a page's timeline
-  !recall <query>          Search the brain for matching pages
-  !page <slug>             Show a full page with timeline
-
-  Brain slugs use hierarchy: client/acme-corp, incident/wifi-site2, person/bob-smith
-  Page types: client, system, incident, decision, note, person, company, project
 
 PERSONA
   !persona <feedback>      Queue a persona enhancement as a [DRAFT] proposal
@@ -78,7 +80,13 @@ SYSTEM STATUS
   !status                  Same as !tier
   !help                    This command reference
 
-BRAIN API (via web_fetch)
+HTTP API (workflows port 5678; every route below needs
+  Authorization: Bearer $PROXY_AUTH_TOKEN, which chat does not have)
+
+  Brain slugs use hierarchy: client/acme-corp, incident/wifi-site2, person/bob-smith
+  Page types: client, system, incident, decision, note, person, company, project
+
+BRAIN API
   POST /brain/pages              Create or update a page
   GET  /brain/pages/{slug}       Get page with timeline + tags
   DELETE /brain/pages/{slug}     Delete a page
@@ -93,7 +101,7 @@ BRAIN API (via web_fetch)
   GET  /brain/pages/{slug}/versions    Version history
   GET  /brain/pages/{slug}/chunks      Content chunks
 
-TASK API (via web_fetch)
+TASK API
   POST /task                     Create task
   GET  /task                     List tasks (?status=pending)
   GET  /task/{id}                Get task by ID
@@ -102,8 +110,8 @@ TASK API (via web_fetch)
   DELETE /task/{id}              Cancel task
 
 HEALTH
-  GET  /healthz                  Service health + brain status
-  GET  /tier                     Tier status JSON
+  GET  /healthz                  Service health + brain status (no token)
+  GET  /tier                     Tier status JSON (no token)
 
 MARKETING
   /projects list                 List tracked GitHub projects
@@ -111,7 +119,7 @@ MARKETING
   /projects add <slug> <owner>/<repo> [--topics ...] [--subs ...]
   /projects rm <slug>
 
-  /sched list                    List scheduled jobs
+  /sched list [--paused]         List scheduled jobs (--paused: paused only)
   /sched add <name> cron "<expr>" -- <generator>
   /sched pause|resume|rm|run <id|name>
 
@@ -120,7 +128,8 @@ MARKETING
   /scan github traffic [slug]    Pull repo traffic stats
   /scan web <prompt>             LLM web search
 
-  /marketing                     Alias: /sched run morning_scan"""
+  /marketing                     Queue Reddit + GitHub scan tasks for every
+                                 tracked project (runs morning_scan)"""
     return llm_proxy._synthetic_response(text)
 
 
@@ -128,6 +137,55 @@ MARKETING
 
 
 _TASK_ACTIONS = ("cancel", "priority", "list", "tail")
+
+_DONE_MARKERS = {"completed": "✅", "failed": "❌", "blocked": "❓"}
+
+
+def _first_token(text: str) -> tuple[str, str]:
+    """Split off the first whitespace-delimited word: (word lowercased, rest).
+
+    Commands match on the whole first word, so "tailor" is not "tail" and
+    "/schedule" is not "/sched"."""
+    parts = text.split(None, 1)
+    if not parts:
+        return "", ""
+    return parts[0].lower(), parts[1].strip() if len(parts) > 1 else ""
+
+
+def _parse_flags(
+    parts: list[str], flags: tuple[str, ...]
+) -> tuple[list[str], dict[str, str]]:
+    """Pull `--flag value` pairs out of a token list.
+
+    Returns the remaining positional tokens and {flag: value}. A flag with
+    no value after it is kept as a positional token."""
+    positional: list[str] = []
+    values: dict[str, str] = {}
+    i = 0
+    while i < len(parts):
+        if parts[i] in flags and i + 1 < len(parts):
+            values[parts[i]] = parts[i + 1]
+            i += 2
+        else:
+            positional.append(parts[i])
+            i += 1
+    return positional, values
+
+
+def _ops_name() -> str:
+    """Who works the queue: the profile's `assistant.ops.name`, else a
+    neutral label (no operator's agent name in core code)."""
+    profile = tenant_profile.active_profile()
+    ops = ((getattr(profile, "assistant", None) or {}).get("ops")) or {}
+    return str(ops.get("name") or "").strip() or "The ops agent"
+
+
+def _live_scheduler():
+    """The running APScheduler (None outside the app lifespan)."""
+    from app import app
+
+    return getattr(app.state, "scheduler", None)
+
 
 # ─── Marketing Commands (/sched, /scan, /projects) ──────────────
 
@@ -145,28 +203,20 @@ _MARKETING_PREFIXES = (
 
 def _extract_marketing_command(msg: str) -> dict | None:
     """Parse marketing commands. Returns dict with verb, subcmd, args or None."""
-    stripped = msg.strip()
-    lower = stripped.lower()
-
-    for prefix in _MARKETING_PREFIXES:
-        if lower.startswith(prefix):
-            rest = stripped[len(prefix) :].strip()
-            verb = prefix.lstrip("/!")
-            if verb == "marketing":
-                return {"verb": "sched", "subcmd": "run", "args": "morning_scan"}
-            if not rest:
-                return {"verb": verb, "subcmd": "list", "args": ""}
-            # Parse subcommand
-            parts = rest.split(None, 1)
-            subcmd = parts[0].lower()
-            args = parts[1] if len(parts) > 1 else ""
-            return {"verb": verb, "subcmd": subcmd, "args": args}
-
-    return None
+    prefix, rest = _first_token(msg.strip())
+    if prefix not in _MARKETING_PREFIXES:
+        return None
+    verb = prefix.lstrip("/!")
+    if verb == "marketing":
+        return {"verb": "sched", "subcmd": "run", "args": "morning_scan"}
+    if not rest:
+        return {"verb": verb, "subcmd": "list", "args": ""}
+    subcmd, args = _first_token(rest)
+    return {"verb": verb, "subcmd": subcmd, "args": args}
 
 
 async def _dispatch_marketing_command(
-    cmd: dict, is_stream: bool
+    cmd: dict, is_stream: bool = False
 ) -> JSONResponse | StreamingResponse:
     """Route parsed marketing commands to handlers."""
     verb = cmd["verb"]
@@ -183,16 +233,18 @@ async def _dispatch_marketing_command(
         else:
             text = f"Unknown command: {verb}"
     except Exception as exc:
+        llm_proxy.logger.exception("chat command /%s %s failed", verb, subcmd)
         text = f"Error: {exc}"
 
-    resp = llm_proxy._synthetic_response(text)
-    if is_stream:
-        return llm_proxy._wrap_json_as_sse(resp)
-    return resp
+    return _reply(text, is_stream)
 
 
 async def _handle_sched_command(subcmd: str, args: str) -> str:
-    """Handle /sched subcommands."""
+    """Handle /sched subcommands.
+
+    Changes go through the scheduler helpers with the live APScheduler, as
+    the HTTP routes do, so a pause/resume/add/rm takes effect immediately
+    instead of at the next restart."""
     from app import brain_db
 
     if subcmd == "list":
@@ -202,6 +254,10 @@ async def _handle_sched_command(subcmd: str, args: str) -> str:
                 "No schedules configured. Use /sched add <name> cron "
                 '"<expr>" -- <generator>'
             )
+        if "--paused" in args.split():
+            scheds = [s for s in scheds if s.get("paused")]
+            if not scheds:
+                return "No paused schedules."
         lines = ["Scheduled Jobs:\n"]
         for s in scheds:
             status = "PAUSED" if s.get("paused") else "ACTIVE"
@@ -250,64 +306,61 @@ async def _handle_sched_command(subcmd: str, args: str) -> str:
         name = before_dash[0]
         cron_expr = " ".join(before_dash[2:])
         kind = after_dash[0] if after_dash else "custom_scan"
+        kwargs = {"topic": " ".join(after_dash[1:])} if after_dash[1:] else {}
 
-        from generators import GENERATORS
+        from scheduler import add_schedule, validate_schedule
 
-        if kind not in GENERATORS:
-            return (
-                f"Unknown generator: {kind}. Available: {', '.join(GENERATORS.keys())}"
-            )
-
-        from scheduler import add_schedule
+        try:
+            validate_schedule(kind, cron_expr, kwargs)
+        except ValueError as exc:
+            return f"Schedule not added: {exc}"
 
         sched_id = hashlib.md5(name.encode()).hexdigest()[:8]
 
         await add_schedule(
-            None,
-            brain_db,
-            sched_id,
-            name,
-            kind,
-            cron_expr,
-            {"topic": " ".join(after_dash[1:])} if after_dash[1:] else {},
+            _live_scheduler(), brain_db, sched_id, name, kind, cron_expr, kwargs
         )
         return (
             f"Schedule added: {name} ({sched_id})\n  cron: {cron_expr}\n  kind: {kind}"
         )
 
-    if subcmd in ("pause",):
+    if subcmd in ("pause", "resume", "rm", "remove", "delete"):
+        from scheduler import pause_schedule, remove_schedule, resume_schedule
+
+        # Resolve <id|name> first: the scheduler helpers and job ids are
+        # keyed by id only.
         sched = brain_db.get_schedule(args.strip())
         if not sched:
             return f"Schedule not found: {args}"
-        brain_db.set_schedule_paused(sched["id"], True)
-        return f"Paused: {sched['name']} ({sched['id']})"
-
-    if subcmd in ("resume",):
-        sched = brain_db.get_schedule(args.strip())
-        if not sched:
-            return f"Schedule not found: {args}"
-        brain_db.set_schedule_paused(sched["id"], False)
-        return f"Resumed: {sched['name']} ({sched['id']})"
-
-    if subcmd in ("rm", "remove", "delete"):
-        from scheduler import remove_schedule
-
-        removed = await remove_schedule(None, brain_db, args.strip())
-        if not removed:
-            return f"Schedule not found: {args}"
-        return f"Removed: {args}"
+        label = f"{sched['name']} ({sched['id']})"
+        live = _live_scheduler()
+        if subcmd == "pause":
+            await pause_schedule(live, brain_db, sched["id"])
+            return f"Paused: {label}"
+        if subcmd == "resume":
+            await resume_schedule(live, brain_db, sched["id"])
+            return f"Resumed: {label}"
+        await remove_schedule(live, brain_db, sched["id"])
+        return f"Removed: {label}"
 
     if subcmd == "run":
+        from generators import GENERATORS
         from scheduler import run_schedule_now
 
+        target = args.strip()
+        if not brain_db.get_schedule(target) and target in GENERATORS:
+            # /marketing names the morning_scan generator, which no shipped
+            # profile seeds as a schedule: run the generator itself once.
+            await GENERATORS[target](brain_db=brain_db)
+            return f"Ran generator {target} once (no schedule by that name)."
         try:
-            result = await run_schedule_now(None, brain_db, args.strip())
-            return (
-                f"Ran schedule: {result.get('schedule_id', args)} — "
-                f"{result.get('status', 'unknown')}"
-            )
+            result = await run_schedule_now(_live_scheduler(), brain_db, target)
         except ValueError as e:
             return str(e)
+        status = result.get("status", "unknown")
+        if result.get("error"):
+            status = f"{status}: {result['error']}"
+        return f"Ran schedule: {result.get('schedule_id', args)} — {status}"
 
     return (
         "Usage:\n"
@@ -335,9 +388,12 @@ async def _handle_scan_command(subcmd: str, args: str) -> str:
             brain_db, subreddits, project_slug
         )
 
-        results: list = await reddit_search.search_subreddits(
-            topic, subreddits, since=since, limit_per_sub=10
-        )
+        try:
+            results: list = await reddit_search.search_subreddits(
+                topic, subreddits, since=since, limit_per_sub=10
+            )
+        except UpstreamError as exc:
+            return f"Reddit search unavailable: {exc}"
 
         if not results:
             return f"No Reddit results for '{topic}' in {subreddits}"
@@ -357,29 +413,30 @@ async def _handle_scan_command(subcmd: str, args: str) -> str:
 
         return "\n".join(lines)
 
+    word, rest = _first_token(args)
+    if subcmd == "github" and word == "traffic":
+        return await _github_traffic(rest.split()[0] if rest else "")
+
     if subcmd == "github":
         # /scan github <topic> [--kind repos|issues] [--stars 5]
-        parts = args.split()
-        topic = parts[0] if parts else ""
-        kind = "repos"
-        min_stars = 0
-
-        for i, p in enumerate(parts):
-            if p == "--kind" and i + 1 < len(parts):
-                kind = parts[i + 1]
-            elif p == "--stars" and i + 1 < len(parts):
-                try:
-                    min_stars = int(parts[i + 1])
-                except ValueError:
-                    pass
+        positional, flags = _parse_flags(args.split(), ("--kind", "--stars"))
+        topic = " ".join(positional)
+        kind = flags.get("--kind", "repos")
+        try:
+            min_stars = int(flags.get("--stars", "0"))
+        except ValueError:
+            min_stars = 0
 
         if not topic:
             return "Usage: /scan github <topic> [--kind repos|issues] [--stars 5]"
 
-        if kind == "issues":
-            results = await github_search.search_issues(topic)
-        else:
-            results = await github_search.search_repos(topic, min_stars=min_stars)
+        try:
+            if kind == "issues":
+                results = await github_search.search_issues(topic)
+            else:
+                results = await github_search.search_repos(topic, min_stars=min_stars)
+        except UpstreamError as exc:
+            return f"GitHub search unavailable: {exc}"
 
         if not results:
             return f"No GitHub results for '{topic}'"
@@ -404,50 +461,12 @@ async def _handle_scan_command(subcmd: str, args: str) -> str:
     if subcmd == "web":
         if not args:
             return "Usage: /scan web <prompt>"
-        result = await llm_proxy._llm_call(args, max_tokens=1000, web_search=True)
-        return result or "No results from web search."
-
-    if subcmd == "github" and args.lower().startswith("traffic"):
-        parts = args.split()
-        slug = parts[1] if len(parts) > 1 else ""
-        if not slug:
-            projects = brain_db.list_projects()
-            if not projects:
-                return "No projects tracked. Use /projects add first."
-            lines = []
-            for proj in projects:
-                traffic = await github_search.get_self_traffic(
-                    proj["owner"], proj["repo"]
-                )
-                if traffic:
-                    lines.append(
-                        f"{proj['owner']}/{proj['repo']}\n"
-                        f"  Views: {traffic.views_count} "
-                        f"({traffic.views_uniques} unique)\n"
-                        f"  Clones: {traffic.clones_count} "
-                        f"({traffic.clones_uniques} unique)"
-                    )
-                else:
-                    lines.append(
-                        f"{proj['owner']}/{proj['repo']}: traffic unavailable "
-                        f"(needs GITHUB_PAT)"
-                    )
-            return "\n\n".join(lines) if lines else "No traffic data available."
-
-        project = brain_db.get_project(slug)
-        if not project:
-            return f"Project not found: {slug}"
-
-        traffic = await github_search.get_self_traffic(
-            project["owner"], project["repo"]
-        )
-        if not traffic:
-            return "Traffic unavailable — needs GITHUB_PAT with repo scope"
-        return (
-            f"Traffic for {project['owner']}/{project['repo']} (14 days)\n"
-            f"  Views: {traffic.views_count} ({traffic.views_uniques} unique)\n"
-            f"  Clones: {traffic.clones_count} ({traffic.clones_uniques} unique)"
-        )
+        try:
+            result = await llm_proxy._llm_call(args, max_tokens=1000, web_search=True)
+        except UpstreamError as exc:
+            return f"Web search unavailable: {exc}"
+        # None means every search tier failed, not "nothing found".
+        return result or "Web search unavailable: no search tier answered."
 
     return (
         "Usage:\n"
@@ -458,28 +477,49 @@ async def _handle_scan_command(subcmd: str, args: str) -> str:
     )
 
 
+def _traffic_lines(owner: str, repo: str, traffic) -> str:
+    return (
+        f"Traffic for {owner}/{repo} (14 days)\n"
+        f"  Views: {traffic.views_count} ({traffic.views_uniques} unique)\n"
+        f"  Clones: {traffic.clones_count} ({traffic.clones_uniques} unique)"
+    )
+
+
+async def _github_traffic(slug: str) -> str:
+    """/scan github traffic [slug]: one project, or every tracked one."""
+    from app import brain_db
+
+    if slug:
+        project = brain_db.get_project(slug)
+        if not project:
+            return f"Project not found: {slug}"
+        projects = [project]
+    else:
+        projects = brain_db.list_projects()
+        if not projects:
+            return "No projects tracked. Use /projects add first."
+
+    blocks = []
+    for proj in projects:
+        owner, repo = proj["owner"], proj["repo"]
+        traffic = await github_search.get_self_traffic(owner, repo)
+        if traffic:
+            blocks.append(_traffic_lines(owner, repo, traffic))
+        else:
+            blocks.append(await research_router.traffic_unavailable(owner, repo))
+    return "\n\n".join(blocks)
+
+
 def _parse_scan_args(args: str) -> tuple[str, list[str], str | None, str]:
     """Parse scan arguments, extracting topic, subreddits, project, since."""
-    parts = args.split()
-    topic_parts: list[str] = []
-    subreddits: list[str] = []
-    project_slug = None
-    since = "7d"
-    i = 0
-    while i < len(parts):
-        if parts[i] == "--subs" and i + 1 < len(parts):
-            subreddits = parts[i + 1].split(",")
-            i += 2
-        elif parts[i] == "--project" and i + 1 < len(parts):
-            project_slug = parts[i + 1]
-            i += 2
-        elif parts[i] == "--since" and i + 1 < len(parts):
-            since = parts[i + 1]
-            i += 2
-        else:
-            topic_parts.append(parts[i])
-            i += 1
-    return " ".join(topic_parts), subreddits, project_slug, since
+    positional, flags = _parse_flags(args.split(), ("--subs", "--project", "--since"))
+    subs = flags.get("--subs")
+    return (
+        " ".join(positional),
+        subs.split(",") if subs else [],
+        flags.get("--project"),
+        flags.get("--since", "7d"),
+    )
 
 
 async def _handle_projects_command(subcmd: str, args: str) -> str:
@@ -538,22 +578,10 @@ async def _handle_projects_command(subcmd: str, args: str) -> str:
             return "Format: owner/repo"
         owner, repo = owner_repo.split("/", 1)
 
-        topics: list[str] = []
-        subs: list[str] = []
-        posture = ""
-        i = 2
-        while i < len(parts):
-            if parts[i] == "--topics" and i + 1 < len(parts):
-                topics = parts[i + 1].split(",")
-                i += 2
-            elif parts[i] == "--subs" and i + 1 < len(parts):
-                subs = parts[i + 1].split(",")
-                i += 2
-            elif parts[i] == "--posture" and i + 1 < len(parts):
-                posture = parts[i + 1]
-                i += 2
-            else:
-                i += 1
+        _, flags = _parse_flags(parts[2:], ("--topics", "--subs", "--posture"))
+        topics = flags["--topics"].split(",") if "--topics" in flags else []
+        subs = flags["--subs"].split(",") if "--subs" in flags else []
+        posture = flags.get("--posture", "")
 
         brain_db.upsert_project(slug, owner, repo, topics, subs, posture=posture)
         return f"Project added: {slug} ({owner}/{repo})"
@@ -587,16 +615,12 @@ def _extract_task_command(msg: str) -> dict | None:
     for prefix in ("!task ", "/task "):
         if lower.startswith(prefix):
             rest = stripped[len(prefix) :].strip()
-            rest_lower = rest.lower()
-            # Check for sub-actions
-            for action in _TASK_ACTIONS:
-                if rest_lower.startswith(action):
-                    args = rest[len(action) :].strip()
-                    if action == "list":
-                        return {"type": "list"}
-                    if action == "tail":
-                        return {"type": "tail"}
-                    return {"type": "action", "action": action, "args": args}
+            # Whole first word only: "tailor the resume" is a new task.
+            action, args = _first_token(rest)
+            if action in ("list", "tail"):
+                return {"type": action}
+            if action in _TASK_ACTIONS:
+                return {"type": "action", "action": action, "args": args}
             # Default: create a new task
             if rest:
                 return {"type": "create", "description": rest}
@@ -606,134 +630,114 @@ def _extract_task_command(msg: str) -> dict | None:
 
 
 async def _dispatch_task_command(
-    cmd: dict, is_stream: bool
+    cmd: dict, is_stream: bool = False
 ) -> JSONResponse | StreamingResponse:
     """Route parsed task commands to handlers."""
     if cmd["type"] == "list":
-        return await _handle_tasks_list(is_stream)
+        text = _handle_tasks_list()
     elif cmd["type"] == "tail":
-        return await _handle_tasks_tail(is_stream)
+        text = _handle_tasks_tail()
     elif cmd["type"] == "create":
-        return await _handle_task_command(cmd["description"], is_stream)
+        text = _handle_task_command(cmd["description"])
     elif cmd["type"] == "action":
-        return await _handle_task_action(cmd["action"], cmd["args"], is_stream)
-    return llm_proxy._synthetic_response(
-        "Unknown task command. Try: !task <description> or !tasks"
-    )
+        text = _handle_task_action(cmd["action"], cmd["args"])
+    else:
+        text = "Unknown task command. Try: !task <description> or !tasks"
+    return _reply(text, is_stream)
 
 
-async def _handle_task_command(
-    description: str, is_stream: bool
-) -> JSONResponse | StreamingResponse:
+def _handle_task_command(description: str) -> str:
     """Enqueue a task via the internal API and return confirmation."""
     from app import TaskCreate as TC
     from app import create_task
 
     try:
         task = create_task(TC(description=description))
-        text = (
-            f"Task queued (#{task['id']})\n"
-            f"  {task['description']}\n"
-            f"  Priority: {task['priority']} | Status: {task['status']}\n"
-            f"Max Ops will pick this up on the next heartbeat cycle."
-        )
     except Exception as exc:
-        text = f"Failed to queue task: {exc}"
+        llm_proxy.logger.exception("chat !task: could not queue task")
+        return f"Failed to queue task: {exc}"
+    return (
+        f"Task queued (#{task['id']})\n"
+        f"  {task['description']}\n"
+        f"  Priority: {task['priority']} | Status: {task['status']}\n"
+        f"{_ops_name()} will pick this up on the next heartbeat cycle."
+    )
 
-    resp = llm_proxy._synthetic_response(text)
-    if is_stream:
-        return llm_proxy._wrap_json_as_sse(resp)
-    return resp
+
+def _recently_closed(tasks: list[dict], n: int) -> list[dict]:
+    """The n tasks closed most recently (completed, failed or blocked),
+    newest first. list_tasks orders by priority, which is the wrong order
+    for "what just happened"."""
+    closed = [t for t in tasks if t["status"] in TaskStatus.RESULTS]
+    closed.sort(key=lambda t: t.get("completed_at") or "", reverse=True)
+    return closed[:n]
 
 
-async def _handle_tasks_list(is_stream: bool) -> JSONResponse | StreamingResponse:
+def _queue_section(title: str, tasks: list[dict]) -> list[str]:
+    if not tasks:
+        return []
+    lines = [title]
+    for t in tasks:
+        src = heartbeat._operator_label() if t.get("source") == "user" else "SYS"
+        lines.append(f"  [{src}] #{t['id']} [P{t['priority']}] {t['description'][:55]}")
+    lines.append("")
+    return lines
+
+
+def _handle_tasks_list() -> str:
     """Show the current task queue."""
     from app import list_tasks
 
-    data = list_tasks()
-    tasks = data["tasks"]
+    tasks = list_tasks()["tasks"]
     if not tasks:
-        text = "Task queue is empty. Send !task <description> to add one."
-    else:
-        pending = [t for t in tasks if t["status"] == "pending"]
-        active = [t for t in tasks if t["status"] == "active"]
-        done = [t for t in tasks if t["status"] in ("completed", "failed")]
+        return "Task queue is empty. Send !task <description> to add one."
 
-        lines = [
-            f"Task Queue ({len(pending)} pending, {len(active)} active, "
-            f"{len(done)} done)\n"
-        ]
+    pending = [t for t in tasks if t["status"] == TaskStatus.PENDING]
+    active = [t for t in tasks if t["status"] == TaskStatus.ACTIVE]
+    done = sum(1 for t in tasks if t["status"] in TaskStatus.RESULTS)
 
-        if active:
-            lines.append("NOW PROCESSING:")
-            for t in active:
-                src = (
-                    heartbeat._operator_label() if t.get("source") == "user" else "SYS"
-                )
-                lines.append(
-                    f"  [{src}] #{t['id']} [P{t['priority']}] {t['description'][:55]}"
-                )
-            lines.append("")
+    lines = [
+        f"Task Queue ({len(pending)} pending, {len(active)} active, {done} done)\n"
+    ]
+    lines += _queue_section("NOW PROCESSING:", active)
+    lines += _queue_section("QUEUED:", pending)
 
-        if pending:
-            lines.append("QUEUED:")
-            for t in pending:
-                src = (
-                    heartbeat._operator_label() if t.get("source") == "user" else "SYS"
-                )
-                lines.append(
-                    f"  [{src}] #{t['id']} [P{t['priority']}] {t['description'][:55]}"
-                )
-            lines.append("")
+    recent = _recently_closed(tasks, 3)
+    if recent:
+        lines.append("RECENT:")
+        for t in recent:
+            marker = _DONE_MARKERS[t["status"]]
+            lines.append(f"  {marker} #{t['id']} {t['description'][:40]}")
+            if t["result"]:
+                lines.append(f"     → {t['result'][:80]}")
 
-        if done:
-            lines.append("RECENT:")
-            for t in done[-3:]:  # Show last 3
-                marker = "✅" if t["status"] == "completed" else "❌"
-                lines.append(f"  {marker} #{t['id']} {t['description'][:40]}")
-                if t["result"]:
-                    lines.append(f"     → {t['result'][:80]}")
-
-        lines.append(
-            "\nCommands: !task <desc> | !task cancel <id> | !task priority <id> <1-5>"
-        )
-        text = "\n".join(lines)
-
-    resp = llm_proxy._synthetic_response(text)
-    if is_stream:
-        return llm_proxy._wrap_json_as_sse(resp)
-    return resp
+    lines.append(
+        "\nCommands: !task <desc> | !task cancel <id> | !task priority <id> <1-5>"
+    )
+    return "\n".join(lines)
 
 
-async def _handle_tasks_tail(is_stream: bool) -> JSONResponse | StreamingResponse:
-    """Show recently completed/failed tasks with results."""
+def _handle_tasks_tail() -> str:
+    """Show the most recently closed tasks with results, newest first."""
     from app import list_tasks
 
-    data = list_tasks()
-    done = [t for t in data["tasks"] if t["status"] in ("completed", "failed")]
-    if not done:
-        text = "No completed tasks yet."
-    else:
-        lines = [f"Recent Tasks ({len(done)} completed)\n"]
-        for t in done[-5:]:  # Last 5
-            marker = "✅" if t["status"] == "completed" else "❌"
-            lines.append(f"{marker} #{t['id']} — {t['description'][:50]}")
-            if t["result"]:
-                lines.append(f"   {t['result'][:120]}")
-            if t["completed_at"]:
-                lines.append(f"   Completed: {t['completed_at'][:19]}")
-            lines.append("")
-        text = "\n".join(lines)
-
-    resp = llm_proxy._synthetic_response(text)
-    if is_stream:
-        return llm_proxy._wrap_json_as_sse(resp)
-    return resp
+    recent = _recently_closed(list_tasks()["tasks"], 5)
+    if not recent:
+        return "No finished tasks yet."
+    lines = [f"Recent Tasks (last {len(recent)} finished)\n"]
+    for t in recent:
+        lines.append(
+            f"{_DONE_MARKERS[t['status']]} #{t['id']} — {t['description'][:50]}"
+        )
+        if t["result"]:
+            lines.append(f"   {t['result'][:120]}")
+        if t["completed_at"]:
+            lines.append(f"   {t['status'].capitalize()}: {t['completed_at'][:19]}")
+        lines.append("")
+    return "\n".join(lines)
 
 
-async def _handle_task_action(
-    action: str, args: str, is_stream: bool
-) -> JSONResponse | StreamingResponse:
+def _handle_task_action(action: str, args: str) -> str:
     """Handle task management subcommands: cancel, priority."""
     from app import brain_db
 
@@ -742,24 +746,16 @@ async def _handle_task_action(
     task = brain_db.get_task(task_id)
 
     if not task:
-        text = f"Task #{task_id} not found."
-    elif action == "cancel":
-        if task["status"] in ("completed", "failed"):
-            text = f"Task #{task_id} already {task['status']}."
-        else:
-            brain_db.cancel_task(task_id)
-            text = f"Task #{task_id} cancelled."
-    elif action == "priority":
+        return f"Task #{task_id} not found."
+    if action == "cancel":
+        if task["status"] in TaskStatus.DONE:
+            return f"Task #{task_id} already {task['status']}."
+        brain_db.cancel_task(task_id)
+        return f"Task #{task_id} cancelled."
+    if action == "priority":
         new_p = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
         if new_p is None or not 1 <= new_p <= 5:
-            text = f"Usage: !task priority {task_id} <1-5>"
-        else:
-            brain_db.update_priority(task_id, new_p)
-            text = f"Task #{task_id} priority set to {new_p}."
-    else:
-        text = f"Unknown action: {action}. Try: cancel, priority"
-
-    resp = llm_proxy._synthetic_response(text)
-    if is_stream:
-        return llm_proxy._wrap_json_as_sse(resp)
-    return resp
+            return f"Usage: !task priority {task_id} <1-5>"
+        brain_db.update_priority(task_id, new_p)
+        return f"Task #{task_id} priority set to {new_p}."
+    return f"Unknown action: {action}. Try: cancel, priority"

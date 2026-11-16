@@ -728,8 +728,9 @@ class TestHelpCommand:
         assert "BRAIN API" in content
         assert "HEALTH" in content
         assert "!task" in content
-        assert "!recall" in content
-        assert "!remember" in content
+        # No proxy handler exists for these, so help must not list them.
+        assert "!recall" not in content
+        assert "!remember" not in content
         assert "!tier" in content
         assert "/brain/search" in content
         assert "PERSONA" in content
