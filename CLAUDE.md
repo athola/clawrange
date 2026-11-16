@@ -2,8 +2,8 @@
 
 ## What This Is
 
-Personal AI ops stack: an OpenClaw assistant ("John-117") backed by a
-FastAPI workflows service that owns the brain database, task queue, LLM
+Personal AI ops stack: an OpenClaw assistant (persona rendered from the
+active tenant profile) backed by a FastAPI workflows service that owns the brain database, task queue, LLM
 proxy, scheduler, and marketing scanners. Runs in Docker on a single host
 and optionally exposes the assistant to the internet through a
 Tailscale and Caddy gateway.
@@ -15,18 +15,26 @@ Tailscale and Caddy gateway.
 - `openclaw/`: assistant config: `soul.md` (persona) and `soul-ops.md`
   (ops agent), both rendered and gitignored (`make persona PROFILE=<name>`;
   ops comes from `soul-ops.template.md` plus the profile's `assistant.ops`
-  block, with org and location in `.env`), `HEARTBEAT.md` (max-ops
-  heartbeat checklist; OpenClaw 2026.8+ reads it from a monitor scratch,
+  block, with org and location in `.env`), `HEARTBEAT.md` (the ops
+  agent's heartbeat checklist; OpenClaw 2026.8+ reads it from a monitor scratch,
   which `sync-heartbeat.sh` reloads on every container start),
   `config/openclaw.json` (rendered over the live config on start by
   `render-config.js`: agents, Telegram binding, tool policy; pins the
   heartbeat prompt the proxy intercepts and keeps dreaming, self-learning
   and cross-conversation recall off)
 - `workflows/`: FastAPI service:
-  - `app.py`: FastAPI entrypoint and route registration
-  - `auth.py`: app-wide bearer auth (`PROXY_AUTH_TOKEN`), fails closed;
-    only `/healthz` (+ `/research`, `/crm`, `/persona`), `GET /tier`,
+  - `app.py`: FastAPI entrypoint and route registration (no `/docs`,
+    `/redoc` or `/openapi.json`)
+  - `auth.py`: app-wide bearer auth (`PROXY_AUTH_TOKEN`), fails closed on
+    an empty token or the old `generate-a-token-here` placeholder; only
+    `GET /healthz`, `GET /healthz/{research,crm,persona}`, `GET /tier` and
     `GET /sched[/{id}]` are public
+  - `http_auth.py`: `auth_headers`, the one builder that turns a
+    profile's `auth` block into outbound request headers (connector
+    sources and the REST CRM adapter)
+  - `clock.py`: `utcnow_iso`, the timestamp format every store writes
+  - `errors.py`: `UpstreamError`, raised when a scanner, the LLM tiers or
+    a fetch failed, so callers never read an outage as an empty result
   - `rundown.py`, `deals.py`, `deal_sources.py`: daily outreach and
     homelab deal rundowns
   - `brain.py`, `brain_db.py`: persistent knowledge store and task queue
@@ -39,13 +47,25 @@ Tailscale and Caddy gateway.
     and the no-vector fallback (overall and per query tag) against
     `baseline.json`. Real-brain mode keeps its golden set under
     `data/retrieval/` (gitignored)
-  - `llm_proxy.py`: OpenAI-compatible proxy with tiered routing,
-    web-search routing, anti-hallucination guard, balance circuit breaker
-  - `chat_commands.py`: `/tier`, `!help`, `!task`, `/sched`, `/scan` and
-    `/projects` chat commands handled inside the proxy
-  - `heartbeat.py`: heartbeat interceptor (task selection, thinking
-    prompts, `_handle_heartbeat`)
-  - `digest.py`: hourly heartbeat digest buffer and message planner
+  - `llm_proxy.py`: OpenAI-compatible chat and embeddings routes, tiered
+    routing (chat races the free tiers, background `_llm_call` tries them
+    in order), web-search routing to the OpenRouter `:online` tier,
+    anti-hallucination guard, balance circuit breaker; dispatches chat
+    commands and heartbeats to the modules below
+  - `chat_commands.py`: `/tier`, `!help`, `!task`, `!persona` (alias
+    `!learn`), `/sched`, `/scan` and `/projects` chat commands handled
+    inside the proxy
+  - `heartbeat.py`: heartbeat interceptor (`_handle_heartbeat`, task
+    selection and settling, stale-active reaping, proactive scan, thinking
+    prompts, soul.md loading) plus the heartbeat-only helpers and state
+    moved out of `llm_proxy`; reads the LLM, balance and breaker helpers
+    from `llm_proxy` at call time. A task `active` longer than
+    `HEARTBEAT_ACTIVE_REAP_HOURS` (default 6) is failed; a task that hits
+    an LLM outage goes back to pending and is failed on its 6th outage
+    cycle (`LLM_RETRY_LIMIT`)
+  - `digest.py`: hourly heartbeat digest buffer, message planner and the
+    heartbeat stamps the watchdog reads. Heartbeat and digest log through
+    the `clawrange.*` loggers (`clawrange.heartbeat`, `clawrange.digest`)
   - `research_router.py`: routes heartbeat tasks to the marketing scanners
     and the research orchestrator
   - `scheduler.py`, `generators.py`: APScheduler jobs and generators
@@ -88,7 +108,9 @@ Tailscale and Caddy gateway.
   Pre-commit enforces ruff, ruff-format, and mypy on every commit and the
   full pytest suite at pre-push; `make lint` mirrors the commit gate.
   `make setup` (or `make hooks`) installs both git hooks.
-- Docker images use `:latest` for testing: pin versions before production.
+- Docker images are pinned (`ghcr.io/openclaw/openclaw:2026.11.3`, and
+  `python:3.12.16-slim-trixie` under `workflows/Dockerfile`). Bump them
+  on purpose; never switch back to `:latest`.
 - `.env` is gitignored. `.env.example` is the template.
 - OpenClaw runs internally on port 18789, mapped to host port 3000.
 - Ports bind `127.0.0.1` plus `DOCKER_HOST_IP` (docker0, for sibling
@@ -133,50 +155,73 @@ Every route requires `Authorization: Bearer $PROXY_AUTH_TOKEN` except
 `GET /healthz`, `/healthz/{research,crm,persona}`, `GET /tier`, `GET /sched`
 and `GET /sched/{id}` (polled by the homepage dashboard). Anonymous `/sched`
 reads omit `kwargs` and reduce `last_status` to `ok`/`failed`. An unset
-token fails closed (401).
+token fails closed (401), and `scripts/start.sh` refuses to start the
+stack without one. There is no `/docs`, `/redoc` or `/openapi.json`.
 
 **Health and tiers**
 - `GET  /healthz` (port 3000): OpenClaw health
-- `GET  /healthz` (port 5678): Workflows health (includes brain page count)
+- `GET  /healthz` (port 5678): Workflows health. Always 200 while the
+  process serves; `status` is `ok` or `degraded`, `problems` names the
+  broken parts (`db`, `vector_search`, `scheduler`, `profile`), plus
+  `brain` (page and vector counts, `vector_search`), `scheduler` and
+  `profile` blocks. Anonymous callers get the problem names but no error
+  text; a bearer-token request gets the detail.
 - `GET  /tier`               : current tier status and balance
 - `POST /tier/notify`        : push tier status to Telegram
 
 **LLM proxy**
 - `POST /v1/chat/completions`: OpenAI-compatible chat (port 3000 via
   OpenClaw, or port 5678 directly on workflows)
+- `POST /v1/embeddings`: OpenAI-compatible embeddings through OpenRouter
+  with the configured `EMBED_MODEL`, for any bearer-token client
 
 **Task queue**
 - `POST /task`               : create task
 - `GET  /task`               : list tasks (optional `?status=`)
-- `GET  /task/{id}`, `POST /task/{id}/claim`, `POST /task/{id}/result`,
-  `DELETE /task/{id}`
+- `GET  /task/{id}`, `POST /task/{id}/claim`, `POST /task/{id}/result`
+  (`status` is `completed`, `failed` or `blocked`), `DELETE /task/{id}`
 
 **Brain (persistent knowledge)**
-- `GET/POST /brain/*`: see `workflows/brain.py` for routes (pages,
-  embeddings, search)
+- `GET /brain/search`, `GET /brain/tags`, `GET/POST /brain/pages`
+- `GET/DELETE /brain/pages/{slug}`; per page `GET/POST .../timeline`,
+  `GET/POST .../links`, `DELETE .../links/{link_id}`, `GET/POST .../tags`,
+  `DELETE .../tags/{tag_name}`, `GET .../versions`, `GET .../chunks`,
+  `GET .../graph`. See `workflows/brain.py`. No embeddings route lives
+  here: the backfill job writes page vectors, and `POST /v1/embeddings`
+  is the only embeddings endpoint.
 
 **Marketing orchestrator**
 - `GET/POST/DELETE /projects` and `/projects/{slug}`
 - `GET/POST/PATCH/DELETE /sched` and `/sched/{id}`, `POST /sched/{id}/run`
-- `POST /scan/reddit`, `POST /scan/github`, `POST /scan/web`
+  (returns `{status: ok|delivery_failed|error, schedule_id, last_status}`)
+- `POST /scan/reddit`, `POST /scan/github`, `POST /scan/web`: a scan whose
+  upstream failed returns 502 with the reason, never an empty 200
 
 **Research orchestrator**
-- `POST /research`: multi-source research across 5 channels
-  (`discourse` Reddit, `code` GitHub, `discourse_web` GLM,
-  `academic` arXiv and Semantic Scholar, `triz` cross-domain) with
-  dedup, ranking, triangulation, and confidence flags. Persists a
-  session and returns `session_id`.
+- `POST /research`: multi-source research across up to 5 channels
+  (`discourse` Reddit, `code` GitHub, `discourse_web` OpenRouter
+  `:online` web search, `academic` arXiv and Semantic Scholar, `triz`
+  cross-domain); a request without `channels` runs `discourse`, `code`
+  and `discourse_web`. Dedup, ranking, triangulation, and confidence
+  flags. Persists a session and returns `session_id`. Partial channel
+  failures land in `errors`; when every channel fails it returns 502.
 - `GET /research/sessions`: list recent sessions, newest first
 - `GET /research/sessions/{id}`: full session with all findings
 - `GET /healthz/research`: per-channel configured/source/reason
-  report so operators can diagnose empty results.
+  report so operators can diagnose empty results. `discourse_web` and
+  `triz` report source `openrouter-online` and count as configured only
+  when `OPENROUTER_API_KEY` is set.
 - See `workflows/research.py` for synthesis logic and
   `docs/research-and-marketing.md` for the operator guide.
 
 **Tome bridge (local-only)**
 - `scripts/tome_bridge.py` polls the workflows task queue for
-  tasks tagged `research:tome:` and runs them through Alex's
-  local `claude /tome:research` session. Stdlib only, no deps.
+  tasks tagged `research:tome:` and runs them through the operator's
+  local `claude /tome:research` session. Stdlib only, no deps. The
+  topic is untrusted queue text, so the session gets only `WebSearch`,
+  `WebFetch`, `Skill` and `Agent` (`--tools`/`--allowedTools`,
+  `--permission-mode dontAsk`, `--strict-mcp-config`) and runs in an
+  empty temp directory, never the repo.
 - Make targets: `make tome-bridge` (one pass) and
   `make tome-bridge-watch` (poll forever).
 
@@ -186,7 +231,9 @@ token fails closed (401).
 - `GET  /crm/templates`: list available query templates
 - `GET  /crm/leads?status=&limit=`: list leads
 - `POST /crm/sync/{connector_id}`: run a connector now → counts
-- `GET  /healthz/crm`: CRM adapter health and configured connectors
+- `GET  /healthz/crm`: CRM adapter health (`status`, `adapter`, `leads`
+  only; never the DB path or REST base URL), connectors and templates;
+  503 when the adapter reports an error
 - See `docs/multi-tenant-guide.md` for profile authoring.
 
 **Persona & meta-learning (profile-driven, identity block optional)**
@@ -198,8 +245,11 @@ token fails closed (401).
 - `POST /persona/render`: re-render current profile to its targets
 - `POST /persona/reflect`: on-demand reflection (source=`reflect`)
 - `GET  /persona/identity`, `GET /persona/soul`: current rendered text
-- `GET  /healthz/persona`: profile, render-target writability, pending count
-- Render via `make persona PROFILE=<name>`. Export approved learnings with
+- `GET  /healthz/persona`: profile, pending count, target names and
+  `writable` (per target group, whether a render could replace every
+  file it writes; no paths)
+- Render via `make persona PROFILE=<name>` (`make profile` renders the
+  same files and also sets `CLAWRANGE_PROFILE` in `.env`). Export approved learnings with
   `make persona-export`. Offline loop demo via `make persona-demo`.
   `PERSONA_SIGNAL_LEARNING=1` enables the flagged outcome-signal source.
   See `docs/multi-tenant-guide.md` for profile authoring.
@@ -209,14 +259,15 @@ token fails closed (401).
 
 ## Research and Marketing Conventions
 
-- **Citation discipline**: every factual claim John-117 makes must
+- **Citation discipline**: every factual claim the assistant makes must
   cite a URL from a recent `/research` finding. Single-source
   claims are flagged "needs verification".
 - **Marketing posture**: useful comments first. Product mentions
   only when directly relevant. Drafts queue as `[DRAFT]` tasks for
   human approval: never auto-post.
 - **Tracked projects**: `claude-night-market`, `skrills`,
-  `simple-resume`, `personal-brand` (Alex's AI-systems voice).
+  `simple-resume`, `clawrange`, `personal-brand` (the operator's
+  AI-systems voice).
   Seeded from the active profile by `seed_from_profile` on startup
   (the `marketing` profile defines them; the default `starter` has none).
 - **Heavy research**: when a question needs academic literature,

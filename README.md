@@ -1,8 +1,8 @@
 # ClawRange
 
 Personal AI ops stack for [@athola](https://github.com/athola). Wraps an
-OpenClaw assistant ("John-117") around a FastAPI workflows service that
-holds the persistent brain, task queue, scheduler, and marketing scanners.
+OpenClaw assistant around a FastAPI workflows service that holds the
+persistent brain, task queue, scheduler, and marketing scanners.
 Designed to run on a single machine (laptop, ThinkCentre, or droplet) and
 optionally exposed to the public internet through a Tailscale and Caddy
 gateway.
@@ -28,23 +28,36 @@ gateway.
 
 ```bash
 make setup          # generates .env from template and a random gateway token
-# edit .env -- add OPENROUTER_API_KEY at minimum
+# edit .env: add OPENROUTER_API_KEY and a PROXY_AUTH_TOKEN, e.g.
+#   echo "PROXY_AUTH_TOKEN=$(openssl rand -hex 32)" >> .env
 make start          # bring up OpenClaw and workflows
 make health         # confirm both services answer /healthz
 make test           # run the validation suite
 ```
 
+`PROXY_AUTH_TOKEN` ships empty and `make start` refuses to start without
+it: the workflows API fails closed, so an empty token would answer 401 on
+every protected route. On a fresh clone `make start` also renders
+`openclaw/soul.md` from the active profile before the containers start.
+
 To see one real end-to-end run (scheduler, LLM proxy and Telegram), fire
 a seeded job now instead of waiting for its cron. A fresh clone runs the
 identity-free `starter` profile, which seeds no jobs; list what your
 profile seeds, then run one (the `marketing` example seeds
-`morning_digest` and `homelab_deals`):
+`morning_digest`, `hot_pulse`, `daily-content-idea`, `homelab_deals` and
+`daily-research-pulse`):
 
 ```bash
+set -a; . ./.env; set +a                                  # load PROXY_AUTH_TOKEN
 curl -s localhost:5678/sched                              # seeded jobs
-curl -s -X POST localhost:5678/sched/<id>/run             # run one now
+curl -s -X POST localhost:5678/sched/<id>/run \
+  -H "Authorization: Bearer $PROXY_AUTH_TOKEN"            # run one now
 curl -s localhost:5678/tier                               # tier and balance
 ```
+
+Every workflows route needs `Authorization: Bearer $PROXY_AUTH_TOKEN`
+except the health checks, `GET /tier` and `GET /sched[/{id}]`. A run
+answers `{"status": "ok" | "delivery_failed" | "error", "last_status": ...}`.
 
 Everything tenant-specific (timezone, tracked projects, outreach policy,
 deal targets and marketplaces) is profile YAML, never code: see
@@ -118,7 +131,7 @@ render it:
 ```bash
 cp -r config/profiles/chief-of-staff config/profiles/myassistant   # start from an example
 $EDITOR config/profiles/myassistant/profile.yaml                   # set name, role, identity
-make persona PROFILE=myassistant                                   # → openclaw/soul.md and identity.md
+make persona PROFILE=myassistant                                   # renders openclaw/soul.md and identity.md
 ```
 
 Shipped examples: `starter` (identity-free baseline), `lead-crm`,
@@ -174,26 +187,33 @@ The workflows service is a single FastAPI process. It owns:
 - `/healthz`, `/tier`, `/tier/notify`: health and tier status
 - `/v1/chat/completions`: OpenAI-compatible LLM proxy with tiered
   routing, balance circuit breaker, and anti-hallucination guard
+- `/v1/embeddings`: OpenAI-compatible embeddings through OpenRouter, for
+  any client that holds the bearer token
 - `/task`, `/task/{id}`, `/task/{id}/claim`, `/task/{id}/result`:
-  task queue
-- `/brain/*`: persistent knowledge store (pages and embeddings)
+  task queue (`DELETE /task/{id}` cancels)
+- `/brain/*`: persistent knowledge store (pages, timeline, links, tags,
+  versions, chunks, graph and search; `DELETE` on a page, a link or a tag)
 - `/projects`, `/sched`, `/scan/{reddit,github,web}`: marketing
-  orchestrator (`/scan/web` routes through GLM server-side web search)
+  orchestrator (`/scan/web` uses the OpenRouter `:online` search tier; a
+  scan whose upstream fails returns 502, not an empty result)
 - `/research`, `/research/sessions`: multi-source research
   orchestrator with citation flagging and persistent sessions
 - `/webhook/test`: connectivity canary
 
+The service serves no `/docs`, `/redoc` or `/openapi.json`. The routes
+live in `workflows/app.py` and the routers it mounts.
+
 ### Research Orchestrator
 
-`POST /research` fans out across five channels in parallel:
-Reddit (`discourse`), GitHub (`code`), GLM web search
-(`discourse_web`), arXiv and Semantic Scholar (`academic`), and
-TRIZ analogical reasoning (`triz`): then merges and ranks the
-results with authority bonuses (stars, scores, citations),
-recency bonus, and a cross-channel triangulation bonus capped at
-+0.15. Each finding is tagged with a confidence flag (high /
-medium / low) so John-117 can mark single-source claims as
-"needs verification".
+`POST /research` fans out in parallel across the channels a request
+names: Reddit (`discourse`), GitHub (`code`), OpenRouter `:online` web
+search (`discourse_web`), arXiv and Semantic Scholar (`academic`), and
+TRIZ analogical reasoning (`triz`). Without `channels` it runs
+`discourse`, `code` and `discourse_web`. It then merges and ranks the
+results with authority bonuses (stars, scores, citations), recency
+bonus, and a cross-channel triangulation bonus capped at +0.15. Each
+finding is tagged with a confidence flag (high / medium / low) so the
+assistant can mark single-source claims as "needs verification".
 
 Operators can probe per-channel readiness with `GET /healthz/research`
 or run the full smoke test with `make test-research TOPIC="..."`.
@@ -202,8 +222,8 @@ Every call persists a session in the brain so earlier research is
 recoverable via `GET /research/sessions/{id}` without re-running
 the fanout. Heavier work (full tome `/tome:research` synthesis,
 academic deep-dives) is handled by `scripts/tome_bridge.py` which
-polls for `research:tome:` tasks and runs them through Alex's
-local Claude Code session. See
+polls for `research:tome:` tasks and runs them through the
+operator's local Claude Code session. See
 [docs/research-and-marketing.md](docs/research-and-marketing.md)
 for the full operator guide.
 
@@ -224,8 +244,8 @@ registers 14 generators in `GENERATORS`; the marketing ones are:
 - `comment_draft`: drafts a useful, non-promotional reply for a
   given URL and queues it as a `[DRAFT]` task for human approval
 
-The `marketing` profile seeds four tracked projects
-(`claude-night-market`, `skrills`, `simple-resume`, and
+The `marketing` profile seeds five tracked projects
+(`claude-night-market`, `skrills`, `simple-resume`, `clawrange` and
 `personal-brand`) on first boot. Schedules are stored in the
 brain DB and managed via `/sched`. Each generator enqueues tasks
 into the same queue agents read from `/task/{id}/claim`, so manual
@@ -250,7 +270,7 @@ via Telegram. Stand up your own by copying the profile and editing YAML:
 ```bash
 cp -r config/profiles/lead-crm config/profiles/acme
 $EDITOR config/profiles/acme/profile.yaml   # set profile: acme, fields, connectors
-make profile PROFILE=acme                     # render openclaw/soul.md and set .env
+make profile PROFILE=acme                     # render soul.md/identity.md, set .env
 make seed-demo                                # optional: load demo leads offline
 ```
 
