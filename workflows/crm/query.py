@@ -28,7 +28,11 @@ def _since(duration: object) -> str:
     seconds = _parse_duration(str(duration))
     if seconds is None:
         raise ValueError(f"invalid duration: {duration!r}")
-    return (datetime.now(UTC) - timedelta(seconds=seconds)).isoformat()
+    try:
+        return (datetime.now(UTC) - timedelta(seconds=seconds)).isoformat()
+    except OverflowError as exc:
+        # Callers map ValueError to a 400; a huge window is a bad parameter.
+        raise ValueError(f"duration out of range: {duration!r}") from exc
 
 
 def coerce_params(template: dict, raw: dict | None) -> dict:
@@ -134,7 +138,9 @@ async def route_nl(prompt: str, templates: list[dict], *, llm=_default_llm) -> d
 
     The LLM only *selects* a template name and fills params — it never
     writes SQL. A malformed or off-catalog reply yields ``template=None``
-    (the caller renders a safe fallback) rather than raising.
+    (the caller renders a safe fallback) rather than raising. When the LLM
+    itself is unreachable (it raised or returned nothing) the result also
+    carries ``llm_unavailable=True`` so the reply can say so.
     """
     instruction = (
         "You translate a question into ONE of the available CRM report "
@@ -147,6 +153,14 @@ async def route_nl(prompt: str, templates: list[dict], *, llm=_default_llm) -> d
     )
     try:
         raw = await llm(instruction)
+    except Exception as exc:
+        logger.warning("route_nl: LLM call failed: %s", exc)
+        return {"template": None, "params": {}, "llm_unavailable": True}
+    if not raw:
+        # _default_llm turns an outage into "": not a reply to parse.
+        logger.warning("route_nl: LLM returned no reply")
+        return {"template": None, "params": {}, "llm_unavailable": True}
+    try:
         parsed = _extract_json(raw)
     except Exception as exc:
         logger.warning("route_nl: could not parse LLM response: %s", exc)
@@ -185,8 +199,15 @@ async def answer(
     template = find_template(templates, route["template"])
     if template is None:
         names = ", ".join(t["name"] for t in templates) or "(none configured)"
+        if route.get("llm_unavailable"):
+            text = (
+                "The language model is unavailable right now, so I can't "
+                f"interpret questions. Run a report directly instead: {names}."
+            )
+        else:
+            text = f"I couldn't map that to a known report. Available: {names}."
         return {
-            "answer": f"I couldn't map that to a known report. Available: {names}.",
+            "answer": text,
             "template": None,
             "params": {},
             "rows": [],

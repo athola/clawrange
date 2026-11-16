@@ -563,3 +563,351 @@ def test_shipped_profiles_validate_with_live_registry():
 
     for name in ("lead-crm", "chief-of-staff", "marketing", "starter"):
         load_profile(name)
+
+
+# ─── #47 / #15 / #51: CRM and connectors ───────────────────────────
+
+LEAD_CSV = "Email Address,Full Name\nada@x.com,Ada\n"
+
+
+def _crm_profile(source=None, templates=None):
+    return Profile(
+        "t",
+        {
+            "profile": "t",
+            "connectors": [
+                {
+                    "id": "portal",
+                    "source": source
+                    or {"kind": "http_csv", "url": "https://p/e", "auth": {}},
+                    "transform": {
+                        "kind": "leads_clean",
+                        "mapping": {"Email Address": "email", "Full Name": "name"},
+                        "required": ["email"],
+                        "dedup_key": "email",
+                    },
+                    "sink": {"kind": "crm", "object": "leads", "upsert_key": "email"},
+                }
+            ],
+            "crm": {
+                "adapter": "sqlite",
+                "query_templates": templates
+                or [
+                    {
+                        "name": "recent",
+                        "params": {"window": {"type": "duration", "default": "7d"}},
+                        "sql": "SELECT COUNT(*) AS n FROM leads "
+                        "WHERE created_at >= :since",
+                    }
+                ],
+            },
+        },
+    )
+
+
+def _crm_client(tmp_path, *, profile=None, crm=None, handler=None, llm=None):
+    import httpx
+
+    from crm.sqlite_adapter import SQLiteCRM
+    from crm_api import create_crm_router
+
+    if crm is None:
+        crm = SQLiteCRM(str(tmp_path / "crm.db"))
+        crm.init()
+    http = httpx.Client(
+        transport=httpx.MockTransport(
+            handler or (lambda req: httpx.Response(200, text=LEAD_CSV))
+        )
+    )
+    api = FastAPI()
+    api.include_router(
+        create_crm_router(profile or _crm_profile(), crm, llm=llm, http_client=http)
+    )
+    return TestClient(api), crm
+
+
+def test_leads_limit_must_be_positive(tmp_path):
+    client, _ = _crm_client(tmp_path)
+    assert client.get("/crm/leads", params={"limit": -1}).status_code == 422
+    assert client.get("/crm/leads", params={"limit": 0}).status_code == 422
+
+
+def test_sync_keeps_worked_lead_status(tmp_path):
+    """Every hourly sync reset each lead's status to 'new'."""
+    client, crm = _crm_client(tmp_path)
+    assert client.post("/crm/sync/portal").status_code == 200
+    lead = crm.list("leads")[0]
+    crm.upsert("leads", [{"email": lead["email"], "status": "contacted"}], "email")
+    assert client.post("/crm/sync/portal").status_code == 200
+    (lead,) = crm.list("leads")
+    assert lead["status"] == "contacted"
+
+
+def test_new_lead_gets_schema_default_status(tmp_path):
+    _, crm = _crm_client(tmp_path)
+    crm.upsert("leads", [{"email": "n@x.com"}], "email")
+    assert crm.list("leads")[0]["status"] == "new"
+
+
+def test_huge_duration_is_400(tmp_path):
+    client, _ = _crm_client(tmp_path)
+    r = client.post(
+        "/crm/query/run",
+        json={"template": "recent", "params": {"window": "99999999999999d"}},
+    )
+    assert r.status_code == 400
+
+
+def test_coerce_huge_duration_is_value_error():
+    from crm.query import coerce_params
+
+    with pytest.raises(ValueError):
+        coerce_params({"params": {"w": {"type": "duration"}}}, {"w": "99999999999999d"})
+
+
+def test_healthz_crm_hides_path(tmp_path):
+    client, crm = _crm_client(tmp_path)
+    r = client.get("/healthz/crm")
+    assert r.status_code == 200
+    assert str(tmp_path) not in r.text
+    assert r.json()["adapter"]["status"] == "ok"
+
+
+def test_healthz_crm_hides_rest_base_url(tmp_path):
+    from crm.rest_adapter import RestCRM
+
+    rest = RestCRM({"base_url": "https://secret-crm.internal/api"})
+    client, _ = _crm_client(tmp_path, crm=rest)
+    r = client.get("/healthz/crm")
+    assert "secret-crm" not in r.text
+    assert r.json()["adapter"]["status"] == "configured"
+
+
+def test_healthz_crm_reports_adapter_error(tmp_path):
+    from crm.sqlite_adapter import SQLiteCRM
+
+    blocker = tmp_path / "blocker"
+    blocker.write_text("file")
+    broken = SQLiteCRM(str(blocker / "crm.db"))  # parent is a file
+    client, _ = _crm_client(tmp_path, crm=broken)
+    r = client.get("/healthz/crm")
+    assert r.status_code == 503
+    assert r.json()["adapter"]["status"] == "error"
+    assert str(tmp_path) not in r.text
+
+
+def test_leads_clean_keeps_rows_missing_dedup_key():
+    from connectors.transforms import leads_clean
+
+    rows = [{"name": "A"}, {"name": "B"}]
+    out = leads_clean(rows, {"dedup_key": "email"})
+    assert [r["name"] for r in out] == ["A", "B"]
+
+
+def test_leads_clean_email_dedup_ignores_case():
+    from connectors.transforms import leads_clean
+
+    rows = [{"email": "Ada@X.com", "name": "A"}, {"email": "ada@x.com", "name": "B"}]
+    out = leads_clean(rows, {"dedup_key": "email"})
+    assert len(out) == 1 and out[0]["name"] == "B"
+    assert out[0]["email"] == "ada@x.com"
+    assert "status" not in out[0]  # schema default covers inserts only
+
+
+def test_http_csv_rejects_html():
+    import httpx
+
+    from connectors.sources import http_csv
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(
+                200, text="<html>login</html>", headers={"content-type": "text/html"}
+            )
+        )
+    )
+    with pytest.raises(ValueError, match="CSV"):
+        http_csv({"url": "https://p/e"}, client=client)
+
+
+def test_http_csv_unset_url_is_not_ok(tmp_path):
+    """An unset ${PORTAL_EXPORT_URL} recorded 'ok (0 written)'."""
+    from connectors.base import ConnectorNotConfigured
+    from connectors.sources import http_csv
+
+    with pytest.raises(ConnectorNotConfigured):
+        http_csv({"url": ""})
+    client, _ = _crm_client(
+        tmp_path, profile=_crm_profile(source={"kind": "http_csv", "url": ""})
+    )
+    r = client.post("/crm/sync/portal")
+    assert r.status_code == 409 and "not configured" in r.json()["detail"]
+
+
+def test_login_scrape_does_not_resend_password_on_307():
+    import httpx
+
+    from connectors.sources import login_scrape
+
+    posts = []
+
+    def handler(request):
+        if request.method == "POST":
+            posts.append(str(request.url))
+            return httpx.Response(307, headers={"location": "https://evil/login"})
+        return httpx.Response(200, text=LEAD_CSV)
+
+    spec = {
+        "auth": {
+            "kind": "login_form",
+            "login_form": {
+                "login_url": "https://portal/login",
+                "password": "pw",
+                "export_path": "/export",
+            },
+        }
+    }
+    with pytest.raises(ValueError, match="redirect"):
+        login_scrape(spec, client=httpx.Client(transport=httpx.MockTransport(handler)))
+    assert posts == ["https://portal/login"]
+
+
+def test_login_scrape_accepts_302_without_following():
+    import httpx
+
+    from connectors.sources import login_scrape
+
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path))
+        if request.method == "POST":
+            return httpx.Response(302, headers={"location": "/dashboard"})
+        return httpx.Response(200, text=LEAD_CSV)
+
+    spec = {
+        "auth": {
+            "kind": "login_form",
+            "login_form": {"login_url": "https://portal/login", "export_path": "/e"},
+        }
+    }
+    rows = login_scrape(
+        spec, client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    assert rows == [{"Email Address": "ada@x.com", "Full Name": "Ada"}]
+    assert ("POST", "/login") in seen and seen[-1] == ("GET", "/e")
+
+
+def _rest(handler, objects):
+    import httpx
+
+    from crm.rest_adapter import RestCRM
+
+    client = httpx.Client(
+        base_url="https://crm.example", transport=httpx.MockTransport(handler)
+    )
+    return RestCRM({"base_url": "https://crm.example", "objects": objects}, client)
+
+
+def test_rest_upsert_skips_existing_record():
+    import httpx
+
+    calls = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path, dict(request.url.params)))
+        if request.method == "GET":
+            email = request.url.params.get("email")
+            rows = [{"id": 7, "email": "a@x.com"}] if email == "a@x.com" else []
+            return httpx.Response(200, json=rows)
+        return httpx.Response(201, json={"id": 8})
+
+    crm = _rest(handler, {"leads": {"create": "POST /leads", "list": "GET /leads"}})
+    n = crm.upsert("leads", [{"email": "a@x.com"}, {"email": "b@x.com"}], "email")
+    assert n == 1
+    assert [c[0] for c in calls if c[0] == "POST"] == ["POST"]
+
+
+def test_rest_upsert_updates_existing_when_configured():
+    import httpx
+
+    calls = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        if request.method == "GET":
+            return httpx.Response(
+                200, json={"results": [{"id": 7, "email": "a@x.com"}]}
+            )
+        return httpx.Response(200, json={})
+
+    crm = _rest(
+        handler,
+        {
+            "leads": {
+                "create": "POST /leads",
+                "list": "GET /leads",
+                "update": "PATCH /leads/{id}",
+            }
+        },
+    )
+    assert crm.upsert("leads", [{"email": "a@x.com", "name": "A"}], "email") == 1
+    assert ("PATCH", "/leads/7") in calls
+    assert not any(m == "POST" for m, _ in calls)
+
+
+def test_rest_upsert_needs_list_endpoint():
+    import httpx
+
+    crm = _rest(lambda r: httpx.Response(201), {"leads": {"create": "POST /leads"}})
+    with pytest.raises(ValueError, match="list"):
+        crm.upsert("leads", [{"email": "a@x.com"}], "email")
+
+
+@pytest.mark.parametrize("reply", ["", None])
+def test_nl_query_reports_llm_outage(tmp_path, reply):
+    from errors import UpstreamError
+
+    async def llm(prompt):
+        if reply is None:
+            raise UpstreamError("all tiers failed")
+        return reply
+
+    client, _ = _crm_client(tmp_path, llm=llm)
+    body = client.post("/crm/query", json={"prompt": "how many?"}).json()
+    assert body["template"] is None
+    assert "unavailable" in body["answer"]
+    assert "couldn't map" not in body["answer"]
+
+
+def test_nl_query_unparseable_reply_still_maps_message(tmp_path):
+    async def llm(prompt):
+        return "no idea"
+
+    client, _ = _crm_client(tmp_path, llm=llm)
+    body = client.post("/crm/query", json={"prompt": "how many?"}).json()
+    assert "couldn't map" in body["answer"]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_unset_url_records_error(tmp_path):
+    from crm.sqlite_adapter import SQLiteCRM
+    from generators import pipeline_generator
+
+    statuses = []
+
+    class Brain:
+        def update_schedule_status(self, sid, ts, status):
+            statuses.append(status)
+
+    crm = SQLiteCRM(str(tmp_path / "crm.db"))
+    crm.init()
+    await pipeline_generator(
+        Brain(),
+        "portal",
+        profile=_crm_profile(source={"kind": "http_csv", "url": ""}),
+        crm=crm,
+        schedule_id="lead-sync",
+    )
+    assert statuses and statuses[0].startswith("error")
+    assert "not configured" in statuses[0] or "no url" in statuses[0]

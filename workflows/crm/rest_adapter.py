@@ -5,7 +5,9 @@ real: flip ``crm.adapter: rest`` in a profile and lead writes/reads go to
 an HTTP CRM instead of the bundled SQLite one — no pipeline changes.
 
 ``upsert``/``list`` are implemented against a generic REST shape (an
-``objects`` map of ``"<METHOD> /path"`` endpoints) and are exercised in
+``objects`` map of ``"<METHOD> /path"`` endpoints: ``create`` and ``list``
+required for upsert, optional ``update`` with an ``{id}`` placeholder) and
+are exercised in
 tests via an injected httpx client. ``run_template`` deliberately raises:
 SaaS CRMs do not run ad-hoc SQL, so analytics there means a server-side
 report you map in — out of scope for this reference stub.
@@ -57,12 +59,48 @@ class RestCRM(CRMAdapter):
         if not self.base_url:
             logger.warning("RestCRM: no base_url configured (adapter unconfigured)")
 
+    def _existing(self, object: str, upsert_key: str, value) -> dict | None:
+        """The remote record whose ``upsert_key`` equals ``value``, if any.
+
+        Asks the list endpoint with ``?<upsert_key>=<value>`` and confirms
+        the match client-side, since a CRM may ignore unknown filters.
+        """
+        for row in self.list(object, filters={upsert_key: value}, limit=1000):
+            if isinstance(row, dict) and str(row.get(upsert_key, "")).casefold() == (
+                str(value).casefold()
+            ):
+                return row
+        return None
+
     def upsert(self, object: str, records: list[dict], upsert_key: str) -> int:
+        """Create records whose ``upsert_key`` is new; update (with an
+        ``update`` endpoint such as ``"PATCH /leads/{id}"``) or skip the
+        rest, so a re-sync never duplicates remote leads."""
         method, path = self._endpoint(object, "create")
+        try:
+            self._endpoint(object, "list")
+        except ValueError as exc:
+            raise ValueError(
+                f"RestCRM.upsert needs a 'list' endpoint for '{object}' to honor "
+                f"upsert_key '{upsert_key}'"
+            ) from exc
+        update = (self.objects.get(object) or {}).get("update")
         client = self._http()
         written = 0
         for rec in records:
-            resp = client.request(method, path, json=rec)
+            value = rec.get(upsert_key)
+            if value in (None, ""):
+                logger.warning("RestCRM.upsert: skipping record missing %s", upsert_key)
+                continue
+            existing = self._existing(object, upsert_key, value)
+            if existing is None:
+                resp = client.request(method, path, json=rec)
+            elif update:
+                u_method, u_path = self._endpoint(object, "update")
+                rid = existing.get("id", "")
+                resp = client.request(u_method, u_path.format(id=rid), json=rec)
+            else:
+                continue  # already present and no update endpoint: skip
             resp.raise_for_status()
             written += 1
         return written
@@ -86,8 +124,9 @@ class RestCRM(CRMAdapter):
         )
 
     def health(self) -> dict:
+        # No base_url: /healthz/crm is public, and the URL can carry a
+        # tenant id or credential.
         return {
             "status": "configured" if self.base_url else "unconfigured",
             "adapter": "rest",
-            "base_url": self.base_url,
         }

@@ -1,10 +1,13 @@
 """Connector transforms — map/clean raw rows into CRM records (FR-3.2).
 
 ``leads_clean`` renames source columns to CRM fields via ``mapping``, trims
-whitespace, drops rows missing any ``required`` field, defaults ``status``
-to ``new`` and ``created_at`` to now, then dedupes on ``dedup_key``
-(last-wins). ``passthrough`` is the identity transform for connectors whose
-source already emits CRM-shaped rows.
+whitespace, lowercases ``email``, drops rows missing any ``required`` field,
+defaults ``created_at`` to now, then dedupes on ``dedup_key`` (last-wins,
+case-insensitive; rows without the key are kept as-is). ``status`` is left
+unset unless the source supplies it: the CRM schema defaults new leads to
+``new``, and setting it here would reset worked leads on every sync.
+``passthrough`` is the identity transform for connectors whose source
+already emits CRM-shaped rows.
 """
 
 from __future__ import annotations
@@ -40,19 +43,28 @@ def leads_clean(rows: list[Record], spec: dict) -> list[Record]:
         else:
             rec = dict(raw)
         rec = {k: (v.strip() if isinstance(v, str) else v) for k, v in rec.items()}
+        if isinstance(rec.get("email"), str):
+            # Addresses are case-insensitive in practice, and the CRM's
+            # UNIQUE(email) is not: store one spelling.
+            rec["email"] = rec["email"].lower()
 
         if any(not rec.get(field) for field in required):
             continue
 
-        rec.setdefault("status", "new")
         if not rec.get("created_at"):
             rec["created_at"] = _now()
         cleaned.append(rec)
 
     if dedup_key:
         deduped: dict = {}
+        unkeyed: list[Record] = []
         for rec in cleaned:
-            deduped[rec.get(dedup_key)] = rec  # last row wins
-        cleaned = list(deduped.values())
+            key = rec.get(dedup_key)
+            if key in (None, ""):
+                # Rows lacking the key are distinct, not one row under None.
+                unkeyed.append(rec)
+                continue
+            deduped[str(key).casefold()] = rec  # last row wins
+        cleaned = list(deduped.values()) + unkeyed
 
     return cleaned

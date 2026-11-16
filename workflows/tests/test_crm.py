@@ -294,6 +294,8 @@ def test_rest_upsert_via_injected_client():
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
+        if request.method == "GET":  # upsert_key lookup: not there yet
+            return httpx.Response(200, json=[])
         return httpx.Response(201, json={"id": 1})
 
     client = httpx.Client(
@@ -304,15 +306,16 @@ def test_rest_upsert_via_injected_client():
     crm_rest = RestCRM(
         {
             "base_url": "https://crm.example",
-            "objects": {"leads": {"create": "POST /leads"}},
+            "objects": {"leads": {"create": "POST /leads", "list": "GET /leads"}},
         },
         client=client,
     )
     n = crm_rest.upsert("leads", [{"email": "a@x.com", "name": "A"}], "email")
     assert n == 1
-    assert seen[0].method == "POST"
-    assert seen[0].url.path == "/leads"
-    assert seen[0].headers["Authorization"] == "Bearer t"
+    post = seen[-1]
+    assert post.method == "POST"
+    assert post.url.path == "/leads"
+    assert post.headers["Authorization"] == "Bearer t"
 
 
 # ─── review fixes: upsert integrity, SQL guard, limits ────────────

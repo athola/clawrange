@@ -123,7 +123,9 @@ class SQLiteCRM(CRMAdapter):
             row = {k: rec[k] for k in _LEAD_COLUMNS if k in rec}
             row.setdefault("created_at", now)
             row["updated_at"] = now
-            row.setdefault("status", "new")
+            # No status default here: the schema's DEFAULT 'new' covers
+            # inserts, and an explicit 'new' would reset a worked lead's
+            # status through ON CONFLICT ... SET status=excluded.status.
             if upsert_key not in row or row[upsert_key] in (None, ""):
                 logger.warning("crm.upsert: skipping record missing %s", upsert_key)
                 continue
@@ -202,8 +204,10 @@ class SQLiteCRM(CRMAdapter):
                 "path": self.path,
                 "leads": leads,
             }
-        except Exception as exc:  # pragma: no cover - defensive
-            return {"status": "error", "adapter": "sqlite", "error": str(exc)}
+        except Exception as exc:
+            # The message can name the DB path; keep it in the log.
+            logger.warning("crm health: sqlite unavailable: %s", exc)
+            return {"status": "error", "adapter": "sqlite", "error": type(exc).__name__}
 
 
 def _guard_readonly(sql: str) -> None:

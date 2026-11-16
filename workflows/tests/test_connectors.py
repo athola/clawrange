@@ -88,9 +88,13 @@ def test_http_csv_api_key_header():
     assert seen["key"] == "SECRET"
 
 
-def test_http_csv_unconfigured_url_degrades():
-    # An unresolved ${VAR} resolves to "" -> treat as unconfigured, return [].
-    assert http_csv({"kind": "http_csv", "url": ""}) == []
+def test_http_csv_unconfigured_url_raises():
+    # An unresolved ${VAR} resolves to "": an unconfigured error, not an
+    # empty fetch that would record "ok (0 written)".
+    from connectors.base import ConnectorNotConfigured
+
+    with pytest.raises(ConnectorNotConfigured):
+        http_csv({"kind": "http_csv", "url": ""})
 
 
 # ─── sources: login_scrape (FR-3.1) ───────────────────────────────
@@ -168,7 +172,8 @@ def test_leads_clean_renames_drops_and_dedupes():
     assert len(out) == 1  # empty-email dropped; dupe collapsed
     assert out[0]["name"] == "Ada Again"  # last wins
     assert out[0]["source"] == "referral"
-    assert out[0]["status"] == "new"  # default applied
+    # No status default: the CRM schema sets 'new' on insert only.
+    assert "status" not in out[0]
 
 
 def test_leads_clean_trims_and_defaults_created_at():
