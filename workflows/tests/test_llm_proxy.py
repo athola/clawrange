@@ -16,7 +16,7 @@ import heartbeat
 import llm_proxy
 import research_router
 import telegram
-from app import app
+from app import app, brain_db
 
 client = TestClient(app)
 
@@ -2643,8 +2643,6 @@ class TestResearchRouter:
         assert r.status_code == 200
         assert r.json()["choices"][0]["message"]["content"] == ""
 
-        from app import brain_db
-
         done = brain_db.get_task(t["id"])
         assert done["status"] == "completed"
         assert "news.ycombinator.com" in done["result"]
@@ -2678,7 +2676,6 @@ class TestHeartbeatInterceptor:
     def setup_method(self):
         _reset_state()
         # Clear persistent task queue via brain_db
-        from app import brain_db
 
         for table in ("tasks",):
             brain_db._conn.execute(f"DELETE FROM {table}")
@@ -2762,8 +2759,6 @@ class TestHeartbeatInterceptor:
         # No per-completion Telegram notification
         mock_notify.assert_not_called()
 
-        from app import brain_db
-
         tasks = brain_db.list_tasks()
         completed = [t for t in tasks if t["status"] == "completed"]
         assert len(completed) >= 1
@@ -2843,8 +2838,6 @@ class TestHeartbeatInterceptor:
         pending-only dedup recreated the alert every cycle, spamming
         Telegram with a duplicate wall of text per heartbeat."""
 
-        from app import brain_db
-
         mock_balance.return_value = 3.0
 
         existing = brain_db.create_task(
@@ -2885,8 +2878,6 @@ class TestHeartbeatInterceptor:
         an alarmist report."""
         import time as _time
 
-        from app import brain_db
-
         heartbeat._proactive_state["stale_tasks"] = _time.monotonic()
         heartbeat._proactive_state["llm_thinking"] = _time.monotonic()
 
@@ -2915,8 +2906,6 @@ class TestHeartbeatInterceptor:
         """Tier-recovery alert tasks also close in Python with the current
         circuit state."""
         import time as _time
-
-        from app import brain_db
 
         heartbeat._proactive_state["stale_tasks"] = _time.monotonic()
         heartbeat._proactive_state["llm_thinking"] = _time.monotonic()
@@ -2967,8 +2956,6 @@ class TestHeartbeatInterceptor:
         heartbeat._proactive_state["llm_thinking"] = __import__("time").monotonic()
 
         from datetime import timedelta
-
-        from app import brain_db
 
         # Create a task and backdate its created_at to 5 hours ago
         old_task = brain_db.create_task("old task from earlier")
@@ -3062,15 +3049,12 @@ class TestHeartbeatInterceptor:
             sent = [call.args[0] for call in mock_notify.await_args_list]
             assert any("Strix Halo 128GB" in text for text in sent)
 
-        from app import brain_db
-
         all_tasks = brain_db.list_tasks()
         llm_tasks = [t for t in all_tasks if "Strix Halo 128GB" in t["description"]]
         assert len(llm_tasks) == 1
 
     def _think_with(self, suggestion: str) -> list[dict]:
         """Run one heartbeat whose LLM thinking returns `suggestion`."""
-        from app import brain_db
 
         heartbeat._proactive_state.pop("llm_thinking", None)
         heartbeat._proactive_state["stale_tasks"] = time.monotonic()
@@ -3102,7 +3086,6 @@ class TestHeartbeatInterceptor:
             "Query ClawRange FastAPI workflows documentation and best practices "
             "to identify optimization patterns"
         )
-        from app import brain_db
 
         heartbeat._proactive_state.pop("llm_thinking", None)
         heartbeat._proactive_state["stale_tasks"] = time.monotonic()
@@ -3207,9 +3190,7 @@ class TestSemanticDedup:
     """Tests for keyword-overlap task deduplication."""
 
     def test_extract_keywords_filters_stop_words(self):
-        from heartbeat import _extract_keywords
-
-        kw = _extract_keywords(
+        kw = heartbeat._extract_keywords(
             "Review the ClawRange tier allocation for current balance"
         )
         assert "the" not in kw
@@ -3220,9 +3201,7 @@ class TestSemanticDedup:
         assert "balance" in kw
 
     def test_extract_keywords_skips_short_words(self):
-        from heartbeat import _extract_keywords
-
-        kw = _extract_keywords("go do it now")
+        kw = heartbeat._extract_keywords("go do it now")
         assert "go" not in kw
         assert "do" not in kw
         assert "it" not in kw
@@ -3301,11 +3280,9 @@ class TestSemanticDedup:
     def test_recent_task_dedup_uses_the_shared_overlap_rule(self, existing, suggestion):
         """S11: the heartbeat dedup and the waiting-on-you footer share one
         keyword-overlap rule, so they agree on every pair."""
-        from heartbeat import _descriptions_overlap, _has_recent_task
-
         task = {"description": existing, "created_at": datetime.now(UTC).isoformat()}
-        expected = _descriptions_overlap({"description": suggestion}, task)
-        assert _has_recent_task([task], suggestion) is expected
+        expected = heartbeat._descriptions_overlap({"description": suggestion}, task)
+        assert heartbeat._has_recent_task([task], suggestion) is expected
 
     def test_recent_task_dedup_delegates_to_descriptions_overlap(self, monkeypatch):
         """S11: _has_recent_task carries no private copy of the rule."""
@@ -4111,7 +4088,6 @@ class TestThinkingPromptDoesNotAskAlex:
 
 class TestBlockedTaskStatus:
     def test_complete_task_accepts_blocked(self):
-        from app import brain_db
 
         t = brain_db.create_task("needs alex input", priority=3)
         brain_db.complete_task(t["id"], "BLOCKED — Need Input", "blocked")
@@ -4121,7 +4097,6 @@ class TestBlockedTaskStatus:
     def test_blocked_task_is_not_pending(self):
         """A blocked task must leave the pending queue or the heartbeat
         reworks it every cycle -- the loop this fix exists to break."""
-        from app import brain_db
 
         t = brain_db.create_task("needs alex input", priority=3)
         brain_db.complete_task(t["id"], "BLOCKED", "blocked")
@@ -4490,7 +4465,6 @@ class TestGenericOperatorWording:
 
     def test_fallback_names_the_operator_generically(self, monkeypatch):
         """The give-up note after the LLM retry limit names the operator."""
-        from app import brain_db
 
         task = brain_db.create_task("Send weekly invoice")
         monkeypatch.setattr(
@@ -4585,7 +4559,6 @@ class TestNextHeartbeatTask:
 class TestHeartbeatLeavesForeignTasks:
     def setup_method(self):
         _reset_state()
-        from app import brain_db
 
         brain_db._conn.execute("DELETE FROM tasks")
         brain_db._conn.commit()
@@ -4593,8 +4566,6 @@ class TestHeartbeatLeavesForeignTasks:
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
     def test_tome_task_stays_pending(self, _notify):
         import time as _time
-
-        from app import brain_db
 
         heartbeat._proactive_state["stale_tasks"] = _time.monotonic()
         heartbeat._proactive_state["llm_thinking"] = _time.monotonic()
@@ -4764,7 +4735,6 @@ class TestLlmCallExceptionHandling:
 class TestHeartbeatRobustness:
     def setup_method(self):
         _reset_state()
-        from app import brain_db
 
         brain_db._conn.execute("DELETE FROM tasks")
         brain_db._conn.commit()
@@ -4780,7 +4750,6 @@ class TestHeartbeatRobustness:
 
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
     def test_work_exception_fails_task_and_beat_continues(self, _n):
-        from app import brain_db
 
         t = brain_db.create_task("Test task for heartbeat")
         with patch(
@@ -4794,7 +4763,6 @@ class TestHeartbeatRobustness:
 
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
     def test_claim_valueerror_skips_task_without_failing_it(self, _n):
-        from app import brain_db
 
         t = brain_db.create_task("Test task for heartbeat")
         work = AsyncMock(return_value="done")
@@ -4809,7 +4777,6 @@ class TestHeartbeatRobustness:
 
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
     def test_claim_falsy_skips_task(self, _n):
-        from app import brain_db
 
         brain_db.create_task("Test task for heartbeat")
         work = AsyncMock(return_value="done")
@@ -4822,7 +4789,6 @@ class TestHeartbeatRobustness:
 
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
     def test_complete_valueerror_tolerated(self, _n):
-        from app import brain_db
 
         brain_db.create_task("Test task for heartbeat")
         with (
@@ -4833,7 +4799,6 @@ class TestHeartbeatRobustness:
 
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
     def test_overall_work_deadline(self, _n, monkeypatch):
-        from app import brain_db
 
         monkeypatch.setenv("HEARTBEAT_WORK_DEADLINE", "0.05")
         t = brain_db.create_task("Test task for heartbeat")
@@ -4958,7 +4923,6 @@ class TestBackgroundTasksHeld:
 class TestDigestNotLostOnFailure:
     def setup_method(self):
         _reset_state()
-        from app import brain_db
 
         brain_db._conn.execute("DELETE FROM tasks")
         brain_db._conn.commit()

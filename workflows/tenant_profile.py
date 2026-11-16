@@ -23,6 +23,9 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
+from crm.sqlite_adapter import OBJECTS, UNIQUE_LEAD_KEYS
+from deals import load_targets
+
 logger = logging.getLogger("clawrange.profile")
 
 _ENV_RE = re.compile(r"\$\{([A-Z0-9_]+)\}")
@@ -294,8 +297,6 @@ def _validate_source_auth(cid: Any, src: dict, auth: str) -> None:
 
 
 def _validate_sqlite_sink(cid: Any, sink: dict) -> None:
-    from crm.sqlite_adapter import OBJECTS, UNIQUE_LEAD_KEYS
-
     obj = sink.get("object", "leads")
     if obj not in OBJECTS:
         raise ProfileError(
@@ -539,8 +540,6 @@ def _validate_homelab_deals(block: dict | None) -> None:
         names.add(name)
     # Build the targets the scanner would build, so anything load_targets
     # rejects fails here at load time instead of at 08:30.
-    from deals import load_targets
-
     try:
         load_targets(block)
     except (ValueError, TypeError, KeyError) as exc:

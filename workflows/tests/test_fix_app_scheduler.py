@@ -9,6 +9,7 @@ import inspect
 import json
 import logging
 import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -24,9 +25,11 @@ from fastapi.testclient import TestClient
 import app as app_module
 import auth
 import generators
+import llm_proxy
 import scheduler as sch
 from brain_db import BrainDB
 from errors import UpstreamError
+from tenant_profile import load_profile
 
 client = TestClient(app_module.app)
 APP_SRC = Path(app_module.__file__).read_text()
@@ -226,8 +229,6 @@ class _Fire:
 
 def test_catch_up_retries_any_delivery_failure():
     """A pipeline 'ok (...; telegram FAILED ...)' row is a failed delivery."""
-    from datetime import UTC, datetime, timedelta
-
     now = datetime(2026, 11, 15, 9, 0, tzinfo=UTC)
     sched = {
         "cron": "0 8 * * *",
@@ -403,8 +404,6 @@ class TestJobLookupOnly:
 
 @pytest.fixture()
 def real_auth(monkeypatch):
-    import llm_proxy
-
     monkeypatch.setattr(llm_proxy, "PROXY_AUTH_TOKEN", "s3cret")
     saved = app_module.app.dependency_overrides.pop(auth.require_token, None)
     yield TestClient(app_module.app, raise_server_exceptions=False)
@@ -542,8 +541,6 @@ def test_unknown_profile_is_loud_and_recorded(db, monkeypatch, caplog):
 
 
 def test_init_profile_renders_soul_with_learned_overlay(db, tmp_path, monkeypatch):
-    from tenant_profile import load_profile
-
     profile = load_profile("starter")
     row = db.create_learning(profile.name, "persona", "Tone", "Be brief.")
     db.set_learning_status(row["id"], "approved")
@@ -555,8 +552,6 @@ def test_init_profile_renders_soul_with_learned_overlay(db, tmp_path, monkeypatc
 
 
 def test_init_profile_keeps_existing_soul(db, tmp_path):
-    from tenant_profile import load_profile
-
     soul = tmp_path / "soul.md"
     soul.write_text("hand edited\n")
     app_module.init_profile(

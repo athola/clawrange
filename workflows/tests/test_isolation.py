@@ -6,6 +6,9 @@ import socket
 
 import pytest
 
+import heartbeat
+import llm_proxy
+
 
 def test_external_dns_is_blocked():
     with pytest.raises(OSError, match="network disabled"):
@@ -17,9 +20,6 @@ def test_local_names_still_resolve():
 
 
 def test_proxy_globals_start_clean():
-    import heartbeat
-    import llm_proxy
-
     assert llm_proxy._circuit_state == {}
     assert heartbeat._proactive_state == {}
     assert heartbeat._thinking_focus_index == 0

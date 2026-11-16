@@ -25,6 +25,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import telegram
 import tenant_profile
 
 logger = logging.getLogger("clawrange.watchdog")
@@ -134,9 +135,7 @@ async def check(
     if now_dt is None:
         now_dt = datetime.now(ZoneInfo(_tz_name()))
     if notify is None:
-        from telegram import notify as telegram_notify
-
-        notify = telegram_notify
+        notify = telegram.notify
 
     stamp = _read_json(_seen_path())
     arrived = stamp.get("ts")
@@ -216,10 +215,8 @@ async def check_heartbeat() -> None:
         logger.exception("heartbeat watchdog pass failed")
         _failed_passes += 1
         if _failed_passes == FAILED_PASS_ALERT:
-            from telegram import notify as telegram_notify
-
             try:
-                await telegram_notify(
+                await telegram.notify(
                     f"Heartbeat watchdog: {_failed_passes} passes in a row "
                     f"failed ({type(exc).__name__}: {str(exc)[:120]}). "
                     "Stalls are not being detected; check the workflows logs."

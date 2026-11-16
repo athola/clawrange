@@ -4,6 +4,8 @@ import asyncio
 import json
 import logging
 import os
+import shutil
+import sqlite3
 import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -12,9 +14,12 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+import app as app_module
 import auth
 import chat_commands
 import llm_proxy
+import persona_api
+from persona_api import Proposal
 
 TOKEN = "k1-test-token"
 GOOD = {"Authorization": f"Bearer {TOKEN}"}
@@ -39,7 +44,6 @@ class _Loopback(httpx.AsyncClient):
     """An AsyncClient wired to the workflows app in-process."""
 
     def __init__(self, *args, **kwargs):
-        import app as app_module
 
         kwargs["transport"] = httpx.ASGITransport(app=app_module.app)
         super().__init__(*args, **kwargs)
@@ -53,7 +57,6 @@ def authed_app(monkeypatch):
     loopback HTTP self-call (the old implementation) reaches the real auth
     dependency instead of a closed port: reverting the fix fails with 401.
     """
-    import app as app_module
 
     app = app_module.app
     saved = app.dependency_overrides.pop(auth.require_token, None)
@@ -87,7 +90,6 @@ class TestPersonaInProcess:
 
     def test_target_default_matches_api(self, authed_app):
         """Chat feedback lands under the same heading as a bare API proposal."""
-        from persona_api import Proposal
 
         client, db = authed_app
         _chat(client, "!persona Prefer plain words over jargon.")
@@ -150,7 +152,6 @@ class TestPersonaInProcess:
         assert len(db.list_learnings()) == before
 
     def test_propose_storage_error_is_a_friendly_reply(self, authed_app):
-        import sqlite3
 
         client, _db = authed_app
         with patch(
@@ -168,7 +169,6 @@ class TestPersonaInProcess:
         assert _learnings(db, "reflective tone in weekly reviews"), _reply(r)
 
     def test_reflect_failure_is_reported(self, authed_app, monkeypatch):
-        import persona_api
 
         def boom(profile_name):
             raise RuntimeError("generator exploded")
@@ -365,8 +365,6 @@ class TestFailureReporting:
         monkeypatch.setattr(llm_proxy, "PROXY_AUTH_TOKEN", TOKEN)
         call = AsyncMock(return_value=httpx.Response(404, text="no such model"))
         with _balance(50.0), patch.object(llm_proxy, "_call_provider", call):
-            import app as app_module
-
             r = _chat(TestClient(app_module.app), "hello")
         assert "HTTP 404" in _reply(r)
 
@@ -406,8 +404,6 @@ class TestToolCallHistory:
         async def capture(provider, models, body, api_key):
             sent.append(body["messages"])
             return _ok()
-
-        import app as app_module
 
         with _balance(50.0), patch.object(llm_proxy, "_call_provider", capture):
             r = TestClient(app_module.app).post(
@@ -512,7 +508,6 @@ class TestAuthHardening:
         assert "placeholder" in caplog.text
 
     def test_placeholder_rejected_through_the_app(self, monkeypatch):
-        import app as app_module
 
         monkeypatch.setattr(llm_proxy, "PROXY_AUTH_TOKEN", PLACEHOLDER)
         saved = app_module.app.dependency_overrides.pop(auth.require_token, None)
@@ -585,7 +580,6 @@ class TestAuthHardening:
 class TestStartProdSoulGuard:
     @pytest.fixture
     def repo(self, tmp_path):
-        import shutil
 
         root = tmp_path / "repo"
         (root / "scripts").mkdir(parents=True)
@@ -629,7 +623,6 @@ class TestStartProdSoulGuard:
         assert guard < up
 
     def test_soul_rendered_before_prod_compose_up(self, repo):
-        import shutil
 
         root, bin_dir, log = repo
         real_make = shutil.which("make")

@@ -3,9 +3,15 @@ CRM, connector and deal modules (cluster K7)."""
 
 from __future__ import annotations
 
+import importlib.util
 import os
+import pathlib
+import shutil
 import stat
+import subprocess
+import sys
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -13,9 +19,20 @@ from fastapi.testclient import TestClient
 import app as app_module
 import persona_learning as pl
 from brain_db import BrainDB
+from connectors.base import ConnectorNotConfigured
+from connectors.sources import http_csv, login_scrape
+from connectors.transforms import leads_clean
+from crm.query import coerce_params
+from crm.rest_adapter import RestCRM
+from crm.sqlite_adapter import SQLiteCRM
+from crm_api import create_crm_router
+from deal_sources import _ebay_listing
+from deals import Listing, WatchTarget, classify, load_targets
+from errors import UpstreamError
+from generators import pipeline_generator
 from persona import render_all
 from persona_api import create_persona_router
-from tenant_profile import Profile
+from tenant_profile import Profile, ProfileError, load_profile, validate
 
 
 def _mode(path) -> int:
@@ -113,9 +130,6 @@ def test_targets_skip_missing_main_workspace(tmp_path, monkeypatch):
 
 
 def _render_script():
-    import importlib.util
-    import pathlib
-
     path = pathlib.Path(__file__).resolve().parent.parent / "scripts"
     spec = importlib.util.spec_from_file_location(
         "persona_render", path / "persona_render.py"
@@ -289,7 +303,6 @@ KINDS = {"pipeline", "crm_digest", "persona_reflect"}
 
 
 def _validate(raw: dict, kinds=KINDS):
-    from tenant_profile import validate
 
     raw.setdefault("profile", "acme")
     validate(Profile("acme", raw), known_generator_kinds=kinds)
@@ -310,14 +323,12 @@ def _deals(**over):
     ],
 )
 def test_validate_rejects_non_list_exclude(raw):
-    from tenant_profile import ProfileError
 
     with pytest.raises(ProfileError, match="exclude"):
         _validate(raw)
 
 
 def test_load_targets_rejects_string_exclude():
-    from deals import load_targets
 
     with pytest.raises(ValueError, match="exclude"):
         load_targets(_deals(exclude="caddy")["homelab_deals"])
@@ -342,7 +353,6 @@ def _connector(**over):
     ],
 )
 def test_validate_sqlite_sink_fields(sink, match):
-    from tenant_profile import ProfileError
 
     with pytest.raises(ProfileError, match=match):
         _validate({"connectors": [_connector(sink=sink)], "crm": {"adapter": "sqlite"}})
@@ -366,7 +376,6 @@ def test_validate_rest_sink_fields_not_sqlite_constrained():
     ],
 )
 def test_validate_auth_kind_matches_source(source):
-    from tenant_profile import ProfileError
 
     c = _connector()
     c["source"] = source
@@ -396,7 +405,6 @@ def test_validate_login_scrape_with_form_ok():
     ],
 )
 def test_validate_rejects_blank_or_null_names(assistant):
-    from tenant_profile import ProfileError
 
     with pytest.raises(ProfileError, match="assistant"):
         _validate({"assistant": assistant})
@@ -407,7 +415,6 @@ def test_validate_allows_empty_avatar():
 
 
 def test_validate_rejects_bad_cron_with_live_registry():
-    from tenant_profile import ProfileError
 
     raw = {
         "seeds": {
@@ -423,7 +430,6 @@ def test_validate_rejects_bad_cron_with_live_registry():
 def test_validate_rejects_foreign_profile_name():
     """A copied profile still naming its source would file proposals under
     the wrong profile."""
-    from tenant_profile import ProfileError
 
     raw = {
         "seeds": {
@@ -442,10 +448,6 @@ def test_validate_rejects_foreign_profile_name():
 
 
 def test_copied_chief_of_staff_reflects_under_its_own_name(tmp_path):
-    import pathlib
-    import shutil
-
-    from tenant_profile import load_profile
 
     src = pathlib.Path(__file__).resolve().parents[2] / "config" / "profiles"
     shutil.copytree(src / "chief-of-staff", tmp_path / "myassistant")
@@ -491,7 +493,6 @@ def _crm(template):
     ],
 )
 def test_validate_crm_templates(template, match):
-    from tenant_profile import ProfileError
 
     with pytest.raises(ProfileError, match=match):
         _validate(_crm(template))
@@ -501,7 +502,6 @@ def test_validate_crm_templates(template, match):
 
 
 def test_load_targets_red_flags_not_shared():
-    from deals import load_targets
 
     block = {
         "red_flags": {"barebone": ["no cpu"]},
@@ -517,7 +517,6 @@ def test_load_targets_red_flags_not_shared():
 
 
 def test_load_targets_part_and_memory_are_plain_bool():
-    from deals import load_targets
 
     (gpu,) = load_targets(
         {
@@ -534,7 +533,6 @@ def test_load_targets_part_and_memory_are_plain_bool():
 
 
 def test_watch_target_rejects_non_positive_great_price():
-    from deals import WatchTarget
 
     with pytest.raises(ValueError, match="great_price"):
         WatchTarget(name="x", query="x", category="gpu", great_price=0)
@@ -544,9 +542,6 @@ def test_unknown_shipping_is_not_insane():
     """Unknown eBay shipping counted as $0 made a listing look 'insane';
     without a known shipping cost it can be great, not insane. Feed posts
     state one price and never itemize shipping, so they are unaffected."""
-    from deal_sources import _ebay_listing
-    from deals import Listing, WatchTarget, classify
-
     t = WatchTarget(name="R740", query="r740", category="server", great_price=500)
     unknown = _ebay_listing({"itemId": "1", "title": "R740", "price": {"value": "300"}})
     assert unknown is not None and unknown.shipping is None
@@ -578,9 +573,6 @@ def test_unknown_shipping_is_not_insane():
 def test_validate_schedule_import_is_cycle_free(tmp_path, code):
     """validate() lazily imports scheduler; a cycle there would surface only
     in a fresh interpreter, where nothing is imported yet."""
-    import pathlib
-    import subprocess
-    import sys
 
     workflows = pathlib.Path(__file__).resolve().parents[1]
     env = {
@@ -603,7 +595,6 @@ def test_validate_schedule_import_is_cycle_free(tmp_path, code):
 
 
 def test_shipped_profiles_validate_with_live_registry():
-    from tenant_profile import load_profile
 
     for name in ("lead-crm", "chief-of-staff", "marketing", "starter"):
         load_profile(name)
@@ -650,10 +641,6 @@ def _crm_profile(source=None, templates=None):
 
 
 def _crm_client(tmp_path, *, profile=None, crm=None, handler=None, llm=None):
-    import httpx
-
-    from crm.sqlite_adapter import SQLiteCRM
-    from crm_api import create_crm_router
 
     if crm is None:
         crm = SQLiteCRM(str(tmp_path / "crm.db"))
@@ -703,7 +690,6 @@ def test_huge_duration_is_400(tmp_path):
 
 
 def test_coerce_huge_duration_is_value_error():
-    from crm.query import coerce_params
 
     with pytest.raises(ValueError):
         coerce_params({"params": {"w": {"type": "duration"}}}, {"w": "99999999999999d"})
@@ -718,7 +704,6 @@ def test_healthz_crm_hides_path(tmp_path):
 
 
 def test_healthz_crm_hides_rest_base_url(tmp_path):
-    from crm.rest_adapter import RestCRM
 
     rest = RestCRM({"base_url": "https://secret-crm.internal/api"})
     client, _ = _crm_client(tmp_path, crm=rest)
@@ -728,7 +713,6 @@ def test_healthz_crm_hides_rest_base_url(tmp_path):
 
 
 def test_healthz_crm_reports_adapter_error(tmp_path):
-    from crm.sqlite_adapter import SQLiteCRM
 
     blocker = tmp_path / "blocker"
     blocker.write_text("file")
@@ -741,7 +725,6 @@ def test_healthz_crm_reports_adapter_error(tmp_path):
 
 
 def test_leads_clean_keeps_rows_missing_dedup_key():
-    from connectors.transforms import leads_clean
 
     rows = [{"name": "A"}, {"name": "B"}]
     out = leads_clean(rows, {"dedup_key": "email"})
@@ -749,7 +732,6 @@ def test_leads_clean_keeps_rows_missing_dedup_key():
 
 
 def test_leads_clean_email_dedup_ignores_case():
-    from connectors.transforms import leads_clean
 
     rows = [{"email": "Ada@X.com", "name": "A"}, {"email": "ada@x.com", "name": "B"}]
     out = leads_clean(rows, {"dedup_key": "email"})
@@ -762,9 +744,6 @@ def test_leads_clean_email_dedup_ignores_case():
 
 
 def test_http_csv_rejects_html():
-    import httpx
-
-    from connectors.sources import http_csv
 
     client = httpx.Client(
         transport=httpx.MockTransport(
@@ -779,8 +758,6 @@ def test_http_csv_rejects_html():
 
 def test_http_csv_unset_url_is_not_ok(tmp_path):
     """An unset ${PORTAL_EXPORT_URL} recorded 'ok (0 written)'."""
-    from connectors.base import ConnectorNotConfigured
-    from connectors.sources import http_csv
 
     with pytest.raises(ConnectorNotConfigured):
         http_csv({"url": ""})
@@ -792,9 +769,6 @@ def test_http_csv_unset_url_is_not_ok(tmp_path):
 
 
 def test_login_scrape_does_not_resend_password_on_307():
-    import httpx
-
-    from connectors.sources import login_scrape
 
     posts = []
 
@@ -820,9 +794,6 @@ def test_login_scrape_does_not_resend_password_on_307():
 
 
 def test_login_scrape_accepts_302_without_following():
-    import httpx
-
-    from connectors.sources import login_scrape
 
     seen = []
 
@@ -846,9 +817,6 @@ def test_login_scrape_accepts_302_without_following():
 
 
 def _rest(handler, objects):
-    import httpx
-
-    from crm.rest_adapter import RestCRM
 
     client = httpx.Client(
         base_url="https://crm.example", transport=httpx.MockTransport(handler)
@@ -857,7 +825,6 @@ def _rest(handler, objects):
 
 
 def test_rest_upsert_skips_existing_record():
-    import httpx
 
     calls = []
 
@@ -876,7 +843,6 @@ def test_rest_upsert_skips_existing_record():
 
 
 def test_rest_upsert_updates_existing_when_configured():
-    import httpx
 
     calls = []
 
@@ -904,7 +870,6 @@ def test_rest_upsert_updates_existing_when_configured():
 
 
 def test_rest_upsert_needs_list_endpoint():
-    import httpx
 
     crm = _rest(lambda r: httpx.Response(201), {"leads": {"create": "POST /leads"}})
     with pytest.raises(ValueError, match="list"):
@@ -913,7 +878,6 @@ def test_rest_upsert_needs_list_endpoint():
 
 @pytest.mark.parametrize("reply", ["", None])
 def test_nl_query_reports_llm_outage(tmp_path, reply):
-    from errors import UpstreamError
 
     async def llm(prompt):
         if reply is None:
@@ -938,8 +902,6 @@ def test_nl_query_unparseable_reply_still_maps_message(tmp_path):
 
 @pytest.mark.asyncio
 async def test_pipeline_unset_url_records_error(tmp_path):
-    from crm.sqlite_adapter import SQLiteCRM
-    from generators import pipeline_generator
 
     statuses = []
 

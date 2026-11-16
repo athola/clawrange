@@ -11,12 +11,13 @@ import sys
 
 import httpx
 import pytest
+import sqlite_vec
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import embeddings
 from brain import create_brain_router
-from brain_db import BrainDB, _chunk_text
+from brain_db import BrainDB, TaskStatus, _chunk_text
 
 
 @pytest.fixture
@@ -66,8 +67,6 @@ class TestVecStatus:
         )
 
     def test_load_failure_reason_is_kept(self, tmp_path, monkeypatch, caplog):
-        import sqlite_vec
-
         def boom(conn):
             raise RuntimeError("extension blew up")
 
@@ -467,8 +466,6 @@ class TestBackfillResilience:
 
 class TestTaskStatus:
     def test_members_and_open_set(self):
-        from brain_db import TaskStatus
-
         assert {s.value for s in TaskStatus} == {
             "pending",
             "active",

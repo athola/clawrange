@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from connectors import SINKS, SOURCES, TRANSFORMS, run_connector
+from connectors.base import ConnectorNotConfigured
 from connectors.sources import http_csv, login_scrape
 from connectors.transforms import leads_clean
 from crm.sqlite_adapter import SQLiteCRM
@@ -118,8 +119,6 @@ def test_http_csv_shared_auth_kinds(auth, header, value):
 def test_http_csv_unconfigured_url_raises():
     # An unresolved ${VAR} resolves to "": an unconfigured error, not an
     # empty fetch that would record "ok (0 written)".
-    from connectors.base import ConnectorNotConfigured
-
     with pytest.raises(ConnectorNotConfigured):
         http_csv({"kind": "http_csv", "url": ""})
 

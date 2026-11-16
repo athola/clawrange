@@ -3,10 +3,13 @@ generators, scheduler, and marketing command parsing."""
 
 import json
 from datetime import UTC
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
+import llm_proxy
 from app import brain_db
+from errors import UpstreamError
 
 
 @pytest.fixture(autouse=True)
@@ -2400,10 +2403,6 @@ class TestMarketingAPIEndpoints:
         assert resp.status_code == 400
 
     def test_scan_web(self, client, monkeypatch):
-        from unittest.mock import AsyncMock
-
-        import llm_proxy
-
         monkeypatch.setattr(llm_proxy, "_llm_call", AsyncMock(return_value="found"))
         resp = client.post("/scan/web", json={"prompt": "test query"})
         assert resp.status_code == 200
@@ -2472,9 +2471,6 @@ class TestRedditAdapter:
 
     @pytest.mark.asyncio
     async def test_public_fallback_network_error_raises_upstream(self):
-        from unittest.mock import AsyncMock, patch
-
-        from errors import UpstreamError
         from reddit_search import search_subreddits
 
         mock_client = AsyncMock()
@@ -2505,7 +2501,6 @@ class TestRedditAdapter:
 class TestGitHubAdapter:
     @pytest.mark.asyncio
     async def test_search_unreachable_raises_upstream(self):
-        from errors import UpstreamError
         from github_search import search_repos
 
         # Unit tests have no network: the failed search raises (#26)
@@ -2600,7 +2595,6 @@ class TestGitHubIssueSearch:
     @pytest.mark.asyncio
     async def test_calls_async_issues_search(self, monkeypatch):
         from types import SimpleNamespace
-        from unittest.mock import AsyncMock
 
         import github_search
 

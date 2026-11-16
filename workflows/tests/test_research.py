@@ -11,6 +11,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from errors import UpstreamError
 from research import (
     Finding,
     compute_relevance_score,
@@ -406,8 +407,6 @@ class TestAcademicChannel:
         monkeypatch.setattr(httpx.AsyncClient, "get", fail_get)
 
         # Both arxiv and semantic-scholar fail: the channel failed (#26).
-        from errors import UpstreamError
-
         with pytest.raises(UpstreamError):
             await _fetch_academic("anything")
 
@@ -464,7 +463,6 @@ class TestTrizChannel:
 
     @pytest.mark.asyncio
     async def test_raises_when_llm_returns_none(self, monkeypatch):
-        from errors import UpstreamError
         from research import _fetch_triz
 
         async def fake_llm(prompt, max_tokens=100, web_search=False):
@@ -628,8 +626,6 @@ class TestResearchReviewFixes:
 
             async def __aexit__(self, *a):
                 return False
-
-        from errors import UpstreamError
 
         monkeypatch.setattr(research.httpx, "AsyncClient", Boom)
         with (

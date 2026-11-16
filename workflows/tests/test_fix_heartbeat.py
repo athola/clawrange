@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import sqlite3
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -17,13 +18,13 @@ import heartbeat
 import llm_proxy
 import research_router
 import watchdog
+from app import brain_db
+from brain_db import BrainDB
 from errors import UpstreamError
 
 
 @pytest.fixture()
 def db():
-    from app import brain_db
-
     return brain_db
 
 
@@ -236,10 +237,6 @@ class TestTaskReleaseAndReap:
         assert [t["id"] for t in db.fail_stale_active(hours=6)] == [task["id"]]
 
     def test_migration_adds_claimed_at_to_old_schema(self, tmp_path):
-        import sqlite3
-
-        from brain_db import BrainDB
-
         path = tmp_path / "old.db"
         conn = sqlite3.connect(path)
         conn.execute(

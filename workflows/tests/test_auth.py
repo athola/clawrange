@@ -8,13 +8,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 import auth
+from app import app, brain_db
 
 
 @pytest.fixture()
 def real_auth():
     """Undo conftest's global auth bypass for this module's tests."""
-    from app import app
-
     saved = app.dependency_overrides.pop(auth.require_token, None)
     yield TestClient(app)
     if saved is not None:
@@ -153,8 +152,6 @@ class TestPublicScheduleView:
 
     @pytest.fixture(autouse=True)
     def _sched(self):
-        from app import brain_db
-
         brain_db.upsert_schedule(
             "pub_view",
             "pub view",
@@ -196,8 +193,6 @@ class TestPublicHealthzView:
 
     @pytest.fixture(autouse=True)
     def _broken(self, monkeypatch):
-        from app import app, brain_db
-
         monkeypatch.setattr(app.state, "profile_error", self.SECRET, raising=False)
         monkeypatch.setattr(
             brain_db, "vec_status", lambda: {"enabled": False, "reason": self.SECRET}

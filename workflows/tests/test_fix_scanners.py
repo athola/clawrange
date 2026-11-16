@@ -1,7 +1,9 @@
 """Regression tests for the PR #11 review fixes in scanners and generators."""
 
 import sys
+import time
 from types import SimpleNamespace
+from typing import get_args
 from unittest.mock import AsyncMock
 
 import httpx
@@ -9,12 +11,15 @@ import pytest
 
 import generators
 import github_search
+import persona_learning
 import reddit_search
 import research
 import rundown
 from app import brain_db
+from crm.sqlite_adapter import SQLiteCRM
 from errors import UpstreamError
-from reddit_search import SearchHealth
+from reddit_search import RedditPost, SearchHealth
+from tenant_profile import Profile
 
 TOPICS = ["topic A", "topic B", "topic C"]
 
@@ -83,7 +88,6 @@ def _emerging_project():
 
 
 def _emerging_post():
-    from reddit_search import RedditPost
 
     return RedditPost(
         id="em1",
@@ -106,8 +110,6 @@ class TestEmergingHitsAfterDelivery:
 
     @pytest.mark.asyncio
     async def test_rerun_does_not_recount_emerging_hits(self, monkeypatch):
-        from unittest.mock import AsyncMock
-
         _emerging_project()
         monkeypatch.setattr(
             "reddit_search.search_subreddits", AsyncMock(return_value=[])
@@ -128,8 +130,6 @@ class TestEmergingHitsAfterDelivery:
 
     @pytest.mark.asyncio
     async def test_failed_delivery_records_no_emerging_hit(self, monkeypatch):
-        from unittest.mock import AsyncMock
-
         _emerging_project()
         monkeypatch.setattr(
             "reddit_search.search_subreddits", AsyncMock(return_value=[])
@@ -158,10 +158,6 @@ class TestPipelineStatusRedaction:
 
     @pytest.mark.asyncio
     async def test_connector_error_status_has_no_url(self, tmp_path, monkeypatch):
-        import httpx
-
-        from crm.sqlite_adapter import SQLiteCRM
-        from tenant_profile import Profile
 
         secret_url = "https://portal.example/export?token=s3cret"
         profile = Profile(
@@ -222,8 +218,6 @@ class TestPersonaReflect:
 
     @pytest.mark.asyncio
     async def test_defaults_to_the_active_profile(self, monkeypatch):
-        from unittest.mock import AsyncMock
-
         monkeypatch.setenv("CLAWRANGE_PROFILE", "marketing")
         monkeypatch.setattr(
             "llm_proxy._llm_call", AsyncMock(return_value="Lead with the answer.")
@@ -234,8 +228,6 @@ class TestPersonaReflect:
 
     @pytest.mark.asyncio
     async def test_multi_line_reply_proposes_first_line(self, monkeypatch):
-        from unittest.mock import AsyncMock
-
         reply = "\n  Lead with the answer.\nThis keeps Telegram replies short.\n"
         monkeypatch.setattr("llm_proxy._llm_call", AsyncMock(return_value=reply))
         await generators.persona_reflect_generator(brain_db, profile_name="cos")
@@ -244,8 +236,6 @@ class TestPersonaReflect:
 
     @pytest.mark.asyncio
     async def test_none_on_first_line_queues_nothing(self, monkeypatch):
-        from unittest.mock import AsyncMock
-
         reply = "None.\nNothing stood out this week."
         monkeypatch.setattr("llm_proxy._llm_call", AsyncMock(return_value=reply))
         await generators.persona_reflect_generator(brain_db, profile_name="cos")
@@ -253,9 +243,6 @@ class TestPersonaReflect:
 
     @pytest.mark.asyncio
     async def test_invalid_suggestion_is_skipped_not_raised(self, monkeypatch):
-        from unittest.mock import AsyncMock
-
-        import persona_learning
 
         too_long = "x" * (persona_learning.CONTENT_MAX + 1)
         monkeypatch.setattr("llm_proxy._llm_call", AsyncMock(return_value=too_long))
@@ -278,7 +265,6 @@ class TestGeneratorHelpers:
         generators._record_status(Broken(), "hot_pulse", "ok")  # no raise
 
     def test_engagement_rank_orders_by_relevance_and_score(self):
-        from reddit_search import RedditPost
 
         def post(score):
             return RedditPost(
@@ -336,7 +322,6 @@ class TestResearchRequestChannels:
         assert resp.json()["channels"] == ["code", "discourse_web"]
 
     def test_literal_matches_the_dispatch_table(self):
-        from typing import get_args
 
         names = set(get_args(research.ResearchChannel))
         assert names == set(research._CHANNEL_FETCHER_NAMES) | {"web"}
@@ -413,7 +398,6 @@ def _oauth_env(monkeypatch):
 
 def _fake_asyncpraw(monkeypatch, fail=(), close_fails=False):
     """Install a fake asyncpraw whose subreddit search fails for `fail`."""
-    import time
 
     _oauth_env(monkeypatch)
 
