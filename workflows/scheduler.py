@@ -326,7 +326,8 @@ def _parse_cron(cron_str: str) -> dict:
 
     Supports:
       - 5-field cron: "0 9 * * *"
-      - Duration aliases: "every 6h", "every 30m", "every 2d"
+      - Duration aliases: "every 6h", "every 30m", "every 1d" (even
+        steps only; see _EVEN_STEPS)
     """
     cron_str = cron_str.strip()
 
@@ -406,8 +407,24 @@ def validate_schedule(kind: str, cron: str, kwargs: dict | None) -> None:
             raise ValueError(f"kwargs not accepted by {kind}: {unknown}")
 
 
+# A "*/N" cron step restarts at every hour, day or month boundary, so only
+# a step that divides the cycle gives even gaps: "every 7h" fires at
+# 0,7,14,21 and then 0 again, three hours later. Month lengths vary, so
+# no day step above 1 is even.
+_EVEN_STEPS = {
+    "m": {5, 6, 10, 12, 15, 20, 30},
+    "h": {1, 2, 3, 4, 6, 8, 12, 24},
+    "d": {1},
+}
+_STEP_FIELD = {"m": ("minute", "hour"), "h": ("hour", "day"), "d": ("day", "month")}
+
+
 def _parse_duration(duration_str: str) -> dict:
-    """Convert 'every Nh' or 'every Nm' to cron-like interval kwargs."""
+    """Convert 'every Nm|Nh|Nd' to cron-like interval kwargs.
+
+    Steps that would fire at uneven gaps are rejected; write a cron
+    expression for those.
+    """
 
     match = re.match(r"every\s+(\d+)\s*([mhd])", duration_str.lower())
     if not match:
@@ -416,16 +433,16 @@ def _parse_duration(duration_str: str) -> dict:
     amount = int(match.group(1))
     unit = match.group(2)
 
-    if unit == "m":
-        if amount < 5:
-            amount = 5
-        return {"minute": f"*/{amount}"}
-    elif unit == "h":
-        return {"hour": f"*/{amount}"}
-    elif unit == "d":
-        return {"day": f"*/{amount}"}
-
-    raise ValueError(f"Unknown duration unit: {unit}")
+    if unit == "m" and amount < 5:
+        amount = 5
+    field, cycle = _STEP_FIELD[unit]
+    if amount not in _EVEN_STEPS[unit]:
+        steps = ", ".join(f"{n}{unit}" for n in sorted(_EVEN_STEPS[unit]))
+        raise ValueError(
+            f"'{duration_str}' does not divide evenly into a {cycle}, so its "
+            f"gaps would be uneven; use one of {steps} or a cron expression"
+        )
+    return {field: f"*/{amount}"}
 
 
 async def add_schedule(

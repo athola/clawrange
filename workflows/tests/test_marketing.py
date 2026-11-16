@@ -2115,8 +2115,11 @@ class TestSchedulerModule:
     def test_parse_cron_duration_days(self):
         from scheduler import _parse_cron
 
-        result = _parse_cron("every 2d")
-        assert result == {"day": "*/2"}
+        result = _parse_cron("every 1d")
+        assert result == {"day": "*/1"}
+        # Day steps above 1 restart each month (uneven gaps): rejected.
+        with pytest.raises(ValueError, match="evenly"):
+            _parse_cron("every 2d")
 
     def test_parse_cron_invalid(self):
         from scheduler import _parse_cron
