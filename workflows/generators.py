@@ -558,6 +558,87 @@ async def morning_digest_generator(
     # why Reddit came back empty instead of looking like a quiet day.
     health = reddit_search.SearchHealth()
 
+    best_for_post, scores_by_sub = await _collect_digest_candidates(
+        brain_db, projects, scan_subreddits, project_sub_sets, health
+    )
+    picks_by_project = _tier_digest_picks(
+        projects,
+        best_for_post,
+        scores_by_sub,
+        top_per_project,
+        popularity_multiplier,
+        popular_bonus_cap,
+    )
+
+    # Discovery pass: search across all of Reddit (no sub restriction)
+    # for each project's first search term. Posts in non-curated subs
+    # that match relevance get tagged emerging — surfaced in their own
+    # 🆕 section AND, once delivered, recorded as hits in subreddit_stats
+    # so they accumulate toward the auto-promote threshold (≥5 hits in 14d).
+    emerging_picks_by_project = await _discover_emerging(
+        brain_db, projects, project_sub_sets, health=health
+    )
+
+    # Auto-promote any non-curated subs that have crossed the threshold
+    # since the last digest. Mutates project.subreddits + stamps the
+    # stats row promoted_at, so the next run treats it as curated.
+    newly_promoted = _promote_emerging_subreddits(brain_db, projects)
+
+    # Evidence from every channel. Reddit picks keep their tiering; the
+    # other channels degrade independently so one outage never empties
+    # the report.
+    evidence: list[rundown.Evidence] = []
+    for project in projects:
+        slug = project["slug"]
+        for post, is_bonus in picks_by_project.get(slug, []):
+            evidence.append(_reddit_evidence(project, post, is_bonus, "Reddit"))
+        for post in emerging_picks_by_project.get(slug, []):
+            evidence.append(_reddit_evidence(project, post, False, "🆕 Emerging subs"))
+    policy = _outreach_policy(kwargs.get("profile_name"))
+    other, statuses = await rundown.gather_other_channels(projects, policy)
+    evidence = rundown.assign_refs(projects, evidence + other)
+    statuses.insert(0, rundown.reddit_status(health))
+    synthesis = await rundown.synthesize(projects, evidence, policy)
+
+    report = rundown.build_report(
+        projects=projects,
+        evidence=evidence,
+        statuses=statuses,
+        synthesis=synthesis,
+        coverage=_render_subreddit_report(brain_db, projects, newly_promoted),
+        now=datetime.now(UTC),
+        policy=policy,
+    )
+    sent, total = await telegram.notify_long(report)
+
+    # The status row is how "did it arrive?" gets answered later, so it
+    # records delivery, not just that the cron fired.
+    counts = (
+        f"{len(evidence)} items, "
+        f"{sum(len(v) for v in picks_by_project.values())} reddit picks, "
+        f"{len(newly_promoted)} promoted, synthesis {'ok' if synthesis else 'off'}"
+    )
+    status = _delivery_status(sent, total, counts)
+    _record_status(brain_db, schedule_id, status)
+
+    if sent < total:
+        logger.warning("morning_digest: %s; not marking seen", status)
+        return
+
+    _mark_digest_delivered(brain_db, picks_by_project, emerging_picks_by_project)
+    logger.info("morning_digest: %s", status)
+
+
+async def _collect_digest_candidates(
+    brain_db,
+    projects: list[dict],
+    scan_subreddits: list[str],
+    project_sub_sets: dict[str, set[str]],
+    health: reddit_search.SearchHealth,
+) -> tuple[dict[str, tuple[dict, RedditPost, float, bool]], dict[str, list[int]]]:
+    """Search each project's queries and route every unseen post to the
+    project it fits best. Returns that best-fit map (post id to project,
+    post, relevance, sub affinity) and the known scores per subreddit."""
     # Track all post scores per subreddit so we can compute adaptive
     # popularity thresholds (popularity_multiplier × median).
     scores_by_sub: dict[str, list[int]] = {}
@@ -618,7 +699,19 @@ async def morning_digest_generator(
                 prior_priority = prior[2] + (0.1 if prior[3] else 0) if prior else -1.0
                 if priority > prior_priority:
                     best_for_post[post.id] = (project, post, rel, sub_affinity)
+    return best_for_post, scores_by_sub
 
+
+def _tier_digest_picks(
+    projects: list[dict],
+    best_for_post: dict[str, tuple[dict, RedditPost, float, bool]],
+    scores_by_sub: dict[str, list[int]],
+    top_per_project: int,
+    popularity_multiplier: float,
+    popular_bonus_cap: int,
+) -> dict[str, list[tuple[RedditPost, bool]]]:
+    """Each project's strict picks then its popular-bonus picks, as
+    (post, is_bonus) pairs; is_bonus drives the ★ render."""
     # Adaptive popularity thresholds per subreddit. Need at least 3
     # samples for a stable median; otherwise no bonus picks from that sub.
     sub_thresholds: dict[str, float] = {
@@ -641,7 +734,7 @@ async def morning_digest_generator(
                 bonus_by_project.setdefault(slug, []).append((post, rel))
 
     # Final picks per project: top_per_project strict, then up to
-    # popular_bonus_cap bonus picks. is_bonus flag drives the ★ render.
+    # popular_bonus_cap bonus picks.
     picks_by_project: dict[str, list[tuple[RedditPost, bool]]] = {}
     for project in projects:
         slug = project["slug"]
@@ -653,62 +746,16 @@ async def morning_digest_generator(
         chosen += [(p, True) for p, _ in bonus[:popular_bonus_cap]]
         if chosen:
             picks_by_project[slug] = chosen
+    return picks_by_project
 
-    # Discovery pass: search across all of Reddit (no sub restriction)
-    # for each project's first search term. Posts in non-curated subs
-    # that match relevance get tagged emerging — surfaced in their own
-    # 🆕 section AND, once delivered, recorded as hits in subreddit_stats
-    # so they accumulate toward the auto-promote threshold (≥5 hits in 14d).
-    emerging_picks_by_project = await _discover_emerging(
-        brain_db, projects, project_sub_sets, health=health
-    )
 
-    # Auto-promote any non-curated subs that have crossed the threshold
-    # since the last digest. Mutates project.subreddits + stamps the
-    # stats row promoted_at, so the next run treats it as curated.
-    newly_promoted = _promote_emerging_subreddits(brain_db, projects)
-
-    # Evidence from every channel. Reddit picks keep their tiering; the
-    # other channels degrade independently so one outage never empties
-    # the report.
-    evidence: list[rundown.Evidence] = []
-    for project in projects:
-        slug = project["slug"]
-        for post, is_bonus in picks_by_project.get(slug, []):
-            evidence.append(_reddit_evidence(project, post, is_bonus, "Reddit"))
-        for post in emerging_picks_by_project.get(slug, []):
-            evidence.append(_reddit_evidence(project, post, False, "🆕 Emerging subs"))
-    policy = _outreach_policy(kwargs.get("profile_name"))
-    other, statuses = await rundown.gather_other_channels(projects, policy)
-    evidence = rundown.assign_refs(projects, evidence + other)
-    statuses.insert(0, rundown.reddit_status(health))
-    synthesis = await rundown.synthesize(projects, evidence, policy)
-
-    report = rundown.build_report(
-        projects=projects,
-        evidence=evidence,
-        statuses=statuses,
-        synthesis=synthesis,
-        coverage=_render_subreddit_report(brain_db, projects, newly_promoted),
-        now=datetime.now(UTC),
-        policy=policy,
-    )
-    sent, total = await telegram.notify_long(report)
-
-    # The status row is how "did it arrive?" gets answered later, so it
-    # records delivery, not just that the cron fired.
-    counts = (
-        f"{len(evidence)} items, "
-        f"{sum(len(v) for v in picks_by_project.values())} reddit picks, "
-        f"{len(newly_promoted)} promoted, synthesis {'ok' if synthesis else 'off'}"
-    )
-    status = _delivery_status(sent, total, counts)
-    _record_status(brain_db, schedule_id, status)
-
-    if sent < total:
-        logger.warning("morning_digest: %s; not marking seen", status)
-        return
-
+def _mark_digest_delivered(
+    brain_db,
+    picks_by_project: dict[str, list[tuple[RedditPost, bool]]],
+    emerging_picks_by_project: dict[str, list[RedditPost]],
+) -> None:
+    """After a full delivery: never resurface these posts, and count their
+    subreddits' hits toward curation and auto-promotion."""
     for slug, picks in picks_by_project.items():
         for post, _is_bonus in picks:
             brain_db.mark_seen("reddit_post", post.id, slug)
@@ -718,7 +765,6 @@ async def morning_digest_generator(
             brain_db.mark_seen("reddit_post", post.id, slug)
             brain_db.record_subreddit_search(post.subreddit, slug, is_curated=False)
             brain_db.record_subreddit_hit(post.subreddit, slug)
-    logger.info("morning_digest: %s", status)
 
 
 async def _discover_emerging(
