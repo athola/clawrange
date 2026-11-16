@@ -12,17 +12,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Full history so gitleaks can scan every commit in the push/PR.
+          fetch-depth: 0
 
+      # The whole repo, not just scripts/: openclaw/sync-heartbeat.sh and
+      # workflows/entrypoint.sh run in the containers.
       - name: ShellCheck
         uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38  # 2.0.0
         with:
-          scandir: scripts
+          scandir: "."
           severity: warning
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7  # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Validate YAML
         run: |
           pip install --quiet yamllint==1.38.0
-          yamllint -d relaxed docker-compose.yml deerflow/config.yaml
+          yamllint -d relaxed docker-compose.yml docker-compose.prod.yml deerflow/config.yaml
 
       - name: Validate JSON
         run: |
@@ -33,6 +43,8 @@ jobs:
       - name: Validate Docker Compose
         run: |
           docker compose -f docker-compose.yml config --quiet
+          # The prod override requires TAILSCALE_IP; any address will do here.
+          TAILSCALE_IP=100.64.0.1 docker compose -f docker-compose.yml -f docker-compose.prod.yml config --quiet
 
       - name: Scan for secrets
         run: |
@@ -62,6 +74,11 @@ jobs:
 
       - name: Sync locked environment
         run: uv sync --locked
+
+      # Same hook as the local commit gate: rendered personas and local-*
+      # profiles hold operator identity and must never be committed.
+      - name: Operator-private files not committed
+        run: uvx --from pre-commit==4.4.0 pre-commit run forbid-operator-private --all-files
 
       - name: requirements.txt matches uv.lock
         run: |

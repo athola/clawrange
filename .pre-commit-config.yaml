@@ -70,7 +70,9 @@ repos:
         name: pytest (full test suite via uv)
         entry: uv run pytest
         language: system
-        types: [python]
+        # always_run: the suite also tests profiles, compose and shell
+        # scripts, so a push touching only YAML or .sh must still run it.
+        always_run: true
         pass_filenames: false
         args: [-q, -rf]
         stages: [pre-push]
