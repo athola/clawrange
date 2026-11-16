@@ -700,11 +700,19 @@ class LLMUnavailable(UpstreamError):
     """Every LLM tier failed, so the task was not worked (not a result)."""
 
 
+SEARCH_HELD_NOTE = (
+    "Note: no live web data was used; the paid search tier is held by the "
+    "OpenRouter balance floor."
+)
+
+
 async def _llm_work_task(description: str) -> str:
     """Ask the LLM to actually work on a task. Returns the result text.
 
     Raises LLMUnavailable when no tier answered, so the caller can re-queue
-    the task instead of closing it with an apology as its result.
+    the task instead of closing it with an apology as its result. A web
+    task whose search the balance floor denied is not an outage: it gets
+    one non-search attempt, and the result says no live web data was used.
     """
     needs_web = _task_needs_web(description)
     prompt = await _build_work_prompt(description, web_search=needs_web)
@@ -712,6 +720,12 @@ async def _llm_work_task(description: str) -> str:
         logger.info("task needs web search: %r", description[:80])
     max_tok = 1500 if needs_web else 500
     result = await llm_proxy._llm_call(prompt, max_tokens=max_tok, web_search=needs_web)
+    if not result and needs_web and not await llm_proxy.search_allowed():
+        logger.info("search held by the balance floor; working without web data")
+        prompt = await _build_work_prompt(description)
+        result = await llm_proxy._llm_call(prompt, max_tokens=500)
+        if result:
+            result = f"{SEARCH_HELD_NOTE}\n\n{result}"
     if not result:
         raise LLMUnavailable("no LLM tier answered")
     logger.info("LLM worked task: %r", result[:100])
@@ -771,7 +785,9 @@ def _status_alert_result(description: str, remaining: float | None) -> str:
         f"${remaining:.2f}" if remaining is not None else llm_proxy.describe_balance()
     )
     if remaining is None:
-        routing = "floor check skipped until the balance can be read"
+        routing = (
+            "free tiers active; paid and search held until the balance can be read"
+        )
     elif remaining <= 0:
         routing = "openrouter skipped (depleted), zai-direct carrying traffic"
     else:

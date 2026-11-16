@@ -76,7 +76,7 @@ class SearchHealth:
     ok: int = 0
     skipped: int = 0
     failures: Counter[str] = field(default_factory=Counter)
-    _block_streak: int = 0
+    _block_streak: int = field(default=0, init=False)
 
     def record(self, status: int | str) -> None:
         self.requests += 1

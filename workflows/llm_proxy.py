@@ -29,10 +29,6 @@ import heartbeat
 import telegram
 import tenant_profile
 
-# NOTE on deferred imports: ``app`` imports this module at module scope, and
-# ``persona_api`` imports ``generators``, which imports this module. Uses of
-# ``app`` and the persona modules below stay function-local (cycle guard).
-
 logger = logging.getLogger("clawrange.llm_proxy")
 
 router = APIRouter()
@@ -819,8 +815,9 @@ async def _llm_call(
         deadline_at = time.monotonic() + LLM_CALL_DEADLINE
         for tier in CONFIG["tiers"]:
             tier_name = tier["name"]
-            # Background work never spends paid credit: the paid tier is
-            # opt-in per chat message (!paid / !claude), never automatic.
+            # The paid chat tier is never tried here: it is opt-in per chat
+            # message (!paid / !claude). web_search=True does spend paid
+            # :online credit, behind the floor in _llm_call_search.
             if tier.get("paid"):
                 continue
             provider = tier["provider"]
@@ -964,6 +961,23 @@ async def _background_attempt(
     return text
 
 
+async def search_allowed() -> bool:
+    """False when the balance floor holds the paid search tier.
+
+    The search tier is denied while the OpenRouter balance is unknown or at
+    or below OPENROUTER_BALANCE_FLOOR. Callers use this to tell that denial
+    from an outage: a denied search is policy, not a provider failure. A
+    missing search config or key is not the floor, so it reports allowed.
+    """
+    search_cfg = CONFIG.get("search")
+    if not search_cfg or search_cfg["provider"] != "openrouter":
+        return True
+    if not os.getenv(CONFIG["providers"]["openrouter"]["env_key"], ""):
+        return True
+    remaining = await _check_openrouter_balance()
+    return remaining is not None and remaining > OPENROUTER_BALANCE_FLOOR
+
+
 async def _llm_call_search(prompt: str, max_tokens: int) -> str | None:
     """Route web-search tasks to the dedicated search tier (OpenRouter :online).
 
@@ -986,15 +1000,13 @@ async def _llm_call_search(prompt: str, max_tokens: int) -> str | None:
     if not os.getenv(env_key, ""):
         logger.info("background search: skip: %s is not set", env_key)
         return None
-    if provider == "openrouter":
-        remaining = await _check_openrouter_balance()
-        if remaining is None or remaining <= OPENROUTER_BALANCE_FLOOR:
-            logger.warning(
-                "background search: skip: OpenRouter balance %s (floor $%.2f)",
-                describe_balance(),
-                OPENROUTER_BALANCE_FLOOR,
-            )
-            return None
+    if not await search_allowed():
+        logger.warning(
+            "background search: skip: OpenRouter balance %s (floor $%.2f)",
+            describe_balance(),
+            OPENROUTER_BALANCE_FLOOR,
+        )
+        return None
     budget = deadline_at - time.monotonic()
     if budget <= 0:
         logger.warning("background search: deadline reached before the attempt")

@@ -1345,20 +1345,20 @@ async def pipeline_generator(
 
     profile = profile or tenant_profile.load_profile()
     spec = profile.connector(connector)
-    now = datetime.now(UTC).isoformat()
+    now = datetime.now(UTC)
 
     if spec is None:
         logger.warning("pipeline: connector %r not defined in profile", connector)
         if schedule_id:
-            brain_db.update_schedule_status(
-                schedule_id, now, f"error (unknown connector {connector})"
+            _record_status(
+                brain_db, schedule_id, f"error (unknown connector {connector})", now
             )
         return None
 
     adapter = _crm_for(profile, crm)
     if adapter is None:
         if schedule_id:
-            brain_db.update_schedule_status(schedule_id, now, "error (no crm)")
+            _record_status(brain_db, schedule_id, "error (no crm)", now)
         return None
 
     try:
@@ -1369,8 +1369,8 @@ async def pipeline_generator(
     except Exception as exc:
         logger.warning("pipeline: connector %s failed: %s", connector, exc)
         if schedule_id:
-            brain_db.update_schedule_status(
-                schedule_id, now, f"error ({_redact_urls(str(exc))})"
+            _record_status(
+                brain_db, schedule_id, f"error ({_redact_urls(str(exc))})", now
             )
         return None
 
@@ -1388,8 +1388,8 @@ async def pipeline_generator(
 
     # Recorded after delivery so the status says whether the summary landed.
     if schedule_id:
-        brain_db.update_schedule_status(
-            schedule_id, now, f"ok ({counts['written']} written{delivery})"
+        _record_status(
+            brain_db, schedule_id, f"ok ({counts['written']} written{delivery})", now
         )
     return counts
 
@@ -1413,12 +1413,12 @@ async def crm_digest_generator(
 
     profile = profile or tenant_profile.load_profile()
     queries = queries or []
-    now = datetime.now(UTC).isoformat()
+    now = datetime.now(UTC)
 
     adapter = _crm_for(profile, crm)
     if adapter is None:
         if schedule_id:
-            brain_db.update_schedule_status(schedule_id, now, "error (no crm)")
+            _record_status(brain_db, schedule_id, "error (no crm)", now)
         return None
 
     templates = profile.query_templates()
@@ -1440,7 +1440,7 @@ async def crm_digest_generator(
     sent, total = await telegram.notify_long(digest)
     if schedule_id:
         status = _delivery_status(sent, total, f"{len(queries)} queries")
-        brain_db.update_schedule_status(schedule_id, now, status)
+        _record_status(brain_db, schedule_id, status, now)
     return digest
 
 

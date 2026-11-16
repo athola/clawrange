@@ -22,6 +22,7 @@ from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+import digest
 import tenant_profile
 import watchdog
 from generators import GENERATORS, _redact_urls
@@ -199,7 +200,8 @@ def register_maintenance(scheduler, brain_db) -> None:
 
 def _job_error_listener(brain_db):
     """EVENT_JOB_ERROR handler: a crashed tenant job records ``error: ...``
-    on its schedule row, so /sched and the dashboard show the failure."""
+    on its schedule row, so /sched and the dashboard show the failure, and
+    buffers one digest line so the operator hears about it on Telegram."""
 
     def listener(event: JobExecutionEvent) -> None:
         job_id = event.job_id or ""
@@ -207,14 +209,21 @@ def _job_error_listener(brain_db):
         logger.error("scheduled job %s crashed: %r", job_id, exc)
         for prefix in ("marketing_", "catchup_"):
             if job_id.startswith(prefix):
-                status = _redact_urls(f"error: {type(exc).__name__}: {exc}")[:300]
+                schedule_id = job_id[len(prefix) :]
+                error = _redact_urls(f"{type(exc).__name__}: {exc}")[:300]
                 try:
                     brain_db.update_schedule_status(
-                        job_id[len(prefix) :], datetime.now(UTC).isoformat(), status
+                        schedule_id, datetime.now(UTC).isoformat(), f"error: {error}"
                     )
                 except Exception as write_exc:
                     logger.warning(
                         "could not record crash of %s: %s", job_id, write_exc
+                    )
+                try:
+                    digest._digest_record(f"Schedule {schedule_id} crashed: {error}")
+                except Exception as digest_exc:
+                    logger.warning(
+                        "could not buffer crash of %s: %s", job_id, digest_exc
                     )
                 return
 
