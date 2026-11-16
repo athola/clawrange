@@ -25,6 +25,8 @@ from .adapter import CRMAdapter, RecordList
 
 logger = logging.getLogger("clawrange.crm.rest")
 
+TIMEOUT_S = 15.0  # per request to the remote CRM
+
 
 class RestCRM(CRMAdapter):
     def __init__(self, cfg: dict, client: httpx.Client | None = None):
@@ -40,7 +42,7 @@ class RestCRM(CRMAdapter):
         # Built once and reused: a client per call leaked connection pools.
         if self._client is None:
             self._client = httpx.Client(
-                base_url=self.base_url, headers=self._headers(), timeout=15
+                base_url=self.base_url, headers=self._headers(), timeout=TIMEOUT_S
             )
         return self._client
 

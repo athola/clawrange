@@ -165,6 +165,7 @@ OPENROUTER_BALANCE_FLOOR = float(os.getenv("OPENROUTER_BALANCE_FLOOR", "10.0"))
 _balance_cache: dict[str, float | None] = {"remaining": None, "checked_at": None}
 _BALANCE_CHECK_INTERVAL = 300  # re-check at most every 5 minutes
 _BALANCE_FAILURE_BACKOFF = 60  # after a failed lookup, wait this long to retry
+_BALANCE_CHECK_TIMEOUT = 10  # seconds for the /credits lookup
 # Outcome of the most recent lookup, for describe_balance(): monotonic time of
 # the last success, and the last failure reason (cleared on success).
 _balance_status: dict[str, Any] = {"ok_at": None, "error": None}
@@ -217,7 +218,7 @@ async def _check_openrouter_balance() -> float | None:
         return _balance_cache.get("remaining")
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=_BALANCE_CHECK_TIMEOUT) as client:
             resp = await client.get(
                 "https://openrouter.ai/api/v1/credits",
                 headers={"Authorization": f"Bearer {api_key}"},

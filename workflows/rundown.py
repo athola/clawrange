@@ -43,6 +43,7 @@ def report_header(title: str, now: datetime, suffix: str = "") -> str:
 HN_SEARCH_URL = "https://hn.algolia.com/api/v1/search_by_date"
 PER_CHANNEL_CAP = 3
 WEB_TIMEOUT_S = 90.0
+HN_TIMEOUT_S = 15.0
 
 _URL_RE = re.compile(r"https?://[^\s)\]>]+")
 _REF_RE = re.compile(r"\\\[([A-Z]\d+(?:\s*,\s*[A-Z]\d+)*)\]")
@@ -153,7 +154,7 @@ async def fetch_hn(project: dict, since_hours: int = 24) -> list[Evidence]:
     """Keyless Algolia search over the last day of HN stories."""
     cutoff = int((datetime.now(UTC) - timedelta(hours=since_hours)).timestamp())
     found: dict[str, Evidence] = {}
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=HN_TIMEOUT_S) as client:
         for query in _queries(project, 2):
             resp = await client.get(
                 HN_SEARCH_URL,

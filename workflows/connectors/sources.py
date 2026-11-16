@@ -24,6 +24,8 @@ from .base import ConnectorNotConfigured, Record
 
 logger = logging.getLogger("clawrange.connectors.sources")
 
+FETCH_TIMEOUT_S = 30.0  # portal exports can be slow to generate
+
 
 def _looks_like_html(resp: httpx.Response) -> bool:
     ctype = resp.headers.get("content-type", "").lower()
@@ -38,7 +40,7 @@ def _ensure_client(client: httpx.Client | None) -> tuple[httpx.Client, bool]:
     """Return (client, owned); owned clients are closed by the caller."""
     if client is not None:
         return client, False
-    return httpx.Client(timeout=30.0), True
+    return httpx.Client(timeout=FETCH_TIMEOUT_S), True
 
 
 def _csv_or_raise(resp: httpx.Response, source: str) -> list[Record]:

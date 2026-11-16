@@ -32,6 +32,7 @@ from rundown import SourceStatus, reddit_status
 logger = logging.getLogger("clawrange.deal_sources")
 
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) clawrange-deals/0.1"
+SOURCE_TIMEOUT_S = 20.0  # per request, shared by every deal source in a run
 SLICKDEALS_RSS = (
     "https://slickdeals.net/newsearch.php?q={q}&searcharea=deals&searchin=first&rss=1"
 )
@@ -391,7 +392,9 @@ async def gather(
     """Poll every configured source, isolating failures per source."""
     listings: list[Listing] = []
     statuses: list[SourceStatus] = []
-    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(
+        timeout=SOURCE_TIMEOUT_S, follow_redirects=True
+    ) as client:
         for key, name, fn_name in _SIMPLE_SOURCES:
             if key not in sources:
                 continue
