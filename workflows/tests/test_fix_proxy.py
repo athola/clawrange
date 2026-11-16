@@ -13,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import auth
+import chat_commands
 import llm_proxy
 
 TOKEN = "k1-test-token"
@@ -114,13 +115,31 @@ class TestPersonaInProcess:
         assert r.status_code == 200
         assert "not queued" in _reply(r).lower()
 
+    @pytest.mark.parametrize(
+        ("text", "args"),
+        [
+            ("!persona Be Brief", " Be Brief"),
+            ("  !LEARN keep it short  ", " keep it short"),
+            ("!persona", ""),
+            ("!personality test", None),
+            ("!learning plan", None),
+            ("tell me about !persona", None),
+            ("", None),
+        ],
+    )
+    def test_extract_persona_command(self, text, args):
+        """Whole first word, case-insensitive; args keep their casing."""
+        assert chat_commands._extract_persona_command(text) == args
+
     @pytest.mark.parametrize("text", ["!personality test", "!learning plan"])
     def test_longer_word_is_not_the_command(self, authed_app, text):
         """Only the whole first word triggers the command (K2 S6/S7 class)."""
         client, db = authed_app
         before = len(db.list_learnings())
         with (
-            patch.object(llm_proxy, "_handle_persona_command", AsyncMock()) as handler,
+            patch.object(
+                chat_commands, "_handle_persona_command", AsyncMock()
+            ) as handler,
             _balance(50.0),
         ):
             with patch.object(

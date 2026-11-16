@@ -1,24 +1,27 @@
 """Chat commands answered inside the proxy.
 
-Covers /tier, !help, !task, /sched, /scan and /projects. Each returns a
-synthetic response and never reaches a provider. The !persona command stays
-in `llm_proxy` with its persona helpers. Shared helpers and state are read
-from `llm_proxy` at call time, so this module never touches `llm_proxy` at
-import time.
+Covers /tier, !help, !task, !persona (alias !learn), /sched, /scan and
+/projects. Each returns a synthetic response and never reaches a provider.
+Shared helpers and state are read from `llm_proxy` at call time, so this
+module never touches `llm_proxy` at import time.
 
-The two dispatchers llm_proxy calls (`_dispatch_task_command`,
-`_dispatch_marketing_command`) take `is_stream` and wrap the reply as SSE
-exactly once; every handler below them returns plain text.
+The dispatchers llm_proxy calls (`_dispatch_task_command`,
+`_dispatch_marketing_command`, `_dispatch_persona_command`) take `is_stream`
+and wrap the reply as SSE exactly once; the handlers below them return
+plain text or a synthetic response.
 """
 
+import asyncio
 import hashlib
 from typing import Any
 
+from fastapi import HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import github_search
 import heartbeat
 import llm_proxy
+import persona_learning
 import reddit_search
 import research_router
 import tenant_profile
@@ -759,3 +762,92 @@ def _handle_task_action(action: str, args: str) -> str:
         brain_db.update_priority(task_id, new_p)
         return f"Task #{task_id} priority set to {new_p}."
     return f"Unknown action: {action}. Try: cancel, priority"
+
+
+# ─── !persona Command ──────────────────────────────────────────────
+# The chat commands call the persona pipeline in-process, the same functions
+# the /persona routes use. A loopback HTTP call would need the API bearer
+# token and could only fail in ways the user can't act on.
+
+# !learn is the spec §6 alias for !persona.
+_PERSONA_COMMANDS = frozenset({"!persona", "!learn"})
+
+
+def _extract_persona_command(msg: str) -> str | None:
+    """The arguments of a !persona / !learn message, or None.
+
+    Whole first word only, so "!personality" is not the command. The
+    arguments keep the original casing.
+    """
+    stripped = msg.strip()
+    first_word = (stripped.lower().split(None, 1) or [""])[0]
+    if first_word not in _PERSONA_COMMANDS:
+        return None
+    return stripped[len(first_word) :]
+
+
+def _persona_context():
+    """(brain_db, profile name) the /persona routes use (function-local: cycle)."""
+    import app as app_module
+
+    return app_module.brain_db, app_module._current_profile().name
+
+
+async def _handle_persona_command(args: str) -> JSONResponse:
+    # Function-local: persona_api does `from generators import ...`, and
+    # generators imports llm_proxy, which imports this module, so a
+    # module-level import fails when generators is imported first.
+    import persona_api
+
+    args = args.strip()
+    if not args:
+        return llm_proxy._synthetic_response(
+            "Usage: !persona <feedback> | !persona reflect"
+        )
+    try:
+        brain_db, profile_name = _persona_context()
+    except HTTPException as exc:
+        return llm_proxy._synthetic_response(f"Persona unavailable: {exc.detail}.")
+    if args.lower() == "reflect":
+        try:
+            queued = await asyncio.to_thread(
+                persona_api.reflect_now, brain_db, profile_name
+            )
+        except Exception as exc:
+            llm_proxy.logger.exception("!persona reflect failed")
+            return llm_proxy._synthetic_response(
+                f"Persona reflection failed: {type(exc).__name__}: {exc}"
+            )
+        return llm_proxy._synthetic_response(
+            f"Persona reflection done: {queued} proposal(s) pending. "
+            "Review drafts with !tasks."
+        )
+    try:
+        row = await asyncio.to_thread(
+            persona_learning.propose,
+            brain_db,
+            profile_name,
+            "persona",
+            persona_api.Proposal.model_fields["target"].default,
+            args,
+            "feedback",
+        )
+    except ValueError as exc:
+        return llm_proxy._synthetic_response(f"Feedback not queued: {exc}.")
+    except Exception as exc:
+        llm_proxy.logger.exception("!persona propose failed")
+        return llm_proxy._synthetic_response(
+            f"Feedback not queued: {type(exc).__name__}: {exc}"
+        )
+    return llm_proxy._synthetic_response(
+        f"Queued persona enhancement as [DRAFT] (id {row.get('id')}). "
+        "Approve via /persona/proposals/<id>/approve."
+    )
+
+
+async def _dispatch_persona_command(
+    args: str, is_stream: bool = False
+) -> JSONResponse | StreamingResponse:
+    """Run a !persona / !learn command and wrap the reply as SSE once."""
+    resp = await _handle_persona_command(args)
+    return llm_proxy._wrap_json_as_sse(resp) if is_stream else resp
