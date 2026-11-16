@@ -53,6 +53,39 @@ def _load_config() -> dict:
         return json.load(f)
 
 
+def _validate_config(cfg: dict, hints: dict[str, str]) -> None:
+    """Fail at import, not at first request, on a broken models.json.
+
+    Checks: tier names are unique, every tier names a configured provider
+    with models, every provider has a base_url and env_key, the search
+    block names a real provider, and every routing hint targets a tier.
+    """
+    providers = cfg.get("providers") or {}
+    for name, p in providers.items():
+        for key in ("base_url", "env_key"):
+            if not p.get(key):
+                raise ValueError(f"models.json: provider {name!r} has no {key}")
+    names: set[str] = set()
+    for tier in cfg.get("tiers") or []:
+        name = tier.get("name")
+        if not name or name in names:
+            raise ValueError(f"models.json: duplicate or empty tier name {name!r}")
+        names.add(name)
+        if tier.get("provider") not in providers:
+            raise ValueError(
+                f"models.json: tier {name!r} uses unknown provider "
+                f"{tier.get('provider')!r}"
+            )
+        if not tier.get("models"):
+            raise ValueError(f"models.json: tier {name!r} lists no models")
+    search = cfg.get("search")
+    if search and (search.get("provider") not in providers or not search.get("models")):
+        raise ValueError("models.json: search block needs a known provider and models")
+    for keyword, target in hints.items():
+        if target not in names:
+            raise ValueError(f"tier hint !{keyword} targets unknown tier {target!r}")
+
+
 CONFIG = _load_config()
 
 # ─── Request Body Allowlist ────────────────────────────────────────
@@ -685,11 +718,9 @@ def _waiting_on_you_lines(
     return [f"Waiting on you: #{t['id']} {t['description'][:60]}" for t in kept]
 
 
-PROVIDER_URLS = {
-    "openrouter": "https://openrouter.ai/api/v1/chat/completions",
-    "zai": "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
-    "zai-search": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-}
+# One source of truth: the provider URLs come from models.json (a missing
+# base_url is reported by _validate_config at import).
+PROVIDER_URLS = {name: p.get("base_url", "") for name, p in CONFIG["providers"].items()}
 
 
 async def _call_provider(
@@ -784,6 +815,8 @@ TIER_HINTS = {
     "paid": "openrouter-paid",
     "claude": "openrouter-paid",
 }
+
+_validate_config(CONFIG, TIER_HINTS)
 
 
 def _detect_tier_hint(messages: list[dict]) -> str | None:
@@ -1056,7 +1089,7 @@ async def _llm_call(
             tier_name = tier["name"]
             # Background work never spends paid credit: the paid tier is
             # opt-in per chat message (!paid / !claude), never automatic.
-            if tier_name == "openrouter-paid":
+            if tier.get("paid"):
                 continue
             provider = tier["provider"]
             if provider not in PROVIDER_URLS:
@@ -1767,9 +1800,10 @@ async def _handle_non_streaming(
                         "Routing around OpenRouter until it's topped up."
                     )
                 continue
-        if tier_name == "openrouter-paid" and not forced_tier:
+        # Paid tiers are opt-in per message (!paid / !claude), never raced.
+        if tier.get("paid") and not forced_tier:
             continue
-        if tier_name == "openrouter-paid":
+        if tier.get("paid") and provider == "openrouter":
             remaining = await _check_openrouter_balance()
             # An unknown balance (lookup never succeeded or failing) denies
             # paid: the floor exists to protect credit we cannot see.

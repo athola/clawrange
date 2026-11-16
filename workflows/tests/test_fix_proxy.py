@@ -232,11 +232,7 @@ class TestSearchGuard:
 
 
 def _free_tiers() -> list[dict]:
-    return [
-        t
-        for t in llm_proxy.CONFIG["tiers"]
-        if not (t.get("paid") or t["name"] == "openrouter-paid")
-    ]
+    return [t for t in llm_proxy.CONFIG["tiers"] if not t.get("paid")]
 
 
 class TestBackgroundAttemptTimeout:
@@ -382,3 +378,75 @@ class TestToolCallHistory:
         roles = [m["role"] for m in sent[0]]
         assert roles[:4] == ["user", "assistant", "tool", "user"]
         assert sent[0][1].get("tool_calls")
+
+
+# ─── #45: the paid flag and tier config validation ───────────────────
+
+
+def _config(**overrides) -> dict:
+    cfg = json.loads(json.dumps(llm_proxy.CONFIG))
+    cfg.update(overrides)
+    return cfg
+
+
+class TestPaidFlag:
+    def test_shipped_paid_tier_is_flagged(self):
+        paid = [t["name"] for t in llm_proxy.CONFIG["tiers"] if t.get("paid")]
+        assert paid == ["openrouter-paid"]
+
+    def test_renamed_paid_tier_is_still_never_used_in_background(
+        self, keys, monkeypatch
+    ):
+        cfg = _config()
+        for tier in cfg["tiers"]:
+            if tier.get("paid"):
+                tier["name"] = "premium"
+        monkeypatch.setattr(llm_proxy, "CONFIG", cfg)
+        paid_models = next(t["models"] for t in cfg["tiers"] if t.get("paid"))
+        seen: list[list[str]] = []
+
+        async def fail(provider, models, body, api_key):
+            seen.append(list(models))
+            return httpx.Response(500, text="boom")
+
+        with _balance(50.0), patch.object(llm_proxy, "_call_provider", fail):
+            assert asyncio.run(llm_proxy._llm_call("q")) is None
+            asyncio.run(llm_proxy._handle_non_streaming(BODY))
+        assert seen
+        assert paid_models not in seen
+
+
+class TestConfigValidation:
+    def test_shipped_config_is_valid(self):
+        llm_proxy._validate_config(llm_proxy.CONFIG, llm_proxy.TIER_HINTS)
+
+    def test_zai_search_provider_is_gone(self):
+        assert "zai-search" not in llm_proxy.CONFIG["providers"]
+        assert set(llm_proxy.PROVIDER_URLS) == set(llm_proxy.CONFIG["providers"])
+
+    def test_duplicate_tier_names_rejected(self):
+        cfg = _config()
+        cfg["tiers"].append(dict(cfg["tiers"][0]))
+        with pytest.raises(ValueError, match="duplicate"):
+            llm_proxy._validate_config(cfg, {})
+
+    def test_unknown_provider_rejected(self):
+        cfg = _config()
+        cfg["tiers"][0]["provider"] = "nowhere"
+        with pytest.raises(ValueError, match="nowhere"):
+            llm_proxy._validate_config(cfg, {})
+
+    def test_provider_without_url_rejected(self):
+        cfg = _config()
+        del cfg["providers"]["zai"]["base_url"]
+        with pytest.raises(ValueError, match="base_url"):
+            llm_proxy._validate_config(cfg, {})
+
+    def test_hint_to_missing_tier_rejected(self):
+        with pytest.raises(ValueError, match="ghost"):
+            llm_proxy._validate_config(_config(), {"boo": "ghost"})
+
+    def test_unknown_search_provider_rejected(self):
+        cfg = _config(search={"provider": "nowhere", "models": ["m"]})
+        with pytest.raises(ValueError, match="search"):
+            llm_proxy._validate_config(cfg, {})
