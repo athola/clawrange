@@ -50,8 +50,9 @@ _LEAD_COLUMNS = (
     "updated_at",
 )
 # Columns with a UNIQUE index; ON CONFLICT(col) requires one. Keep in sync
-# with _SCHEMA.
-_UNIQUE_LEAD_KEYS = frozenset({"email"})
+# with _SCHEMA. tenant_profile validates connector sinks against these.
+UNIQUE_LEAD_KEYS = frozenset({"email"})
+OBJECTS = frozenset({"leads"})  # objects upsert() writes
 _ACTIVITY_COLUMNS = ("id", "lead_id", "kind", "detail", "ts")
 MAX_TEMPLATE_ROWS = 1000
 
@@ -98,12 +99,12 @@ class SQLiteCRM(CRMAdapter):
     # ─── writes ───────────────────────────────────────────────────
 
     def upsert(self, object: str, records: list[dict], upsert_key: str) -> int:
-        if object != "leads":
+        if object not in OBJECTS:
             raise ValueError(f"SQLiteCRM only supports object 'leads', got '{object}'")
-        if upsert_key not in _UNIQUE_LEAD_KEYS:
+        if upsert_key not in UNIQUE_LEAD_KEYS:
             raise ValueError(
                 f"upsert_key '{upsert_key}' must be a unique lead column "
-                f"({', '.join(sorted(_UNIQUE_LEAD_KEYS))})"
+                f"({', '.join(sorted(UNIQUE_LEAD_KEYS))})"
             )
         with self._lock:
             conn = self._rw()

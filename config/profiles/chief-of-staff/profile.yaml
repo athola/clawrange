@@ -47,8 +47,9 @@ assistant:
 seeds:
   projects: []
   schedules:
+    # persona_reflect's profile_name defaults to this profile's directory
+    # name, so a copy reflects under its own name.
     - id: persona_reflect_daily
       name: "Daily persona reflection"
       kind: persona_reflect
       cron: "0 8 * * *"
-      kwargs: {profile_name: chief-of-staff}

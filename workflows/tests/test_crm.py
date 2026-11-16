@@ -386,7 +386,7 @@ def test_list_rejects_unknown_filter_column(crm):
 
 
 def test_unique_keys_match_schema(crm):
-    """_UNIQUE_LEAD_KEYS must mirror the UNIQUE indexes in _SCHEMA."""
+    """UNIQUE_LEAD_KEYS must mirror the UNIQUE indexes in _SCHEMA."""
     import crm.sqlite_adapter as sa
 
     conn = crm._rw()
@@ -395,7 +395,7 @@ def test_unique_keys_match_schema(crm):
         if idx["unique"]:
             for col in conn.execute(f"PRAGMA index_info({idx['name']})").fetchall():
                 unique.add(col["name"])
-    assert unique == set(sa._UNIQUE_LEAD_KEYS)
+    assert unique == set(sa.UNIQUE_LEAD_KEYS)
 
 
 def test_rest_adapter_reuses_one_client():

@@ -290,6 +290,7 @@ def _ebay_listing(item: dict) -> Listing | None:
         url=item.get("itemWebUrl", ""),
         price=price,
         shipping=shipping,
+        shipping_itemized=True,
         condition=item.get("condition", ""),
         seller_feedback=(item.get("seller") or {}).get("feedbackScore"),
         location=(item.get("itemLocation") or {}).get("country", ""),

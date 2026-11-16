@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+from typing import Literal, get_args
 
 logger = logging.getLogger("clawrange.deals")
 
@@ -64,7 +65,9 @@ _PRICE_RE = re.compile(r"(?:\$|\bUSD\s?)\s?(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d{2}))
 
 # How much the stack wants a target, apart from price. Orders deals inside
 # a price tier; never moves one across tiers.
-NEED_LEVELS = ("need", "want", "watch")
+Need = Literal["need", "want", "watch"]
+NEED_LEVELS: tuple[Need, ...] = get_args(Need)
+Tier = Literal["insane", "great"]
 
 # Default target categories bought as parts (profile: `part_categories`).
 # Everything else is a whole system, and so is a part listing whose title
@@ -92,7 +95,7 @@ class WatchTarget:
     # What the same build costs bought as separate parts. A bundle under it
     # is a deal even above great_price.
     parts_cost: float | None = None
-    need: str = "want"  # one of NEED_LEVELS
+    need: Need = "want"
     fills: list[str] = field(default_factory=list)  # stack_gaps keys
     # Policy applied by load_targets from the profile block; the defaults
     # keep a hand-built target usable on its own.
@@ -101,6 +104,14 @@ class WatchTarget:
     part: bool | None = None  # None: decide from COMPONENT_CATEGORIES
     check_memory: bool | None = None  # None: MEMORY_CHECK_CATEGORIES
     ebay_category: str = ""  # eBay category id scoping the search
+
+    def __post_init__(self) -> None:
+        # great_price divides every discount; zero or negative is meaningless.
+        if not self.great_price > 0:
+            raise ValueError(
+                f"target '{self.name}' great_price must be positive, "
+                f"got {self.great_price!r}"
+            )
 
     @property
     def too_good_floor(self) -> float:
@@ -118,6 +129,13 @@ class Listing:
     condition: str = ""
     seller_feedback: int | None = None
     location: str = ""
+    # The source quotes shipping apart from price (eBay), so shipping=None
+    # means unknown rather than included. Feed posts state one price.
+    shipping_itemized: bool = False
+
+    @property
+    def shipping_unknown(self) -> bool:
+        return self.shipping_itemized and self.shipping is None
 
     @property
     def total(self) -> float | None:
@@ -137,7 +155,7 @@ class Deal:
     listing: Listing
     target: WatchTarget
     total: float
-    tier: str  # "insane" | "great"
+    tier: Tier
     pct_below_target: float
     pct_below_median: float | None
     flags: list[str]
@@ -268,8 +286,11 @@ def classify(
     usable = history if history and history.samples >= MIN_HISTORY_SAMPLES else None
     below_median = 1 - total / usable.median if usable else None
 
-    insane = total <= INSANE_OF_TARGET * target.great_price or (
-        below_median is not None and below_median >= INSANE_UNDER_MEDIAN
+    # Unknown shipping is counted as $0 in total, so it can't prove an
+    # insane price; such a listing can still rank as great.
+    insane = not listing.shipping_unknown and (
+        total <= INSANE_OF_TARGET * target.great_price
+        or (below_median is not None and below_median >= INSANE_UNDER_MEDIAN)
     )
     below_parts = 1 - total / target.parts_cost if target.parts_cost else None
     great = (
@@ -301,35 +322,50 @@ def load_targets(block: dict) -> list[WatchTarget]:
     `sources.ebay.categories` (target category -> eBay category id) set
     the per-target fields. Every key is optional.
     """
-    shared = list(block.get("exclude") or [])
+    shared = _phrases(block.get("exclude"), "homelab_deals.exclude")
     share = float(block.get("too_good_share") or TOO_GOOD_OF_TARGET)
     flags = {str(k): list(v or []) for k, v in (block.get("red_flags") or {}).items()}
+    # An explicit empty list means "none", so test for None, not falsiness.
     parts = block.get("part_categories")
+    part_cats = COMPONENT_CATEGORIES if parts is None else frozenset(parts)
     memory = block.get("memory_check_categories")
+    memory_cats = MEMORY_CHECK_CATEGORIES if memory is None else frozenset(memory)
     ebay_cats = ((block.get("sources") or {}).get("ebay") or {}).get("categories") or {}
     out = []
     for t in block.get("targets") or []:
         category = t.get("category", "other")
+        name = t["name"]
         out.append(
             WatchTarget(
-                name=t["name"],
+                name=name,
                 query=t["query"],
                 category=category,
                 great_price=float(t["max_price_great"]),
-                exclude=list(t.get("exclude") or []) + shared,
+                exclude=_phrases(t.get("exclude"), f"target '{name}' exclude") + shared,
                 memory_gb=t.get("min_vram_gb") or t.get("memory_gb"),
                 note=t.get("note", ""),
                 parts_cost=float(t["parts_cost"]) if t.get("parts_cost") else None,
                 need=t.get("need", "want"),
                 fills=list(t.get("fills") or []),
                 too_good_share=share,
-                red_flags=flags,
-                part=None if parts is None else category in parts,
-                check_memory=None if memory is None else category in memory,
+                # Each target gets its own copy: one shared dict would let a
+                # change to one target's flags leak into every other.
+                red_flags={k: list(v) for k, v in flags.items()},
+                part=category in part_cats,
+                check_memory=category in memory_cats,
                 ebay_category=str(ebay_cats.get(category) or ""),
             )
         )
     return out
+
+
+def _phrases(value, where: str) -> list[str]:
+    """A list of phrases; a bare string would be split into characters."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise ValueError(f"{where} must be a list of phrases, got {value!r}")
+    return list(value)
 
 
 def stale_observation(row: dict, targets: list[WatchTarget]) -> bool:

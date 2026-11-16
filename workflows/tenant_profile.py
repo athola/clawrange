@@ -153,6 +153,7 @@ def validate(
             f"name '{profile.name}'"
         )
 
+    live_registry = known_generator_kinds is None
     if known_generator_kinds is None:
         # Function-local on purpose: generators imports tenant_profile at
         # module level, so a top-level import here would be circular. The
@@ -176,6 +177,7 @@ def validate(
             raise ProfileError(
                 f"connector '{c.get('id')}' has unknown auth kind '{auth}'"
             )
+        _validate_source_auth(c.get("id"), src, auth)
         transform = c.get("transform")
         if transform and transform.get("kind") not in KNOWN_TRANSFORM_KINDS:
             raise ProfileError(
@@ -187,6 +189,10 @@ def validate(
             raise ProfileError(
                 f"connector '{c.get('id')}' has unknown sink kind '{sink.get('kind')}'"
             )
+        # get_adapter defaults to sqlite, which accepts one object and only
+        # UNIQUE columns as upsert keys; anything else fails every sync.
+        if ((profile.crm or {}).get("adapter") or "sqlite") == "sqlite":
+            _validate_sqlite_sink(c.get("id"), sink)
 
     assistant = profile.raw.get("assistant") or {}
     identity = assistant.get("identity")
@@ -202,6 +208,7 @@ def validate(
         emoji = identity.get("emoji", "")
         if emoji and len(str(emoji)) > EMOJI_MAX_LEN:
             raise ProfileError("assistant.identity.emoji is too long")
+    _validate_assistant_text(assistant)
 
     _validate_ops(assistant.get("ops"))
 
@@ -212,6 +219,8 @@ def validate(
             raise ProfileError(
                 f"crm.adapter '{adapter}' is unknown (known: {sorted(KNOWN_ADAPTERS)})"
             )
+        for template in crm.get("query_templates") or []:
+            _validate_query_template(template)
 
     _validate_timezone(profile.assistant.get("timezone"))
     _validate_search_hygiene(profile.assistant.get("search_hygiene"))
@@ -237,11 +246,129 @@ def validate(
                 f"schedule '{s.get('id')}' has kind '{kind}' not in "
                 f"GENERATORS ({sorted(known_generator_kinds)})"
             )
-        connector_ref = (s.get("kwargs") or {}).get("connector")
+        kwargs = s.get("kwargs") or {}
+        connector_ref = kwargs.get("connector")
         if connector_ref is not None and connector_ref not in connector_ids:
             raise ProfileError(
                 f"schedule '{s.get('id')}' references undefined connector "
                 f"'{connector_ref}'"
+            )
+        named = kwargs.get("profile_name")
+        if named is not None and named != profile.name:
+            # A copied profile that still names its source would file its
+            # work under the wrong profile; omit it to use this directory.
+            raise ProfileError(
+                f"schedule '{s.get('id')}' kwargs.profile_name '{named}' is not "
+                f"this profile ('{profile.name}'); omit it to default to this one"
+            )
+        if live_registry:
+            # Same check the /sched API runs before persisting (cron syntax,
+            # kwargs the generator accepts); the seed path never ran it.
+            # Injected test kinds aren't real generators, so it needs the
+            # live registry.
+            from scheduler import validate_schedule
+
+            try:
+                validate_schedule(kind, s.get("cron") or "", s.get("kwargs"))
+            except ValueError as exc:
+                raise ProfileError(f"schedule '{s.get('id')}': {exc}") from exc
+
+
+def _validate_source_auth(cid: Any, src: dict, auth: str) -> None:
+    """login_scrape needs a login_form; other sources can't use one.
+
+    Checks structure only: ``${VAR}`` values resolve to "" before
+    validation, and an unset credential means unconfigured, not invalid.
+    """
+    if src.get("kind") == "login_scrape":
+        form = (src.get("auth") or {}).get("login_form")
+        if auth != "login_form" or not isinstance(form, dict):
+            raise ProfileError(
+                f"connector '{cid}' login_scrape source needs auth.kind "
+                "login_form with a login_form mapping"
+            )
+    elif auth == "login_form":
+        raise ProfileError(
+            f"connector '{cid}' auth kind login_form needs a login_scrape source"
+        )
+
+
+def _validate_sqlite_sink(cid: Any, sink: dict) -> None:
+    from crm.sqlite_adapter import OBJECTS, UNIQUE_LEAD_KEYS
+
+    obj = sink.get("object", "leads")
+    if obj not in OBJECTS:
+        raise ProfileError(
+            f"connector '{cid}' sink object '{obj}' is not supported by the "
+            f"sqlite CRM (known: {sorted(OBJECTS)})"
+        )
+    key = sink.get("upsert_key", "email")
+    if key not in UNIQUE_LEAD_KEYS:
+        raise ProfileError(
+            f"connector '{cid}' sink upsert_key '{key}' must be a unique lead "
+            f"column (known: {sorted(UNIQUE_LEAD_KEYS)})"
+        )
+
+
+def _validate_assistant_text(assistant: dict) -> None:
+    """Persona fields are substituted into templates as text: null or a
+    non-string would raise on every render, and a blank name renders an
+    assistant with no name. An empty avatar is fine (no avatar)."""
+    if "name" in assistant and not _non_blank(assistant["name"]):
+        raise ProfileError("assistant.name must be non-empty text")
+    identity = assistant.get("identity") or {}
+    for key, value in identity.items():
+        if not isinstance(value, str):
+            raise ProfileError(f"assistant.identity.{key} must be text")
+    if "name" in identity and not identity["name"].strip():
+        raise ProfileError("assistant.identity.name must be non-empty text")
+
+
+def _non_blank(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+# Mirrors crm.query.coerce_params: any other type would bind the raw value.
+KNOWN_QUERY_PARAM_TYPES = {"duration", "enum", "string"}
+_LIKE_RE = re.compile(r"\bLIKE\s+:like\b(\s+ESCAPE\b)?", re.IGNORECASE)
+
+
+def _validate_query_template(t: Any) -> None:
+    if not isinstance(t, dict) or not _non_blank(t.get("name")):
+        raise ProfileError("crm.query_templates entries need a name")
+    name = t["name"]
+    params = t.get("params") or {}
+    if not isinstance(params, dict):
+        raise ProfileError(f"crm template '{name}' params must be a mapping")
+    for pname, spec in params.items():
+        spec = spec or {}
+        ptype = spec.get("type")
+        if ptype not in KNOWN_QUERY_PARAM_TYPES:
+            raise ProfileError(
+                f"crm template '{name}' param '{pname}' has unknown type "
+                f"{ptype!r} (known: {sorted(KNOWN_QUERY_PARAM_TYPES)})"
+            )
+        if ptype == "enum":
+            values = spec.get("values")
+            if not isinstance(values, list) or not values:
+                raise ProfileError(
+                    f"crm template '{name}' enum '{pname}' needs a values list"
+                )
+            mapping = spec.get("map")
+            if mapping is not None and (
+                not isinstance(mapping, dict) or set(values) - set(mapping)
+            ):
+                raise ProfileError(
+                    f"crm template '{name}' enum '{pname}' map must cover every "
+                    f"value {values}"
+                )
+    if any((s or {}).get("type") == "string" for s in params.values()):
+        likes = _LIKE_RE.findall(t.get("sql") or "")
+        if any(not escape for escape in likes):
+            # coerce_params escapes % and _ with a backslash; without the
+            # ESCAPE clause SQLite would treat them as wildcards again.
+            raise ProfileError(
+                f"crm template '{name}': every 'LIKE :like' needs ESCAPE '\\'"
             )
 
 
@@ -348,6 +475,8 @@ def _validate_deal_policy(block: dict) -> None:
     flags = block.get("red_flags") or {}
     if not isinstance(flags, dict) or not all(_is_str_list(v) for v in flags.values()):
         raise ProfileError("homelab_deals.red_flags must map a label -> [phrases]")
+    if block.get("exclude") is not None and not _is_str_list(block["exclude"]):
+        raise ProfileError("homelab_deals.exclude must be a list of phrases")
     for key in ("part_categories", "memory_check_categories"):
         if block.get(key) is not None and not _is_str_list(block[key]):
             raise ProfileError(f"homelab_deals.{key} must be a list of categories")
@@ -405,9 +534,21 @@ def _validate_homelab_deals(block: dict | None) -> None:
                 f"homelab_deals target '{name}' fills {unknown} not declared "
                 f"in stack_gaps (known: {sorted(gaps)})"
             )
+        if t.get("exclude") is not None and not _is_str_list(t["exclude"]):
+            raise ProfileError(
+                f"homelab_deals target '{name}' exclude must be a list of phrases"
+            )
         if name in names:
             raise ProfileError(f"homelab_deals target '{name}' is duplicated")
         names.add(name)
+    # Build the targets the scanner would build, so anything load_targets
+    # rejects fails here at load time instead of at 08:30.
+    from deals import load_targets
+
+    try:
+        load_targets(block)
+    except (ValueError, TypeError, KeyError) as exc:
+        raise ProfileError(f"homelab_deals: {exc}") from exc
 
 
 _ACTIVE: dict[str, Any] = {}
@@ -519,6 +660,21 @@ def operator_timezone(profile: Profile | None = None) -> str:
     return str(profile.assistant.get("timezone") or "UTC")
 
 
+# Generators that act on one profile's data take it as kwargs.profile_name.
+_PROFILE_SCOPED_KINDS = {"persona_reflect"}
+
+
+def _default_profile_name(raw: dict, name: str) -> None:
+    """Fill ``profile_name`` for profile-scoped schedules from the directory,
+    so a ``cp -r`` copy of a profile works under its own name."""
+    for s in (raw.get("seeds") or {}).get("schedules") or []:
+        if isinstance(s, dict) and s.get("kind") in _PROFILE_SCOPED_KINDS:
+            kwargs = s.get("kwargs") or {}
+            if isinstance(kwargs, dict):
+                kwargs.setdefault("profile_name", name)
+                s["kwargs"] = kwargs
+
+
 def load_profile(
     name: str | None = None,
     *,
@@ -547,6 +703,7 @@ def load_profile(
     if not isinstance(raw, dict):
         raise ProfileError(f"profile {name} is not a YAML mapping")
     raw = resolve_env(raw, env)
+    _default_profile_name(raw, name)
 
     profile = Profile(name=name, raw=raw)
     if validate_profile:
