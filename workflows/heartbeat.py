@@ -21,6 +21,7 @@ import llm_proxy
 import research_router
 import telegram
 import tenant_profile
+from errors import UpstreamError
 
 # ─── Heartbeat Interceptor ───────────────────────────────────────
 
@@ -34,7 +35,6 @@ _HEARTBEAT_MARKER = "clawrange heartbeat:"
 _PROACTIVE_INTERVALS = {
     "stale_tasks": 1800,  # 30 min — nudge about tasks stuck pending
     "llm_thinking": 900,  # 15 min — balance responsiveness vs churn
-    "pending_reminder": 3600,  # 1 hr — remind the operator of P3+ tasks to review
 }
 
 # Path to soul.md inside the container (mounted read-only).
@@ -67,9 +67,9 @@ def _next_heartbeat_task(pending: list[dict]) -> dict | None:
 def _load_soul() -> str:
     """Persona context for self-directed prompts. Empty string if missing.
 
-    Prefers the rendered OpenClaw workspace SOUL.md, which carries approved
-    learnings. The bundled soul.md is a read-only bind of the repo template
-    and never sees them.
+    Prefers the OpenClaw workspace SOUL.md, re-rendered on every learning
+    approval. The fallback SOUL_MD_PATH is a read-only bind of the rendered
+    openclaw/soul.md, current only as of the last `make persona`.
     """
     state = os.environ.get("OPENCLAW_STATE_DIR")
     candidates = [Path(state) / "workspace" / "SOUL.md"] if state else []
@@ -128,8 +128,6 @@ def _strip_persona_backstory(soul: str, headings: tuple[str, ...] | None = None)
     for line in lines:
         if line.startswith("## "):
             skipping = line.strip() in strip
-            if skipping:
-                continue
         if skipping:
             continue
         out.append(line)
@@ -209,7 +207,8 @@ def _build_thinking_prompt(subjects: list[str], context: str = "") -> str:
             if created and created > cutoff:
                 recent_descriptions.append(t["description"])
     except Exception:
-        pass
+        # The prompt still works without the dedup hint; say why it is gone.
+        llm_proxy.logger.exception("thinking prompt: could not list recent tasks")
     recent_block = ""
     if recent_descriptions:
         recent_list = "\n".join(f"  - {d}" for d in recent_descriptions[-10:])
@@ -243,7 +242,7 @@ def _build_thinking_prompt(subjects: list[str], context: str = "") -> str:
 
 
 def _is_heartbeat(msg: str) -> bool:
-    """Detect heartbeat messages from max-ops agent."""
+    """Detect heartbeat messages from the ops agent."""
     return msg.lower().strip().startswith(_HEARTBEAT_MARKER)
 
 
@@ -286,6 +285,28 @@ def _has_recent_task(queue: list[dict], keyword: str, hours: int = 24) -> bool:
     return False
 
 
+def _has_recent_prefix(
+    queue: list[dict], prefix: str, hours: int = 24, exact: bool = False
+) -> bool:
+    """True if a task created in the last N hours (any status) starts with
+    `prefix` (or equals it, with exact=True), ignoring case.
+
+    For descriptions the heartbeat writes itself. Keyword overlap merged
+    distinct alerts ("tier recovery: zai-direct" matched the openrouter
+    one) and missed the stale nudge, whose text starts with a count.
+    """
+    cutoff = datetime.now(UTC) - timedelta(hours=hours)
+    want = prefix.strip().lower()
+    for t in queue:
+        created = llm_proxy._parse_task_time(t.get("created_at"))
+        if created is None or created <= cutoff:
+            continue
+        desc = (t.get("description") or "").strip().lower()
+        if desc == want or (not exact and desc.startswith(want)):
+            return True
+    return False
+
+
 async def _llm_suggest_task(subjects: list[str], context: str = "") -> str | None:
     """Ask the LLM for one proactive task suggestion."""
     text = await llm_proxy._llm_call(
@@ -303,20 +324,14 @@ async def _gather_system_state() -> str:
     """Collect current system state for task context."""
     from app import brain_db
 
-    # Tier status
-    tier_lines = []
-    for tier in llm_proxy.CONFIG["tiers"]:
-        name = tier["name"]
-        status = (
-            "TRIPPED"
-            if llm_proxy._circuit_open(name, probe=False)
-            else ("ACTIVE" if name == llm_proxy._last_tier_used else "ready")
-        )
-        tier_lines.append(f"  {name}: {status} — {tier['description']}")
+    tier_lines = [
+        f"  {t['name']}: {t['status']} — {t['description']}"
+        for t in llm_proxy.tier_snapshot()
+    ]
 
-    # Balance
-    remaining = await llm_proxy._check_openrouter_balance()
-    balance = f"${remaining:.2f}" if remaining is not None else "not configured"
+    # Refresh the cache, then describe it (unknown is never shown as a number).
+    await llm_proxy._check_openrouter_balance()
+    balance = llm_proxy.describe_balance()
 
     # Task queue summary
     all_tasks = brain_db.list_tasks()
@@ -368,7 +383,7 @@ async def _build_work_prompt(task_description: str, web_search: bool = False) ->
                 "\nBrain is empty — no clients, people, or incidents recorded yet.\n"
             )
     except Exception:
-        pass
+        llm_proxy.logger.exception("work prompt: could not list brain pages")
 
     format_rules = (
         (
@@ -442,31 +457,79 @@ _WEB_SEARCH_KEYWORDS = {
 }
 
 
+# Whole words only: as substrings, "hn" matched "John" and "technology" and
+# sent them to the paid search tier. Inflections ("searching", "research")
+# no longer match; research-shaped tasks reach the research router first.
+_WEB_SEARCH_RE = re.compile(
+    r"\b(?:"
+    + "|".join(
+        re.escape(kw) for kw in sorted(_WEB_SEARCH_KEYWORDS, key=len, reverse=True)
+    )
+    + r")\b"
+)
+
+
 def _task_needs_web(description: str) -> bool:
     """Return True if the task description suggests it needs live web data."""
-    desc_lower = description.lower()
-    return any(kw in desc_lower for kw in _WEB_SEARCH_KEYWORDS)
+    return _WEB_SEARCH_RE.search(description.lower()) is not None
+
+
+class LLMUnavailable(UpstreamError):
+    """Every LLM tier failed, so the task was not worked (not a result)."""
 
 
 async def _llm_work_task(description: str) -> str:
-    """Ask the LLM to actually work on a task. Returns the result text."""
+    """Ask the LLM to actually work on a task. Returns the result text.
+
+    Raises LLMUnavailable when no tier answered, so the caller can re-queue
+    the task instead of closing it with an apology as its result.
+    """
     needs_web = _task_needs_web(description)
     prompt = await _build_work_prompt(description, web_search=needs_web)
     if needs_web:
         print(f"[PROXY] task needs web search: {description[:80]!r}", flush=True)
     max_tok = 1500 if needs_web else 500
     result = await llm_proxy._llm_call(prompt, max_tokens=max_tok, web_search=needs_web)
-    if result:
-        print(f"[PROXY] LLM worked task: {result[:100]!r}", flush=True)
-        return result
-    return (
-        f"Could not reach LLM to work this task. "
-        f"{_sentence_start(tenant_profile.operator_name())} should handle manually: "
-        f"{description}"
+    if not result:
+        raise LLMUnavailable("no LLM tier answered")
+    print(f"[PROXY] LLM worked task: {result[:100]!r}", flush=True)
+    return result
+
+
+_BALANCE_UNKNOWN_PREFIX = "Balance unknown alert:"
+_ALERT_TASK_PREFIXES = (
+    "low balance alert:",
+    "investigate tier recovery:",
+    _BALANCE_UNKNOWN_PREFIX.lower(),
+)
+
+# How long the balance must stay unreadable before the alert: one failed
+# lookup (a network blip at startup) is not worth a task.
+BALANCE_UNKNOWN_ALERT_SECS = 1800.0
+_balance_unknown_since: float | None = None
+
+
+def _balance_unknown_for(remaining: float | None) -> float:
+    """Seconds the OpenRouter balance has been unreadable (0 if known, if
+    no key is configured, or if no lookup has failed yet)."""
+    global _balance_unknown_since
+    failing = (
+        remaining is None
+        and bool(os.getenv("OPENROUTER_API_KEY"))
+        and bool(llm_proxy._balance_status.get("error"))
     )
+    if not failing:
+        _balance_unknown_since = None
+        return 0.0
+    now = time.monotonic()
+    if _balance_unknown_since is None:
+        _balance_unknown_since = now
+    return now - _balance_unknown_since
 
 
-_ALERT_TASK_PREFIXES = ("low balance alert:", "investigate tier recovery:")
+# Fixed start of the stale-queue nudge, so dedup matches what is written.
+# Not a status alert: it goes through the worker like any system task.
+STALE_NUDGE_PREFIX = "Stale queue:"
 
 
 def _is_status_alert(description: str) -> bool:
@@ -482,9 +545,11 @@ def _is_status_alert(description: str) -> bool:
 
 def _status_alert_result(description: str, remaining: float | None) -> str:
     """Factual closing note for a status-alert task, from live state."""
-    balance = f"${remaining:.2f}" if remaining is not None else "unknown"
+    balance = (
+        f"${remaining:.2f}" if remaining is not None else llm_proxy.describe_balance()
+    )
     if remaining is None:
-        routing = "balance unknown (credits API unreachable)"
+        routing = "floor check skipped until the balance can be read"
     elif remaining <= 0:
         routing = "openrouter skipped (depleted), zai-direct carrying traffic"
     else:
@@ -502,7 +567,7 @@ def _status_alert_result(description: str, remaining: float | None) -> str:
 
 
 # Total ceiling for one heartbeat task's work. OpenClaw's client times out the
-# heartbeat request (see LLM_CALL_DEADLINE above), so stay well under it.
+# heartbeat request (see llm_proxy.LLM_CALL_DEADLINE), so stay well under it.
 HEARTBEAT_WORK_DEADLINE_DEFAULT = 90.0
 
 
@@ -514,6 +579,38 @@ def _heartbeat_work_deadline() -> float:
     except ValueError:
         return HEARTBEAT_WORK_DEADLINE_DEFAULT
     return value if value > 0 else HEARTBEAT_WORK_DEADLINE_DEFAULT
+
+
+# Heartbeats a task may be re-queued for an LLM outage before it fails
+# (6 x 10 min = an hour); bounds starvation of the tasks queued behind it.
+LLM_RETRY_LIMIT = 6
+_llm_retry_counts: dict[str, int] = {}
+
+# A task claimed longer ago than this has lost its worker (env
+# HEARTBEAT_ACTIVE_REAP_HOURS). Tome research runs take minutes, not hours.
+ACTIVE_REAP_HOURS_DEFAULT = 6.0
+
+
+def _active_reap_hours() -> float:
+    raw = os.environ.get("HEARTBEAT_ACTIVE_REAP_HOURS", "")
+    try:
+        value = float(raw)
+    except ValueError:
+        return ACTIVE_REAP_HOURS_DEFAULT
+    return value if value > 0 else ACTIVE_REAP_HOURS_DEFAULT
+
+
+def _reap_stale_active(brain_db) -> None:
+    """Fail tasks stuck in `active` and report each in the digest."""
+    hours = _active_reap_hours()
+    for t in brain_db.fail_stale_active(hours):
+        label = _operator_label() if t.get("source") == "user" else "SYSTEM"
+        llm_proxy.logger.warning("reaped task #%s: active over %gh", t["id"], hours)
+        digest._digest_record(
+            f"[{label}] #{t['id']}: {t['description']}\n"
+            f"Failed: still active after {hours:g}h; its worker never "
+            "finished. Re-create the task to retry."
+        )
 
 
 async def _run_heartbeat_task(task: dict, brain_db, remaining: float | None) -> str:
@@ -539,9 +636,10 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
     """Run heartbeat checks in Python instead of relying on the LLM.
 
     Three layers of initiative:
-    1. Infrastructure monitoring — tripped tiers, low balance (every cycle)
-    2. Task queue awareness — stale task nudges (every 30 min)
-    3. LLM-powered thinking — self-directed task suggestions (every 1 hr)
+    1. Infrastructure monitoring: tripped tiers, low or unreadable balance,
+       tasks stuck active (every cycle)
+    2. Task queue awareness: stale task nudges (every 30 min)
+    3. LLM-powered thinking: self-directed task suggestions (every 15 min)
 
     Everything worth reporting buffers into the hourly digest instead of
     messaging per event. At most once per HEARTBEAT_DIGEST_INTERVAL the
@@ -564,7 +662,9 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
     ]
 
     remaining = await llm_proxy._check_openrouter_balance()
+    unknown_for = _balance_unknown_for(remaining)
 
+    _reap_stale_active(brain_db)
     all_tasks = brain_db.list_tasks()
 
     # ── 2. Check for pending tasks ──────────────────────────────
@@ -591,6 +691,7 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
 
     if task:
         deadline = _heartbeat_work_deadline()
+        llm_down = False
         try:
             result = await asyncio.wait_for(
                 _run_heartbeat_task(task, brain_db, remaining), timeout=deadline
@@ -599,13 +700,42 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
         except TimeoutError:
             result = ""
             failure = f"timed out after {deadline:g}s"
+        except LLMUnavailable:
+            result = ""
+            failure = None
+            llm_down = True
         except Exception as exc:
             llm_proxy.logger.exception("heartbeat task #%s failed", task["id"])
             result = ""
             failure = f"{type(exc).__name__}: {str(exc)[:200]}"
 
+        attempts = _llm_retry_counts.pop(task["id"], 0) + (1 if llm_down else 0)
+        if llm_down and attempts >= LLM_RETRY_LIMIT:
+            llm_down = False
+            failure = (
+                f"could not reach the LLM in {attempts} attempts; "
+                f"{_sentence_start(tenant_profile.operator_name())} "
+                "should handle it manually"
+            )
+
         try:
-            if failure is not None:
+            if llm_down:
+                # An outage is not a result: put the task back for the next
+                # cycle. One digest line per task per outage, not per cycle.
+                brain_db.release_task(task["id"])
+                _llm_retry_counts[task["id"]] = attempts
+                llm_proxy.logger.warning(
+                    "heartbeat task #%s re-queued: LLM unreachable (attempt %d/%d)",
+                    task["id"],
+                    attempts,
+                    LLM_RETRY_LIMIT,
+                )
+                if attempts == 1:
+                    digest._digest_record(
+                        f"[{label}] #{task['id']}: {task['description']}\n"
+                        "LLM unreachable; re-queued, retrying each heartbeat."
+                    )
+            elif failure is not None:
                 llm_proxy.logger.warning(
                     "heartbeat task #%s failed: %s", task["id"], failure
                 )
@@ -645,8 +775,9 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
         for name in tripped:
             desc = f"Investigate tier recovery: {name}"
             # 24h dedup regardless of status — pending-only dedup had the
-            # same recreate-after-complete loop as the balance alert.
-            if not _has_recent_task(all_tasks, desc, hours=24):
+            # same recreate-after-complete loop as the balance alert. Exact
+            # match: each tier gets its own alert.
+            if not _has_recent_prefix(all_tasks, desc, exact=True):
                 t = brain_db.create_task(desc, priority=2)
                 tasks_created.append(t)
 
@@ -655,7 +786,19 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
             # Any alert in the last 24h counts, completed or not. The old
             # pending-only dedup re-created the alert every cycle once the
             # previous one completed, spamming Telegram with duplicates.
-            if not _has_recent_task(all_tasks, "Low balance alert", hours=24):
+            if not _has_recent_prefix(all_tasks, "Low balance alert:"):
+                t = brain_db.create_task(desc, priority=1)
+                tasks_created.append(t)
+
+        if unknown_for >= BALANCE_UNKNOWN_ALERT_SECS:
+            # A balance that cannot be read is not a healthy balance: say
+            # so once a day instead of silently skipping the floor check.
+            lookup_error = llm_proxy._balance_status.get("error")
+            if not _has_recent_prefix(all_tasks, _BALANCE_UNKNOWN_PREFIX):
+                desc = (
+                    f"{_BALANCE_UNKNOWN_PREFIX} OpenRouter credits lookup "
+                    f"failing ({lookup_error})"
+                )
                 t = brain_db.create_task(desc, priority=1)
                 tasks_created.append(t)
 
@@ -668,9 +811,13 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
                 for t in all_tasks
                 if t["status"] == "pending"
                 and datetime.fromisoformat(t["created_at"]) < stale_cutoff
+                and not t["description"].startswith(STALE_NUDGE_PREFIX)
             ]
-            if stale and not _has_recent_task(all_tasks, "stale tasks pending"):
-                desc = f"{len(stale)} task(s) pending > 4 hours — review queue"
+            if stale and not _has_recent_prefix(all_tasks, STALE_NUDGE_PREFIX):
+                desc = (
+                    f"{STALE_NUDGE_PREFIX} {len(stale)} task(s) pending over "
+                    "4 hours; review the queue"
+                )
                 t = brain_db.create_task(desc, priority=2)
                 tasks_created.append(t)
 
@@ -742,6 +889,9 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
     else:
         text = ""
     resp = llm_proxy._synthetic_response(text)
+    # Reached only when the cycle ran to the end; the watchdog alerts when
+    # heartbeats keep arriving without this stamp moving.
+    digest.record_heartbeat_done()
 
     if is_stream:
         return llm_proxy._wrap_json_as_sse(resp)

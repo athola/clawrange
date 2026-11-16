@@ -2,20 +2,22 @@
 
 The heartbeat runs every 10 minutes but Telegram should hear from it at
 most hourly. This module owns the persisted buffer, the due check and the
-message planning. The heartbeat handler in `llm_proxy` records into it.
+message planning, plus the heartbeat stamps the watchdog reads. The
+handler in `heartbeat.py` records into it.
 """
 
 import json
 import os
+import re
 import time
 
 import telegram
 
 # ─── Heartbeat Digest ──────────────────────────────────────────────
-# The heartbeat runs every 10 minutes, but Telegram should hear from it
-# at most hourly. Completed work buffers here and is delivered as the
-# heartbeat response (which OpenClaw relays to Telegram) once the hour
-# elapses — every other cycle stays silent.
+# Completed work buffers here. Once the hour elapses the heartbeat sends
+# each item straight to Telegram (one message per item) and returns a
+# short summary as its response, which OpenClaw relays; every other cycle
+# stays silent.
 
 HEARTBEAT_DIGEST_INTERVAL = float(
     os.getenv("HEARTBEAT_DIGEST_INTERVAL", "3600")
@@ -33,6 +35,10 @@ HEARTBEAT_DIGEST_MAX_MESSAGES = int(
 DIGEST_RESULT_LIMIT = int(
     os.getenv("HEARTBEAT_DIGEST_RESULT_LIMIT", "3500")
 )  # chars of a task result buffered per digest item (room for one message)
+
+HEARTBEAT_DIGEST_MAX_LINES = int(
+    os.getenv("HEARTBEAT_DIGEST_MAX_LINES", "200")
+)  # buffered items kept while sends keep failing; oldest are dropped first
 
 
 def _digest_state_path() -> str:
@@ -53,14 +59,39 @@ def record_heartbeat_seen(now: float | None = None) -> None:
     dead OpenClaw. Written every heartbeat (~10 min), so a plain file
     is cheap and restart-safe.
     """
+    _write_stamp("ts", now)
+
+
+def record_heartbeat_done(now: float | None = None) -> None:
+    """Stamp the end of a heartbeat that ran to completion.
+
+    The arrival stamp is written before any work, so a handler that raises
+    later would keep it fresh; the watchdog reads this one instead.
+    """
+    _write_stamp("done_ts", now)
+
+
+def _write_stamp(key: str, now: float | None) -> None:
+    """Update one key of the heartbeat stamp file, keeping the other."""
     path = os.getenv("HEARTBEAT_SEEN_PATH", "/data/heartbeat_seen.json")
     try:
-        with open(path, "w") as fh:
-            json.dump({"ts": now if now is not None else time.time()}, fh)
+        try:
+            with open(path) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        data.setdefault("done_ts", None)
+        data[key] = now if now is not None else time.time()
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as fh:
+            json.dump({"ts": data.get("ts"), "done_ts": data["done_ts"]}, fh)
+        os.replace(tmp, path)
     except OSError as exc:
         # The stamp is an observability aid; a heartbeat must never fail
         # because it could not be recorded.
-        print(f"[PROXY] heartbeat-seen stamp failed: {exc}", flush=True)
+        print(f"[PROXY] heartbeat {key} stamp failed: {exc}", flush=True)
 
 
 def _digest_load() -> None:
@@ -80,16 +111,32 @@ def _digest_load() -> None:
         return
     _digest_state["lines"] = []
     _digest_state["last_flush"] = 0.0
+    path = _digest_state_path()
     try:
-        with open(_digest_state_path()) as fh:
+        with open(path) as fh:
             saved = json.load(fh)
-        if isinstance(saved, dict):
-            lines = saved.get("lines")
-            if isinstance(lines, list):
-                _digest_state["lines"] = [str(x) for x in lines]
-            _digest_state["last_flush"] = float(saved.get("last_flush") or 0.0)
-    except (OSError, ValueError, TypeError):
-        pass
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as exc:
+        # The next save would overwrite the undelivered lines: keep the
+        # unreadable file beside it for a human to recover.
+        aside = f"{path}.corrupt"
+        try:
+            os.replace(path, aside)
+            where = f"moved to {aside}"
+        except OSError:
+            where = "could not be moved aside"
+        print(f"[PROXY] digest state corrupt ({exc}); {where}", flush=True)
+        return
+    if not isinstance(saved, dict):
+        return
+    lines = saved.get("lines")
+    if isinstance(lines, list):
+        _digest_state["lines"] = [str(x) for x in lines]
+    try:
+        _digest_state["last_flush"] = float(saved.get("last_flush") or 0.0)
+    except (TypeError, ValueError):
+        pass  # a bad clock only makes the next digest due now
 
 
 def _digest_save() -> None:
@@ -188,8 +235,39 @@ def _digest_commit(
     failed_lines = {owners[i] for i in failed if owners[i] is not None}
     carry = [ln for idx, ln in enumerate(lines[:kept]) if idx in failed_lines]
     carry += lines[kept:]
-    _digest_state["lines"] = carry + _digest_state["lines"][len(lines) :]
+    _digest_state["lines"] = _digest_trim(carry + _digest_state["lines"][len(lines) :])
     _digest_save()
+
+
+_DROPPED_RE = re.compile(r"^(\d+) older digest item\(s\) dropped")
+
+
+def _digest_trim(lines: list[str]) -> list[str]:
+    """Keep the newest HEARTBEAT_DIGEST_MAX_LINES lines.
+
+    With Telegram unset or failing, every flush re-buffers every line, so
+    the buffer (and the state file rewritten each heartbeat) would grow
+    without bound. The oldest items go first, replaced by one marker line
+    that carries the running count. Trimmed only here, after a flush, so a
+    record during an in-flight send cannot shift the taken prefix.
+    """
+    dropped = 0
+    if lines and (m := _DROPPED_RE.match(lines[0])):
+        dropped = int(m.group(1))
+        lines = lines[1:]
+    room = max(HEARTBEAT_DIGEST_MAX_LINES - 1, 1)
+    if len(lines) > room:
+        over = len(lines) - room
+        dropped += over
+        lines = lines[-room:]
+        print(f"[PROXY] digest buffer full: dropped {over} oldest item(s)", flush=True)
+    if not dropped:
+        return lines
+    marker = (
+        f"{dropped} older digest item(s) dropped: Telegram delivery kept "
+        "failing. Full results: GET /task"
+    )
+    return [marker, *lines]
 
 
 def _clip_result(text: str, limit: int = 500) -> str:

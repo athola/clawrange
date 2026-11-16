@@ -298,7 +298,8 @@ class BrainDB:
                 source       TEXT DEFAULT 'system',
                 result       TEXT,
                 created_at   TEXT NOT NULL,
-                completed_at TEXT
+                completed_at TEXT,
+                claimed_at   TEXT
             );
 
             CREATE TABLE IF NOT EXISTS links (
@@ -466,6 +467,12 @@ class BrainDB:
                 decided_at  TEXT
             )
         """)
+
+        # Databases created before claimed_at existed: add it in place. The
+        # stale-active reaper needs the claim time, not the creation time.
+        task_cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+        if "claimed_at" not in task_cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN claimed_at TEXT")
 
         conn.commit()
 
@@ -1168,8 +1175,9 @@ class BrainDB:
         # The status predicate makes the claim atomic: if another consumer
         # claimed it between the read above and this write, nothing changes.
         cur = self._conn.execute(
-            "UPDATE tasks SET status = 'active' WHERE id = ? AND status = 'pending'",
-            (task_id,),
+            "UPDATE tasks SET status = 'active', claimed_at = ? "
+            "WHERE id = ? AND status = 'pending'",
+            (_now(), task_id),
         )
         self._conn.commit()
         if cur.rowcount != 1:
@@ -1201,6 +1209,48 @@ class BrainDB:
         updated = self.get_task(task_id)
         assert updated is not None, "task not found after write"
         return updated
+
+    def release_task(self, task_id: str) -> dict[str, Any]:
+        """Return a claimed task to the queue (active back to pending)."""
+        cur = self._conn.execute(
+            "UPDATE tasks SET status = ?, claimed_at = NULL "
+            "WHERE id = ? AND status = ?",
+            (TaskStatus.PENDING, task_id, TaskStatus.ACTIVE),
+        )
+        self._conn.commit()
+        task = self.get_task(task_id)
+        if not task:
+            raise ValueError("Task not found")
+        if cur.rowcount != 1:
+            raise ValueError(f"Task is {task['status']}, not active")
+        return task
+
+    def fail_stale_active(self, hours: float) -> list[dict[str, Any]]:
+        """Fail tasks claimed more than `hours` ago that no worker finished.
+
+        A worker that dies between claim and complete (the tome bridge on a
+        connection error) leaves its task active forever. Rows claimed before
+        claimed_at existed fall back to their creation time.
+        """
+        cutoff = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
+        rows = self._conn.execute(
+            "SELECT id FROM tasks WHERE status = ? "
+            "AND COALESCE(claimed_at, created_at) < ?",
+            (TaskStatus.ACTIVE, cutoff),
+        ).fetchall()
+        note = f"Failed: still active after {hours:g}h; no worker completed it."
+        now = _now()
+        reaped = []
+        for row in rows:
+            cur = self._conn.execute(
+                "UPDATE tasks SET status = ?, result = ?, completed_at = ? "
+                "WHERE id = ? AND status = ?",
+                (TaskStatus.FAILED, note, now, row["id"], TaskStatus.ACTIVE),
+            )
+            if cur.rowcount == 1:
+                reaped.append(row["id"])
+        self._conn.commit()
+        return [t for t in (self.get_task(i) for i in reaped) if t]
 
     def update_priority(self, task_id: str, priority: int) -> dict[str, Any]:
         task = self.get_task(task_id)

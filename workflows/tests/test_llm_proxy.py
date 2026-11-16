@@ -2988,11 +2988,15 @@ class TestHeartbeatInterceptor:
         )
         brain_db._conn.commit()
 
-        r = client.post(
-            "/v1/chat/completions",
-            json=self._heartbeat_body(),
-            headers=AUTH_HEADER,
-        )
+        # The LLM must answer: an unreachable LLM re-queues the task (G5).
+        with patch.object(
+            llm_proxy, "_llm_call", AsyncMock(return_value="Reviewed it.")
+        ):
+            r = client.post(
+                "/v1/chat/completions",
+                json=self._heartbeat_body(),
+                headers=AUTH_HEADER,
+            )
         content = r.json()["choices"][0]["message"]["content"]
         # The stale task is processed and buffered into the digest; the
         # heartbeat response itself stays silent.
@@ -3541,12 +3545,12 @@ class TestLlmWorkTaskRouting:
 
     @patch.dict("os.environ", FAKE_ENV)
     @pytest.mark.usefixtures("marketing_persona")
-    def test_empty_llm_response_returns_manual_fallback(self):
+    def test_empty_llm_response_raises_llm_unavailable(self):
         """
         GIVEN _llm_call returns an empty string (all tiers down)
         WHEN _llm_work_task runs
-        THEN it returns a manual-handoff string mentioning the description,
-             so heartbeat/Telegram surfaces the failure to Alex.
+        THEN it raises LLMUnavailable, so the heartbeat re-queues the task
+             instead of storing an apology as its completed result.
         """
         import asyncio
 
@@ -3562,11 +3566,8 @@ class TestLlmWorkTaskRouting:
             patch.object(llm_proxy, "_llm_call", side_effect=fake_call),
             patch.object(heartbeat, "_build_work_prompt", side_effect=fake_prompt),
         ):
-            result = asyncio.run(heartbeat._llm_work_task("Send weekly invoice"))
-
-        assert "Could not reach LLM" in result
-        assert "Alex should handle manually" in result
-        assert "Send weekly invoice" in result
+            with pytest.raises(heartbeat.LLMUnavailable):
+                asyncio.run(heartbeat._llm_work_task("Send weekly invoice"))
 
 
 class TestBuildWorkPromptFormatting:
@@ -4489,20 +4490,25 @@ class TestGenericOperatorWording:
         yield
         tenant_profile._ACTIVE.clear()
 
-    def test_fallback_names_the_operator_generically(self):
-        async def fake_call(prompt, max_tokens, web_search=False):
-            return ""
+    def test_fallback_names_the_operator_generically(self, monkeypatch):
+        """The give-up note after the LLM retry limit names the operator."""
+        from app import brain_db
 
-        async def fake_prompt(desc, web_search=False):
-            return "PROMPT"
-
+        task = brain_db.create_task("Send weekly invoice")
+        monkeypatch.setattr(
+            heartbeat, "_llm_retry_counts", {task["id"]: heartbeat.LLM_RETRY_LIMIT - 1}
+        )
+        monkeypatch.setattr(
+            llm_proxy, "_check_openrouter_balance", AsyncMock(return_value=50.0)
+        )
         with (
-            patch.object(llm_proxy, "_llm_call", side_effect=fake_call),
-            patch.object(heartbeat, "_build_work_prompt", side_effect=fake_prompt),
+            patch.object(llm_proxy, "_llm_call", AsyncMock(return_value="")),
+            patch.object(heartbeat, "_build_work_prompt", AsyncMock(return_value="P")),
         ):
-            result = asyncio.run(heartbeat._llm_work_task("Send weekly invoice"))
+            asyncio.run(heartbeat._handle_heartbeat(False))
+        result = brain_db.get_task(task["id"])["result"]
         # The starter profile's placeholder owner.name is "Operator".
-        assert "Operator should handle manually" in result
+        assert "Operator should handle it manually" in result
         assert "Alex" not in result
 
     def test_no_persona_hygiene_without_config(self):
