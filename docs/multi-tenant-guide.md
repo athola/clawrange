@@ -7,7 +7,7 @@ it pulls data from, and what CRM it writes to) lives in a single declarative
 machinery (connectors, CRM adapters, query execution) lives in code and is
 shared by every profile.
 
-Three profiles ship in the box, all identity-free:
+Four profiles ship in the box, all free of any real operator's identity:
 
 - **`starter`**: the default (`CLAWRANGE_PROFILE` unset → `starter`). A
   generic, identity-free baseline so a fresh clone runs without carrying
@@ -19,6 +19,9 @@ Three profiles ship in the box, all identity-free:
 - **`lead-crm`**: a worked business example: an assistant that hourly syncs
   leads from a web portal into a local CRM and answers relational and
   time-series questions about them on a schedule or via a Telegram prompt.
+- **`chief-of-staff`**: the end-to-end example of the persona, identity
+  and meta-learning loop (an assistant named Max, with an ops agent and a
+  `learned.yaml` overlay). See section 10.
 
 To stand up your own assistant, copy one of these, rename it, and edit YAML.
 Operator-private profiles named `local-*` are gitignored, so your real
@@ -27,8 +30,14 @@ identity never gets committed.
 ```bash
 cp -r config/profiles/lead-crm config/profiles/acme
 $EDITOR config/profiles/acme/profile.yaml      # set profile: acme
-make profile PROFILE=acme                        # render soul.md and set .env
+make profile PROFILE=acme                        # render the persona, set .env
 ```
+
+`make profile` renders the same files as `make persona` (soul.md, and
+identity.md when the profile has an `identity` block, with any approved
+learnings) and also sets `CLAWRANGE_PROFILE` in `.env`. Profile
+validation is strict, so load a profile once before you deploy it:
+`CLAWRANGE_PROFILE=acme uv run python -c 'import sys; sys.path.insert(0, "workflows"); import tenant_profile as t; t.load_profile()'`.
 
 ## 1. The profile at a glance
 
@@ -77,7 +86,8 @@ Two ways to define the persona:
   it is used as-is (the `marketing` profile does this to preserve John-117
   byte-for-byte).
 
-Render it to `openclaw/soul.md` (which OpenClaw reads at runtime) with:
+Render it to `openclaw/soul.md` (which OpenClaw reads at runtime), plus
+`identity.md` when the profile has an identity block, with:
 
 ```bash
 make profile PROFILE=acme
@@ -158,6 +168,11 @@ crm:
   query_templates: [...]   # see below
 ```
 
+Inside the workflows container the CRM is always `/data/crm.db` (host
+`data/brain/crm.db`): `docker-compose.yml` sets `CRM_DB_PATH` there.
+Setting `CRM_DB_PATH` yourself only affects host-side tools such as
+`make seed-demo`.
+
 ### Swapping the backend
 
 The pipeline and query layers only ever talk to the `CRMAdapter` interface,
@@ -168,6 +183,11 @@ so switching backends is a one-line profile change:
 - **`rest`**: a documented seam stub. `upsert`/`list` map to the profile's
   `objects` endpoints over HTTP. `run_template` raises a clear error because
   SaaS CRMs don't run ad-hoc SQL (define a server-side report and map it in).
+  `upsert` needs a `list` endpoint for the object: it looks each record up
+  with `?<upsert_key>=<value>` (matched again client-side, case-insensitive)
+  and creates only the new ones. Add an `update` endpoint such as
+  `"PATCH /leads/{id}"` to update existing records; without it they are
+  skipped, so a re-sync never duplicates remote leads.
 
 To plug in a brand-new CRM, implement `CRMAdapter` in
 `workflows/crm/<your>_adapter.py` and register it in `crm/adapter.py`'s
@@ -206,13 +226,16 @@ schedules:
     name: "Hourly lead sync"
     kind: pipeline
     cron: "0 * * * *"
-    kwargs: {connector: portal-leads, schedule_id: lead-sync}
+    kwargs: {connector: portal-leads}
   - id: crm-digest
     name: "Morning CRM digest"
     kind: crm_digest
     cron: "0 8 * * *"
-    kwargs: {queries: [new_leads_count, leads_by_status], schedule_id: crm-digest}
+    kwargs: {queries: [new_leads_count, leads_by_status]}
 ```
+
+The scheduler passes each generator its own row id as `schedule_id`, so
+kwargs never need to repeat it (a value given there is overridden).
 
 Profiles are validated at load time: an unknown source/sink/adapter kind, a
 schedule whose `kind` is not a registered generator, or a schedule
@@ -229,7 +252,11 @@ referencing an undefined connector all raise a `ProfileError` immediately.
 | `POST /crm/sync/{connector_id}` | run a connector now |
 | `GET  /healthz/crm` | adapter health and configured connectors |
 
-A marketing-only deployment exposes none of these.
+All but `GET /healthz/crm` need `Authorization: Bearer $PROXY_AUTH_TOKEN`.
+`/healthz/crm` is public, so it reports only `status`, `adapter` and
+`leads` from the adapter (never the DB path, REST base URL or raw error
+text), plus connector and template names. It returns 503 when the adapter
+reports an error. A marketing-only deployment exposes none of these.
 
 ## 7. Try it offline (no real portal)
 
@@ -240,8 +267,11 @@ make seed-demo                     # load config/profiles/lead-crm/demo_leads.cs
 
 `make seed-demo` runs the demo CSV through the real `leads_clean` transform
 and upserts it into the CRM, so `/crm/query` and the `crm_digest` schedule
-work end-to-end without any external service. Point `CRM_DB_PATH` at a host
-path to keep the demo database outside the container.
+work end-to-end without any external service. `make seed-demo` runs on the
+host and writes to `CRM_DB_PATH` from the shell environment (it does not
+read `.env`; default `data/crm/crm.db`). The container reads
+`data/brain/crm.db`, so run `CRM_DB_PATH=data/brain/crm.db make seed-demo`
+to seed the database the running stack uses.
 
 ## 8. Outreach and deal policy
 
@@ -371,6 +401,9 @@ as outward-facing actions.
   cannot approve another's drafts.
 - **Inspect:** `GET /persona/proposals?status=pending`,
   `GET /persona/identity`, `GET /persona/soul`, and `GET /healthz/persona`.
+  The health route is public and reports the profile, the pending count,
+  the target names and `writable`: per target group, whether a render
+  could replace every file it writes right now (no paths are shown).
 
 ### Persisting an evolved persona for git
 
