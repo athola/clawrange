@@ -10,6 +10,7 @@ connection) and fail at startup.
 import inspect
 import json
 import logging
+import os
 import re
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
@@ -244,9 +245,15 @@ def init_scheduler(brain_db) -> AsyncIOScheduler | None:
         _startup_error("timezone", f"unknown timezone {tz_name!r}, using UTC")
         tz_name = "UTC"
     _STATE["timezone"] = tz_name
-    watch_tz = watchdog._tz_name()
-    if not _valid_tz(watch_tz):
-        _startup_error("watchdog", f"unknown HEARTBEAT_WATCH_TZ {watch_tz!r}")
+    # watchdog._tz_name() already falls back to a valid zone, so check the raw
+    # override: the watchdog keeps running, but /healthz still shows the typo.
+    watch_override = os.getenv("HEARTBEAT_WATCH_TZ", "").strip()
+    if watch_override and not _valid_tz(watch_override):
+        _startup_error(
+            "watchdog",
+            f"unknown HEARTBEAT_WATCH_TZ {watch_override!r}, "
+            f"using {watchdog._tz_name()}",
+        )
 
     try:
         scheduler = AsyncIOScheduler(
