@@ -189,20 +189,21 @@ async def check(
     minutes = (
         None if seen is None else int((now_ts - _silent_since(seen, now_dt)) // 60)
     )
+    hint = "check the OpenClaw container (docker logs msp-openclaw)"
     if seen is None and arrived is None:
         detail = "no heartbeat has ever been recorded"
     elif arrived is not None and (seen is None or float(arrived) > float(seen)):
         since = f" for {minutes}m" if minutes is not None else ""
         detail = (
             f"heartbeats arrive but have not completed{since} during active "
-            "hours (the workflows heartbeat handler is failing; check its logs)"
+            "hours (the workflows heartbeat handler is failing)"
         )
+        hint = "check the workflows container (docker logs msp-workflows)"
     else:
         detail = f"no heartbeat for {minutes}m during active hours"
 
     ok = await notify(
-        f"Heartbeat watchdog: {detail}. Telegram digests are stalled — "
-        "check the OpenClaw container (docker logs msp-openclaw)."
+        f"Heartbeat watchdog: {detail}. Telegram digests are stalled — {hint}."
     )
     if ok:
         _write_json(_state_path(), {"alerting": True, "last_alert_ts": now_ts})

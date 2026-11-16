@@ -857,6 +857,7 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
             remaining,
             tripped,
             waiting=llm_proxy._waiting_on_you_lines(all_tasks),
+            balance=llm_proxy.describe_balance(),
         )
         # Items go straight to Telegram — one message each — before the
         # response returns, so they land ahead of the relayed summary.

@@ -397,7 +397,7 @@ def wd(monkeypatch, tmp_path):
     monkeypatch.delenv("HEARTBEAT_WATCH_TZ", raising=False)
     monkeypatch.setenv("HEARTBEAT_WATCH_STATE", str(tmp_path / "watchdog.json"))
     monkeypatch.setenv("HEARTBEAT_SEEN_PATH", str(tmp_path / "seen.json"))
-    monkeypatch.setattr(watchdog, "_failed_passes", 0)
+    monkeypatch.setattr(watchdog, "_failed_passes", 0, raising=False)
     return tmp_path
 
 
@@ -454,7 +454,9 @@ class TestWatchdogCompletionStamp:
         _seen(wd, ts=now.timestamp() - 60, done_ts=now.timestamp() - 3600)
         notify = AsyncMock(return_value=True)
         assert _check(now, notify) == "alerted"
-        assert "not completed" in notify.await_args.args[0]
+        text = notify.await_args.args[0]
+        assert "not completed" in text
+        assert "msp-workflows" in text and "msp-openclaw" not in text
 
     def test_legacy_stamp_without_done_ts_uses_arrival(self, wd):
         now = _chicago(12)
@@ -587,3 +589,17 @@ class TestDigestState:
         assert len(lines) == 5
         assert "6 older digest item(s) dropped" in lines[0]
         assert lines[-1] == "item 9"
+
+    def test_footer_shows_unknown_balance(self, fresh_digest):
+        digest._digest_record("item")
+        _m, text, _o, _t = digest._digest_take_ex(
+            time.time(), None, [], balance="unknown (lookup failed: HTTP 503)"
+        )
+        assert "OpenRouter balance: unknown (lookup failed: HTTP 503)" in text
+
+    def test_footer_omits_unconfigured_balance(self, fresh_digest):
+        digest._digest_record("item")
+        _m, text, _o, _t = digest._digest_take_ex(
+            time.time(), None, [], balance="not configured"
+        )
+        assert "OpenRouter balance" not in text

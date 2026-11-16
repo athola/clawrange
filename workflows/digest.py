@@ -178,6 +178,7 @@ def _digest_take_ex(
     remaining: float | None,
     tripped: list[str],
     waiting: list[str] | None = None,
+    balance: str | None = None,
 ) -> tuple[list[str], str, list[int | None], list[str]]:
     """Plan a digest flush WITHOUT clearing the buffer.
 
@@ -191,6 +192,10 @@ def _digest_take_ex(
     relays, keeping an independent channel for the actionable footer
     (open questions, tripped tiers, balance).
 
+    ``balance`` is the rendered balance line (llm_proxy.describe_balance);
+    without it the footer falls back to ``remaining`` and omits an unknown
+    balance.
+
     A due interval with an empty buffer stays silent, unless unanswered
     questions are waiting on the operator: that silence is
     indistinguishable from a dead assistant, so the questions surface.
@@ -203,7 +208,10 @@ def _digest_take_ex(
     footer = list(waiting)
     if tripped:
         footer.append(f"Tiers: {', '.join(tripped)} TRIPPED")
-    if remaining is not None:
+    if balance is not None:
+        if balance != "not configured":
+            footer.append(f"OpenRouter balance: {balance}")
+    elif remaining is not None:
         footer.append(f"OpenRouter balance: ${remaining:.2f}")
     if not lines:
         if not footer:
