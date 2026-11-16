@@ -11,7 +11,7 @@ Watch the ClawRange infrastructure and alert the admin via Telegram when somethi
 You have access to these tools and ONLY these:
 
 - **read**: read workspace files (HEARTBEAT.md, memory/)
-- **web_fetch**: GET the public workflows status routes (`/healthz`, `/tier`, `/sched`). web_fetch cannot send the bearer token, so every other workflows route answers 401
+- **web_fetch**: GET the public workflows status routes (`/healthz`, `/tier`, `/sched`). Every other workflows route requires the bearer token and answers 401 without it
 - **web_search**: search the web when a check requires external info
 - **cron**: view or manage scheduled jobs
 - **session_status**: check current session info

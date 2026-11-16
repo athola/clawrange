@@ -109,6 +109,12 @@ class TestSearchAllowed:
         with _balance(FLOOR + 40):
             assert asyncio.run(llm_proxy.search_allowed()) is True
 
+    def test_missing_key_is_not_a_floor_denial(self, monkeypatch):
+        # No key: the search fails as an outage, not as the floor.
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        with _balance(None):
+            assert asyncio.run(llm_proxy.search_allowed()) is True
+
 
 WEB_TASK = "Scan reddit for MSP pain points"
 
@@ -134,6 +140,8 @@ class TestSearchDeniedFallback:
         assert result.endswith("Offline answer.")
         assert "no live web data" in result.lower()
         assert "balance floor" in result.lower()
+        # The note must not make a finished result read as blocked.
+        assert not heartbeat._needs_input(result)
         assert call.await_count == 2
         assert call.await_args_list[0].kwargs["web_search"] is True
         assert call.await_args_list[1].kwargs.get("web_search", False) is False

@@ -40,11 +40,11 @@ Decisions, the alternatives weighed, and what was given up. Newest first.
   that the service keeps root inside its container.
 - **Options weighed**:
   - `user: "1000:1000"` on the workflows service (#16.c). Rejected for now:
-    the service has always run as root (no `user:` in either compose file,
-    no `USER` in `workflows/Dockerfile`), so the files it already wrote under
-    the `./data/brain` and `OPENCLAW_STATE_DIR` bind mounts are root-owned.
-    Switching would need a one-time ownership migration of those host
-    directories first, or the brain database stops being writable.
+    the service runs as root (no `user:` on the workflows service in either
+    compose file, no `USER` in `workflows/Dockerfile`), so what it creates
+    under the `./data/brain` bind mount, the brain database included, is
+    root-owned. Switching would need a one-time ownership migration of that
+    host directory first, or the database stops being writable.
   - Chmod every render to a fixed 0644. Rejected: it would loosen a file the
     operator tightened on purpose.
 - **Negative consequences**: a compromise of the workflows process is root in
