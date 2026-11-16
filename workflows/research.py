@@ -3,16 +3,20 @@
 Ports a focused subset of `tome`'s synthesis logic into the
 workflows service so the assistant can call a single endpoint and get
 ranked, deduplicated, citation-bearing findings across Reddit,
-GitHub, and GLM web search. The shape of `Finding`, the dedup
-rules, the authority bonuses, and the triangulation bonus all
-mirror the tome plugin so future cross-pollination is cheap.
+GitHub, web search, academic indexes and TRIZ analogies. The shape of
+`Finding`, the dedup rules, the authority bonuses, and the
+triangulation bonus all mirror the tome plugin so future
+cross-pollination is cheap.
 
-Channels:
-- code: GitHub repos and issues
-- discourse: Reddit, HN, blogs (via GLM web search)
-- academic: stub for future arXiv/Semantic Scholar work
+Channels (the default request runs the first three):
+- discourse: Reddit subreddits
+- code: GitHub repos
+- discourse_web (alias 'web'): web search via the proxy's OpenRouter
+  `:online` tier
+- academic: arXiv and Semantic Scholar
+- triz: cross-domain analogies via the same web-search tier
 
-The orchestrator runs all eligible channel fetchers in parallel,
+The orchestrator runs the requested channel fetchers in parallel,
 compresses each channel into Finding lists, merges, ranks, and
 returns a single ordered list with confidence flags.
 """
@@ -258,22 +262,24 @@ def channel_health() -> dict[str, dict[str, Any]]:
     if not github_configured:
         report["code"]["reason"] = "GITHUB_PAT not set"
 
-    # discourse_web / GLM via proxy
-    web_configured = bool(os.getenv("ZAI_API_KEY") or os.getenv("OPENROUTER_API_KEY"))
+    # discourse_web: the proxy's search tier (OpenRouter `:online`). Z.AI's
+    # web search is not used, so ZAI_API_KEY alone does not enable it.
+    web_configured = bool(os.getenv("OPENROUTER_API_KEY"))
+    web_reason = "OPENROUTER_API_KEY not set (web search uses OpenRouter :online)"
     report["discourse_web"] = {
-        "source": "glm-web",
+        "source": "openrouter-online",
         "configured": web_configured,
     }
     if not web_configured:
-        report["discourse_web"]["reason"] = "ZAI_API_KEY or OPENROUTER_API_KEY not set"
+        report["discourse_web"]["reason"] = web_reason
 
     # academic: public arXiv + Semantic Scholar APIs, no key needed.
     report["academic"] = {"source": "arxiv+semantic_scholar", "configured": True}
 
-    # triz: an LLM call through the proxy, so the same key as discourse_web.
-    report["triz"] = {"source": "glm-web", "configured": web_configured}
+    # triz: a web-search call through the proxy, so the same key.
+    report["triz"] = {"source": "openrouter-online", "configured": web_configured}
     if not web_configured:
-        report["triz"]["reason"] = "ZAI_API_KEY or OPENROUTER_API_KEY not set"
+        report["triz"]["reason"] = web_reason
 
     return report
 
@@ -450,11 +456,11 @@ async def _fetch_academic(topic: str, **kwargs: Any) -> list[Finding]:
 async def _fetch_triz(topic: str, **kwargs: Any) -> list[Finding]:
     """Cross-domain analogical reasoning channel.
 
-    Asks the GLM proxy to find solutions in adjacent fields
-    (queueing theory, biology, economics, control systems, etc.)
-    that map onto the topic's contradiction. Returns up to one
-    synthesized finding; the prompt steers GLM toward concrete
-    analogies with a domain-bridge mapping.
+    Asks the proxy's web-search tier (OpenRouter `:online`) to find
+    solutions in adjacent fields (queueing theory, biology, economics,
+    control systems, etc.) that map onto the topic's contradiction.
+    Returns one synthesized finding; the prompt steers the model toward
+    concrete analogies with a domain-bridge mapping.
     """
 
     prompt = (
@@ -482,11 +488,12 @@ async def _fetch_triz(topic: str, **kwargs: Any) -> list[Finding]:
 
 
 async def _fetch_web(topic: str, **kwargs: Any) -> list[Finding]:
-    """Use the GLM web-search proxy for general discourse coverage.
+    """Use the proxy's web-search tier (OpenRouter `:online`) for general
+    discourse coverage.
 
-    Returns at most one synthesized Finding per call — GLM responses
-    are already a synthesis. The caller should treat this as a
-    summary, not a list of pages.
+    Returns one synthesized Finding per call; the reply is already a
+    synthesis. The caller should treat this as a summary, not a list
+    of pages.
     """
 
     prompt = (
@@ -539,11 +546,13 @@ async def orchestrate_research(
 ) -> dict[str, Any]:
     """Run a multi-source research session and return ranked findings.
 
-    Channels (default: all):
+    Channels (default: discourse, code, discourse_web):
     - 'discourse'      -> Reddit subreddits via `_fetch_reddit`
     - 'code'           -> GitHub repos via `_fetch_github`
-    - 'discourse_web'  -> GLM web search summary via `_fetch_web`
-      (also accepted as the shorthand 'web')
+    - 'discourse_web'  -> web search summary (OpenRouter `:online`) via
+      `_fetch_web` (also accepted as the shorthand 'web')
+    - 'academic'       -> arXiv and Semantic Scholar via `_fetch_academic`
+    - 'triz'           -> cross-domain analogies via `_fetch_triz`
 
     Returns:
         {

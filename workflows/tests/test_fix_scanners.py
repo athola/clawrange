@@ -263,6 +263,26 @@ class TestPersonaReflect:
         assert brain_db.list_learnings(profile="cos") == []
 
 
+class TestResearchHealthWebChannels:
+    """#42: web search runs on OpenRouter :online, so only its key counts."""
+
+    @pytest.mark.parametrize("channel", ["discourse_web", "triz"])
+    def test_zai_key_alone_is_not_configured(self, monkeypatch, channel):
+        monkeypatch.setenv("ZAI_API_KEY", "z")
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        info = research.channel_health()[channel]
+        assert info["configured"] is False
+        assert "OPENROUTER_API_KEY" in info["reason"]
+        assert "ZAI" not in info["reason"]
+        assert info["source"] == "openrouter-online"
+
+    @pytest.mark.parametrize("channel", ["discourse_web", "triz"])
+    def test_openrouter_key_configures_web(self, monkeypatch, channel):
+        monkeypatch.delenv("ZAI_API_KEY", raising=False)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+        assert research.channel_health()[channel]["configured"] is True
+
+
 class TestResearchRequestChannels:
     """#46: a typo'd channel is a 422, not a 200 with zero findings."""
 

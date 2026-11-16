@@ -1,7 +1,9 @@
-"""Schedule generators for marketing orchestrator.
+"""Schedule generators run by the scheduler (registry: ``GENERATORS``).
 
-Each generator reads from the projects table and enqueues tasks
-into the existing task queue via brain_db.create_task().
+Some enqueue tasks via brain_db.create_task() (scans, content ideas,
+research pulse, reviews); others build and deliver a report themselves:
+the multi-channel outreach digest (Reddit, Hacker News, GitHub, web),
+the hot pulse, CRM syncs and digests, and the homelab deal rundown.
 """
 
 from __future__ import annotations
@@ -487,9 +489,14 @@ async def morning_digest_generator(
     popular_bonus_cap: int = 2,
     **kwargs,
 ) -> None:
-    """Deliver the 8am Reddit comment-candidate digest to Telegram.
+    """Deliver the daily outreach rundown to Telegram.
 
-    Two-tier picks per project:
+    The report combines Reddit picks (below) with the other channels
+    from `rundown.gather_other_channels` (Hacker News, GitHub issues,
+    web search), an LLM synthesis, per-source health, and the subreddit
+    coverage report.
+
+    Two-tier Reddit picks per project:
     - Strict tier: posts whose title/snippet literally matches the
       project's topics or search_terms. Capped at top_per_project,
       ranked by relevance × log(score+1).
@@ -1141,7 +1148,7 @@ async def hot_pulse_generator(
 # marketing profile reproduces the original hardcoded set exactly
 # (regression-locked by tests/test_profile.py). seed_from_profile is the
 # entry point; the app lifespan passes the active profile
-# (CLAWRANGE_PROFILE, default "marketing").
+# (CLAWRANGE_PROFILE, default "starter", which seeds nothing).
 
 
 def _seed_schedules_from_profile(brain_db, profile) -> list[dict]:
