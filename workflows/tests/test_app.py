@@ -59,7 +59,11 @@ class TestTierStatus:
         return_value=12.50,
     )
     @patch("llm_proxy._last_tier_used", "zai-direct")
-    def test_returns_tier_list(self, _mock_balance):
+    def test_returns_tier_list(self, _mock_balance, monkeypatch):
+        # /tier renders llm_proxy.describe_balance(), which reads the cache
+        # the (mocked) balance check would have filled.
+        monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+        monkeypatch.setitem(llm_proxy._balance_cache, "remaining", 12.50)
         r = client.get("/tier")
         assert r.status_code == 200
         data = r.json()

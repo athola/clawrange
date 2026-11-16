@@ -16,14 +16,16 @@ import github_search
 import llm_proxy
 import reddit_search
 import research
+import scheduler as scheduler_mod
 import tenant_profile
 from brain import create_brain_router
-from brain_db import BrainDB
+from brain_db import BrainDB, TaskStatus
 from crm import get_adapter
 from crm_api import create_crm_router
+from errors import UpstreamError
 from generators import seed_from_profile
 from llm_proxy import router as llm_router
-from persona import write_soul
+from persona import render_all
 from persona_api import create_persona_router
 from scheduler import (
     add_schedule,
@@ -33,6 +35,7 @@ from scheduler import (
     remove_schedule,
     resume_schedule,
     run_schedule_now,
+    status_kind,
     validate_schedule,
 )
 from telegram import notify
@@ -61,7 +64,7 @@ brain_db.init_db()
 _embed_cfg = embeddings.config()
 brain_db.use_vector_table(_embed_cfg.table, _embed_cfg.dim)
 
-# ─── Scheduler Setup ─────────────────────────────────────────────
+# ─── Tenant Profile and Lifespan ─────────────────────────────────
 
 
 def init_profile(
@@ -77,21 +80,34 @@ def init_profile(
     Renders the persona to ``soul.md`` when missing, seeds projects and
     schedules from the profile, and — when the profile defines a CRM — inits
     the adapter on ``app.state.crm`` and mounts the ``/crm`` router. Returns
-    the resolved profile. Degrades gracefully: a profile-load failure logs and
-    leaves the marketing-style baseline (no CRM) untouched. ``http_client`` is
-    injectable so the connector-sync route can be tested offline.
+    the resolved profile. A profile-load failure (e.g. a misspelled
+    ``CLAWRANGE_PROFILE``) does not crash boot: it logs at ERROR, sets
+    ``app.state.profile_error`` (``/healthz`` then reports degraded) and leaves
+    the baseline (no seeds, no CRM) untouched. ``http_client`` is injectable so
+    the connector-sync route can be tested offline.
     """
+    app.state.profile_error = None
     if profile is None:
         try:
             profile = load_profile()
-        except Exception as exc:  # graceful: never crash boot on a bad profile
-            logger.warning("init_profile: could not load profile: %s", exc)
+        except Exception as exc:  # never crash boot on a bad profile
+            name = os.environ.get("CLAWRANGE_PROFILE") or "starter"
+            app.state.profile_error = f"{name}: {exc}"
+            logger.error(
+                "init_profile: profile %r failed to load, running with no "
+                "profile (nothing seeded, no CRM, UTC): %s",
+                name,
+                exc,
+            )
             return None
 
     app.state.profile = profile
+    seed_from_profile(brain_db, profile)
 
     # Render the persona only when no soul.md is present, so hand-edits and
-    # the marketing verbatim soul are never clobbered on restart.
+    # the marketing verbatim soul are never clobbered on restart. Rendered
+    # after seeding so the learned.yaml overlay is in the brain, and written
+    # atomically with the approved learnings like every other render.
     soul = (
         soul_path
         or os.environ.get("SOUL_PATH")
@@ -103,12 +119,11 @@ def init_profile(
     )
     try:
         if not os.path.exists(soul):
-            write_soul(profile, soul)
-            logger.info("init_profile: rendered persona -> %s", soul)
+            approved = brain_db.list_learnings(profile=profile.name, status="approved")
+            if render_all(profile, {"soul": soul}, approved).get("soul"):
+                logger.info("init_profile: rendered persona -> %s", soul)
     except Exception as exc:
         logger.warning("init_profile: persona render skipped: %s", exc)
-
-    seed_from_profile(brain_db, profile)
 
     if profile.crm:
         crm = get_adapter(profile.crm)
@@ -126,6 +141,13 @@ async def lifespan(app: FastAPI):
     init_profile(app, brain_db)
     scheduler = init_scheduler(brain_db)
     app.state.scheduler = scheduler
+    # Scheduled reports and the heartbeat watchdog are how the operator
+    # hears about outages, so a broken start must not be log-only.
+    problems = list(scheduler_mod.scheduler_state()["errors"])
+    if getattr(app.state, "profile_error", None):
+        problems.append(f"profile: {app.state.profile_error}")
+    if problems:
+        await notify("Workflows started degraded:\n- " + "\n- ".join(problems))
     yield
     if scheduler:
         scheduler.shutdown(wait=False)
@@ -137,7 +159,19 @@ app = FastAPI(
     lifespan=lifespan,
     # Bearer auth on every route except the read-only allowlist in auth.py.
     dependencies=[Depends(auth.require_token)],
+    # FastAPI serves its docs routes outside `dependencies`, so they would
+    # expose the route and schema map anonymously. Off.
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
+
+
+def _scheduler():
+    """The running scheduler, or None (lifespan not run or start failed)."""
+    return getattr(app.state, "scheduler", None)
+
+
 app.include_router(llm_router)
 app.include_router(create_brain_router(brain_db), prefix="/brain")
 
@@ -223,7 +257,14 @@ class TaskCreate(BaseModel):
 
 class TaskResult(BaseModel):
     result: str
-    status: str = "completed"
+    status: TaskStatus = TaskStatus.COMPLETED
+
+    @field_validator("status")
+    @classmethod
+    def _closing_status(cls, v: TaskStatus) -> TaskStatus:
+        if v not in TaskStatus.RESULTS:
+            raise ValueError(f"status must be one of {sorted(TaskStatus.RESULTS)}")
+        return v
 
 
 @app.post("/task")
@@ -232,7 +273,7 @@ def create_task(body: TaskCreate):
 
 
 @app.get("/task")
-def list_tasks(status: str | None = None):
+def list_tasks(status: TaskStatus | None = None):
     tasks = brain_db.list_tasks(status)
     return {"tasks": tasks, "total": len(tasks)}
 
@@ -247,7 +288,7 @@ def get_task(task_id: str):
 
 @app.post("/task/{task_id}/claim")
 def claim_task(task_id: str):
-    """Mark a pending task as active — called by max-ops at start of execution."""
+    """Mark a pending task as active: a worker calls this when it starts."""
     try:
         return brain_db.claim_task(task_id)
     except ValueError as e:
@@ -257,11 +298,8 @@ def claim_task(task_id: str):
 
 @app.post("/task/{task_id}/result")
 def complete_task(task_id: str, body: TaskResult):
-    """Store result and mark task complete — called by max-ops via web_fetch."""
-    if body.status not in ("completed", "failed"):
-        raise HTTPException(
-            status_code=400, detail="Status must be completed or failed"
-        )
+    """Store a worker's result and close the task (completed, failed or
+    blocked)."""
     if not brain_db.get_task(task_id):
         raise HTTPException(status_code=404, detail="Task not found")
     try:
@@ -286,19 +324,47 @@ def cancel_task(task_id: str):
 
 @app.get("/healthz")
 def healthz():
+    """Always 200 while the process serves requests: the container
+    entrypoint restarts the service after repeated non-200s, which would
+    not fix a bad profile or a broken table. ``status`` says ``degraded``
+    when the database, scheduler, profile or vector search is broken."""
+    problems: list[str] = []
     try:
-        row = brain_db._conn.execute("SELECT COUNT(*) as cnt FROM pages").fetchone()
-        total_pages = row["cnt"] if row else 0
-    except Exception:
-        total_pages = -1
+        counts = brain_db.health_counts()
+        db_state = "ok"
+    except Exception as exc:
+        logger.error("healthz: brain query failed: %s", exc)
+        counts = {"pages": -1, "vectors": -1}
+        db_state = "error"
+        problems.append("db")
+    vec = brain_db.vec_status()
+    if not vec["enabled"]:
+        problems.append("vector_search")
+    sched = scheduler_mod.scheduler_state()
+    running = _scheduler()
+    if sched["status"] in ("failed", "degraded") or (
+        running is not None and not running.running
+    ):
+        problems.append("scheduler")
+    profile = getattr(app.state, "profile", None)
+    profile_error = getattr(app.state, "profile_error", None)
+    if profile_error:
+        problems.append("profile")
     return {
-        "status": "ok",
+        "status": "degraded" if problems else "ok",
+        "problems": problems,
         "brain": {
-            "db": "ok" if total_pages >= 0 else "error",
-            "pages": total_pages,
-            "embeddings": brain_db.has_embeddings(),
+            "db": db_state,
+            "pages": counts["pages"],
+            "embeddings": counts["vectors"] > 0,
             "embedding_model": _embed_cfg.model,
-            "vectors": brain_db.embedding_count(),
+            "vectors": counts["vectors"],
+            "vector_search": vec,
+        },
+        "scheduler": sched,
+        "profile": {
+            "name": profile.name if profile is not None else None,
+            "error": profile_error,
         },
     }
 
@@ -309,13 +375,11 @@ def healthz():
 @app.get("/tier")
 async def tier_status():
     tiers = llm_proxy.tier_snapshot()
-    remaining = await llm_proxy._check_openrouter_balance()
+    await llm_proxy._check_openrouter_balance()  # refresh the cache
     return {
         "tiers": tiers,
         "last_used": llm_proxy._last_tier_used or "none",
-        "balance_remaining": f"${remaining:.2f}"
-        if remaining is not None
-        else "not configured",
+        "balance_remaining": llm_proxy.describe_balance(),
         "balance_floor": f"${llm_proxy.OPENROUTER_BALANCE_FLOOR:.2f}",
         "paid_auto_fallback": "off",
     }
@@ -327,14 +391,11 @@ async def tier_notify():
     lines = ["*Tier Status*\n"]
     lines += [f"  [{t['status']}] {t['name']}" for t in llm_proxy.tier_snapshot()]
 
-    remaining = await llm_proxy._check_openrouter_balance()
-    if remaining is not None:
-        floor = llm_proxy.OPENROUTER_BALANCE_FLOOR
-        lines.append(f"\nBalance: ${remaining:.2f} (floor: ${floor:.2f})")
-    else:
-        lines.append("\nBalance: not configured")
+    await llm_proxy._check_openrouter_balance()  # refresh the cache
+    floor = llm_proxy.OPENROUTER_BALANCE_FLOOR
+    lines.append(f"\nBalance: {llm_proxy.describe_balance()} (floor: ${floor:.2f})")
     lines.append(f"Last used: {llm_proxy._last_tier_used or 'none'}")
-    lines.append("Paid fallback: off (use 'paid' keyword)")
+    lines.append("Paid fallback: off (send !paid or !claude to enable)")
 
     text = "\n".join(lines)
     sent = await notify(text)
@@ -372,10 +433,8 @@ class ProjectCreate(BaseModel):
 
 @app.get("/projects")
 def list_projects():
-    return {
-        "projects": brain_db.list_projects(),
-        "total": len(brain_db.list_projects()),
-    }
+    projects = brain_db.list_projects()
+    return {"projects": projects, "total": len(projects)}
 
 
 @app.get("/projects/{slug}")
@@ -434,22 +493,25 @@ def _schedule_view(sched: dict[str, Any], full: bool) -> dict[str, Any]:
     view = {k: v for k, v in sched.items() if k != "kwargs"}
     status = sched.get("last_status")
     if status:
-        view["last_status"] = "failed" if "FAILED" in status else "ok"
+        view["last_status"] = "ok" if status_kind(status) == "ok" else "failed"
     return view
+
+
+def _next_fire_times() -> dict[str, str | None]:
+    """Schedule id to the next fire time of its registered job."""
+    return {
+        j["id"].removeprefix("marketing_"): j["next_fire_time"]
+        for j in list_scheduled_jobs(_scheduler())
+        if j["id"].startswith("marketing_")
+    }
 
 
 @app.get("/sched")
 def list_schedules(request: Request):
     scheds = brain_db.list_schedules()
-    jobs = (
-        list_scheduled_jobs(app.state.scheduler)
-        if hasattr(app.state, "scheduler")
-        else []
-    )
-    job_map = {j["id"].replace("marketing_", ""): j for j in jobs}
+    fires = _next_fire_times()
     for s in scheds:
-        j = job_map.get(s["id"])
-        s["next_fire_time"] = j["next_fire_time"] if j else None
+        s["next_fire_time"] = fires.get(s["id"])
     full = auth.is_authenticated(request)
     return {
         "schedules": [_schedule_view(s, full) for s in scheds],
@@ -462,14 +524,7 @@ def get_schedule(schedule_id: str, request: Request):
     sched = brain_db.get_schedule(schedule_id)
     if not sched:
         raise HTTPException(status_code=404, detail="Schedule not found")
-    jobs = (
-        list_scheduled_jobs(app.state.scheduler)
-        if hasattr(app.state, "scheduler")
-        else []
-    )
-    job_map = {j["id"].replace("marketing_", ""): j for j in jobs}
-    j = job_map.get(sched["id"])
-    sched["next_fire_time"] = j["next_fire_time"] if j else None
+    sched["next_fire_time"] = _next_fire_times().get(sched["id"])
     return _schedule_view(sched, auth.is_authenticated(request))
 
 
@@ -480,7 +535,7 @@ async def create_schedule(body: ScheduleCreate):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     sched = await add_schedule(
-        app.state.scheduler if hasattr(app.state, "scheduler") else None,
+        _scheduler(),
         brain_db,
         body.id,
         body.name,
@@ -496,13 +551,13 @@ async def update_schedule(schedule_id: str, body: SchedulePatch):
     if body.paused is not None:
         if body.paused:
             return await pause_schedule(
-                app.state.scheduler if hasattr(app.state, "scheduler") else None,
+                _scheduler(),
                 brain_db,
                 schedule_id,
             )
         else:
             return await resume_schedule(
-                app.state.scheduler if hasattr(app.state, "scheduler") else None,
+                _scheduler(),
                 brain_db,
                 schedule_id,
             )
@@ -523,7 +578,7 @@ async def update_schedule(schedule_id: str, body: SchedulePatch):
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return await add_schedule(
-            app.state.scheduler if hasattr(app.state, "scheduler") else None,
+            _scheduler(),
             brain_db,
             schedule_id,
             existing["name"],
@@ -538,7 +593,7 @@ async def update_schedule(schedule_id: str, body: SchedulePatch):
 @app.delete("/sched/{schedule_id}")
 async def delete_schedule(schedule_id: str):
     if not await remove_schedule(
-        app.state.scheduler if hasattr(app.state, "scheduler") else None,
+        _scheduler(),
         brain_db,
         schedule_id,
     ):
@@ -550,7 +605,7 @@ async def delete_schedule(schedule_id: str):
 async def run_schedule(schedule_id: str):
     try:
         return await run_schedule_now(
-            app.state.scheduler if hasattr(app.state, "scheduler") else None,
+            _scheduler(),
             brain_db,
             schedule_id,
         )
@@ -559,6 +614,11 @@ async def run_schedule(schedule_id: str):
 
 
 # ─── Ad-hoc Scans (Marketing Orchestrator) ────────────────────────
+
+
+def _bad_gateway(source: str, exc: Exception | str) -> HTTPException:
+    """A scanner that could not run is a 502, never an empty 200 result."""
+    return HTTPException(status_code=502, detail=f"{source} search failed: {exc}")
 
 
 @app.post("/scan/reddit")
@@ -572,12 +632,15 @@ async def scan_reddit(body: dict[str, Any]):
 
     subreddits = tenant_profile.resolve_subreddits(brain_db, subreddits, project_slug)
 
-    results = await reddit_search.search_subreddits(
-        topic,
-        subreddits,
-        since=body.get("since", "7d"),
-        limit_per_sub=body.get("limit", 25),
-    )
+    try:
+        results = await reddit_search.search_subreddits(
+            topic,
+            subreddits,
+            since=body.get("since", "7d"),
+            limit_per_sub=body.get("limit", 25),
+        )
+    except UpstreamError as exc:
+        raise _bad_gateway("reddit", exc) from exc
 
     task_id = None
     if body.get("deliver_to_telegram", True) and results:
@@ -616,32 +679,31 @@ async def scan_github(body: dict[str, Any]):
     if not topic:
         raise HTTPException(status_code=400, detail="topic is required")
 
-    if kind == "repos":
-        results: list = await github_search.search_repos(
-            topic,
-            min_stars=body.get("min_stars", 0),
-            language=body.get("language"),
-            limit=body.get("limit", 25),
+    if kind not in ("repos", "issues"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown kind: {kind}. Use repos, issues, or self_traffic",
         )
-        return {
-            "results": [r.model_dump() for r in results],
-            "total": len(results),
-            "query": topic,
-            "kind": kind,
-        }
-    elif kind == "issues":
-        results = await github_search.search_issues(topic, limit=body.get("limit", 25))
-        return {
-            "results": [r.model_dump() for r in results],
-            "total": len(results),
-            "query": topic,
-            "kind": kind,
-        }
-
-    raise HTTPException(
-        status_code=400,
-        detail=f"Unknown kind: {kind}. Use repos, issues, or self_traffic",
-    )
+    try:
+        if kind == "repos":
+            results: list = await github_search.search_repos(
+                topic,
+                min_stars=body.get("min_stars", 0),
+                language=body.get("language"),
+                limit=body.get("limit", 25),
+            )
+        else:
+            results = await github_search.search_issues(
+                topic, limit=body.get("limit", 25)
+            )
+    except UpstreamError as exc:
+        raise _bad_gateway("github", exc) from exc
+    return {
+        "results": [r.model_dump() for r in results],
+        "total": len(results),
+        "query": topic,
+        "kind": kind,
+    }
 
 
 @app.post("/scan/web")
@@ -651,7 +713,9 @@ async def scan_web(body: dict[str, Any]):
         raise HTTPException(status_code=400, detail="prompt is required")
 
     result = await llm_proxy._llm_call(prompt, max_tokens=1500, web_search=True)
-    return {"result": result or "", "query": prompt}
+    if not result:
+        raise _bad_gateway("web search", "no tier returned a result")
+    return {"result": result, "query": prompt}
 
 
 # ─── Research Orchestrator ───────────────────────────────────────
@@ -671,7 +735,7 @@ async def run_research(body: ResearchRequest):
     """Run a multi-source research session and return ranked findings.
 
     Channels default to discourse (Reddit), code (GitHub), and
-    discourse_web (GLM web search). Findings are deduplicated by URL,
+    discourse_web (the proxy's web-search tier). Findings are deduplicated by URL,
     ranked with authority and recency bonuses, and tagged with a
     confidence flag based on cross-channel triangulation.
 
@@ -691,9 +755,12 @@ async def run_research(body: ResearchRequest):
     if body.subreddits:
         kwargs["subreddits"] = body.subreddits
 
-    result = await research.orchestrate_research(
-        body.topic, channels=body.channels, **kwargs
-    )
+    try:
+        result = await research.orchestrate_research(
+            body.topic, channels=body.channels, **kwargs
+        )
+    except UpstreamError as exc:  # every channel failed; partials are in errors
+        raise _bad_gateway("research", exc) from exc
 
     session = brain_db.create_research_session(body.topic, result["channels"])
     for f in result["findings"]:

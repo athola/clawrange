@@ -2399,9 +2399,15 @@ class TestMarketingAPIEndpoints:
         resp = client.post("/scan/github", json={})
         assert resp.status_code == 400
 
-    def test_scan_web(self, client):
+    def test_scan_web(self, client, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        import llm_proxy
+
+        monkeypatch.setattr(llm_proxy, "_llm_call", AsyncMock(return_value="found"))
         resp = client.post("/scan/web", json={"prompt": "test query"})
         assert resp.status_code == 200
+        assert resp.json()["result"] == "found"
 
     def test_scan_web_no_prompt(self, client):
         resp = client.post("/scan/web", json={})
