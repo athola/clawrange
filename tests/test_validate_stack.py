@@ -34,27 +34,7 @@ def project_tree(tmp_path):
 
 def _create_minimal_project(root):
     """Scaffold the minimum files so check_required_files passes."""
-    required = [
-        "docker-compose.yml",
-        ".env.example",
-        ".gitignore",
-        "Makefile",
-        "openclaw/soul.template.md",
-        "openclaw/config/openclaw.json",
-        "deerflow/config.yaml",
-        "workflows/app.py",
-        "workflows/Dockerfile",
-        "workflows/requirements.txt",
-        "scripts/start.sh",
-        "scripts/stop.sh",
-        "scripts/reset.sh",
-        "scripts/test_all.sh",
-        "scripts/test_openclaw.sh",
-        "scripts/test_workflows.sh",
-        "scripts/test_deerflow.sh",
-        "scripts/test_ollama.sh",
-    ]
-    for f in required:
+    for f in validate_stack.REQUIRED_FILES:
         path = root / f
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()

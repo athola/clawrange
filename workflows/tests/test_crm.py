@@ -284,6 +284,27 @@ def test_rest_run_template_raises_documented():
         a.run_template({"name": "x", "sql": "SELECT 1"}, {})
 
 
+@pytest.mark.parametrize(
+    ("auth", "headers"),
+    [
+        ({"kind": "bearer", "token": "T"}, {"Authorization": "Bearer T"}),
+        ({"kind": "api_key", "value": "K"}, {"X-API-Key": "K"}),
+        ({"kind": "api_key", "header": "X-Key", "value": "K"}, {"X-Key": "K"}),
+        ({"kind": "api_key", "api_key": {"header": "X-N", "value": "K"}}, {"X-N": "K"}),
+        (
+            {"kind": "basic", "basic": {"username": "u", "password": "p"}},
+            {"Authorization": "Basic dTpw"},
+        ),
+        ({"kind": "bearer"}, {}),
+        (None, {}),
+    ],
+)
+def test_rest_auth_headers_share_the_connector_builder(auth, headers):
+    """#14: one auth-header builder; the REST CRM keeps its flat api_key
+    shape and gains the connector's nested api_key and basic kinds."""
+    assert RestCRM({"base_url": "https://x", "auth": auth})._headers() == headers
+
+
 def test_rest_health_reports_configured_state():
     assert RestCRM({"base_url": "https://x"}).health()["status"] == "configured"
     assert RestCRM({}).health()["status"] == "unconfigured"

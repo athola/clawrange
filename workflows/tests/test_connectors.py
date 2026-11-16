@@ -88,6 +88,33 @@ def test_http_csv_api_key_header():
     assert seen["key"] == "SECRET"
 
 
+@pytest.mark.parametrize(
+    ("auth", "header", "value"),
+    [
+        (
+            {"kind": "basic", "basic": {"username": "u", "password": "p"}},
+            "authorization",
+            "Basic dTpw",
+        ),
+        ({"kind": "api_key", "header": "X-Flat", "value": "F"}, "x-flat", "F"),
+        ({"kind": "none"}, "authorization", None),
+    ],
+)
+def test_http_csv_shared_auth_kinds(auth, header, value):
+    """#14: connectors and the REST CRM share one auth-header builder."""
+    seen = {}
+
+    def handler(request):
+        seen["v"] = request.headers.get(header)
+        return httpx.Response(200, text=CSV)
+
+    http_csv(
+        {"kind": "http_csv", "url": "https://p/e", "auth": auth},
+        client=_mock_client(handler),
+    )
+    assert seen["v"] == value
+
+
 def test_http_csv_unconfigured_url_raises():
     # An unresolved ${VAR} resolves to "": an unconfigured error, not an
     # empty fetch that would record "ok (0 written)".

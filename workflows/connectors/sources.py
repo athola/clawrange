@@ -11,7 +11,6 @@ unaffected.
 
 from __future__ import annotations
 
-import base64
 import csv
 import io
 import logging
@@ -19,27 +18,11 @@ from urllib.parse import urljoin
 
 import httpx
 
+from http_auth import auth_headers
+
 from .base import ConnectorNotConfigured, Record
 
 logger = logging.getLogger("clawrange.connectors.sources")
-
-
-def _auth_headers(auth: dict | None) -> dict:
-    """Build request headers for the static auth kinds (none/api_key/bearer/basic)."""
-    auth = auth or {}
-    kind = auth.get("kind", "none")
-    if kind == "bearer" and auth.get("token"):
-        return {"Authorization": f"Bearer {auth['token']}"}
-    if kind == "api_key":
-        ak = auth.get("api_key") or {}
-        if ak.get("value"):
-            return {ak.get("header", "X-API-Key"): ak["value"]}
-    if kind == "basic":
-        b = auth.get("basic") or {}
-        if b.get("username") is not None:
-            raw = f"{b.get('username', '')}:{b.get('password', '')}".encode()
-            return {"Authorization": f"Basic {base64.b64encode(raw).decode()}"}
-    return {}
 
 
 def _looks_like_html(resp: httpx.Response) -> bool:
@@ -74,7 +57,7 @@ def http_csv(spec: dict, *, client: httpx.Client | None = None) -> list[Record]:
         raise ConnectorNotConfigured("http_csv: no url configured")
     c, owned = _ensure_client(client)
     try:
-        resp = c.get(url, headers=_auth_headers(spec.get("auth")))
+        resp = c.get(url, headers=auth_headers(spec.get("auth")))
         resp.raise_for_status()
         return _csv_or_raise(resp, "http_csv")
     finally:

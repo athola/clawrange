@@ -33,34 +33,38 @@ class TestResult:
         self.message = msg
 
 
+REQUIRED_FILES = (
+    "docker-compose.yml",
+    ".env.example",
+    ".gitignore",
+    "Makefile",
+    "openclaw/soul.template.md",
+    "openclaw/config/openclaw.json",
+    "deerflow/config.yaml",
+    "workflows/app.py",
+    "workflows/Dockerfile",
+    "workflows/requirements.txt",
+    "scripts/start.sh",
+    "scripts/stop.sh",
+    "scripts/reset.sh",
+    "scripts/test_all.sh",
+    "scripts/test_openclaw.sh",
+    "scripts/test_workflows.sh",
+    "scripts/test_deerflow.sh",
+    "scripts/test_ollama.sh",
+)
+
+
 def check_required_files() -> TestResult:
     """Verify all required project files exist."""
     result = TestResult("Required Files")
-    required = [
-        "docker-compose.yml",
-        ".env.example",
-        ".gitignore",
-        "Makefile",
-        "openclaw/soul.template.md",
-        "openclaw/config/openclaw.json",
-        "deerflow/config.yaml",
-        "workflows/app.py",
-        "workflows/Dockerfile",
-        "workflows/requirements.txt",
-        "scripts/start.sh",
-        "scripts/stop.sh",
-        "scripts/reset.sh",
-        "scripts/test_all.sh",
-        "scripts/test_openclaw.sh",
-        "scripts/test_workflows.sh",
-        "scripts/test_deerflow.sh",
-        "scripts/test_ollama.sh",
+    missing = [
+        f for f in REQUIRED_FILES if not os.path.exists(os.path.join(PROJECT_ROOT, f))
     ]
-    missing = [f for f in required if not os.path.exists(os.path.join(PROJECT_ROOT, f))]
     if missing:
         result.fail_(f"Missing: {', '.join(missing)}")
     else:
-        result.pass_(f"All {len(required)} required files present")
+        result.pass_(f"All {len(REQUIRED_FILES)} required files present")
     return result
 
 

@@ -19,6 +19,8 @@ import logging
 
 import httpx
 
+from http_auth import auth_headers
+
 from .adapter import CRMAdapter, RecordList
 
 logger = logging.getLogger("clawrange.crm.rest")
@@ -32,13 +34,7 @@ class RestCRM(CRMAdapter):
         self._client = client
 
     def _headers(self) -> dict:
-        auth = self.cfg.get("auth", {}) or {}
-        kind = auth.get("kind")
-        if kind == "bearer" and auth.get("token"):
-            return {"Authorization": f"Bearer {auth['token']}"}
-        if kind == "api_key" and auth.get("value"):
-            return {auth.get("header", "X-API-Key"): auth["value"]}
-        return {}
+        return auth_headers(self.cfg.get("auth"))
 
     def _http(self) -> httpx.Client:
         # Built once and reused: a client per call leaked connection pools.

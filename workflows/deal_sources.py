@@ -231,20 +231,15 @@ async def fetch_reddit(
             await sleep(pace)
         url = REDDIT_NEW_RSS.format(sub=sub)
         # One bad sub (timeout, malformed feed) must not drop the others.
-        for attempt in range(2):
-            try:
-                resp = await client.get(url, headers={"User-Agent": USER_AGENT})
-                health.record(resp.status_code)
-                if resp.status_code == 200:
-                    out.extend(parse_feed(resp.text, f"r/{sub}"))
-                    break
-            except Exception as exc:
-                logger.warning("deals: reddit r/%s feed failed: %r", sub, exc)
-                health.record("error")
-                break
-            if resp.status_code != 429 or attempt:
-                break
-            await sleep(pace * 2)
+        try:
+            resp = await reddit_search.get_retrying_429(
+                client, url, {"User-Agent": USER_AGENT}, health, sleep, pace * 2
+            )
+            if resp.status_code == 200:
+                out.extend(parse_feed(resp.text, f"r/{sub}"))
+        except Exception as exc:
+            logger.warning("deals: reddit r/%s feed failed: %r", sub, exc)
+            health.record("error")
     return out, reddit_status(health)
 
 

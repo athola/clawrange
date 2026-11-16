@@ -336,6 +336,7 @@ async def _fetch_github(topic: str, **kwargs: Any) -> list[Finding]:
 
 _ARXIV_API = "http://export.arxiv.org/api/query"
 _S2_API = "https://api.semanticscholar.org/graph/v1/paper/search"
+_ACADEMIC_TIMEOUT_S = 10.0  # per request, arXiv and Semantic Scholar
 
 
 async def _fetch_academic(topic: str, **kwargs: Any) -> list[Finding]:
@@ -350,7 +351,7 @@ async def _fetch_academic(topic: str, **kwargs: Any) -> list[Finding]:
 
     async def _arxiv() -> list[Finding]:
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=_ACADEMIC_TIMEOUT_S) as client:
                 resp = await client.get(
                     _ARXIV_API,
                     params={
@@ -400,7 +401,7 @@ async def _fetch_academic(topic: str, **kwargs: Any) -> list[Finding]:
 
     async def _semantic_scholar() -> list[Finding]:
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=_ACADEMIC_TIMEOUT_S) as client:
                 resp = await client.get(
                     _S2_API,
                     params={

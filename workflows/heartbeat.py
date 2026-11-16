@@ -59,6 +59,10 @@ _FOREIGN_TASK = re.compile(
     re.IGNORECASE,
 )
 
+# Digest lines quote at most this much of a task description; the full
+# text stays on the task (GET /task/{id}).
+DESCRIPTION_PREVIEW_CHARS = 60
+
 # ─── Heartbeat State ─────────────────────────────────────────────
 # Reset per test by conftest._reset_proxy_globals.
 
@@ -184,7 +188,8 @@ def _blocked_digest_line(task: dict) -> str:
     The full text stays on the task (GET /task/{id}); Telegram gets the
     fact that something stalled and which task it was, not the essay.
     """
-    return f"Blocked #{task['id']}: needs your input — {task['description'][:60]}"
+    desc = task["description"][:DESCRIPTION_PREVIEW_CHARS]
+    return f"Blocked #{task['id']}: needs your input — {desc}"
 
 
 # A blocked task asked the operator a question and left the pending queue; dedup
@@ -266,7 +271,10 @@ def _waiting_on_you_lines(
         if len(kept) == WAITING_ON_YOU_MAX_LINES:
             break
     kept.reverse()  # oldest first reads better in the digest
-    return [f"Waiting on you: #{t['id']} {t['description'][:60]}" for t in kept]
+    return [
+        f"Waiting on you: #{t['id']} {t['description'][:DESCRIPTION_PREVIEW_CHARS]}"
+        for t in kept
+    ]
 
 
 def _next_heartbeat_task(pending: list[dict]) -> dict | None:
@@ -1060,7 +1068,8 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
     # (OpenClaw relays non-empty heartbeat responses, not empty ones).
     for t in tasks_created:
         digest._digest_record(
-            f"Created #{t['id']} [P{t['priority']}] {t['description'][:60]}"
+            f"Created #{t['id']} [P{t['priority']}] "
+            f"{t['description'][:DESCRIPTION_PREVIEW_CHARS]}"
         )
 
     if digest._digest_due():

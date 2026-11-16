@@ -17,9 +17,13 @@ API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 # so the plain-text retry never tips a chunk over the edge.
 MAX_CHARS = 4000
 
+# Bot API timeouts: message sends, and the fire-and-forget typing/delete calls.
+SEND_TIMEOUT_S = 10.0
+QUICK_TIMEOUT_S = 5.0
+
 
 async def _call(
-    method: str, payload: dict, timeout: float = 10
+    method: str, payload: dict, timeout: float = SEND_TIMEOUT_S
 ) -> httpx.Response | None:
     """POST one Bot API method. None when unconfigured or on network error."""
     if not BOT_TOKEN or not CHAT_ID:
@@ -161,7 +165,7 @@ async def notify_long(
 
 async def send_typing() -> bool:
     """Send 'typing' chat action so the user sees the bot is working."""
-    r = await _call("sendChatAction", {"action": "typing"}, timeout=5)
+    r = await _call("sendChatAction", {"action": "typing"}, timeout=QUICK_TIMEOUT_S)
     return r is not None and r.is_success
 
 
@@ -185,5 +189,7 @@ async def delete_message(message_id: int) -> bool:
     """Delete a message by ID."""
     if not message_id:
         return False
-    r = await _call("deleteMessage", {"message_id": message_id}, timeout=5)
+    r = await _call(
+        "deleteMessage", {"message_id": message_id}, timeout=QUICK_TIMEOUT_S
+    )
     return r is not None and r.is_success

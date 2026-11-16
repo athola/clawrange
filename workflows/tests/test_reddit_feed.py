@@ -170,6 +170,40 @@ class TestFeedRetry:
         assert [p.id for p in posts] == ["b1"]
         assert slept == [reddit_search.FEED_PACE_S * 2]
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("statuses", "final", "slept_expected"),
+        [([200], 200, []), ([429, 200], 200, [7.0]), ([429, 429], 429, [7.0])],
+    )
+    async def test_shared_429_retry(self, statuses, final, slept_expected):
+        """#14: the one 429 retry both the scanner and deal feeds use."""
+        replies = iter(statuses)
+        seen: list[str] = []
+
+        def handler(request):
+            seen.append(request.headers["user-agent"])
+            return httpx.Response(next(replies))
+
+        slept: list[float] = []
+
+        async def fake_sleep(s):
+            slept.append(s)
+
+        health = SearchHealth()
+        async with _REAL_CLIENT(transport=httpx.MockTransport(handler)) as client:
+            resp = await reddit_search.get_retrying_429(
+                client,
+                "https://r.example/x",
+                {"User-Agent": "ua"},
+                health,
+                fake_sleep,
+                7.0,
+            )
+        assert resp.status_code == final
+        assert slept == slept_expected
+        assert seen == ["ua"] * len(statuses)
+        assert health.requests == len(statuses)
+
 
 class TestFallbackIsOptIn:
     @pytest.mark.asyncio

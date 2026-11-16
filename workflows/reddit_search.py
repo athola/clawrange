@@ -16,6 +16,7 @@ import os
 import re
 import xml.etree.ElementTree as ET  # noqa: S405 - DTDs refused before parsing
 from collections import Counter
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -102,6 +103,25 @@ class SearchHealth:
         return f"{self.mode or 'reddit'}: " + "; ".join(parts)
 
 
+async def get_retrying_429(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+    health: SearchHealth,
+    sleep: Callable[[float], Awaitable[Any]],
+    backoff: float,
+) -> httpx.Response:
+    """GET `url`, retried once after `backoff` seconds when Reddit answers
+    429. Every status lands on `health`; transport errors propagate."""
+    resp = await client.get(url, headers=headers)
+    health.record(resp.status_code)
+    if resp.status_code == 429:
+        await sleep(backoff)
+        resp = await client.get(url, headers=headers)
+        health.record(resp.status_code)
+    return resp
+
+
 # ─── Models ──────────────────────────────────────────────────────────
 
 
@@ -128,6 +148,8 @@ FEED_USER_AGENT = (
     or "Mozilla/5.0 (compatible; clawrange/0.1)"
 )
 FEED_PACE_S = 6.0
+# Per-request timeout for the JSON search and feed clients.
+HTTP_TIMEOUT_S = 15.0
 _ATOM = {"a": "http://www.w3.org/2005/Atom"}
 _sleep = asyncio.sleep  # patched in tests
 
@@ -205,15 +227,14 @@ async def _feed_search(
             await _sleep(FEED_PACE_S)
         posts: list[RedditPost] | None = None
         try:
-            for attempt in range(2):  # one retry after backing off a 429
-                resp = await client.get(
-                    FEED_URL.format(sub=sub_name),
-                    headers={"User-Agent": FEED_USER_AGENT},
-                )
-                health.record(resp.status_code)
-                if resp.status_code != 429 or attempt:
-                    break
-                await _sleep(FEED_PACE_S * 2)
+            resp = await get_retrying_429(
+                client,
+                FEED_URL.format(sub=sub_name),
+                {"User-Agent": FEED_USER_AGENT},
+                health,
+                _sleep,
+                FEED_PACE_S * 2,
+            )
             if resp.status_code == 200:
                 # Cache the whole feed; each call applies its own window.
                 posts = parse_feed_posts(resp.text, datetime.min.replace(tzinfo=UTC))
@@ -460,7 +481,7 @@ async def search_all(
 
     async with httpx.AsyncClient(
         headers={"User-Agent": user_agent},
-        timeout=15.0,
+        timeout=HTTP_TIMEOUT_S,
     ) as client:
         try:
             resp = await client.get(
@@ -536,7 +557,7 @@ async def _public_search(
 
     async with httpx.AsyncClient(
         headers={"User-Agent": user_agent},
-        timeout=15.0,
+        timeout=HTTP_TIMEOUT_S,
     ) as client:
         for sub_name in subreddits:
             if health.feed_mode:
