@@ -79,7 +79,7 @@ def is_authenticated(request: Request) -> bool:
 
     Public routes use this to return a reduced view to anonymous callers.
     """
-    import llm_proxy  # local: llm_proxy imports app-level modules lazily
+    import llm_proxy  # local: llm_proxy imports auth at module scope (cycle)
 
     return bearer_ok(request.headers.get("authorization"), llm_proxy.PROXY_AUTH_TOKEN)
 

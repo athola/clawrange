@@ -145,14 +145,6 @@ def render_ops_persona(profile: Profile) -> str | None:
     return text.rstrip("\n") + "\n"
 
 
-def write_soul(profile: Profile, path: str | Path) -> Path:
-    """Render the persona and write it to ``path`` (default OpenClaw soul)."""
-    dest = Path(path)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(render_persona(profile))
-    return dest
-
-
 def _learned_region(learnings: list, kind: str) -> str:
     rows = [x for x in learnings if x.get("kind") == kind]
     if not rows:

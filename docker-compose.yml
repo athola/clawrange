@@ -153,7 +153,7 @@ services:
     environment:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - ZAI_API_KEY=${ZAI_API_KEY}
-      # Embedding model for brain search and OpenClaw memory (OpenRouter).
+      # Embedding model for brain search and /v1/embeddings (OpenRouter).
       - EMBED_MODEL=${EMBED_MODEL:-openai/text-embedding-3-small}
       - EMBED_DIM=${EMBED_DIM:-1536}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}

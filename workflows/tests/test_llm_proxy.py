@@ -3727,7 +3727,7 @@ class TestAntiHallucinationTrailer:
         assert "xml" in content.lower() or "bracket" in content.lower()
 
 
-# ─── Embeddings (Zhipu-backed, for OpenClaw memory) ───────────────
+# ─── Embeddings (OpenRouter, for bearer-token clients) ────────────
 
 EMBED_BODY = {"input": "remember this", "model": "text-embedding-3-small"}
 
@@ -3742,7 +3742,7 @@ FAKE_EMBED_RESPONSE = {
 @patch.dict("os.environ", FAKE_ENV)
 @patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
 class TestEmbeddings:
-    """/v1/embeddings serves OpenClaw memory through OpenRouter (a GLM Coding
+    """/v1/embeddings serves bearer-token clients through OpenRouter (a GLM Coding
     Plan Z.AI key cannot embed: error 1211). The configured model is always
     used, so every stored vector is comparable."""
 
@@ -3775,7 +3775,7 @@ class TestEmbeddings:
     @patch("embeddings.request", new_callable=AsyncMock)
     def test_upstream_non_200_maps_to_same_status(self, mock_req):
         """Upstream errors must surface as errors, never as HTTP 200 bodies
-        that OpenClaw memory would ingest as embeddings."""
+        that a client would ingest as embeddings."""
         mock_req.return_value = _mock_response(429, {"error": "rate limited"})
         r = client.post("/v1/embeddings", json=EMBED_BODY, headers=AUTH_HEADER)
         assert r.status_code == 429

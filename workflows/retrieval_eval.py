@@ -44,7 +44,6 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOCAL_DIR = os.path.join(_REPO, "data", "retrieval")
 SESSIONS_DIR = os.path.join(_REPO, "data", "openclaw-state", "agents")
 METRICS = ("hit@1", "hit@3", "hit@5", "mrr@10", "ndcg@10")
-HEADERS = ("none", "title")
 
 
 # ─── Metrics (binary relevance, page-level) ───────────────────────

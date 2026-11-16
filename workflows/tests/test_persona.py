@@ -9,7 +9,6 @@ from persona import (
     render_all,
     render_identity,
     render_persona,
-    write_soul,
 )
 from tenant_profile import Profile, load_profile
 
@@ -113,19 +112,6 @@ def test_render_identity_fills_fields_and_defaults_name():
     assert "**Name:** Max" in out  # defaults to assistant.name
     assert "**Creature:** Chief of Staff" in out
     assert "🎯" in out
-
-
-def test_write_soul_round_trips(tmp_path):
-    p = Profile(
-        "acme",
-        {
-            "profile": "acme",
-            "assistant": {"name": "Acme Bot", "role": "assistant", "capabilities": []},
-        },
-    )
-    dest = tmp_path / "soul.md"
-    write_soul(p, dest)
-    assert dest.read_text() == render_persona(p)
 
 
 def test_compose_appends_learned_region_and_is_non_destructive():
