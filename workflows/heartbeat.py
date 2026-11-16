@@ -790,6 +790,8 @@ def _status_alert_result(description: str, remaining: float | None) -> str:
         )
     elif remaining <= 0:
         routing = "openrouter skipped (depleted), zai-direct carrying traffic"
+    elif remaining <= llm_proxy.OPENROUTER_BALANCE_FLOOR:
+        routing = "free tiers active; paid and search held by the balance floor"
     else:
         routing = "openrouter active"
     lowered = description.lower()

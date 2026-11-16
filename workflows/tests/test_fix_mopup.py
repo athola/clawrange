@@ -90,6 +90,18 @@ def test_unknown_balance_alert_says_paid_and_search_are_held():
     assert "paid" in text and "search" in text
 
 
+def test_balance_at_or_below_floor_is_not_reported_as_active(monkeypatch):
+    """Above $0 but at or below the floor, paid and search are denied: the
+    closing note must say so, not 'openrouter active'."""
+    monkeypatch.setattr(llm_proxy, "OPENROUTER_BALANCE_FLOOR", 10.0)
+    for remaining in (4.0, 10.0):
+        text = heartbeat._status_alert_result("Low balance alert: x", remaining)
+        assert "openrouter active" not in text
+        assert "paid and search held" in text
+    above = heartbeat._status_alert_result("Low balance alert: x", 25.0)
+    assert "openrouter active" in above
+
+
 # ─── Search denied by the balance floor is not an outage ────────────
 
 
