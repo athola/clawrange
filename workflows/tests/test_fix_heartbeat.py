@@ -5,14 +5,17 @@ import json
 import logging
 import time
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
 
+import chat_commands
 import digest
 import heartbeat
 import llm_proxy
+import research_router
 import watchdog
 from errors import UpstreamError
 
@@ -578,12 +581,15 @@ def fresh_digest(monkeypatch, tmp_path):
 
 
 class TestDigestState:
-    def test_corrupt_state_is_kept_aside(self, fresh_digest, capsys):
+    def test_corrupt_state_is_kept_aside(self, fresh_digest, caplog):
         fresh_digest.write_text('{"lines": ["undelivered item"')
-        digest._digest_record("new item")
+        with caplog.at_level(logging.ERROR, logger="clawrange.digest"):
+            digest._digest_record("new item")
         aside = fresh_digest.with_name(fresh_digest.name + ".corrupt")
         assert "undelivered item" in aside.read_text()
-        assert "corrupt" in capsys.readouterr().out
+        assert [r.name for r in caplog.records if "corrupt" in r.getMessage()] == [
+            "clawrange.digest"
+        ]
         assert digest._digest_state["lines"] == ["new item"]
 
     def test_bad_clock_keeps_lines(self, fresh_digest):
@@ -628,3 +634,36 @@ class TestDigestState:
             time.time(), None, [], balance="not configured"
         )
         assert "OpenRouter balance" not in text
+
+
+# ─── #14: split modules log under their own names ─────────────────
+
+
+class TestModuleLoggers:
+    @pytest.mark.parametrize(
+        ("module", "name"),
+        [
+            (heartbeat, "clawrange.heartbeat"),
+            (digest, "clawrange.digest"),
+            (chat_commands, "clawrange.chat_commands"),
+            (research_router, "clawrange.research_router"),
+        ],
+    )
+    def test_module_has_its_own_logger(self, module, name):
+        assert module.logger.name == name
+        source = Path(module.__file__).read_text()
+        assert "llm_proxy.logger" not in source
+        assert "print(" not in source
+
+    def test_heartbeat_suggestion_logs_under_heartbeat(self, monkeypatch, caplog):
+        monkeypatch.setattr(heartbeat, "_build_thinking_prompt", lambda s, c="": "p")
+        monkeypatch.setattr(
+            llm_proxy, "_llm_call", AsyncMock(return_value="Draft a caching post")
+        )
+        with caplog.at_level(logging.INFO, logger="clawrange.heartbeat"):
+            assert asyncio.run(heartbeat._llm_suggest_task(["caching"])) == (
+                "Draft a caching post"
+            )
+        assert [r.name for r in caplog.records if "suggested" in r.getMessage()] == [
+            "clawrange.heartbeat"
+        ]

@@ -9,6 +9,7 @@ working and this module never touches `llm_proxy` at import time.
 """
 
 import asyncio
+import logging
 import os
 import re
 import time
@@ -23,6 +24,8 @@ import research_router
 import telegram
 import tenant_profile
 from errors import UpstreamError
+
+logger = logging.getLogger("clawrange.heartbeat")
 
 # ─── Heartbeat Interceptor ───────────────────────────────────────
 
@@ -374,7 +377,7 @@ def _current_thinking_subjects() -> list[str]:
     try:
         return _thinking_subjects(brain_db.list_projects(), _deals_block())
     except Exception:
-        llm_proxy.logger.exception("thinking: could not load subjects")
+        logger.exception("thinking: could not load subjects")
         return []
 
 
@@ -418,7 +421,7 @@ def _build_thinking_prompt(subjects: list[str], context: str = "") -> str:
                 recent_descriptions.append(t["description"])
     except Exception:
         # The prompt still works without the dedup hint; say why it is gone.
-        llm_proxy.logger.exception("thinking prompt: could not list recent tasks")
+        logger.exception("thinking prompt: could not list recent tasks")
     recent_block = ""
     if recent_descriptions:
         recent_list = "\n".join(f"  - {d}" for d in recent_descriptions[-10:])
@@ -520,7 +523,7 @@ async def _llm_suggest_task(subjects: list[str], context: str = "") -> str | Non
     if text:
         text = text.strip('"')
         if 10 <= len(text) <= 200 and "\n" not in text:
-            print(f"[PROXY] LLM suggested task: {text!r}", flush=True)
+            logger.info("LLM suggested task: %r", text)
             return text
     return None
 
@@ -588,7 +591,7 @@ async def _build_work_prompt(task_description: str, web_search: bool = False) ->
                 "\nBrain is empty — no clients, people, or incidents recorded yet.\n"
             )
     except Exception:
-        llm_proxy.logger.exception("work prompt: could not list brain pages")
+        logger.exception("work prompt: could not list brain pages")
 
     format_rules = (
         (
@@ -698,12 +701,12 @@ async def _llm_work_task(description: str) -> str:
     needs_web = _task_needs_web(description)
     prompt = await _build_work_prompt(description, web_search=needs_web)
     if needs_web:
-        print(f"[PROXY] task needs web search: {description[:80]!r}", flush=True)
+        logger.info("task needs web search: %r", description[:80])
     max_tok = 1500 if needs_web else 500
     result = await llm_proxy._llm_call(prompt, max_tokens=max_tok, web_search=needs_web)
     if not result:
         raise LLMUnavailable("no LLM tier answered")
-    print(f"[PROXY] LLM worked task: {result[:100]!r}", flush=True)
+    logger.info("LLM worked task: %r", result[:100])
     return result
 
 
@@ -816,7 +819,7 @@ def _reap_stale_active(brain_db) -> None:
     hours = _active_reap_hours()
     for t in brain_db.fail_stale_active(hours):
         label = _operator_label() if t.get("source") == "user" else "SYSTEM"
-        llm_proxy.logger.warning("reaped task #%s: active over %gh", t["id"], hours)
+        logger.warning("reaped task #%s: active over %gh", t["id"], hours)
         digest._digest_record(
             f"[{label}] #{t['id']}: {t['description']}\n"
             f"Failed: still active after {hours:g}h; its worker never "
@@ -893,7 +896,7 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
         except ValueError as exc:
             # Another consumer won the race (or the task was cancelled):
             # leave it alone this cycle, never mark it failed.
-            print(f"[PROXY] claim skipped for #{task['id']}: {exc}", flush=True)
+            logger.warning("claim skipped for #%s: %s", task["id"], exc)
             claimed = None
         if not claimed:
             # Lost the race / not pending: skip this cycle entirely.
@@ -916,7 +919,7 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
             failure = None
             llm_down = True
         except Exception as exc:
-            llm_proxy.logger.exception("heartbeat task #%s failed", task["id"])
+            logger.exception("heartbeat task #%s failed", task["id"])
             result = ""
             failure = f"{type(exc).__name__}: {str(exc)[:200]}"
 
@@ -935,7 +938,7 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
                 # cycle. One digest line per task per outage, not per cycle.
                 brain_db.release_task(task["id"])
                 _llm_retry_counts[task["id"]] = attempts
-                llm_proxy.logger.warning(
+                logger.warning(
                     "heartbeat task #%s re-queued: LLM unreachable (attempt %d/%d)",
                     task["id"],
                     attempts,
@@ -947,9 +950,7 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
                         "LLM unreachable; re-queued, retrying each heartbeat."
                     )
             elif failure is not None:
-                llm_proxy.logger.warning(
-                    "heartbeat task #%s failed: %s", task["id"], failure
-                )
+                logger.warning("heartbeat task #%s failed: %s", task["id"], failure)
                 brain_db.complete_task(task["id"], f"Failed: {failure}", "failed")
                 digest._digest_record(
                     f"[{label}] #{task['id']}: {task['description']}\nFailed: {failure}"
@@ -972,7 +973,7 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
                 )
         except ValueError as exc:
             # Task was cancelled or finished elsewhere meanwhile.
-            llm_proxy.logger.warning("could not complete task #%s: %s", task["id"], exc)
+            logger.warning("could not complete task #%s: %s", task["id"], exc)
 
         # No direct Telegram notification: the digest line above carries
         # the completion, at most once per hour.
@@ -1046,7 +1047,7 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
             suggestion = await _llm_suggest_task(subjects, _thinking_context())
             if suggestion and not _is_grounded_suggestion(suggestion, subjects):
                 # Prompt rules alone never held this line; drop it in code.
-                print(f"[PROXY] dropped ungrounded task: {suggestion!r}", flush=True)
+                logger.info("dropped ungrounded task: %r", suggestion)
                 suggestion = None
             if suggestion and not _has_recent_task(all_tasks, suggestion):
                 t = brain_db.create_task(suggestion, priority=3)
@@ -1094,10 +1095,7 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
         # OpenClaw logs only Telegram *failures*, so a silent digest and a
         # dropped one look identical downstream. Log the handoff to give the
         # two logs a correlation point.
-        print(
-            f"[PROXY] digest flushed: {len(messages)} message(s), {failed} failed",
-            flush=True,
-        )
+        logger.info("digest flushed: %d message(s), %d failed", len(messages), failed)
     else:
         text = ""
     resp = llm_proxy._synthetic_response(text)

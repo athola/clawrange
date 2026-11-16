@@ -13,6 +13,7 @@ plain text or a synthetic response.
 
 import asyncio
 import hashlib
+import logging
 from typing import Any
 
 from fastapi import HTTPException
@@ -27,6 +28,8 @@ import research_router
 import tenant_profile
 from brain_db import TaskStatus, project_list
 from errors import UpstreamError
+
+logger = logging.getLogger("clawrange.chat_commands")
 
 
 def _reply(text: str, is_stream: bool) -> JSONResponse | StreamingResponse:
@@ -236,7 +239,7 @@ async def _dispatch_marketing_command(
         else:
             text = f"Unknown command: {verb}"
     except Exception as exc:
-        llm_proxy.logger.exception("chat command /%s %s failed", verb, subcmd)
+        logger.exception("chat command /%s %s failed", verb, subcmd)
         text = f"Error: {exc}"
 
     return _reply(text, is_stream)
@@ -657,7 +660,7 @@ def _handle_task_command(description: str) -> str:
     try:
         task = create_task(TC(description=description))
     except Exception as exc:
-        llm_proxy.logger.exception("chat !task: could not queue task")
+        logger.exception("chat !task: could not queue task")
         return f"Failed to queue task: {exc}"
     return (
         f"Task queued (#{task['id']})\n"
@@ -814,7 +817,7 @@ async def _handle_persona_command(args: str) -> JSONResponse:
                 persona_api.reflect_now, brain_db, profile_name
             )
         except Exception as exc:
-            llm_proxy.logger.exception("!persona reflect failed")
+            logger.exception("!persona reflect failed")
             return llm_proxy._synthetic_response(
                 f"Persona reflection failed: {type(exc).__name__}: {exc}"
             )
@@ -835,7 +838,7 @@ async def _handle_persona_command(args: str) -> JSONResponse:
     except ValueError as exc:
         return llm_proxy._synthetic_response(f"Feedback not queued: {exc}.")
     except Exception as exc:
-        llm_proxy.logger.exception("!persona propose failed")
+        logger.exception("!persona propose failed")
         return llm_proxy._synthetic_response(
             f"Feedback not queued: {type(exc).__name__}: {exc}"
         )

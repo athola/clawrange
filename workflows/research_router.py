@@ -1,19 +1,19 @@
 """Heartbeat task routing to the marketing scanners and research orchestrator.
 
 Research- and scan-shaped heartbeat tasks are answered here with real,
-citable findings instead of going to the chat LLM. Shared helpers and state
-are read from `llm_proxy` at call time, so this module never touches it at
-import time.
+citable findings instead of going to the chat LLM.
 """
 
+import logging
 import re
 
 import github_search
-import llm_proxy
 import reddit_search
 import tenant_profile
 from brain_db import project_list
 from errors import UpstreamError
+
+logger = logging.getLogger("clawrange.research_router")
 
 # ─── Marketing Scan Interceptor ──────────────────────────────────
 
@@ -116,7 +116,7 @@ async def _try_research_task(description: str) -> str | None:
     except UpstreamError:
         raise
     except Exception:
-        llm_proxy.logger.exception("research router: orchestrator failed")
+        logger.exception("research router: orchestrator failed")
         return None
 
     findings = result.get("findings", [])

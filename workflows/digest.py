@@ -7,11 +7,14 @@ handler in `heartbeat.py` records into it.
 """
 
 import json
+import logging
 import os
 import re
 import time
 
 import telegram
+
+logger = logging.getLogger("clawrange.digest")
 
 # ─── Heartbeat Digest ──────────────────────────────────────────────
 # Completed work buffers here. Once the hour elapses the heartbeat sends
@@ -91,7 +94,7 @@ def _write_stamp(key: str, now: float | None) -> None:
     except OSError as exc:
         # The stamp is an observability aid; a heartbeat must never fail
         # because it could not be recorded.
-        print(f"[PROXY] heartbeat {key} stamp failed: {exc}", flush=True)
+        logger.warning("heartbeat %s stamp failed: %s", key, exc)
 
 
 def _digest_load() -> None:
@@ -126,7 +129,7 @@ def _digest_load() -> None:
             where = f"moved to {aside}"
         except OSError:
             where = "could not be moved aside"
-        print(f"[PROXY] digest state corrupt ({exc}); {where}", flush=True)
+        logger.error("digest state corrupt (%s); %s", exc, where)
         return
     if not isinstance(saved, dict):
         return
@@ -157,7 +160,7 @@ def _digest_save() -> None:
             )
         os.replace(tmp, path)
     except OSError as exc:
-        print(f"[PROXY] digest state save failed: {exc}", flush=True)
+        logger.error("digest state save failed: %s", exc)
 
 
 def _digest_record(line: str) -> None:
@@ -268,7 +271,7 @@ def _digest_trim(lines: list[str]) -> list[str]:
         over = len(lines) - room
         dropped += over
         lines = lines[-room:]
-        print(f"[PROXY] digest buffer full: dropped {over} oldest item(s)", flush=True)
+        logger.warning("digest buffer full: dropped %d oldest item(s)", over)
     if not dropped:
         return lines
     marker = (
