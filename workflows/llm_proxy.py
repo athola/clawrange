@@ -13,6 +13,7 @@ import re
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -130,6 +131,35 @@ OPENROUTER_BALANCE_FLOOR = float(os.getenv("OPENROUTER_BALANCE_FLOOR", "10.0"))
 _balance_cache: dict[str, float | None] = {"remaining": None, "checked_at": None}
 _BALANCE_CHECK_INTERVAL = 300  # re-check at most every 5 minutes
 _BALANCE_FAILURE_BACKOFF = 60  # after a failed lookup, wait this long to retry
+# Outcome of the most recent lookup, for describe_balance(): monotonic time of
+# the last success, and the last failure reason (cleared on success).
+_balance_status: dict[str, Any] = {"ok_at": None, "error": None}
+
+
+def describe_balance() -> str:
+    """Human-readable OpenRouter balance for status lines and alerts.
+
+    Never renders an unknown balance as a number: a failing credits lookup
+    says so, and a cached value served after a failure carries its age.
+    """
+    if not os.getenv("OPENROUTER_API_KEY", ""):
+        return "not configured"
+    remaining = _balance_cache.get("remaining")
+    error = _balance_status.get("error")
+    if remaining is None:
+        if error:
+            return f"unknown (lookup failed: {error})"
+        return "unknown (not checked yet)"
+    amount = f"${remaining:.2f}"
+    if not error:
+        return amount
+    ok_at = _balance_status.get("ok_at")
+    age = (
+        "age unknown"
+        if ok_at is None
+        else f"{int((time.monotonic() - ok_at) // 60)} min old"
+    )
+    return f"{amount} ({age}; lookup failing: {error})"
 
 
 async def _check_openrouter_balance() -> float | None:
@@ -163,10 +193,14 @@ async def _check_openrouter_balance() -> float | None:
                 remaining = float(data["total_credits"]) - float(data["total_usage"])
                 _balance_cache["remaining"] = remaining
                 _balance_cache["checked_at"] = now
+                _balance_status["ok_at"] = now
+                _balance_status["error"] = None
                 return remaining
             logger.warning("openrouter credits lookup: HTTP %s", resp.status_code)
+            _balance_status["error"] = f"HTTP {resp.status_code}"
     except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
         logger.warning("openrouter credits lookup failed: %s", exc)
+        _balance_status["error"] = f"{type(exc).__name__}: {str(exc)[:80]}"
 
     # Back off instead of re-hitting a failing API on every request: stamp
     # the check so the next attempt comes _BALANCE_FAILURE_BACKOFF from now.
