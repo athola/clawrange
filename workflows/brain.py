@@ -101,9 +101,9 @@ def create_brain_router(db: BrainDB) -> APIRouter:
 
     # Page listing (no slug conflict — matches before {slug:path})
     @router.get("/pages")
-    def list_pages(page_type: str | None = None, limit: int = 50):
-        pt = PageType(page_type) if page_type else None
-        pages = db.list_pages(pt, limit)
+    def list_pages(page_type: PageType | None = None, limit: int = 50):
+        # Typed as the enum so an unknown ?page_type= is a 422, not a 500.
+        pages = db.list_pages(page_type, limit)
         return {"pages": pages, "total": len(pages)}
 
     # Page create (POST, no path param conflict)

@@ -93,7 +93,7 @@ def db(tmp_path):
 
 class TestVectorTable:
     def test_per_model_table_and_counts(self, db):
-        db.upsert_page("a", "Alpha", "concept", "alpha body")
+        db.upsert_page("a", "Alpha", "note", "alpha body")
         missing = db.missing_embeddings(10)
         assert missing and db.embedding_count() == 0
         db.store_embeddings([(missing[0]["id"], [1.0, 0, 0, 0])])
@@ -102,16 +102,16 @@ class TestVectorTable:
         assert db.has_embeddings() is True
 
     def test_cosine_score(self, db):
-        db.upsert_page("a", "Alpha", "concept", "alpha body")
+        db.upsert_page("a", "Alpha", "note", "alpha body")
         chunk = db.missing_embeddings(1)[0]
         db.store_embeddings([(chunk["id"], [2.0, 0, 0, 0])])
         hit = db.search_vector([1.0, 0, 0, 0], limit=1)[0]
         assert hit["slug"] == "a" and hit["score"] == pytest.approx(1.0)
 
     def test_rechunk_orphans_are_pruned(self, db):
-        db.upsert_page("a", "Alpha", "concept", "first body")
+        db.upsert_page("a", "Alpha", "note", "first body")
         db.store_embeddings([(db.missing_embeddings(1)[0]["id"], [1.0, 0, 0, 0])])
-        db.upsert_page("a", "Alpha", "concept", "a completely different body")
+        db.upsert_page("a", "Alpha", "note", "a completely different body")
         assert db.prune_orphan_embeddings() == 1
         assert db.embedding_count() == 0
 
@@ -125,8 +125,8 @@ class TestVectorTable:
 
 class TestBackfill:
     def test_embeds_missing_chunks(self, db, monkeypatch):
-        db.upsert_page("a", "Alpha", "concept", "alpha body")
-        db.upsert_page("b", "Beta", "concept", "beta body")
+        db.upsert_page("a", "Alpha", "note", "alpha body")
+        db.upsert_page("b", "Beta", "note", "beta body")
         monkeypatch.setattr(embeddings, "request", _fake_request(4))
         out = asyncio.run(embeddings.backfill(db, _cfg(EMBED_DIM="4")))
         assert out["stored"] == 2 and db.missing_embeddings(10) == []
@@ -136,7 +136,7 @@ class TestBackfill:
         assert asyncio.run(embeddings.backfill(db, cfg))["skipped"] == "no api key"
 
     def test_failed_embed_stores_nothing(self, db, monkeypatch):
-        db.upsert_page("a", "Alpha", "concept", "alpha body")
+        db.upsert_page("a", "Alpha", "note", "alpha body")
         monkeypatch.setattr(embeddings, "request", _fake_request(4, status=500))
         out = asyncio.run(embeddings.backfill(db, _cfg(EMBED_DIM="4")))
         assert out["stored"] == 0 and db.embedding_count() == 0

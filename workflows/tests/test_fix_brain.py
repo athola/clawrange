@@ -428,3 +428,73 @@ class TestBackfillResilience:
         assert d.get_page("a") is not None
         assert len(d.missing_embeddings(10)) == 1
         d.init_db()  # idempotent
+
+
+# ─── #46: TaskStatus enum and validated page types ────────────────
+
+
+class TestTaskStatus:
+    def test_members_and_open_set(self):
+        from brain_db import TaskStatus
+
+        assert {s.value for s in TaskStatus} == {
+            "pending",
+            "active",
+            "completed",
+            "failed",
+            "blocked",
+            "cancelled",
+        }
+        assert TaskStatus.OPEN == frozenset({TaskStatus.PENDING, TaskStatus.ACTIVE})
+        assert "pending" in TaskStatus.OPEN and "blocked" not in TaskStatus.OPEN
+
+    def test_bad_result_status_message_names_blocked(self, db):
+        t = db.create_task("x")
+        with pytest.raises(ValueError, match="blocked"):
+            db.complete_task(t["id"], "r", "bogus")
+
+    def test_blocked_is_a_valid_result(self, db):
+        t = db.create_task("x")
+        assert db.complete_task(t["id"], "need input", "blocked")["status"] == "blocked"
+        with pytest.raises(ValueError, match="cannot complete"):
+            db.complete_task(t["id"], "again", "completed")
+
+    def test_cancel_rules_unchanged(self, db):
+        """Completed/failed are final; a blocked task (an open question) can
+        still be dismissed by cancelling it."""
+        done = db.create_task("done")
+        db.complete_task(done["id"], "ok", "completed")
+        with pytest.raises(ValueError, match="already completed"):
+            db.cancel_task(done["id"])
+        blocked = db.create_task("q")
+        db.complete_task(blocked["id"], "need input", "blocked")
+        assert db.cancel_task(blocked["id"])["status"] == "cancelled"
+
+    def test_list_orders_open_tasks_first(self, db):
+        done = db.create_task("done", priority=1)
+        db.complete_task(done["id"], "ok", "completed")
+        active = db.create_task("active", priority=5)
+        db.claim_task(active["id"])
+        db.create_task("pending", priority=5)
+        assert [t["description"] for t in db.list_tasks()] == [
+            "pending",
+            "active",
+            "done",
+        ]
+
+
+class TestPageTypeValidated:
+    def test_upsert_rejects_unknown_type(self, db):
+        with pytest.raises(ValueError):
+            db.upsert_page("a", "Alpha", "bogus", "body")
+        assert db.get_page("a") is None
+
+    def test_upsert_accepts_type_string(self, db):
+        assert db.upsert_page("a", "Alpha", "note", "body")["page_type"] == "note"
+
+    def test_list_pages_bogus_type_is_422(self, db):
+        db.upsert_page("a", "Alpha", "note", "body")
+        client = _client(db)
+        assert client.get("/brain/pages?page_type=bogus").status_code == 422
+        r = client.get("/brain/pages?page_type=note")
+        assert r.status_code == 200 and r.json()["total"] == 1

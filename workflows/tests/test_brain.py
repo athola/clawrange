@@ -612,8 +612,8 @@ class TestSemanticSearch:
             "config",
             lambda env=None: embeddings.EmbedConfig("u", "m", 4, "k"),
         )
-        brain_db.upsert_page("net/wifi", "WiFi", "concept", "wireless access points")
-        brain_db.upsert_page("pets/cat", "Cat", "concept", "a small furry animal")
+        brain_db.upsert_page("net/wifi", "WiFi", "note", "wireless access points")
+        brain_db.upsert_page("pets/cat", "Cat", "note", "a small furry animal")
         cat = [c for c in brain_db.missing_embeddings(10) if "furry" in c["content"]][0]
         brain_db.store_embeddings([(cat["id"], [1.0, 0, 0, 0])])
         app = FastAPI()

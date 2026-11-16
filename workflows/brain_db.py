@@ -16,7 +16,7 @@ import struct
 import threading
 import uuid
 from datetime import UTC, datetime, timedelta
-from enum import StrEnum
+from enum import StrEnum, nonmember
 from typing import Any
 
 
@@ -29,6 +29,22 @@ class PageType(StrEnum):
     PERSON = "person"
     COMPANY = "company"
     PROJECT = "project"
+
+
+class TaskStatus(StrEnum):
+    PENDING = "pending"
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    BLOCKED = "blocked"  # closed with a question for the operator
+    CANCELLED = "cancelled"
+
+    # Still in the queue: can be claimed, completed or cancelled.
+    OPEN = nonmember(frozenset({"pending", "active"}))
+    # Statuses a worker may close a task with (complete_task).
+    RESULTS = nonmember(frozenset({"completed", "failed", "blocked"}))
+    # A finished answer: cancelling it would discard the result.
+    DONE = nonmember(frozenset({"completed", "failed"}))
 
 
 class LinkType(StrEnum):
@@ -467,9 +483,10 @@ class BrainDB:
         page_type: PageType | str,
         compiled: str = "",
     ) -> dict[str, Any]:
+        # An unknown type raises ValueError instead of being stored as-is.
+        pt = PageType(page_type).value
         now = _now()
         chash = _content_hash(title, compiled)
-        pt = page_type.value if isinstance(page_type, PageType) else page_type
 
         existing = self._conn.execute(
             "SELECT content_hash FROM pages WHERE slug = ?", (slug,)
@@ -1134,9 +1151,11 @@ class BrainDB:
                 (status,),
             ).fetchall()
         else:
+            # Open tasks first (pending, then active), then everything closed.
             rows = self._conn.execute(
-                "SELECT * FROM tasks ORDER BY CASE status WHEN 'pending' THEN 0 "
-                "WHEN 'active' THEN 1 ELSE 2 END, priority ASC, created_at ASC"
+                "SELECT * FROM tasks ORDER BY CASE status WHEN ? THEN 0 "
+                "WHEN ? THEN 1 ELSE 2 END, priority ASC, created_at ASC",
+                (TaskStatus.PENDING, TaskStatus.ACTIVE),
             ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
@@ -1162,15 +1181,16 @@ class BrainDB:
     def complete_task(
         self, task_id: str, result: str, status: str = "completed"
     ) -> dict[str, Any]:
-        if status not in ("completed", "failed", "blocked"):
-            raise ValueError("Status must be completed or failed")
+        if status not in TaskStatus.RESULTS:
+            raise ValueError("Status must be completed, failed or blocked")
         now = _now()
         # Only open tasks can be completed: a terminal result is final and a
         # cancelled task stays cancelled.
+        open_marks = ", ".join("?" * len(TaskStatus.OPEN))
         cur = self._conn.execute(
             "UPDATE tasks SET status=?, result=?, completed_at=? "
-            "WHERE id=? AND status IN ('pending', 'active')",
-            (status, result, now, task_id),
+            f"WHERE id=? AND status IN ({open_marks})",
+            (str(status), result, now, task_id, *sorted(TaskStatus.OPEN)),
         )
         self._conn.commit()
         if cur.rowcount != 1:
@@ -1199,10 +1219,11 @@ class BrainDB:
         task = self.get_task(task_id)
         if not task:
             raise ValueError("Task not found")
-        if task["status"] in ("completed", "failed"):
+        if task["status"] in TaskStatus.DONE:
             raise ValueError(f"Task already {task['status']}")
         self._conn.execute(
-            "UPDATE tasks SET status = 'cancelled' WHERE id = ?", (task_id,)
+            "UPDATE tasks SET status = ? WHERE id = ?",
+            (TaskStatus.CANCELLED, task_id),
         )
         self._conn.commit()
         result = self.get_task(task_id)

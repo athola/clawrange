@@ -48,7 +48,7 @@ class TestSchemaInit:
 
     def test_init_idempotent(self, db):
         """A second init_db() keeps the schema and the data."""
-        db.upsert_page("a", "Alpha", "concept", "body")
+        db.upsert_page("a", "Alpha", "note", "body")
         db.create_task("work")
 
         def schema():
@@ -760,16 +760,16 @@ class TestConnectionLock:
 class TestKeywordSearchInput:
     @pytest.mark.parametrize("q", ['"', "foo(", "a AND", "NEAR(", "*"])
     def test_fts_syntax_in_user_query_does_not_raise(self, db, q):
-        db.upsert_page("a", "Alpha", "concept", "alpha foo body")
+        db.upsert_page("a", "Alpha", "note", "alpha foo body")
         assert isinstance(db.search_keyword(q), list)
 
     def test_plain_words_still_match(self, db):
-        db.upsert_page("a", "Alpha", "concept", "alpha foo body")
+        db.upsert_page("a", "Alpha", "note", "alpha foo body")
         assert [r["slug"] for r in db.search_keyword("alpha foo")] == ["a"]
 
     def test_limit_is_clamped(self, db):
         for i in range(5):
-            db.upsert_page(f"p{i}", f"T{i}", "concept", "common word")
+            db.upsert_page(f"p{i}", f"T{i}", "note", "common word")
         assert len(db.search_keyword("common", limit=10_000)) == 5
         assert len(db.search_keyword("common", limit=0)) == 1
 
