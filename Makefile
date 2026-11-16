@@ -126,7 +126,7 @@ retrieval-eval-refresh: ## Embed fixture cache misses via OpenRouter, then compa
 	@$(LOAD_ENV); \
 	cd workflows && uv run python retrieval_eval.py --refresh --check-truncation
 
-retrieval-harvest: ## Add John's real brain searches to data/retrieval/golden.json (unlabelled)
+retrieval-harvest: ## Add the assistant's real brain searches to data/retrieval/golden.json (unlabelled)
 	@cd workflows && uv run python retrieval_eval.py --brain ../data/brain/brain.db --harvest
 
 retrieval-eval-brain: ## Compare search configs on the real brain with your labelled queries

@@ -223,7 +223,7 @@ def _has_words(text: str, words: list[str]) -> bool:
 
 def _vram_contradicts(text: str, target: WatchTarget) -> bool:
     """A title that states only smaller memory sizes than the target
-    (a 6 GB or 16 GB laptop A5000 module against the 24 GB card)."""
+    (a 6 GB or 16 GB mobile A5000 module against the 24 GB card)."""
     check = target.check_memory
     if check is None:
         check = target.category in MEMORY_CHECK_CATEGORIES

@@ -624,10 +624,9 @@ def hour_in_window(
     """Return True when `now_utc` falls inside the half-open
     [start_hour, end_hour) window in the named tz.
 
-    DST-aware via zoneinfo: passing ``America/Chicago`` produces the
-    correct CST/CDT offset for any date so the operator's 12am-5am
-    sleep window stays anchored to local clock time across the
-    daylight-saving boundary.
+    DST-aware via zoneinfo: the named zone's offset is resolved for the
+    given date, so a quiet-hours window stays anchored to local clock
+    time across the daylight-saving boundary.
 
     End hour is exclusive: a window of (0, 5) covers 00:00:00 through
     04:59:59 local, so the */5 cron fire at exactly 05:00 wakes the

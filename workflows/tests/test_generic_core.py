@@ -6,6 +6,9 @@ hardware, its eBay categories) may be baked into the core modules.
 """
 
 import ast
+import io
+import re
+import tokenize
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -43,6 +46,8 @@ TENANT_TOKENS = [
     "john-117",
     "halopedia",
     "master chief",
+    "max-ops",
+    "max ops",
     # One tenant's communities and curated lists.
     "claudeai",
     "localllama",
@@ -96,6 +101,41 @@ def _string_literals(path: Path) -> list[str]:
     ]
 
 
+def _comments_and_docstrings(path: Path) -> list[str]:
+    """Every comment and docstring in a module (prose a reader takes as
+    describing the generic core)."""
+    src = path.read_text()
+    texts = [
+        t.string
+        for t in tokenize.generate_tokens(io.StringIO(src).readline)
+        if t.type == tokenize.COMMENT
+    ]
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(
+            node, ast.Module | ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
+        ):
+            doc = ast.get_docstring(node, clean=False)
+            if doc:
+                texts.append(doc)
+    return texts
+
+
+@pytest.mark.parametrize("module", CORE)
+def test_core_comments_and_docstrings_carry_no_operator_identity(module):
+    hits = [
+        (tok, text[:60])
+        for text in _comments_and_docstrings(ROOT / module)
+        for tok in TENANT_TOKENS
+        if tok in text.lower()
+    ]
+    hits += [
+        ("alex", text[:60])
+        for text in _comments_and_docstrings(ROOT / module)
+        if re.search(r"\balex\b", text, re.IGNORECASE)
+    ]
+    assert hits == [], f"{module} names tenant specifics in prose: {hits}"
+
+
 @pytest.mark.parametrize("module", CORE)
 def test_core_string_literals_carry_no_tenant_config(module):
     path = ROOT / module
@@ -110,8 +150,6 @@ def test_core_string_literals_carry_no_tenant_config(module):
 
 def test_core_has_no_operator_name_in_literals():
     """Prompts and labels name the operator via config, never by name."""
-    import re
-
     hits = [
         (m, lit[:60])
         for m in CORE
@@ -123,8 +161,6 @@ def test_core_has_no_operator_name_in_literals():
 
 @pytest.mark.parametrize("surface", TEXT_SURFACES + EXAMPLE_PROFILES)
 def test_shipped_text_surfaces_carry_no_operator_identity(surface):
-    import re
-
     path = ROOT / surface
     if not path.exists():
         pytest.skip(f"{surface} not shipped")
