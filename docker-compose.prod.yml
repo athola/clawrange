@@ -27,6 +27,6 @@ services:
       - ./config/profiles:/config/profiles:ro
       - ./openclaw/soul.md:/opt/soul.md:ro
       - ./data/brain:/data
-      - ./data/openclaw-state:/openclaw-state
+      - ${OPENCLAW_STATE_DIR:-./data/openclaw-state}:/openclaw-state
     environment:
       - UVICORN_RELOAD=0

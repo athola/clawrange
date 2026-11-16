@@ -9,7 +9,11 @@ Run with: python3 tests/validate_stack.py
 
 import json
 import os
+import re
 import sys
+from typing import Any
+
+import yaml
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -255,6 +259,61 @@ def check_soul_template() -> TestResult:
     return result
 
 
+_PROFILE_ENV_RE = re.compile(r"\$\{([A-Z0-9_]+)\}")
+
+
+def _profile_env_refs(value: Any) -> set[str]:
+    """Collect ``${VAR}`` names from a parsed profile (comments excluded)."""
+    if isinstance(value, str):
+        return set(_PROFILE_ENV_RE.findall(value))
+    if isinstance(value, dict):
+        return set().union(*(_profile_env_refs(v) for v in value.values()))
+    if isinstance(value, list):
+        return set().union(*(_profile_env_refs(v) for v in value))
+    return set()
+
+
+def check_profile_env_passthrough() -> TestResult:
+    """Every ``${VAR}`` a shipped profile uses reaches the workflows container.
+
+    Compose passes variables to workflows one by one (an ``env_file`` would
+    hand every secret in .env to the container), so a profile variable with
+    no environment line silently resolves to "" inside the container.
+    """
+    result = TestResult("Profile Env Passthrough")
+    try:
+        with open(os.path.join(PROJECT_ROOT, "docker-compose.yml")) as f:
+            compose = yaml.safe_load(f) or {}
+    except (FileNotFoundError, yaml.YAMLError) as e:
+        result.fail_(f"docker-compose.yml unreadable: {e}")
+        return result
+    service = (compose.get("services") or {}).get("workflows")
+    if not isinstance(service, dict):
+        result.fail_("docker-compose.yml has no workflows service")
+        return result
+    env = service.get("environment") or []
+    if isinstance(env, dict):
+        passed = set(env)
+    else:
+        passed = {str(item).split("=", 1)[0] for item in env}
+
+    missing: list[str] = []
+    profiles = os.path.join(PROJECT_ROOT, "config", "profiles")
+    names = sorted(os.listdir(profiles)) if os.path.isdir(profiles) else []
+    for name in names:
+        path = os.path.join(profiles, name, "profile.yaml")
+        if not os.path.isfile(path):
+            continue
+        with open(path) as f:
+            refs = _profile_env_refs(yaml.safe_load(f))
+        missing.extend(f"{var} ({name})" for var in sorted(refs - passed))
+    if missing:
+        result.fail_("Not in the workflows service environment: " + ", ".join(missing))
+    else:
+        result.pass_(f"All profile variables reach workflows ({len(names)} profiles)")
+    return result
+
+
 def main():
     print("=" * 50)
     print(" CLAWRANGE — CONFIG VALIDATION")
@@ -270,6 +329,7 @@ def main():
         check_openclaw_config,
         check_deerflow_data_sovereignty,
         check_soul_template,
+        check_profile_env_passthrough,
     ]
 
     results: list[TestResult] = []

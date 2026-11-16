@@ -12,9 +12,9 @@ services:
   # Web UI + API at http://localhost:3000
   #
   # SANDBOX: Container filesystem is read-only. Writes only to:
-  #   - ./data/openclaw-state/ (persistent state, sessions, config)
+  #   - ${OPENCLAW_STATE_DIR:-./data/openclaw-state}/ (state, sessions, config)
   #   - ./data/openclaw-tmp/   (ephemeral logs, locks)
-  # Host reads allowed via :ro mounts. No writes outside ~/clawrange.
+  # Host reads allowed via :ro mounts.
   openclaw:
     image: ghcr.io/openclaw/openclaw:2026.11.3
     container_name: msp-openclaw
@@ -43,8 +43,9 @@ services:
       - net.ipv4.tcp_keepalive_intvl=10
       - net.ipv4.tcp_keepalive_probes=3
     volumes:
-      # Persistent state — bind mount to ~/clawrange/data/ (not a Docker volume)
-      - ./data/openclaw-state:/home/node/.openclaw
+      # Persistent state: a bind mount (not a Docker volume). OPENCLAW_STATE_DIR
+      # in .env relocates it; workflows mounts the same host directory.
+      - ${OPENCLAW_STATE_DIR:-./data/openclaw-state}:/home/node/.openclaw
       # Ephemeral scratch space — stays in ~/clawrange/data/
       - ./data/openclaw-tmp:/tmp
       # Config templates — read-only. openclaw/identity.md is deliberately
@@ -59,7 +60,8 @@ services:
       - ./openclaw/render-config.js:/opt/render-config.js:ro
       # Host home — read-only access for agent file reads
       - ${HOME}:/mnt/host-home:ro
-      # Healthcheck script — detects stuck Telegram polling
+      # Healthcheck script: gateway /healthz plus the heartbeat-sync failure
+      # marker. It cannot detect stuck Telegram polling (see the script).
       - ./scripts/healthcheck-openclaw.sh:/opt/healthcheck.sh:ro
     environment:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
@@ -110,7 +112,9 @@ services:
   # Handles webhooks, lead lookups, morning briefings.
   # API at http://localhost:5678
   #
-  # SANDBOX: Read-only container. No host mounts. Network-only service.
+  # SANDBOX: read-only root filesystem. Host mounts: the source tree (dev
+  # only), tenant profiles and soul.md read-only; data/brain and the
+  # OpenClaw state directory read-write. /tmp is a small tmpfs.
   workflows:
     build: ./workflows
     container_name: msp-workflows
@@ -126,7 +130,7 @@ services:
       - ./workflows:/app:ro
       # Tenant profiles — load_profile() resolves CLAWRANGE_PROFILE here.
       - ./config/profiles:/config/profiles:ro
-      # Soul — gives Max its persona context for self-directed tasks
+      # Soul: gives the assistant its persona context for self-directed tasks
       - ./openclaw/soul.md:/opt/soul.md:ro
       # Brain — persistent knowledge storage
       - ./data/brain:/data
@@ -135,7 +139,8 @@ services:
       # Mounted as a whole directory rather than spec §7's narrow per-file
       # mount because render_all writes atomically via os.replace, which
       # breaks single-file bind mounts (the bind pins the old inode).
-      - ./data/openclaw-state:/openclaw-state
+      # The host side honours OPENCLAW_STATE_DIR from .env.
+      - ${OPENCLAW_STATE_DIR:-./data/openclaw-state}:/openclaw-state
     tmpfs:
       - /tmp:size=32M
     environment:
@@ -152,6 +157,8 @@ services:
       - REDDIT_USERNAME=${REDDIT_USERNAME:-}
       - REDDIT_PASSWORD=${REDDIT_PASSWORD:-}
       - REDDIT_USER_AGENT=${REDDIT_USER_AGENT:-clawrange-marketing-bot/0.1}
+      # Empty -> the scanner's built-in agent for the keyless Atom fallback.
+      - REDDIT_FEED_USER_AGENT=${REDDIT_FEED_USER_AGENT:-}
       - GITHUB_PAT=${GITHUB_PAT:-}
       # Homelab deal rundown: eBay Browse API keys and the operator's gear
       # description for the buy read (both optional).
@@ -167,10 +174,33 @@ services:
       # Which tenant profile to load (defaults to the identity-free starter).
       - CLAWRANGE_PROFILE=${CLAWRANGE_PROFILE:-starter}
       # Where the OpenClaw workspace state is mounted (runtime persona render).
+      # Fixed: this is the container path. .env's OPENCLAW_STATE_DIR is the
+      # host path and only changes the mount source above.
       - OPENCLAW_STATE_DIR=/openclaw-state
       # Telegram digest window for heartbeat reporting (seconds). Independent
       # of the heartbeat cadence (every 10m, set in openclaw.json).
       - HEARTBEAT_DIGEST_INTERVAL=${HEARTBEAT_DIGEST_INTERVAL:-3600}
+      # 0 stops the heartbeat inventing its own research tasks.
+      - HEARTBEAT_LLM_SUGGEST=${HEARTBEAT_LLM_SUGGEST:-1}
+      # Non-empty enables the flagged outcome-signal persona proposals.
+      - PERSONA_SIGNAL_LEARNING=${PERSONA_SIGNAL_LEARNING:-}
+      # Lead-CRM profile connector credentials (unset -> connector disabled).
+      # Passed one by one, never via env_file: that would hand every secret
+      # in .env to the container. tests/validate_stack.py checks that each
+      # ${VAR} a shipped profile references is listed here.
+      - PORTAL_EXPORT_URL=${PORTAL_EXPORT_URL:-}
+      - PORTAL_API_KEY=${PORTAL_API_KEY:-}
+      - PORTAL_TOKEN=${PORTAL_TOKEN:-}
+      - PORTAL_USERNAME=${PORTAL_USERNAME:-}
+      - PORTAL_PASSWORD=${PORTAL_PASSWORD:-}
+      - PORTAL_LOGIN_URL=${PORTAL_LOGIN_URL:-}
+      # The SQLite CRM lives next to the brain on the /data mount. .env's
+      # CRM_DB_PATH is a host path (make seed-demo) and would not resolve
+      # inside the container, so it is pinned here.
+      - CRM_DB_PATH=/data/crm.db
+      # REST CRM adapter (profile crm.adapter: rest).
+      - CRM_BASE_URL=${CRM_BASE_URL:-}
+      - CRM_TOKEN=${CRM_TOKEN:-}
       # uvicorn --reload against the mounted source (dev). Prod sets 0.
       - UVICORN_RELOAD=${UVICORN_RELOAD:-1}
       # Bundled persona template (outside /app, which is a read-only mount).

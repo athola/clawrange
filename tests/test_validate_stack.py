@@ -510,3 +510,75 @@ class TestCheckSoulTemplate:
         result = validate_stack.check_soul_template()
         assert result.passed is False
         assert "not found" in result.message
+
+
+# ─── check_profile_env_passthrough ────────────────────────────────
+
+
+class TestCheckProfileEnvPassthrough:
+    """Every ${VAR} a shipped profile references must reach the workflows
+    container: compose passes variables explicitly (no env_file), so a
+    missing line silently resolves the profile field to ""."""
+
+    def _write(self, root, compose, profiles):
+        (root / "docker-compose.yml").write_text(compose)
+        for name, text in profiles.items():
+            d = root / "config" / "profiles" / name
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "profile.yaml").write_text(text)
+
+    def test_pass_when_every_var_is_passed(self, project_tree):
+        self._write(
+            project_tree,
+            "services:\n  workflows:\n    environment:\n"
+            "      - PORTAL_TOKEN=${PORTAL_TOKEN:-}\n"
+            "      - OPERATOR_NAME=${OPERATOR_NAME:-}\n",
+            {
+                "a": "source:\n  token: ${PORTAL_TOKEN}\n",
+                "b": "owner:\n  name: ${OPERATOR_NAME}\n",
+            },
+        )
+        result = validate_stack.check_profile_env_passthrough()
+        assert result.passed is True, result.message
+
+    def test_fail_names_missing_var_and_profile(self, project_tree):
+        self._write(
+            project_tree,
+            "services:\n  workflows:\n    environment:\n"
+            "      - OPERATOR_NAME=${OPERATOR_NAME:-}\n",
+            {"lead": "crm:\n  rest:\n    base_url: ${CRM_BASE_URL}\n"},
+        )
+        result = validate_stack.check_profile_env_passthrough()
+        assert result.passed is False
+        assert "CRM_BASE_URL" in result.message
+        assert "lead" in result.message
+
+    def test_mapping_style_environment(self, project_tree):
+        self._write(
+            project_tree,
+            "services:\n  workflows:\n    environment:\n"
+            "      CRM_TOKEN: ${CRM_TOKEN:-}\n",
+            {"lead": 'items: ["Bearer ${CRM_TOKEN}"]\n'},
+        )
+        result = validate_stack.check_profile_env_passthrough()
+        assert result.passed is True, result.message
+
+    def test_commented_placeholders_are_ignored(self, project_tree):
+        self._write(
+            project_tree,
+            "services:\n  workflows:\n    environment: []\n",
+            {"starter": "# ${VAR} tokens resolve from the environment\nname: x\n"},
+        )
+        result = validate_stack.check_profile_env_passthrough()
+        assert result.passed is True, result.message
+
+    def test_fail_when_workflows_service_missing(self, project_tree):
+        self._write(project_tree, "services: {}\n", {})
+        result = validate_stack.check_profile_env_passthrough()
+        assert result.passed is False
+        assert "workflows" in result.message
+
+    def test_shipped_repo_passes(self):
+        """The real compose file covers the real profiles."""
+        result = validate_stack.check_profile_env_passthrough()
+        assert result.passed is True, result.message
