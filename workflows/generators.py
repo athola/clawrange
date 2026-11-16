@@ -621,8 +621,8 @@ async def morning_digest_generator(
     # Discovery pass: search across all of Reddit (no sub restriction)
     # for each project's first search term. Posts in non-curated subs
     # that match relevance get tagged emerging — surfaced in their own
-    # 🆕 section AND recorded as hits in subreddit_stats so they
-    # accumulate toward the auto-promote threshold (≥5 hits in 14d).
+    # 🆕 section AND, once delivered, recorded as hits in subreddit_stats
+    # so they accumulate toward the auto-promote threshold (≥5 hits in 14d).
     emerging_picks_by_project = await _discover_emerging(
         brain_db, projects, project_sub_sets, health=health
     )
@@ -686,6 +686,11 @@ async def morning_digest_generator(
         for post, _is_bonus in picks:
             brain_db.mark_seen("reddit_post", post.id, slug)
             brain_db.record_subreddit_hit(post.subreddit, slug)
+    for slug, emerging_posts in emerging_picks_by_project.items():
+        for post in emerging_posts:
+            brain_db.mark_seen("reddit_post", post.id, slug)
+            brain_db.record_subreddit_search(post.subreddit, slug, is_curated=False)
+            brain_db.record_subreddit_hit(post.subreddit, slug)
     logger.info("morning_digest: %s", status)
 
 
@@ -698,8 +703,9 @@ async def _discover_emerging(
 ) -> dict[str, list[RedditPost]]:
     """Search /r/all for each project's first term; return posts in
     non-curated subreddits that pass the project's strict relevance
-    filter, capped per project. Records each match as a stat hit so
-    sustained emerging subs accumulate toward auto-promotion.
+    filter, capped per project. Records nothing: the caller records the
+    stat hits and marks the picks seen only after delivery, so a re-run
+    never re-counts a post toward auto-promotion.
     """
 
     out: dict[str, list[RedditPost]] = {}
@@ -736,8 +742,6 @@ async def _discover_emerging(
             if brain_db.is_seen("reddit_post", post.id, slug):
                 continue
             emerging.append((post, rel))
-            brain_db.record_subreddit_search(post.subreddit, slug, is_curated=False)
-            brain_db.record_subreddit_hit(post.subreddit, slug)
 
         if emerging:
             emerging.sort(
