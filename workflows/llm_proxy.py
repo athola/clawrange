@@ -1,8 +1,11 @@
-"""LLM proxy with three-tier fallback and Telegram notifications.
+"""OpenAI-compatible LLM proxy with tiered routing (models.json).
 
-Sits between OpenClaw and LLM providers. Tries each tier in order,
-notifies via Telegram on fallback transitions, and returns the first
-successful response in OpenAI-compatible format (streaming or non-streaming).
+Sits between OpenClaw and the LLM providers. Chat requests race every
+available free tier concurrently and return the first good reply
+(streaming or not); a paid tier is used only when the message asks for it
+(!paid / !claude) and the OpenRouter balance is above the floor.
+Background calls (_llm_call) try the free tiers in order. Tier events
+are logged, not sent to Telegram.
 """
 
 import asyncio
@@ -26,10 +29,9 @@ import heartbeat
 import telegram
 import tenant_profile
 
-# NOTE on deferred imports: ``app`` imports this module at module scope and
-# ``generators``/``scheduler`` import it transitively, so every use of
-# ``app``, ``generators``, and ``scheduler`` below stays function-local
-# (cycle guard).
+# NOTE on deferred imports: ``app`` imports this module at module scope, and
+# ``persona_api`` imports ``generators``, which imports this module. Uses of
+# ``app`` and the persona modules below stay function-local (cycle guard).
 
 logger = logging.getLogger("clawrange.llm_proxy")
 
@@ -134,7 +136,6 @@ def _circuit_open(tier_name: str, probe: bool = True) -> bool:
         return True
     if probe:
         state["probe_at"] = now
-        return False
     return False
 
 
@@ -430,8 +431,6 @@ def _get_rate_limit_detail(resp: httpx.Response) -> str:
     return f"({raw[:120]})" if raw else ""
 
 
-# ─── Provider Calls ───────────────────────────────────────────────
-
 # ─── Response Sanitization ────────────────────────────────────────
 
 # Tool keywords the model commonly hallucinates
@@ -595,13 +594,14 @@ def _is_non_answer(text: str) -> bool:
 # 300 chars and these run past 1000.
 #
 # Match the status declaration in the HEADER, not a request for input
-# anywhere in the body. Checked against the 846 stored task results:
+# anywhere in the body. Checked against the 846 task results stored when
+# this was written:
 #
 #   "what i need from you"  -> 208 hits, nearly all real deliverables. The
 #       work prompt asks for exactly that ("describe what you prepared and
 #       what the operator needs to do to finish it"), so it is not a blocked signal.
 #   header-anchored below   -> 21 hits (2.5%), including both essays that
-#       reached Telegram today.
+#       had reached Telegram.
 #
 # Anchoring to the header also keeps a finished deliverable whose one
 # sub-section is blocked ("Angle 2 (BLOCKED-needs live data)") from being
@@ -930,7 +930,8 @@ _TIMESTAMP_ENVELOPE_RE = re.compile(
     r"^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d{4}-\d{2}-\d{2} \d{2}:\d{2}"
     r"(?::\d{2})? [A-Za-z0-9_+/:-]+\]\s*"
 )
-# First turn of a fresh session: "\n\nRuntime: agent=max | session=... | ...".
+# First turn of a fresh session: "\n\nRuntime: agent=<id> | session=... | ...".
+# Any agent id matches.
 _RUNTIME_LINE_RE = re.compile(r"\n\s*runtime: agent=[^\n]*\s*$", re.IGNORECASE)
 
 
@@ -1326,7 +1327,7 @@ def _extract_openrouter_citations(annotations: list[dict]) -> str:
 
 
 async def _notify_tier_change(tier_name: str) -> None:
-    """Notify via Telegram when the serving tier changes."""
+    """Log a tier switch and remember the tier that served this request."""
     global _last_tier_used
     if _last_tier_used is not None and _last_tier_used != tier_name:
         _background_notify(
@@ -1532,10 +1533,12 @@ async def create_embeddings(
     request: Request,
     authorization: str | None = Header(None),
 ):
-    """OpenAI-compatible embeddings for OpenClaw memory, via OpenRouter.
+    """OpenAI-compatible embeddings via OpenRouter, for any bearer-token client.
 
-    Always uses the configured model (embeddings.config) so every vector
-    OpenClaw stores is comparable; a GLM Coding Plan Z.AI key can't embed.
+    OpenClaw's own memory search is off (memory provider "none"), so no
+    built-in caller uses this today. Always uses the configured model
+    (embeddings.config) so vectors stay comparable; a GLM Coding Plan Z.AI
+    key can't embed.
     """
     # Auth check — same PROXY_AUTH_TOKEN gate as chat completions
     if not auth.bearer_ok(authorization, PROXY_AUTH_TOKEN):
@@ -1566,37 +1569,12 @@ async def create_embeddings(
     return JSONResponse(content=resp.json())
 
 
-@router.post("/v1/chat/completions")
-async def chat_completions(
-    request: Request,
-    authorization: str | None = Header(None),
-):
-    # Auth check — fails closed when PROXY_AUTH_TOKEN is unset
-    if not auth.bearer_ok(authorization, PROXY_AUTH_TOKEN):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+_HELP_COMMANDS = frozenset(
+    {"!help", "/help", "help", "help?", "!commands", "/commands"}
+)
 
-    raw_body = await _json_object(request)
-    messages = raw_body.get("messages", [])
-    if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
-        raise HTTPException(
-            status_code=400, detail="messages must be a list of objects"
-        )
-    is_stream = raw_body.get("stream", False)
-
-    # Intercept status commands before they hit the LLM
-    last_user_msg = _get_last_user_message(messages)
-    msg_lower = last_user_msg.lower().strip()
-    print(f"[PROXY] extracted msg: {msg_lower[:200]!r} stream={is_stream}", flush=True)
-    # Intercept !help — return full command reference
-    help_commands = ("!help", "/help", "help", "help?", "!commands", "/commands")
-    last_line = msg_lower.rstrip().rsplit("\n", 1)[-1].strip()
-    if msg_lower in help_commands or last_line in help_commands:
-        resp = chat_commands._handle_help()
-        if is_stream:
-            return _wrap_json_as_sse(resp)
-        return resp
-
-    tier_commands = (
+_TIER_COMMANDS = frozenset(
+    {
         "/tier",
         "!tier",
         "tier",
@@ -1624,8 +1602,76 @@ async def chat_completions(
         "what's your status?",
         "your status",
         "your status?",
-    )
-    if msg_lower in tier_commands or last_line in tier_commands:
+    }
+)
+
+# Assistant history turns containing these are our own synthetic replies or
+# hallucinated tool syntax; they are stripped before the next request.
+_POISON_MARKERS = (
+    "temporarily on pause",
+    "took too long to respond",
+    "<exec",
+    "[[exec",
+    "<tool_call",
+)
+
+# Appended as a TRAILING system message. LLMs weight instructions near the
+# end of context most heavily: at the start (where soul.md lives) it gets
+# lost, after the last user message the model sees it right before
+# generating.
+#
+# Always injected, even when tools are present. Free-tier upstream models
+# (the racing default) often get OpenAI tool schemas but don't actually
+# support function calling — they invent fake <tool_call:paste>...XML
+# that the proxy then strips, leaving the user with empty replies. The
+# tools wording tells the model to either use the OpenAI tool-call format
+# properly or answer in plain text — never improvise XML.
+_ANTI_HALLUCINATION_TOOLS = (
+    "[SYSTEM] If you need a tool, emit a real OpenAI tool_call object — "
+    "never XML tags, bracket syntax, or <tool_call:NAME> blocks. "
+    "Hallucinated tool syntax is stripped and the response is retried "
+    "on another tier. If no tool fits, answer in plain text from your "
+    "knowledge and conversation context."
+)
+_ANTI_HALLUCINATION_PLAIN = (
+    "[SYSTEM] Respond now in plain text. "
+    "No startup sequences. No initialization steps. "
+    "Never output XML tags, bracket syntax, or tool_call blocks — "
+    "those are not real tools and will be stripped. "
+    "Answer directly using your knowledge and conversation context."
+)
+
+
+@router.post("/v1/chat/completions")
+async def chat_completions(
+    request: Request,
+    authorization: str | None = Header(None),
+):
+    # Auth check — fails closed when PROXY_AUTH_TOKEN is unset
+    if not auth.bearer_ok(authorization, PROXY_AUTH_TOKEN):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    raw_body = await _json_object(request)
+    messages = raw_body.get("messages", [])
+    if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
+        raise HTTPException(
+            status_code=400, detail="messages must be a list of objects"
+        )
+    is_stream = raw_body.get("stream", False)
+
+    # Intercept status commands before they hit the LLM
+    last_user_msg = _get_last_user_message(messages)
+    msg_lower = last_user_msg.lower().strip()
+    print(f"[PROXY] extracted msg: {msg_lower[:200]!r} stream={is_stream}", flush=True)
+    # Intercept !help — return full command reference
+    last_line = msg_lower.rstrip().rsplit("\n", 1)[-1].strip()
+    if msg_lower in _HELP_COMMANDS or last_line in _HELP_COMMANDS:
+        resp = chat_commands._handle_help()
+        if is_stream:
+            return _wrap_json_as_sse(resp)
+        return resp
+
+    if msg_lower in _TIER_COMMANDS or last_line in _TIER_COMMANDS:
         resp = await chat_commands._handle_tier_command()
         if is_stream:
             return _wrap_json_as_sse(resp)
@@ -1664,13 +1710,6 @@ async def chat_completions(
     # AND the deferral detector — any assistant message that would fail
     # _is_non_answer() gets stripped so the model doesn't see its own
     # previous failures and generate apologies or continued deferrals.
-    _POISON_MARKERS = (
-        "temporarily on pause",
-        "took too long to respond",
-        "<exec",
-        "[[exec",
-        "<tool_call",
-    )
     # Never drop an assistant turn that carries tool_calls: its tool results
     # would be left orphaned and providers reject that history with a 400.
     messages = [
@@ -1691,35 +1730,13 @@ async def chat_completions(
     body = {k: v for k, v in raw_body.items() if k in ALLOWED_BODY_FIELDS}
     body["messages"] = messages
 
-    # Inject anti-hallucination reinforcement as a TRAILING system message.
-    # LLMs weight instructions near the end of context most heavily.
-    # Placing it at the start (where soul.md lives) gets lost — placing it
-    # after the last user message means the model sees it right before generating.
-    #
-    # Always inject, even when tools are present. Free-tier upstream models
-    # (the racing default) often get OpenAI tool schemas but don't actually
-    # support function calling — they invent fake <tool_call:paste>...XML
-    # that the proxy then strips, leaving the user with empty replies. The
-    # adapted wording below tells the model to either use the OpenAI
-    # tool-call format properly or answer in plain text — never improvise XML.
-    has_tools = bool(body.get("tools"))
-    if has_tools:
-        _ANTI_HALLUCINATION = (
-            "[SYSTEM] If you need a tool, emit a real OpenAI tool_call object — "
-            "never XML tags, bracket syntax, or <tool_call:NAME> blocks. "
-            "Hallucinated tool syntax is stripped and the response is retried "
-            "on another tier. If no tool fits, answer in plain text from your "
-            "knowledge and conversation context."
-        )
-    else:
-        _ANTI_HALLUCINATION = (
-            "[SYSTEM] Respond now in plain text. "
-            "No startup sequences. No initialization steps. "
-            "Never output XML tags, bracket syntax, or tool_call blocks — "
-            "those are not real tools and will be stripped. "
-            "Answer directly using your knowledge and conversation context."
-        )
-    messages.append({"role": "system", "content": _ANTI_HALLUCINATION})
+    # Inject anti-hallucination reinforcement as a TRAILING system message
+    # (see _ANTI_HALLUCINATION_* for why it goes last and why it is always
+    # injected, tools or not).
+    reminder = (
+        _ANTI_HALLUCINATION_TOOLS if body.get("tools") else _ANTI_HALLUCINATION_PLAIN
+    )
+    messages.append({"role": "system", "content": reminder})
 
     # Tier routing — explicit !keyword overrides, otherwise race all free tiers
     forced_tier = _detect_tier_hint(messages)
