@@ -215,7 +215,10 @@ class TestProxyTierFallback:
         r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
         assert r.status_code == 200
         content = r.json()["choices"][0]["message"]["content"]
-        assert "temporarily on pause" in content
+        # The rate-limit reply, not the generic "no tier answered" one: both
+        # start with "temporarily on pause".
+        assert "rate-limited right now" in content
+        assert "no tier answered" not in content
 
     @patch("llm_proxy._background_notify")
     @patch("llm_proxy._call_provider", side_effect=_openrouter_502)
@@ -855,7 +858,8 @@ class TestAutoRetry:
             r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
             assert r.status_code == 200
             content = r.json()["choices"][0]["message"]["content"]
-            assert "temporarily on pause" in content
+            assert "rate-limited right now" in content
+            assert "no tier answered" not in content
 
     @patch("llm_proxy._background_notify")
     @patch("llm_proxy.asyncio.sleep", new_callable=AsyncMock)
@@ -871,7 +875,8 @@ class TestAutoRetry:
         with patch("llm_proxy._call_provider", side_effect=mock_call):
             r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
             content = r.json()["choices"][0]["message"]["content"]
-            assert "temporarily on pause" in content
+            assert "rate-limited right now" in content
+            assert "no tier answered" not in content
             # Sleep should be called once (first attempt retries, second doesn't)
             mock_sleep.assert_awaited_once()
 

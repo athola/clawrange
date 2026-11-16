@@ -97,12 +97,32 @@ def test_run_template_rejects_mutation(crm):
     )
 
 
-def test_run_template_rejects_mutation_via_readonly_conn(crm):
-    # Even if the guard were bypassed, the connection is opened read-only.
+def test_run_template_rejects_multi_statement(crm):
     crm.upsert("leads", [_lead("a@x.com")], "email")
-    # multi-statement attempt
     with pytest.raises(ValueError):
         crm.run_template({"name": "x", "sql": "SELECT 1; DROP TABLE leads"}, {})
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "DELETE FROM leads",
+        "UPDATE leads SET status = 'won'",
+        "DROP TABLE leads",
+        # A data-modifying CTE reads as a WITH statement to a text check.
+        "WITH x AS (SELECT 1) DELETE FROM leads",
+    ],
+)
+def test_readonly_connection_blocks_writes_without_text_guard(crm, monkeypatch, sql):
+    """The text guard off, the read-only connection alone must refuse."""
+    import crm.sqlite_adapter as sqlite_adapter
+
+    crm.upsert("leads", [_lead("a@x.com")], "email")
+    monkeypatch.setattr(sqlite_adapter, "_guard_readonly", lambda sql: None)
+    with pytest.raises(ValueError, match="rejected"):
+        crm.run_template({"name": "x", "sql": sql}, {})
+    rows = crm.list("leads")
+    assert [r["status"] for r in rows] == ["new"]
 
 
 # ─── activities (time-series substrate) ───────────────────────────

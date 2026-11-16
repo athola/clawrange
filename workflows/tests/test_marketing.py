@@ -1253,20 +1253,20 @@ class TestHotPulseGenerator:
     pulse history (independent of the 24h digest's dedup namespace)."""
 
     @pytest.fixture(autouse=True)
-    def _reset_throttle(self, request, monkeypatch):
+    def _reset_throttle(self, monkeypatch):
         """Reset the module-level delivery-throttle timestamp before
         each test so cross-test pollution doesn't make the second
         test's first fire throttle on the previous test's delivery.
 
         Quiet hours depend on the wall clock (00:00-05:00 in the operator
-        tz, UTC when unset), so every test except the quiet-hours ones
-        pins the gate open and resets the once-per-window flag."""
+        tz, UTC when unset), so the gate is pinned open; the quiet-hours
+        tests pin it themselves, and the pure-helper tests call
+        tenant_profile.hour_in_window, which this patch does not touch."""
         import generators
 
         generators._LAST_HOT_PULSE_DELIVERY_AT = None
         generators._HOT_PULSE_IN_QUIET_HOURS = False
-        if "quiet" not in request.node.name:
-            monkeypatch.setattr(generators, "_is_quiet_hours", lambda *a, **kw: False)
+        monkeypatch.setattr(generators, "_is_quiet_hours", lambda *a, **kw: False)
         yield
         generators._LAST_HOT_PULSE_DELIVERY_AT = None
         generators._HOT_PULSE_IN_QUIET_HOURS = False
@@ -1933,7 +1933,7 @@ class TestHotPulseGenerator:
         02:30 CDT (summer, UTC-5); both are inside [0, 5)."""
         from datetime import datetime
 
-        from generators import _is_quiet_hours
+        from tenant_profile import hour_in_window as _is_quiet_hours
 
         winter_utc = datetime(2026, 1, 15, 7, 30, tzinfo=UTC)
         summer_utc = datetime(2026, 7, 15, 7, 30, tzinfo=UTC)
@@ -1945,7 +1945,7 @@ class TestHotPulseGenerator:
         07:00 CDT — outside the [0, 5) sleep window."""
         from datetime import datetime
 
-        from generators import _is_quiet_hours
+        from tenant_profile import hour_in_window as _is_quiet_hours
 
         winter_noon_utc = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
         summer_noon_utc = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
@@ -1958,7 +1958,7 @@ class TestHotPulseGenerator:
         the operator's pulse up immediately."""
         from datetime import datetime
 
-        from generators import _is_quiet_hours
+        from tenant_profile import hour_in_window as _is_quiet_hours
 
         five_am_cst_utc = datetime(2026, 1, 15, 11, 0, tzinfo=UTC)
         assert _is_quiet_hours(five_am_cst_utc, 0, 5, "America/Chicago") is False
