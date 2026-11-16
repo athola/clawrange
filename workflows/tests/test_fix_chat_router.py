@@ -187,7 +187,7 @@ class TestRouterUpstreamFailures:
 
     @pytest.mark.asyncio
     async def test_traffic_api_failure_with_pat_raises(self, monkeypatch):
-        monkeypatch.setattr(github_search, "GITHUB_PAT", "ghp_x")
+        monkeypatch.setattr(github_search, "GITHUB_PAT", "test-pat")
         monkeypatch.setattr(
             github_search, "get_self_traffic", AsyncMock(return_value=None)
         )
@@ -284,7 +284,7 @@ class TestScanGithubTraffic:
     async def test_traffic_api_failure_with_pat_does_not_blame_pat(
         self, project, monkeypatch
     ):
-        monkeypatch.setattr(github_search, "GITHUB_PAT", "ghp_x")
+        monkeypatch.setattr(github_search, "GITHUB_PAT", "test-pat")
         monkeypatch.setattr(
             github_search, "get_self_traffic", AsyncMock(return_value=None)
         )
