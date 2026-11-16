@@ -7,8 +7,8 @@ Decisions, the alternatives weighed, and what was given up. Newest first.
 | ID | Phase | Status | Decision |
 |----|-------|--------|----------|
 | TR-005 | execute | proposed | Keyword fallback ORs terms; hybrid with vectors unchanged until the eval shows a win |
-| TR-004 | execute | proposed | Keep per-file dev mounts; directory mount blocked by the nested soul.md bind |
-| TR-003 | plan | proposed | Regression-lock marketing seeds (RED equivalence test) before deleting constants |
+| TR-004 | execute | superseded | Keep per-file dev mounts; directory mount blocked by the nested soul.md bind (resolved: soul.md moved to `/opt`) |
+| TR-003 | plan | accepted | Regression-lock marketing seeds (RED equivalence test) before deleting constants |
 | TR-002 | specify | proposed | Minimal CRMAdapter interface and templated-SQL only (no LLM raw SQL) |
 | TR-001 | brainstorm | proposed | Multi-tenant via hybrid declarative profile and connector registry |
 
@@ -62,7 +62,12 @@ Decisions, the alternatives weighed, and what was given up. Newest first.
 ## TR-004: Keep per-file dev mounts until the soul.md bind moves out of /app
 
 - **Phase**: execute
-- **Status**: proposed
+- **Status**: superseded. The recommended option below shipped: the dev
+  compose mounts `./workflows:/app:ro` and binds `openclaw/soul.md` at
+  `/opt/soul.md` with `SOUL_MD_PATH=/opt/soul.md`, which
+  `heartbeat._SOUL_MD_PATH` honors. The per-file mounts are gone. The
+  `llm_proxy._SOUL_MD_PATH` named below is the pre-split location; it now
+  lives in `workflows/heartbeat.py`.
 - **Decision (Y-statement)**: In the context of the workflows dev hot-reload
   mounts, facing the trap that a per-file bind pins an inode and keeps serving
   pre-commit code after git or `ruff-format` replaces the file via
@@ -73,7 +78,7 @@ Decisions, the alternatives weighed, and what was given up. Newest first.
 - **Evidence**: `./workflows:/app:ro` was tried and fails at container init:
 
       Error response from daemon: failed to create task for container:
-      ... error mounting "/home/alext/clawrange/openclaw/soul.md" to rootfs
+      ... error mounting "<repo>/openclaw/soul.md" to rootfs
       at "/app/soul.md": create mountpoint for /app/soul.md mount:
       make mountpoint "/app/soul.md": read-only file system
 
@@ -86,9 +91,9 @@ Decisions, the alternatives weighed, and what was given up. Newest first.
     mountpoint *inside the host tree*, leaving a stray `workflows/soul.md`
     in the repo, plus root-owned `__pycache__`. Rejected.
   - Commit a placeholder `workflows/soul.md`: a fresh clone works only after
-    someone recreates it, and it shadows `llm_proxy._SOUL_MD_PATH` on host
-    runs. Rejected.
-  - Mount `./openclaw:/openclaw:ro` and make `llm_proxy._SOUL_MD_PATH` honor
+    someone recreates it, and it shadows `_SOUL_MD_PATH` (then in
+    `llm_proxy`, now `heartbeat._SOUL_MD_PATH`) on host runs. Rejected.
+  - Mount `./openclaw:/openclaw:ro` and make `_SOUL_MD_PATH` honor
     `SOUL_PATH` (which `app.py:90` already does), so nothing nests under
     `/app`. This also reconciles `app.py:93`, which renders to
     `/openclaw/soul.md` — a path with no bind mount today, so that render is
@@ -99,12 +104,16 @@ Decisions, the alternatives weighed, and what was given up. Newest first.
 - **Negative consequences**: A new `workflows/` module still needs a
   `docker-compose.yml` edit before `uvicorn --reload` can see it, and a
   rename-in-place on a mounted file still serves stale code until restart.
-- **Reversibility**: HIGH. Config-only, plus one line in `llm_proxy.py`.
+- **Reversibility**: HIGH. Config-only, plus one line in `heartbeat.py`
+  (originally `llm_proxy.py`).
 
 ## TR-003: Regression-lock marketing seeds before deleting constants
 
 - **Phase**: plan
-- **Status**: proposed
+- **Status**: accepted. The constants are deleted from `generators.py`;
+  the seeds live only in `config/profiles/marketing/profile.yaml`, locked
+  by `workflows/tests/test_profile.py` against
+  `workflows/tests/golden_marketing_seeds.json`.
 - **Decision (Y-statement)**: In the context of extracting `_DEFAULT_PROJECTS`
   /`_DEFAULT_SCHEDULES` from `generators.py` into `marketing/profile.yaml`,
   facing the risk of silently changing the live marketing assistant's seeded
