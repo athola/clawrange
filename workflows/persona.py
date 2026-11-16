@@ -1,8 +1,10 @@
 """Persona rendering — turn a tenant profile into ``openclaw/soul.md``.
 
-OpenClaw reads ``soul.md`` from a bind mount at runtime, so the persona is
-a render artifact produced at setup time (``make profile PROFILE=<name>``)
-rather than something the workflows service serves.
+OpenClaw reads ``soul.md`` / ``SOUL.md`` and ``IDENTITY.md`` from files, so
+the persona is a render artifact: written at setup (``make persona
+PROFILE=<name>``) and re-rendered by the workflows service whenever a
+learning is approved or rejected. The service also returns the composed
+text on ``GET /persona/soul`` and ``GET /persona/identity``.
 
 Two render paths:
 
@@ -21,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import stat
 import tempfile
 from pathlib import Path
 
@@ -175,17 +178,42 @@ def compose_identity(profile: Profile, learnings: list) -> str:
     return (base + _learned_region(learnings, "identity")).rstrip("\n") + "\n"
 
 
+NEW_FILE_MODE = 0o644
+
+
+def _match_existing(fd: int, path: Path) -> None:
+    """Give the temp file the target's mode (and owner, as root).
+
+    mkstemp creates 0600 and os.replace keeps it. The workflows container
+    runs as root while OpenClaw reads as uid 1000, so a 0600 root-owned
+    SOUL.md would lock the gateway out of its own persona.
+    """
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        os.fchmod(fd, NEW_FILE_MODE)
+        return
+    os.fchmod(fd, stat.S_IMODE(st.st_mode))
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        try:
+            os.fchown(fd, st.st_uid, st.st_gid)
+        except OSError as exc:
+            _log.warning("persona render: cannot chown %s: %s", path, exc)
+
+
 def _atomic_write(path: Path, text: str) -> bool:
     """Write text atomically; return False (no raise) if dir is unwritable.
 
     A unique temp file in the target directory plus fsync, then os.replace,
     so concurrent renders never share a temp name and a crash never leaves a
-    truncated persona behind.
+    truncated persona behind. The result keeps the replaced file's mode and
+    owner (0644 for a new file).
     """
     tmp_name = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+        _match_existing(fd, path)
         with os.fdopen(fd, "w") as fh:
             fh.write(text)
             fh.flush()
@@ -199,23 +227,50 @@ def _atomic_write(path: Path, text: str) -> bool:
         return False
 
 
+def planned_writes(profile: Profile, targets: dict) -> list[tuple[str, Path, str]]:
+    """``(result key, path, content kind)`` for every file a render writes.
+
+    Identity files are written only when the profile declares an
+    ``assistant.identity`` block, and ops files only when it declares
+    ``assistant.ops``: otherwise a render would replace hand-written files
+    with template defaults.
+    """
+    a = profile.assistant
+    out: list[tuple[str, Path, str]] = []
+    if targets.get("soul"):
+        out.append(("soul", Path(targets["soul"]), "soul"))
+    if a.get("identity") and targets.get("identity"):
+        out.append(("identity", Path(targets["identity"]), "identity"))
+    for wp in targets.get("workspace_soul", []):
+        out.append((f"ws_soul:{wp}", Path(wp), "soul"))
+    if a.get("identity"):
+        for wp in targets.get("workspace_identity", []):
+            out.append((f"ws_identity:{wp}", Path(wp), "identity"))
+    if a.get("ops"):
+        if targets.get("ops_soul"):
+            out.append(("ops_soul", Path(targets["ops_soul"]), "ops"))
+        for wp in targets.get("ops_workspace_soul", []):
+            out.append((f"ws_ops_soul:{wp}", Path(wp), "ops"))
+    return out
+
+
+def target_writable(path: Path) -> bool:
+    """Whether a render could replace ``path`` (it writes a temp file in the
+    directory, so the nearest existing ancestor must be a writable dir)."""
+    parent = path.parent
+    while not parent.exists() and parent != parent.parent:
+        parent = parent.parent
+    return parent.is_dir() and os.access(parent, os.W_OK | os.X_OK)
+
+
 def render_all(profile: Profile, targets: dict, learnings: list) -> dict:
     """Render persona+identity to all configured targets. Returns per-target ok."""
-    soul = compose_persona(profile, learnings)
-    ident = compose_identity(profile, learnings)
-    results = {}
-    if targets.get("soul"):
-        results["soul"] = _atomic_write(Path(targets["soul"]), soul)
-    if targets.get("identity"):
-        results["identity"] = _atomic_write(Path(targets["identity"]), ident)
-    for wp in targets.get("workspace_soul", []):
-        results[f"ws_soul:{wp}"] = _atomic_write(Path(wp), soul)
-    for wp in targets.get("workspace_identity", []):
-        results[f"ws_identity:{wp}"] = _atomic_write(Path(wp), ident)
-    ops = render_ops_persona(profile)
-    if ops is not None:
-        if targets.get("ops_soul"):
-            results["ops_soul"] = _atomic_write(Path(targets["ops_soul"]), ops)
-        for wp in targets.get("ops_workspace_soul", []):
-            results[f"ws_ops_soul:{wp}"] = _atomic_write(Path(wp), ops)
-    return results
+    texts = {
+        "soul": compose_persona(profile, learnings),
+        "identity": compose_identity(profile, learnings),
+        "ops": render_ops_persona(profile) or "",
+    }
+    return {
+        key: _atomic_write(path, texts[kind])
+        for key, path, kind in planned_writes(profile, targets)
+    }

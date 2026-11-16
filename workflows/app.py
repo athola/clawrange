@@ -150,9 +150,10 @@ def _persona_render_targets(profile):
 
     The repo's openclaw/ templates only exist on the host (``make persona``);
     in the container app.py lives at /app, so those targets are skipped
-    rather than failing on every approve. Workspace targets are every
-    ``workspace*`` directory OpenClaw created under its state dir, so the
-    core never hard-codes one operator's agent names.
+    rather than failing on every approve. Workspace targets are the main
+    agent's ``workspace`` and, when the profile declares ``assistant.ops``,
+    the ops agent's ``workspace-<ops.agent>``; any other agent's workspace
+    is left alone. Only directories OpenClaw already created are targeted.
     """
     state = os.environ.get(
         "OPENCLAW_STATE_DIR", os.path.join(_REPO_ROOT, "data", "openclaw-state")
@@ -162,26 +163,19 @@ def _persona_render_targets(profile):
     if os.path.isdir(repo_openclaw):
         targets["soul"] = os.path.join(repo_openclaw, "soul.md")
         targets["identity"] = os.path.join(repo_openclaw, "identity.md")
-    try:
-        workspaces = sorted(
-            e.path
-            for e in os.scandir(state)
-            if e.is_dir() and e.name.startswith("workspace")
-        )
-    except OSError:
-        workspaces = []
-    # The ops agent (assistant.ops.agent) gets the ops persona, never the
-    # main one; every other workspace gets the main persona.
-    ops = ((profile.assistant if profile else {}) or {}).get("ops") or {}
-    ops_ws = os.path.join(state, f"workspace-{ops['agent']}") if ops else None
-    main = [w for w in workspaces if w != ops_ws]
+    main_ws = os.path.join(state, "workspace")
+    main = [main_ws] if os.path.isdir(main_ws) else []
     targets["workspace_soul"] = [os.path.join(w, "SOUL.md") for w in main]
     targets["workspace_identity"] = [os.path.join(w, "IDENTITY.md") for w in main]
-    if ops_ws:
+    # The ops agent (assistant.ops.agent) gets the ops persona, never the
+    # main one.
+    ops = ((profile.assistant if profile else {}) or {}).get("ops") or {}
+    if ops:
+        ops_ws = os.path.join(state, f"workspace-{ops['agent']}")
         if os.path.isdir(repo_openclaw):
             targets["ops_soul"] = os.path.join(repo_openclaw, "soul-ops.md")
         targets["ops_workspace_soul"] = (
-            [os.path.join(ops_ws, "SOUL.md")] if ops_ws in workspaces else []
+            [os.path.join(ops_ws, "SOUL.md")] if os.path.isdir(ops_ws) else []
         )
     return targets
 

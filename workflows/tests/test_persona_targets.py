@@ -3,19 +3,16 @@
 import app
 
 
-def test_workspace_targets_discovered_from_state_dir(tmp_path, monkeypatch):
-    """Every OpenClaw workspace under the state dir gets the rendered files,
-    without the core hard-coding one operator's agent names."""
+def test_workspace_targets_only_main_workspace(tmp_path, monkeypatch):
+    """Only the main agent's workspace gets the main persona; other agents'
+    workspaces (undeclared ops agents included) are left alone."""
     for ws in ("workspace", "workspace-ops", "workspace-x"):
         (tmp_path / ws).mkdir()
     (tmp_path / "not-a-workspace").mkdir()
     monkeypatch.setenv("OPENCLAW_STATE_DIR", str(tmp_path))
     t = app._persona_render_targets(None)
-    assert sorted(t["workspace_soul"]) == sorted(
-        str(tmp_path / ws / "SOUL.md")
-        for ws in ("workspace", "workspace-ops", "workspace-x")
-    )
-    assert len(t["workspace_identity"]) == 3
+    assert t["workspace_soul"] == [str(tmp_path / "workspace" / "SOUL.md")]
+    assert t["workspace_identity"] == [str(tmp_path / "workspace" / "IDENTITY.md")]
 
 
 def test_repo_targets_skipped_when_repo_dir_absent(tmp_path, monkeypatch):

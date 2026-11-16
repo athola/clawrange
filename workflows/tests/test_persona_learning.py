@@ -52,7 +52,9 @@ def test_approve_idempotent(db):
 
     result1 = pl.approve(db, "cos", row["id"], render_fn=render_fn)
     result2 = pl.approve(db, "cos", row["id"], render_fn=render_fn)
-    assert call_count["n"] == 1
+    # Re-approving keeps the status and re-renders (the retry for a failed write).
+    assert call_count["n"] == 2
+    assert db.get_learning(row["id"])["status"] == "approved"
     assert isinstance(result1, dict)
     assert isinstance(result2, dict)
 

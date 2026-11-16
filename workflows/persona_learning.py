@@ -61,9 +61,10 @@ def approve(brain_db, profile_name, learning_id, render_fn):
         raise ValueError("learning not found")
     if row["profile"] != profile_name:
         raise ValueError("learning not found")
-    if row["status"] == "approved":
-        return row  # idempotent
-    brain_db.set_learning_status(learning_id, "approved")
+    # Re-approving an approved row still re-renders: it is how an operator
+    # retries after a render that failed to write.
+    if row["status"] != "approved":
+        brain_db.set_learning_status(learning_id, "approved")
     approved = brain_db.list_learnings(profile=profile_name, status="approved")
     rendered = render_fn(approved)
     out = dict(brain_db.get_learning(learning_id))
@@ -76,12 +77,15 @@ def reject(brain_db, profile_name, learning_id, render_fn=None):
     row = brain_db.get_learning(learning_id)
     if not row or row["profile"] != profile_name:
         raise ValueError("learning not found")
-    was_approved = row["status"] == "approved"
-    out = brain_db.set_learning_status(learning_id, "rejected")
-    if was_approved and render_fn is not None:
-        # The rejected content is baked into the rendered files; re-render
-        # the surviving approved set so files and DB stay in sync.
-        render_fn(brain_db.list_learnings(profile=profile_name, status="approved"))
+    # An approved row's content is baked into the rendered files, so
+    # rejecting it re-renders the surviving set. Rejecting an already
+    # rejected row re-renders too, as the retry for a failed write.
+    needs_render = row["status"] in ("approved", "rejected")
+    out = dict(brain_db.set_learning_status(learning_id, "rejected"))
+    if needs_render and render_fn is not None:
+        out["render"] = render_fn(
+            brain_db.list_learnings(profile=profile_name, status="approved")
+        )
     return out
 
 
@@ -124,13 +128,18 @@ def scan_signals(brain_db, profile_name):
         return []
     pending = brain_db.list_learnings(profile=profile_name, status="pending")
     # Repetition heuristic: 3+ pending with same target -> surface a meta-note.
-    by_target = {}
+    # Count only real feedback: the scan's own signal rows must not feed the
+    # count, and a target that already has a pending signal is not re-flagged.
+    by_target: dict[str, int] = {}
+    signalled = set()
     for r in pending:
-        by_target.setdefault(r["target"], 0)
-        by_target[r["target"]] += 1
+        if r["source"] == "signal":
+            signalled.add(r["target"])
+            continue
+        by_target[r["target"]] = by_target.get(r["target"], 0) + 1
     out = []
     for target, count in by_target.items():
-        if count >= 3:
+        if count >= 3 and target not in signalled:
             out.append(
                 propose(
                     brain_db,
@@ -165,11 +174,8 @@ def seed_overlay(brain_db, profile_name, overlay):
     }
     n = 0
     for item in overlay or []:
-        key = (item.get("target"), item.get("content"))
-        if key in existing:
-            continue
         try:
-            _validate_learning(
+            content = _validate_learning(
                 item.get("kind", "persona"),
                 item.get("content"),
                 item.get("source", "seed"),
@@ -178,13 +184,19 @@ def seed_overlay(brain_db, profile_name, overlay):
         except ValueError as exc:
             _log.warning("seed_overlay skipping invalid item %r: %s", item, exc)
             continue
+        # Compare and store the stripped value, so trailing whitespace in
+        # learned.yaml neither re-seeds on every boot nor reaches the render.
+        key = (item.get("target"), content)
+        if key in existing:
+            continue
         row = brain_db.create_learning(
             profile_name,
             item.get("kind", "persona"),
             item.get("target"),
-            item["content"],
+            content,
             item.get("source", "seed"),
         )
+        existing.add(key)
         brain_db.set_learning_status(row["id"], "approved")
         n += 1
     return n

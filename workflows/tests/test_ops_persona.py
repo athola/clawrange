@@ -94,10 +94,11 @@ class TestOpsRenderTargets:
             str(tmp_path / "workspace-max-ops" / "SOUL.md")
         ]
 
-    def test_without_ops_block_every_workspace_is_main(self, tmp_path, monkeypatch):
+    def test_without_ops_block_only_main_workspace(self, tmp_path, monkeypatch):
+        # An undeclared ops agent's workspace must not get the main persona.
         for ws in ("workspace", "workspace-max-ops"):
             (tmp_path / ws).mkdir()
         monkeypatch.setenv("OPENCLAW_STATE_DIR", str(tmp_path))
         t = app._persona_render_targets(_profile())
-        assert len(t["workspace_soul"]) == 2
+        assert t["workspace_soul"] == [str(tmp_path / "workspace" / "SOUL.md")]
         assert t.get("ops_workspace_soul", []) == []

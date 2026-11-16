@@ -97,14 +97,11 @@ persona-export: ## Export approved persona learnings to learned.yaml (PROFILE=<n
 	@$(LOAD_ENV); uv run python workflows/scripts/persona_export.py "$(PROFILE)"
 
 # PROFILE is passed as argv, never interpolated into the Python source.
-persona: ## Render soul.md + identity.md from a profile's identity + learned overlay (PROFILE=<name>)
+# Renders brain approvals plus learned.yaml (overlay only, with a warning,
+# when data/brain/brain.db is missing).
+persona: ## Render soul.md + identity.md from a profile, brain approvals and learned overlay (PROFILE=<name>)
 	@test -n "$(PROFILE)" || { echo "usage: make persona PROFILE=<name>"; exit 1; }
-	@$(LOAD_ENV); uv run python -c "import sys; sys.path.insert(0,'workflows'); \
-from persona import render_all; from tenant_profile import load_profile; \
-import persona_learning as pl; \
-name=sys.argv[1]; p=load_profile(name); \
-r=render_all(p, {'soul':'openclaw/soul.md','identity':'openclaw/identity.md','ops_soul':'openclaw/soul-ops.md'}, pl.load_overlay(name)); \
-print('rendered ->', {k:('ok' if v else 'failed') for k,v in r.items()})" "$(PROFILE)"
+	@$(LOAD_ENV); uv run python workflows/scripts/persona_render.py "$(PROFILE)"
 
 persona-demo: ## Offline walkthrough of the persona meta-learning loop (PROFILE=<name>)
 	@uv run python workflows/scripts/persona_demo.py "$${PROFILE:-chief-of-staff}"
@@ -137,12 +134,9 @@ validate: ## Validate config files and project structure
 
 .PHONY: profile persona persona-demo seed-demo persona-export
 
-profile: ## Render openclaw/soul.md from a profile + set it in .env (PROFILE=<name>)
+profile: ## Render a profile's persona files (as make persona) + set it in .env (PROFILE=<name>)
 	@test -n "$(PROFILE)" || { echo "usage: make profile PROFILE=<name>"; exit 1; }
-	@$(LOAD_ENV); uv run python -c "import sys; sys.path.insert(0,'workflows'); \
-from persona import write_soul; from tenant_profile import load_profile; \
-p=write_soul(load_profile(sys.argv[1]), 'openclaw/soul.md'); \
-print('rendered persona ->', p)" "$(PROFILE)"
+	@$(LOAD_ENV); uv run python workflows/scripts/persona_render.py "$(PROFILE)"
 	@if [ -f .env ]; then \
 		if grep -q '^CLAWRANGE_PROFILE=' .env; then \
 			sed -i.bak 's/^CLAWRANGE_PROFILE=.*/CLAWRANGE_PROFILE=$(PROFILE)/' .env && rm -f .env.bak; \

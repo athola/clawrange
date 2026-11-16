@@ -3,20 +3,30 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 import persona_learning as pl
 from generators import persona_reflect_generator
-from persona import compose_identity, compose_persona, render_all
+from persona import (
+    compose_identity,
+    compose_persona,
+    planned_writes,
+    render_all,
+    target_writable,
+)
 
 
 class Proposal(BaseModel):
     kind: str
     target: str = ""
     content: str
-    source: str = "feedback"
+    # `seed` (learned.yaml) and `signal` (scan_signals) are internal
+    # producers that call persona_learning directly; API callers can't
+    # claim them.
+    source: Literal["feedback", "reflect", "scheduled"] = "feedback"
 
 
 def _run_reflection(profile_name):
@@ -96,10 +106,16 @@ def create_persona_router(brain_db, profile_provider, render_targets_fn) -> APIR
     def health():
         p = _profile()
         pending = brain_db.list_learnings(profile=p.name, status="pending")
+        targets = render_targets_fn(p)
         return {
             "profile": p.name,
             "pending": len(pending),
-            "targets": list(render_targets_fn(p).keys()),
+            "targets": list(targets.keys()),
+            # Per file a render would write: can it be replaced right now?
+            "writable": {
+                key: target_writable(path)
+                for key, path, _ in planned_writes(p, targets)
+            },
         }
 
     return router

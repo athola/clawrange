@@ -147,7 +147,11 @@ def test_compose_appends_learned_region_and_is_non_destructive():
 
 
 def test_render_all_writes_targets(tmp_path):
-    p = Profile(name="t", raw={"profile": "t", "assistant": {"name": "Max"}})
+    # Identity is rendered only for a profile that declares an identity block.
+    p = Profile(
+        name="t",
+        raw={"profile": "t", "assistant": {"name": "Max", "identity": {"vibe": "v"}}},
+    )
     soul = tmp_path / "soul.md"
     ident = tmp_path / "IDENTITY.md"
     res = render_all(p, {"soul": str(soul), "identity": str(ident)}, [])
