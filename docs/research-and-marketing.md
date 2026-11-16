@@ -1,29 +1,36 @@
 # Research and Marketing Operator Guide
 
-This guide covers John-117's multi-source research orchestrator
+This guide covers the assistant's multi-source research orchestrator
 and the top-of-funnel marketing tooling that surrounds it. It is
 the operator-side companion to the planning artifact in
 `archive/research-and-marketing-plan.md`.
 
 ## TL;DR
 
+Every route below except `GET /healthz/research` needs the bearer
+token from `.env`. Load it first with `set -a; . ./.env; set +a`.
+
 ```bash
 # Run a research session and persist it
 curl -s -X POST http://localhost:5678/research \
+  -H "Authorization: Bearer $PROXY_AUTH_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"topic":"agent platforms shipping in 2026"}' | jq .
 
 # Recall recent sessions
-curl -s http://localhost:5678/research/sessions | jq .
+curl -s http://localhost:5678/research/sessions \
+  -H "Authorization: Bearer $PROXY_AUTH_TOKEN" | jq .
 
 # Schedule daily content idea passes (uses last 5 sessions)
 curl -s -X POST http://localhost:5678/sched \
+  -H "Authorization: Bearer $PROXY_AUTH_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"id":"daily-content","name":"Daily content ideas",
        "kind":"content_idea","cron":"0 8 * * *"}'
 
-# Queue a comment draft for a specific Reddit post
-curl -s -X POST http://localhost:5678/sched/draft-once/run -d '{}'
+# Run an existing schedule now (here one with id draft-once)
+curl -s -X POST http://localhost:5678/sched/draft-once/run \
+  -H "Authorization: Bearer $PROXY_AUTH_TOKEN"
 ```
 
 ## Research Orchestrator
@@ -35,11 +42,16 @@ ranked, deduplicated, citation-bearing findings.
 
 | Channel | Source | Notes |
 |---------|--------|-------|
-| `discourse` | Reddit subreddits | Default subs: ClaudeAI, LocalLLaMA, SideProject. Override with `subreddits`. |
+| `discourse` | Reddit subreddits | Default subs come from the active profile (`reddit.default_subreddits`, else the tracked projects' subreddits). Override with `subreddits`. |
 | `code` | GitHub repos | Default `min_stars=50`. |
-| `discourse_web` (or `web`) | GLM server-side web search | Returns one synthesized summary finding per call. |
-| `academic` | arXiv and Semantic Scholar | Public, no API key. Fans out both in parallel. Per-source failures are logged and swallowed. |
-| `triz` | GLM web search with TRIZ prompt | Cross-domain analogical reasoning. Finds solutions in adjacent fields with bridge mappings. |
+| `discourse_web` (or `web`) | OpenRouter `:online` web search through the proxy's search tier | Returns one synthesized summary finding per call. Needs `OPENROUTER_API_KEY` and a balance above the floor. |
+| `academic` | arXiv and Semantic Scholar | Public, no API key. Fans out both in parallel. If one source fails the other's findings are returned; the channel fails only when both do. |
+| `triz` | OpenRouter `:online` web search with a TRIZ prompt | Cross-domain analogical reasoning. Finds solutions in adjacent fields with bridge mappings. |
+
+A request without `channels` runs `discourse`, `code` and
+`discourse_web`; ask for `academic` and `triz` by name. A channel that
+fails is reported under `errors` while the others still return. When
+every requested channel fails, `/research` returns 502 with the reason.
 
 ### Channel readiness check
 
@@ -49,7 +61,9 @@ curl -s http://localhost:5678/healthz/research | jq .
 
 Returns `{configured_count, total_channels, status, channels: {...}}`
 where each channel reports `configured`, `source`, and (when not
-configured) a `reason` like `GITHUB_PAT not set`. Use this to
+configured) a `reason` like `GITHUB_PAT not set`. `discourse_web` and
+`triz` report source `openrouter-online` and are configured only when
+`OPENROUTER_API_KEY` is set. This route is public. Use it to
 diagnose empty `/research` responses before chasing logic bugs.
 
 The shell wrapper `scripts/test_research.sh` (also exposed as
@@ -117,29 +131,33 @@ brain table. Each finding lives in `research_findings`. List recent
 sessions:
 
 ```bash
-curl -s http://localhost:5678/research/sessions?limit=10 | jq .
+curl -s 'http://localhost:5678/research/sessions?limit=10' \
+  -H "Authorization: Bearer $PROXY_AUTH_TOKEN" | jq .
 ```
 
 Get a single session with all findings:
 
 ```bash
-curl -s http://localhost:5678/research/sessions/<id> | jq .
+curl -s http://localhost:5678/research/sessions/<id> \
+  -H "Authorization: Bearer $PROXY_AUTH_TOKEN" | jq .
 ```
 
 The `session_id` is short (12 chars) and is included in every
-`/research` response. John-117 uses this to recall earlier work
+`/research` response. The assistant uses this to recall earlier work
 without re-running the fanout.
 
 ### Heavy research via tome
 
 For research that needs the full tome plugin (multi-hop digging,
-heavy academic synthesis, or TRIZ depth=heavy mode), John-117
+heavy academic synthesis, or TRIZ depth=heavy mode), the assistant
 enqueues a task whose description starts with
 `research:tome: <topic>` (or the bracket form
 `[research:tome] <topic>`).
 
-The bridge script in `scripts/tome_bridge.py` runs from Alex's
-local machine where the tome Claude Code plugin lives:
+The bridge script in `scripts/tome_bridge.py` runs on the
+operator's local machine where the tome Claude Code plugin lives. It
+needs `PROXY_AUTH_TOKEN` in its environment (the make targets load
+`.env`):
 
 ```bash
 make tome-bridge          # one polling pass
@@ -155,11 +173,23 @@ The bridge:
    as a subprocess (timeout default 1800s), and posts the output
    back via `/task/{id}/result`.
 4. Marks tasks `failed` with diagnostic on timeout (rc=124),
-   missing-binary (rc=127), or non-zero exit.
+   missing-binary (rc=127), or non-zero exit. A topic over 300
+   characters or with control characters is failed without running.
+
+The topic is queue text, so the bridged session is locked down: only
+the `WebSearch`, `WebFetch`, `Skill` and `Agent` tools exist and are
+pre-approved (`--tools`, `--allowedTools`, `--permission-mode
+dontAsk`), no MCP server config is loaded (`--strict-mcp-config`), and
+it runs in an empty temporary directory rather than the repo. It cannot
+read files or run commands.
+
+A worker that dies after claiming leaves its task `active`. The
+heartbeat fails any task still active after `HEARTBEAT_ACTIVE_REAP_HOURS`
+(default 6) and reports it in the digest; re-create it to retry.
 
 Setup options:
 - **One-off**: `make tome-bridge` after enqueuing a `research:tome`
-  task from John-117.
+  task from the assistant.
 - **Always-on**: run `make tome-bridge-watch` in a tmux/screen pane,
   or wire it into a systemd user unit / launchd job.
 - **Per-task timeout**: `TOME_BRIDGE_TIMEOUT=600 make tome-bridge`.
@@ -169,8 +199,8 @@ The bridge has zero dependencies beyond Python stdlib and the
 
 ## Marketing Orchestrator (extended)
 
-The four canonical projects are seeded on first boot of the
-workflows service:
+The `marketing` profile seeds five projects on first boot of the
+workflows service (the default `starter` profile seeds none):
 
 | Slug | Purpose | Key subreddits |
 |------|---------|----------------|
@@ -178,7 +208,7 @@ workflows service:
 | `skrills` | Trade-skill capture chrome extension | Construction, ITCareerQuestions, SideProject |
 | `simple-resume` | YAML → PDF/HTML resume generator | resumes, cscareerquestions, SideProject |
 | `clawrange` | This stack, personal AI ops gateway | ClaudeAI, claudecode, vibecoding, opensourceai, codex, sideprojects, LocalLLaMA, selfhosted |
-| `personal-brand` | Alex's AI-systems engineer voice | ClaudeAI, LocalLLaMA, MachineLearning, ExperiencedDevs |
+| `personal-brand` | The operator's AI-systems engineer voice | ClaudeAI, LocalLLaMA, MachineLearning, ExperiencedDevs |
 
 ### Generators
 
@@ -195,7 +225,8 @@ workflows service:
 #### `morning_digest`: the 8am rundown
 
 Delivered by `morning_digest_generator` (in `workflows/generators.py`).
-On a fresh boot, `seed_from_profile` registers a `0 8 * * *` schedule
+On a fresh boot with the `marketing` profile, `seed_from_profile`
+registers a `0 8 * * *` schedule
 in the operator timezone (`SCHEDULER_TZ`, else the profile's
 `assistant.timezone`, else UTC), so the morning rundown
 fires without manual `/sched add`.
@@ -235,7 +266,8 @@ delivery.
 
 If workflows is down at 08:00, the scheduler runs the missed digest at
 boot, as long as the fire was under 4h ago and no later run recorded a
-delivery (`CATCH_UP_SCHEDULES` in `workflows/scheduler.py`).
+delivery. A schedule opts in with `catch_up: true` in the profile
+(`CATCH_UP_WINDOW` and `catch_up_ids` in `workflows/scheduler.py`).
 
 Override at runtime with `kwargs` on the schedule:
 - `project_slugs`: limit to specific projects
@@ -252,7 +284,7 @@ the rundown lists this under **Setup needed** every morning.
 **Step 1: Create the script app**
 
 1. Sign in to Reddit as the account whose voice the bot will speak
-   in (typically `u/athola`).
+   in (for example `u/your-handle`).
 2. Visit https://www.reddit.com/prefs/apps and click
    **"are you a developer? create an app..."** at the bottom.
 3. Fill in the form:
@@ -277,7 +309,7 @@ On the app card you just created:
   Click **"edit"** if it's hidden behind a placeholder.
 
 You also need the Reddit account's own credentials:
-- **username**: the account you logged in as (e.g. `athola`).
+- **username**: the account you logged in as (e.g. `your-handle`).
 - **password**: that account's password. If 2FA is enabled, append
   the current TOTP code with a colon, e.g. `mypassword:123456`,
   per asyncpraw's documented script-app flow. Long-running daemons
@@ -290,9 +322,9 @@ Add to `.env` at the repo root (the file is gitignored):
 ```dotenv
 REDDIT_CLIENT_ID=abc123XYZ
 REDDIT_CLIENT_SECRET=longersecretvalue
-REDDIT_USERNAME=athola
+REDDIT_USERNAME=your-handle
 REDDIT_PASSWORD=yourpassword
-REDDIT_USER_AGENT=clawrange-marketing-bot/0.1 (by u/athola)
+REDDIT_USER_AGENT="clawrange-marketing-bot/0.1 (by u/your-handle)"
 ```
 
 The `REDDIT_USER_AGENT` is required by Reddit's API rules. Include
@@ -302,23 +334,28 @@ default value is acceptable but the personalised form is preferred.
 **Step 4: Reload the workflows container**
 
 ```bash
-docker compose restart workflows
+docker compose up -d workflows
 ```
 
-The container reads `.env` at start. A restart picks up the new
-values. No image rebuild needed.
+Compose substitutes `.env` values into the container environment when
+it creates the container, so recreate it: `docker compose restart`
+keeps the old environment. Only variables listed under the service's
+`environment:` in `docker-compose.yml` reach the container (the
+`REDDIT_*` ones are). No image rebuild needed.
 
 **Step 5: Verify the OAuth path is live**
 
 ```bash
-curl -X POST http://localhost:5678/sched/morning_digest/run
+curl -s -X POST http://localhost:5678/sched/morning_digest/run \
+  -H "Authorization: Bearer $PROXY_AUTH_TOKEN"
 docker logs msp-workflows --since 30s | grep -i reddit
 ```
 
 Look for the absence of `Reddit OAuth not configured — using public
 JSON fallback` in the logs. Confirm `[DRAFT]` tasks appear in the
-queue with `curl http://localhost:5678/task?status=pending` and
-that the Markdown digest landed in Telegram.
+queue with
+`curl -s 'http://localhost:5678/task?status=pending' -H "Authorization: Bearer $PROXY_AUTH_TOKEN"`
+and that the Markdown digest landed in Telegram.
 
 **Troubleshooting**
 
@@ -340,7 +377,7 @@ and reinforced in `openclaw/soul.md`. Core rules:
 3. **Honest disclaimers beat polish** on r/SideProject and
    r/programming.
 4. **Never auto-post**: every draft lands as a `[DRAFT]` task and
-   Alex sends manually after review.
+   the operator sends it manually after review.
 5. **HN for depth, Reddit for breadth**: converts ~3x better,
    reaches ~1/3 the audience.
 6. **r/SideProject format**: `[Launch] Name — one-liner ≤100ch`,
@@ -351,13 +388,13 @@ and reinforced in `openclaw/soul.md`. Core rules:
 ### Operator workflow
 
 ```text
-morning_scan ──► task queue ──► John-117 reviews → enqueues
+morning_scan ──► task queue ──► assistant reviews, enqueues
                                                    comment_draft
                                                           │
                                                           ▼
                                                   [DRAFT] task
                                                           │
-                                                  Alex reviews
+                                                  operator reviews
                                                           │
                                                           ▼
                                                   Manual post
@@ -365,7 +402,7 @@ morning_scan ──► task queue ──► John-117 reviews → enqueues
 
 ## Acceptance evidence
 
-The implementation is covered by 425 unit tests under
+The implementation is covered by the unit tests under
 `workflows/tests/` (see `test_research.py`,
 `test_brain_db_research.py`, `test_marketing.py`,
 `test_app.py::TestResearchEndpoint`). Run them with:
@@ -380,6 +417,7 @@ directly:
 ```bash
 make health
 curl -s -X POST http://localhost:5678/research \
+  -H "Authorization: Bearer $PROXY_AUTH_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"topic":"hello world"}' | jq .
 ```

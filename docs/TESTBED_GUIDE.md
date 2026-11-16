@@ -13,6 +13,8 @@ cd ~/clawrange
 #    Get one at https://openrouter.ai/settings/keys (keep balance above $10)
 make setup
 nano .env
+#    Also set PROXY_AUTH_TOKEN (make start refuses to run without it),
+#    e.g. PROXY_AUTH_TOKEN=<output of: openssl rand -hex 32>
 
 # 3. Start the core stack (OpenClaw and Workflows)
 make start
@@ -36,16 +38,21 @@ Total setup time: under 10 minutes (excluding Docker image pulls).
 
 **OpenClaw** is the AI assistant gateway. It receives messages over
 Telegram (and HTTP), routes them through the workflows LLM proxy, and
-returns responses shaped by `openclaw/soul.md`. The default persona is
-"John-117", the operator's executive assistant. Accessible at
+returns responses shaped by `openclaw/soul.md`, which `make start`
+renders from the active profile on first run. The default `starter`
+profile gives an identity-free assistant; `marketing` and
+`chief-of-staff` are named examples. Accessible at
 http://localhost:3000.
 
 **Workflows** is the FastAPI service. It owns the
 brain database (SQLite and optional embeddings), the persistent task
 queue, the OpenAI-compatible LLM proxy with tiered routing, the
 APScheduler-driven cron jobs, and the marketing scanners
-(Reddit and GitHub). Endpoints live at http://localhost:5678 (see
-[specification.md](archive/specification.md) for the full surface).
+(Reddit and GitHub). Endpoints live at http://localhost:5678 and need
+`Authorization: Bearer $PROXY_AUTH_TOKEN` except the health checks,
+`GET /tier` and `GET /sched[/{id}]` (the current list is in
+`CLAUDE.md`; [specification.md](archive/specification.md) is the
+original design).
 
 **DeerFlow** is the deep research layer (optional). When a question
 needs broad research (market analysis, regulatory deep dives), DeerFlow
@@ -101,7 +108,8 @@ routing, marketing scanners, and Telegram formatting.
 | DeerFlow using ByteDance endpoints | Research calls go to Doubao/Volcengine | Check `deer-flow/config.yaml`. All models must have `base_url: https://openrouter.ai/api/v1` |
 | Ollama out of memory | `out of memory` or killed process | Use a smaller model: `ollama run llama3.2:1b`. Or close other apps to free RAM. |
 | Schedules not firing | `/sched` shows next_fire_time but no tasks created | Workflows must run with a single uvicorn worker. Check container memory and `make logs-workflows`. |
-| Reddit/GitHub scans return empty | `/scan/reddit` or `/scan/github` empty results | Confirm credentials in `.env` (REDDIT_*, GITHUB_PAT). Missing creds degrade gracefully (no exception, just empty list). |
+| Reddit/GitHub scans fail | `/scan/reddit` or `/scan/github` returns 502 | The upstream call failed and `detail` says why. Confirm credentials in `.env` (REDDIT_*, GITHUB_PAT). Without Reddit creds the scan uses the public JSON and feed fallback, which Reddit often refuses; no GitHub PAT means lower rate limits, not an error. An empty 200 means the search ran and found nothing. |
+| Every workflows call returns 401 | `{"detail": "Unauthorized"}` | Set `PROXY_AUTH_TOKEN` in `.env`, recreate the stack, and send `Authorization: Bearer $PROXY_AUTH_TOKEN`. |
 
 ## Cost Estimation
 
@@ -131,10 +139,10 @@ Caddy walkthrough. Key shifts vs. the local testbed:
 
 | Aspect | Testbed (Local) | Production |
 |--------|----------------|------------|
-| **Docker images** | `:latest` tags | Pin to specific versions (e.g. `ghcr.io/openclaw/openclaw:2026.11.3`) |
+| **Docker images** | Pinned (`ghcr.io/openclaw/openclaw:2026.11.3`) | Same pins; bump deliberately |
 | **Network** | Docker bridge on localhost | Tailscale VPN mesh between Droplet and ThinkCentre |
 | **Domain/SSL** | http://localhost | Real domain with Let's Encrypt SSL via Caddy |
-| **soul.md** | Default John-117 persona | Same; the ops agent's persona renders from `soul-ops.template.md` |
+| **soul.md** | Rendered from the active profile (`starter` by default) | Same; the ops agent's persona renders from `soul-ops.template.md` |
 | **Workflows** | Hot-reload bind mounts | Image-baked code, single uvicorn worker |
 | **Brain DB** | `data/brain/brain.db` (bind mount) | Persistent volume with backup strategy |
 | **Secrets** | `.env` file | Docker secrets or sealed env |
@@ -150,7 +158,7 @@ Caddy walkthrough. Key shifts vs. the local testbed:
 
 ## Repurposing for a New Operator
 
-The default persona is wired for the operator. To repoint the stack:
+The persona comes from the active profile. To repoint the stack:
 
 1. Point a profile at the new operator (persona, `assistant.ops` for the
    heartbeat agent) and set `OPERATOR_NAME`, `OPERATOR_ORG` and
