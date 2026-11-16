@@ -2465,9 +2465,10 @@ class TestRedditAdapter:
         assert results[0].score == 42
 
     @pytest.mark.asyncio
-    async def test_public_fallback_swallows_network_errors(self):
+    async def test_public_fallback_network_error_raises_upstream(self):
         from unittest.mock import AsyncMock, patch
 
+        from errors import UpstreamError
         from reddit_search import search_subreddits
 
         mock_client = AsyncMock()
@@ -2475,10 +2476,12 @@ class TestRedditAdapter:
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("reddit_search.httpx.AsyncClient", return_value=mock_client):
-            results = await search_subreddits("test", ["ClaudeAI"])
-
-        assert results == []
+        # A failed search must not look like "no posts" (#26).
+        with (
+            patch("reddit_search.httpx.AsyncClient", return_value=mock_client),
+            pytest.raises(UpstreamError),
+        ):
+            await search_subreddits("test", ["ClaudeAI"])
 
     def test_parse_since(self):
         from reddit_search import _parse_since
@@ -2495,12 +2498,14 @@ class TestRedditAdapter:
 
 class TestGitHubAdapter:
     @pytest.mark.asyncio
-    async def test_search_without_config(self):
+    async def test_search_unreachable_raises_upstream(self):
+        from errors import UpstreamError
         from github_search import search_repos
 
-        # Without githubkit installed, returns empty
-        results = await search_repos("test")
-        assert isinstance(results, list)
+        # Unit tests have no network: the failed search raises (#26)
+        # instead of returning an empty list that reads as "no repos".
+        with pytest.raises(UpstreamError):
+            await search_repos("test")
 
     @pytest.mark.asyncio
     async def test_traffic_without_config(self):

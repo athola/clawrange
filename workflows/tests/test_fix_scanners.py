@@ -1,9 +1,20 @@
 """Regression tests for the PR #11 review fixes in scanners and generators."""
 
+import sys
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import httpx
 import pytest
 
 import generators
+import github_search
+import reddit_search
+import research
+import rundown
 from app import brain_db
+from errors import UpstreamError
+from reddit_search import SearchHealth
 
 TOPICS = ["topic A", "topic B", "topic C"]
 
@@ -250,3 +261,345 @@ class TestPersonaReflect:
         monkeypatch.setattr("llm_proxy._llm_call", AsyncMock(return_value=too_long))
         await generators.persona_reflect_generator(brain_db, profile_name="cos")
         assert brain_db.list_learnings(profile="cos") == []
+
+
+# ─── #26: upstream failures raise instead of returning [] ───────────
+
+
+def _github_client(repos=None, issues=None):
+    async def call(result):
+        if isinstance(result, Exception):
+            raise result
+        return SimpleNamespace(parsed_data=SimpleNamespace(items=result))
+
+    search = SimpleNamespace(
+        async_repos=lambda **kw: call(repos),
+        async_issues_and_pull_requests=lambda **kw: call(issues),
+    )
+    return SimpleNamespace(rest=SimpleNamespace(search=search))
+
+
+class TestGitHubSearchRaises:
+    @pytest.mark.asyncio
+    async def test_repo_search_failure_raises(self, monkeypatch):
+        client = _github_client(repos=RuntimeError("403 rate limited"))
+        monkeypatch.setattr(github_search, "_get_client", lambda: client)
+        with pytest.raises(UpstreamError, match="rate limited"):
+            await github_search.search_repos("x")
+
+    @pytest.mark.asyncio
+    async def test_issue_search_failure_raises(self, monkeypatch):
+        client = _github_client(issues=RuntimeError("timeout"))
+        monkeypatch.setattr(github_search, "_get_client", lambda: client)
+        with pytest.raises(UpstreamError):
+            await github_search.search_issues("x")
+
+    @pytest.mark.asyncio
+    async def test_missing_client_raises(self, monkeypatch):
+        monkeypatch.setattr(github_search, "_get_client", lambda: None)
+        with pytest.raises(UpstreamError):
+            await github_search.search_repos("x")
+        with pytest.raises(UpstreamError):
+            await github_search.search_issues("x")
+
+    @pytest.mark.asyncio
+    async def test_zero_results_is_not_an_error(self, monkeypatch):
+        client = _github_client(repos=[], issues=[])
+        monkeypatch.setattr(github_search, "_get_client", lambda: client)
+        assert await github_search.search_repos("x") == []
+        assert await github_search.search_issues("x") == []
+
+
+def _reddit_transport(monkeypatch, handler):
+    real_client = httpx.AsyncClient
+
+    def factory(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(reddit_search.httpx, "AsyncClient", factory)
+    for var in ("REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def _oauth_env(monkeypatch):
+    for var in (
+        "REDDIT_CLIENT_ID",
+        "REDDIT_CLIENT_SECRET",
+        "REDDIT_USERNAME",
+        "REDDIT_PASSWORD",
+    ):
+        monkeypatch.setenv(var, "x")
+
+
+class TestRedditSearchRaises:
+    @pytest.mark.asyncio
+    async def test_public_search_all_refused_raises(self, monkeypatch):
+        _reddit_transport(monkeypatch, lambda req: httpx.Response(500))
+        health = SearchHealth()
+        with pytest.raises(UpstreamError):
+            await reddit_search.search_subreddits("x", ["a", "b"], health=health)
+        assert health.failures == {"500": 2}
+
+    @pytest.mark.asyncio
+    async def test_public_search_without_health_raises(self, monkeypatch):
+        _reddit_transport(monkeypatch, lambda req: httpx.Response(403))
+        with pytest.raises(UpstreamError):
+            await reddit_search.search_subreddits("x", ["a"])
+
+    @pytest.mark.asyncio
+    async def test_partial_failure_returns_what_was_found(self, monkeypatch):
+        statuses = iter([500, 200])
+
+        def handler(req):
+            return httpx.Response(next(statuses), json={"data": {"children": []}})
+
+        _reddit_transport(monkeypatch, handler)
+        health = SearchHealth()
+        out = await reddit_search.search_subreddits("x", ["a", "b"], health=health)
+        assert out == []
+        assert health.ok == 1
+
+    @pytest.mark.asyncio
+    async def test_cached_feed_counts_as_a_successful_look(self, monkeypatch):
+        feed = '<feed xmlns="http://www.w3.org/2005/Atom"></feed>'
+
+        def handler(req):
+            if req.url.path.endswith(".rss"):
+                return httpx.Response(200, text=feed)
+            return httpx.Response(403)
+
+        _reddit_transport(monkeypatch, handler)
+        monkeypatch.setattr(reddit_search, "_sleep", AsyncMock())
+        health = SearchHealth()
+        for topic in ("one", "two"):
+            out = await reddit_search.search_subreddits(
+                topic, ["a"], health=health, feed_fallback=True
+            )
+            assert out == []
+
+    @pytest.mark.asyncio
+    async def test_failed_feed_raises_on_every_call(self, monkeypatch):
+        _reddit_transport(monkeypatch, lambda req: httpx.Response(403))
+        monkeypatch.setattr(reddit_search, "_sleep", AsyncMock())
+        health = SearchHealth()
+        for topic in ("one", "two"):
+            with pytest.raises(UpstreamError):
+                await reddit_search.search_subreddits(
+                    topic, ["a"], health=health, feed_fallback=True
+                )
+
+    @pytest.mark.asyncio
+    async def test_oauth_without_asyncpraw_raises_and_records(self, monkeypatch):
+        _oauth_env(monkeypatch)
+        monkeypatch.setitem(sys.modules, "asyncpraw", None)
+        health = SearchHealth()
+        with pytest.raises(UpstreamError):
+            await reddit_search.search_subreddits("x", ["a"], health=health)
+        assert health.requests == 1 and health.ok == 0
+        assert not rundown.reddit_status(health).ok
+
+    @pytest.mark.asyncio
+    async def test_oauth_client_error_raises_and_records(self, monkeypatch):
+        _oauth_env(monkeypatch)
+
+        def bad_reddit(**kw):
+            raise RuntimeError("401 invalid_grant")
+
+        monkeypatch.setitem(
+            sys.modules, "asyncpraw", SimpleNamespace(Reddit=bad_reddit)
+        )
+        health = SearchHealth()
+        with pytest.raises(UpstreamError, match="invalid_grant"):
+            await reddit_search.search_subreddits("x", ["a"], health=health)
+        assert health.failures == {"error": 1}
+
+    @pytest.mark.asyncio
+    async def test_search_all_http_error_raises(self, monkeypatch):
+        _reddit_transport(monkeypatch, lambda req: httpx.Response(429))
+        health = SearchHealth()
+        with pytest.raises(UpstreamError):
+            await reddit_search.search_all("x", health=health)
+        assert health.failures == {"429": 1}
+
+    @pytest.mark.asyncio
+    async def test_search_all_transport_error_raises(self, monkeypatch):
+        def handler(req):
+            raise httpx.ConnectError("down")
+
+        _reddit_transport(monkeypatch, handler)
+        with pytest.raises(UpstreamError):
+            await reddit_search.search_all("x")
+
+    @pytest.mark.asyncio
+    async def test_search_all_tripped_raises(self):
+        health = SearchHealth()
+        for _ in range(SearchHealth.BLOCK_LIMIT):
+            health.record(403)
+        with pytest.raises(UpstreamError):
+            await reddit_search.search_all("x", health=health)
+        assert health.skipped == 1
+
+
+class TestResearchChannelsRaise:
+    @pytest.mark.asyncio
+    async def test_academic_raises_when_both_sources_fail(self, monkeypatch):
+        async def fail_get(self, url, **kw):
+            raise httpx.ConnectError("down")
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", fail_get)
+        with pytest.raises(UpstreamError):
+            await research._fetch_academic("x")
+
+    @pytest.mark.asyncio
+    async def test_academic_returns_the_source_that_worked(self, monkeypatch):
+        async def get(self, url, **kw):
+            if "arxiv" in url:
+                raise httpx.ConnectError("down")
+            payload = {"data": [{"title": "Paper", "url": "https://s2/p", "year": 1}]}
+            return httpx.Response(200, json=payload, request=httpx.Request("GET", url))
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", get)
+        out = await research._fetch_academic("x")
+        assert [f.title for f in out] == ["Paper"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fetcher", ["_fetch_web", "_fetch_triz"])
+    async def test_llm_channels_raise_when_the_tier_fails(self, monkeypatch, fetcher):
+        monkeypatch.setattr("llm_proxy._llm_call", AsyncMock(return_value=None))
+        with pytest.raises(UpstreamError):
+            await getattr(research, fetcher)("x")
+
+
+class TestOrchestrateErrors:
+    @pytest.mark.asyncio
+    async def test_partial_failure_is_reported_per_channel(self, monkeypatch):
+        async def boom(topic, **kw):
+            raise UpstreamError()
+
+        async def ok(topic, **kw):
+            return [research.Finding("github", "code", "t", "https://g/1", 0.5, "")]
+
+        monkeypatch.setattr(research, "_fetch_reddit", boom)
+        monkeypatch.setattr(research, "_fetch_github", ok)
+        result = await research.orchestrate_research(
+            "topic", channels=["discourse", "code"]
+        )
+        assert result["total"] == 1
+        # An exception with no message still names what went wrong.
+        assert result["errors"] == {"discourse": "UpstreamError"}
+
+    @pytest.mark.asyncio
+    async def test_every_channel_failing_raises(self, monkeypatch):
+        async def boom(topic, **kw):
+            raise UpstreamError("down")
+
+        for name in ("_fetch_reddit", "_fetch_github", "_fetch_web"):
+            monkeypatch.setattr(research, name, boom)
+        with pytest.raises(UpstreamError, match="discourse"):
+            await research.orchestrate_research("topic")
+
+    @pytest.mark.asyncio
+    async def test_zero_findings_without_errors_is_fine(self, monkeypatch):
+        async def empty(topic, **kw):
+            return []
+
+        for name in ("_fetch_reddit", "_fetch_github", "_fetch_web"):
+            monkeypatch.setattr(research, name, empty)
+        result = await research.orchestrate_research("topic")
+        assert result["total"] == 0 and result["errors"] == {}
+
+
+_PROJECT = {
+    "slug": "p",
+    "owner": "o",
+    "repo": "r",
+    "topics": '["agent orchestration"]',
+    "subreddits": '["ClaudeAI"]',
+    "search_terms": '["agent orchestration"]',
+}
+
+
+async def _nothing(*a, **kw):
+    return []
+
+
+class TestRundownReportsFailedSources:
+    @pytest.mark.asyncio
+    async def test_github_failure_is_an_error_not_zero_items(self, monkeypatch):
+        client = _github_client(issues=RuntimeError("502 bad gateway"))
+        monkeypatch.setattr(github_search, "_get_client", lambda: client)
+        monkeypatch.setattr(rundown, "fetch_hn", _nothing)
+        monkeypatch.setattr(rundown, "fetch_web", _nothing)
+        _evidence, statuses = await rundown.gather_other_channels([_PROJECT])
+        gh = next(s for s in statuses if s.name == "GitHub issues")
+        assert not gh.ok
+        assert "1/1 projects failed" in gh.detail
+
+    @pytest.mark.asyncio
+    async def test_one_project_failing_keeps_the_channel_up(self, monkeypatch):
+        calls = iter([RuntimeError("down"), []])
+
+        async def flaky(**kw):
+            result = next(calls)
+            if isinstance(result, Exception):
+                raise result
+            return SimpleNamespace(parsed_data=SimpleNamespace(items=result))
+
+        search = SimpleNamespace(async_issues_and_pull_requests=flaky)
+        client = SimpleNamespace(rest=SimpleNamespace(search=search))
+        monkeypatch.setattr(github_search, "_get_client", lambda: client)
+        monkeypatch.setattr(rundown, "fetch_hn", _nothing)
+        monkeypatch.setattr(rundown, "fetch_web", _nothing)
+        other = {**_PROJECT, "slug": "q"}
+        _evidence, statuses = await rundown.gather_other_channels([_PROJECT, other])
+        gh = next(s for s in statuses if s.name == "GitHub issues")
+        assert gh.ok
+        assert "1/2 projects failed" in gh.detail
+
+    def test_reddit_skips_without_requests_are_not_ok(self):
+        health = SearchHealth(mode="public")
+        health.skipped = 2
+        assert not rundown.reddit_status(health).ok
+
+
+class TestGeneratorsSurviveScannerOutage:
+    """Generators keep running and record the outage when scanners raise."""
+
+    @pytest.mark.asyncio
+    async def test_hot_pulse_records_outage(self, monkeypatch):
+        brain_db.upsert_project(
+            "p", "o", "r", topics=["x"], subreddits=["a"], search_terms=["x"]
+        )
+        brain_db.upsert_schedule("hot_pulse", "Hot pulse", "hot_pulse", "*/5 * * * *")
+        _reddit_transport(monkeypatch, lambda req: httpx.Response(500))
+        monkeypatch.setattr(generators, "_is_quiet_hours", lambda *a: False)
+        monkeypatch.setattr(generators, "_LAST_HOT_PULSE_DELIVERY_AT", None)
+        notify = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify)
+
+        await generators.hot_pulse_generator(brain_db)
+
+        status = brain_db.get_schedule("hot_pulse")["last_status"]
+        assert status.startswith("reddit outage")
+        notify.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_morning_digest_reports_reddit_and_github_down(self, monkeypatch):
+        brain_db.upsert_project(
+            "p", "o", "r", topics=["x"], subreddits=["a"], search_terms=["x"]
+        )
+        _reddit_transport(monkeypatch, lambda req: httpx.Response(500))
+        monkeypatch.setattr(github_search, "_get_client", lambda: None)
+        monkeypatch.setattr(rundown, "fetch_hn", _nothing)
+        monkeypatch.setattr(rundown, "fetch_web", _nothing)
+        monkeypatch.setattr(rundown, "synthesize", AsyncMock(return_value=""))
+        notify = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify)
+
+        await generators.morning_digest_generator(brain_db)
+
+        # The report still goes out, naming both outages.
+        text = "\n".join(c.args[0] for c in notify.await_args_list)
+        assert "HTTP 500" in text
+        assert "1/1 projects failed" in text

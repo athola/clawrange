@@ -7,6 +7,7 @@ import httpx
 import pytest
 
 import reddit_search
+from errors import UpstreamError
 from reddit_search import SearchHealth
 
 _REAL_CLIENT = httpx.AsyncClient
@@ -174,5 +175,7 @@ class TestFallbackIsOptIn:
     @pytest.mark.asyncio
     async def test_default_callers_never_fetch_feeds(self, reddit):
         calls, _ = reddit
-        await reddit_search.search_subreddits("plugin", ["ClaudeAI"], since="24h")
+        # JSON is refused and feeds are off, so the call raises (#26).
+        with pytest.raises(UpstreamError):
+            await reddit_search.search_subreddits("plugin", ["ClaudeAI"], since="24h")
         assert not any(c.endswith(".rss") for c in calls)

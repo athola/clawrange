@@ -4,6 +4,7 @@ import httpx
 import pytest
 
 import reddit_search
+from errors import UpstreamError
 from reddit_search import SearchHealth
 
 
@@ -35,11 +36,12 @@ class TestSearchHealth:
         _patch_transport(monkeypatch, handler)
         health = SearchHealth()
         subs = [f"sub{i}" for i in range(10)]
-        posts = await reddit_search.search_subreddits(
-            "claude", subs, since="24h", health=health
-        )
+        # No subreddit could be read: an outage, not an empty result (#26).
+        with pytest.raises(UpstreamError):
+            await reddit_search.search_subreddits(
+                "claude", subs, since="24h", health=health
+            )
 
-        assert posts == []
         assert health.mode == "public"
         assert health.failures == {"403": SearchHealth.BLOCK_LIMIT}
         assert health.tripped
@@ -62,13 +64,13 @@ class TestSearchHealth:
         monkeypatch.setattr(reddit_search, "_sleep", no_sleep)
         health = SearchHealth()
         subs = [f"sub{i}" for i in range(10)]
-        posts = await reddit_search.search_subreddits(
-            "claude", subs, since="24h", health=health, feed_fallback=True
-        )
+        with pytest.raises(UpstreamError):
+            await reddit_search.search_subreddits(
+                "claude", subs, since="24h", health=health, feed_fallback=True
+            )
 
         # One refused JSON search switches the run to feeds; BLOCK_LIMIT
         # refused feeds then trip it, and the remaining subs are skipped.
-        assert posts == []
         assert health.mode == "rss"
         assert health.failures == {"403": 1 + SearchHealth.BLOCK_LIMIT}
         assert health.tripped
@@ -100,7 +102,8 @@ class TestSearchHealth:
         health = SearchHealth()
         for _ in range(SearchHealth.BLOCK_LIMIT):
             health.record(403)
-        assert await reddit_search.search_all("claude", health=health) == []
+        with pytest.raises(UpstreamError):
+            await reddit_search.search_all("claude", health=health)
         assert health.skipped == 1
 
     def test_summary_names_the_fix_when_blocked(self):

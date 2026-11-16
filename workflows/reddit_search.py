@@ -23,6 +23,8 @@ from typing import Any
 import httpx
 from pydantic import BaseModel
 
+from errors import UpstreamError
+
 logger = logging.getLogger("clawrange.reddit")
 
 # ─── Configuration ──────────────────────────────────────────────────
@@ -65,9 +67,10 @@ class SearchHealth:
 
     mode: str = ""
     # Set once keyless JSON is refused: the rest of the run reads feeds,
-    # cached here per subreddit so each feed costs one request per run.
+    # cached here per subreddit so each feed costs one request per run
+    # (None: the feed could not be read this run).
     feed_mode: bool = False
-    feeds: dict[str, list[Any]] = field(default_factory=dict)
+    feeds: dict[str, list[Any] | None] = field(default_factory=dict)
     requests: int = 0
     ok: int = 0
     skipped: int = 0
@@ -187,16 +190,20 @@ async def _feed_search(
     topic: str,
     cutoff: datetime,
     health: "SearchHealth",
-) -> list[RedditPost]:
-    """Posts in one subreddit's feed that match the topic (cached per run)."""
+) -> list[RedditPost] | None:
+    """Posts in one subreddit's feed that match the topic (cached per run).
+
+    None when the feed could not be read (refused, failed, or skipped
+    after repeated blocks), so the caller can tell it from an empty feed.
+    """
     key = sub_name.lower()
     if key not in health.feeds:
         if health.tripped:
             health.skipped += 1
-            return []
+            return None
         if health.feeds:
             await _sleep(FEED_PACE_S)
-        posts: list[RedditPost] = []
+        posts: list[RedditPost] | None = None
         try:
             for attempt in range(2):  # one retry after backing off a 429
                 resp = await client.get(
@@ -218,9 +225,12 @@ async def _feed_search(
             logger.warning("Reddit feed r/%s failed: %s", sub_name, exc)
             health.record("error")
         health.feeds[key] = posts
+    cached = health.feeds[key]
+    if cached is None:
+        return None
     return [
         p
-        for p in health.feeds[key]
+        for p in cached
         if datetime.fromisoformat(p.created_utc) >= cutoff and _topic_matches(p, topic)
     ]
 
@@ -316,7 +326,11 @@ async def search_subreddits(
     Returns deduplicated results sorted by score descending. Uses the
     OAuth script-app flow when REDDIT_CLIENT_ID/SECRET/USERNAME/PASSWORD
     are all set; otherwise falls back to Reddit's public JSON endpoint.
-    Network/API errors degrade to an empty list with a warning.
+
+    A subreddit that fails is logged and tallied in `health`; the call
+    still returns what the others found. Raises UpstreamError when no
+    subreddit could be searched at all, so an outage never reads as a
+    quiet day. Zero matches from a successful search is a plain [].
     """
     if not await is_configured():
         logger.info("Reddit OAuth not configured — using public JSON fallback")
@@ -324,11 +338,15 @@ async def search_subreddits(
             topic, subreddits, since, sort, limit_per_sub, health, feed_fallback
         )
 
+    health = health if health is not None else SearchHealth()
+    health.mode = "oauth"
     try:
         import asyncpraw
-    except ImportError:
-        logger.warning("asyncpraw not installed — returning empty results")
-        return []
+    except ImportError as exc:
+        logger.warning("asyncpraw not installed; Reddit OAuth search unavailable")
+        health.record("error")
+        msg = "Reddit search unavailable: asyncpraw not installed"
+        raise UpstreamError(msg) from exc
 
     creds = _get_credentials()
     time_filter = _parse_since(since)
@@ -336,8 +354,7 @@ async def search_subreddits(
 
     seen_ids: set[str] = set()
     results: list[RedditPost] = []
-    if health is not None:
-        health.mode = "oauth"
+    looked = failed = 0
 
     try:
         reddit = asyncpraw.Reddit(
@@ -374,20 +391,29 @@ async def search_subreddits(
                             snippet=_snippet(post.selftext),
                         )
                     )
-                if health is not None:
-                    health.record(200)
+                health.record(200)
+                looked += 1
             except Exception as exc:
                 logger.warning("Reddit search failed for r/%s: %s", sub_name, exc)
-                if health is not None:
-                    health.record(getattr(exc, "status_code", None) or "error")
+                health.record(getattr(exc, "status_code", None) or "error")
+                failed += 1
                 continue
 
         await reddit.close()
     except Exception as exc:
         logger.warning("Reddit API error: %s", exc)
+        health.record("error")
+        raise UpstreamError(f"Reddit API error: {exc}") from exc
 
+    _raise_if_blind(looked, failed, health)
     results.sort(key=lambda p: p.score, reverse=True)
     return results
+
+
+def _raise_if_blind(looked: int, failed: int, health: SearchHealth) -> None:
+    """Raise when a call tried subreddits and could read none of them."""
+    if failed and not looked:
+        raise UpstreamError(f"Reddit search failed: {health.summary()}")
 
 
 async def search_all(
@@ -408,6 +434,10 @@ async def search_all(
     Subreddit.search which requires a subreddit; using `all` works
     but adds complexity). Subject to the same ~30 req/min anonymous
     rate limit as `_public_search`.
+
+    Raises UpstreamError when the request fails or the run's `health` has
+    tripped. In feed mode it returns [] by design (counted as skipped):
+    there is no feed for all of Reddit.
     """
     user_agent = os.getenv("REDDIT_USER_AGENT", "clawrange-marketing-bot/0.1")
     time_filter = _parse_since(since)
@@ -417,9 +447,12 @@ async def search_all(
     results: list[RedditPost] = []
     if health is not None:
         health.mode = health.mode or "public"
+        if health.tripped:
+            health.skipped += 1
+            raise UpstreamError(f"Reddit all-search skipped: {health.summary()}")
         # Feed mode has no all-of-Reddit equivalent short of one request
         # per topic, which the anonymous rate limit cannot afford.
-        if health.tripped or health.feed_mode:
+        if health.feed_mode:
             health.skipped += 1
             return []
 
@@ -439,17 +472,19 @@ async def search_all(
             )
             if health is not None:
                 health.record(resp.status_code)
-            if resp.status_code != 200:
-                logger.warning(
-                    "Reddit all-search '%s' -> HTTP %d", topic, resp.status_code
-                )
-                return []
-            payload = resp.json()
         except Exception as exc:
             logger.warning("Reddit all-search '%s' failed: %s", topic, exc)
             if health is not None:
                 health.record("error")
-            return []
+            raise UpstreamError(f"Reddit all-search failed: {exc}") from exc
+        if resp.status_code != 200:
+            logger.warning("Reddit all-search '%s' -> HTTP %d", topic, resp.status_code)
+            raise UpstreamError(f"Reddit all-search: HTTP {resp.status_code}")
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            logger.warning("Reddit all-search '%s': bad JSON: %s", topic, exc)
+            raise UpstreamError(f"Reddit all-search: bad JSON: {exc}") from exc
 
     for child in payload.get("data", {}).get("children", []):
         post = _post_from_json(child.get("data", {}) or {}, cutoff, seen_ids)
@@ -485,6 +520,17 @@ async def _public_search(
     health = health if health is not None else SearchHealth()
     if not health.feed_mode:
         health.mode = "public"
+    # Per call, not per run: one health spans many calls.
+    looked = failed = 0
+
+    async def from_feed(sub_name: str) -> None:
+        nonlocal looked, failed
+        feed = await _feed_search(client, sub_name, topic, cutoff, health)
+        if feed is None:
+            failed += 1
+        else:
+            looked += 1
+            _add_unique(results, seen_ids, feed)
 
     async with httpx.AsyncClient(
         headers={"User-Agent": user_agent},
@@ -492,11 +538,11 @@ async def _public_search(
     ) as client:
         for sub_name in subreddits:
             if health.feed_mode:
-                feed = await _feed_search(client, sub_name, topic, cutoff, health)
-                _add_unique(results, seen_ids, feed)
+                await from_feed(sub_name)
                 continue
             if health.tripped:
                 health.skipped += 1
+                failed += 1
                 continue
             url = f"https://www.reddit.com/r/{sub_name}/search.json"
             params = {
@@ -515,8 +561,7 @@ async def _public_search(
                     logger.info("Reddit JSON refused; switching to feeds")
                     health.feed_mode, health.mode = True, "rss"
                     health._block_streak = 0
-                    feed = await _feed_search(client, sub_name, topic, cutoff, health)
-                    _add_unique(results, seen_ids, feed)
+                    await from_feed(sub_name)
                     continue
                 if resp.status_code != 200:
                     logger.warning(
@@ -525,13 +570,16 @@ async def _public_search(
                         topic,
                         resp.status_code,
                     )
+                    failed += 1
                     continue
                 payload = resp.json()
             except Exception as exc:
                 logger.warning("Reddit public search r/%s failed: %s", sub_name, exc)
                 health.record("error")
+                failed += 1
                 continue
 
+            looked += 1
             for child in payload.get("data", {}).get("children", []):
                 post = _post_from_json(
                     child.get("data", {}) or {}, cutoff, seen_ids, sub_name
@@ -539,5 +587,6 @@ async def _public_search(
                 if post is not None:
                     results.append(post)
 
+    _raise_if_blind(looked, failed, health)
     results.sort(key=lambda p: p.score, reverse=True)
     return results

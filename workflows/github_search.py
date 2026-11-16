@@ -1,7 +1,9 @@
 """GitHub search adapter — githubkit async wrapper for marketing research.
 
 Calls GitHub's Search API for repos and issues, and the Traffic API
-for self-repo analytics. Gracefully degrades when credentials are missing.
+for self-repo analytics. Search works keyless (at a lower rate limit), so
+a missing PAT is not an error; a failed search raises ``UpstreamError``
+so callers never mistake "could not look" for "nothing found".
 """
 
 import base64
@@ -10,6 +12,8 @@ import os
 from datetime import UTC, datetime
 
 from pydantic import BaseModel
+
+from errors import UpstreamError
 
 logger = logging.getLogger("clawrange.github")
 
@@ -70,6 +74,16 @@ def _get_client():
     return GitHub()
 
 
+def _require_client():
+    """A client for search; keyless search works, so only a missing
+    githubkit means GitHub cannot be searched at all."""
+    client = _get_client()
+    if not client:
+        logger.warning("githubkit not installed; GitHub search unavailable")
+        raise UpstreamError("GitHub search unavailable: githubkit not installed")
+    return client
+
+
 # ─── Search Functions ────────────────────────────────────────────────
 
 
@@ -80,11 +94,8 @@ async def search_repos(
     sort: str = "stars",
     limit: int = 25,
 ) -> list[GitHubRepo]:
-    """Search GitHub repositories."""
-    client = _get_client()
-    if not client:
-        logger.warning("githubkit not installed — returning empty results")
-        return []
+    """Search GitHub repositories. Raises UpstreamError if the search failed."""
+    client = _require_client()
 
     parts = [query]
     if min_stars > 0:
@@ -111,17 +122,15 @@ async def search_repos(
         ]
     except Exception as exc:
         logger.warning("GitHub repo search failed: %s", exc)
-        return []
+        raise UpstreamError(f"GitHub repo search failed: {exc}") from exc
 
 
 async def search_issues(
     query: str,
     limit: int = 25,
 ) -> list[GitHubIssue]:
-    """Search GitHub issues and PRs."""
-    client = _get_client()
-    if not client:
-        return []
+    """Search GitHub issues and PRs. Raises UpstreamError if the search failed."""
+    client = _require_client()
 
     try:
         resp = await client.rest.search.async_issues_and_pull_requests(
@@ -141,7 +150,7 @@ async def search_issues(
         ]
     except Exception as exc:
         logger.warning("GitHub issue search failed: %s", exc)
-        return []
+        raise UpstreamError(f"GitHub issue search failed: {exc}") from exc
 
 
 async def get_self_traffic(owner: str, repo: str) -> GitHubTrafficSnapshot | None:

@@ -26,6 +26,7 @@ import httpx
 import github_search
 import llm_proxy
 from brain_db import project_list
+from errors import UpstreamError
 from reddit_search import SearchHealth
 
 logger = logging.getLogger("clawrange.rundown")
@@ -257,7 +258,7 @@ async def fetch_web(project: dict, policy: dict | None = None) -> list[Evidence]
         timeout=WEB_TIMEOUT_S,
     )
     if not text:
-        raise RuntimeError("web search tier returned nothing")
+        raise UpstreamError("web search tier returned nothing")
     return parse_web_lines(text, project)
 
 
@@ -316,7 +317,9 @@ async def gather_other_channels(
 
 
 def reddit_status(health: SearchHealth) -> SourceStatus:
-    ok = health.ok > 0 or health.requests == 0
+    # Healthy when something was read, or nothing was even attempted.
+    # Skips mean Reddit was not searched, which is not a quiet day.
+    ok = health.ok > 0 or (health.requests == 0 and not health.skipped)
     fix = ""
     if health.mode != "oauth":
         fix = (

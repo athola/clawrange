@@ -33,6 +33,7 @@ import httpx
 
 import llm_proxy
 import tenant_profile
+from errors import UpstreamError
 from github_search import search_repos
 from reddit_search import search_subreddits
 
@@ -333,10 +334,9 @@ _S2_API = "https://api.semanticscholar.org/graph/v1/paper/search"
 async def _fetch_academic(topic: str, **kwargs: Any) -> list[Finding]:
     """Query arXiv (Atom) and Semantic Scholar (JSON) in parallel.
 
-    Both endpoints are public/no-key. Empty/error results never
-    raise — the orchestrator already handles partial failures, but
-    individual academic-channel failures should not bubble out and
-    cause the whole channel to be marked as a triangulation hole.
+    Both endpoints are public/no-key. One source failing is logged and
+    the other's findings are returned; UpstreamError is raised only when
+    both failed, so the orchestrator reports the channel as an error.
     """
 
     limit = int(kwargs.get("limit", 5))
@@ -358,7 +358,7 @@ async def _fetch_academic(topic: str, **kwargs: Any) -> list[Finding]:
                 root = ET.fromstring(resp.text)
         except Exception as exc:
             logger.warning("academic.arxiv failed: %s", exc)
-            return []
+            raise UpstreamError(f"arxiv: {exc}") from exc
 
         ns = {"atom": "http://www.w3.org/2005/Atom"}
         out: list[Finding] = []
@@ -406,7 +406,7 @@ async def _fetch_academic(topic: str, **kwargs: Any) -> list[Finding]:
                 data = resp.json()
         except Exception as exc:
             logger.warning("academic.s2 failed: %s", exc)
-            return []
+            raise UpstreamError(f"semantic_scholar: {exc}") from exc
 
         out: list[Finding] = []
         for item in data.get("data", []):
@@ -430,11 +430,19 @@ async def _fetch_academic(topic: str, **kwargs: Any) -> list[Finding]:
         return out
 
     results = await asyncio.gather(
-        _arxiv(), _semantic_scholar(), return_exceptions=False
+        _arxiv(), _semantic_scholar(), return_exceptions=True
     )
     flat: list[Finding] = []
+    failures: list[str] = []
     for r in results:
+        if isinstance(r, BaseException):
+            if not isinstance(r, Exception):
+                raise r  # cancellation and the like are not source failures
+            failures.append(str(r))
+            continue
         flat.extend(r)
+    if len(failures) == len(results):
+        raise UpstreamError("; ".join(failures))
     return flat
 
 
@@ -458,7 +466,7 @@ async def _fetch_triz(topic: str, **kwargs: Any) -> list[Finding]:
     )
     text = await llm_proxy._llm_call(prompt, max_tokens=600, web_search=True)
     if not text:
-        return []
+        raise UpstreamError("triz: web search tier returned nothing")
     return [
         Finding(
             source="triz",
@@ -487,7 +495,7 @@ async def _fetch_web(topic: str, **kwargs: Any) -> list[Finding]:
     )
     text = await llm_proxy._llm_call(prompt, max_tokens=800, web_search=True)
     if not text:
-        return []
+        raise UpstreamError("web: web search tier returned nothing")
     return [
         Finding(
             source="web",
@@ -538,6 +546,10 @@ async def orchestrate_research(
           "errors": dict[str, str], # channel -> error message
           "total": int,
         }
+
+    A failed channel lands in ``errors`` and the rest still report.
+    Raises UpstreamError when every requested channel failed, so a full
+    outage never reads as "no findings".
     """
     if not topic or not topic.strip():
         raise ValueError("topic is required")
@@ -564,10 +576,16 @@ async def orchestrate_research(
     channel_findings: list[list[Finding]] = []
     for ch, result in zip(used_channels, raw):
         if isinstance(result, BaseException):
-            errors[ch] = str(result)
+            if not isinstance(result, Exception):
+                raise result  # cancellation is not a channel failure
+            errors[ch] = str(result) or type(result).__name__
             channel_findings.append([])
             continue
         channel_findings.append(result)
+
+    if used_channels and len(errors) == len(used_channels):
+        detail = "; ".join(f"{ch}: {msg}" for ch, msg in errors.items())
+        raise UpstreamError(f"every research channel failed ({detail})")
 
     merged = merge_findings(channel_findings)
     ranked = rank_findings(merged)

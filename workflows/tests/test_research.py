@@ -405,9 +405,11 @@ class TestAcademicChannel:
 
         monkeypatch.setattr(httpx.AsyncClient, "get", fail_get)
 
-        # Should not raise; both arxiv and semantic-scholar fail -> []
-        results = await _fetch_academic("anything")
-        assert results == []
+        # Both arxiv and semantic-scholar fail: the channel failed (#26).
+        from errors import UpstreamError
+
+        with pytest.raises(UpstreamError):
+            await _fetch_academic("anything")
 
     @pytest.mark.asyncio
     async def test_orchestrator_includes_academic_when_requested(self, monkeypatch):
@@ -461,15 +463,17 @@ class TestTrizChannel:
         assert first.channel == "triz"
 
     @pytest.mark.asyncio
-    async def test_returns_empty_when_llm_returns_none(self, monkeypatch):
+    async def test_raises_when_llm_returns_none(self, monkeypatch):
+        from errors import UpstreamError
         from research import _fetch_triz
 
         async def fake_llm(prompt, max_tokens=100, web_search=False):
             return None
 
         monkeypatch.setattr("llm_proxy._llm_call", fake_llm)
-        results = await _fetch_triz("anything")
-        assert results == []
+        # No reply is a tier failure, not "no analogies" (#26).
+        with pytest.raises(UpstreamError):
+            await _fetch_triz("anything")
 
 
 # ─── Confidence flagging (single-source warning) ─────────────────
@@ -625,9 +629,14 @@ class TestResearchReviewFixes:
             async def __aexit__(self, *a):
                 return False
 
+        from errors import UpstreamError
+
         monkeypatch.setattr(research.httpx, "AsyncClient", Boom)
-        with caplog.at_level("INFO", logger="clawrange.research"):
-            assert await research._fetch_academic("x") == []
+        with (
+            caplog.at_level("INFO", logger="clawrange.research"),
+            pytest.raises(UpstreamError),
+        ):
+            await research._fetch_academic("x")
         warnings = [r for r in caplog.records if r.levelname == "WARNING"]
         assert len(warnings) == 2
 
