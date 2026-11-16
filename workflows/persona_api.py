@@ -34,6 +34,18 @@ def _run_reflection(profile_name):
     return asyncio.run(persona_reflect_generator(None, profile_name=profile_name))
 
 
+def reflect_now(brain_db, profile_name) -> int:
+    """One reflection pass plus the flagged signal scan; returns pending count.
+
+    Shared by POST /persona/reflect and the ``!persona reflect`` chat
+    command so the two cannot drift. Blocking: call it from a worker thread.
+    """
+    _run_reflection(profile_name)
+    # Flagged outcome-signal source; a no-op unless PERSONA_SIGNAL_LEARNING.
+    pl.scan_signals(brain_db, profile_name)
+    return len(brain_db.list_learnings(profile=profile_name, status="pending"))
+
+
 def create_persona_router(brain_db, profile_provider, render_targets_fn) -> APIRouter:
     router = APIRouter()
 
@@ -95,12 +107,7 @@ def create_persona_router(brain_db, profile_provider, render_targets_fn) -> APIR
 
     @router.post("/persona/reflect")
     def reflect():
-        p = _profile()
-        _run_reflection(p.name)
-        # Flagged outcome-signal source; a no-op unless PERSONA_SIGNAL_LEARNING.
-        pl.scan_signals(brain_db, p.name)
-        pending = brain_db.list_learnings(profile=p.name, status="pending")
-        return {"queued": len(pending)}
+        return {"queued": reflect_now(brain_db, _profile().name)}
 
     @router.get("/healthz/persona")
     def health():

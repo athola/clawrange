@@ -710,44 +710,55 @@ async def _call_provider(
 # ─── Persona Helpers ────────────────────────────────────────────────
 
 
-async def _post_persona_propose(
-    content: str,
-    kind: str = "persona",
-    target: str = "",
-    source: str = "feedback",
-):
-    """Post a persona proposal to the local /persona API. Returns the created row."""
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(
-            "http://localhost:5678/persona/propose",
-            json={"kind": kind, "target": target, "content": content, "source": source},
-        )
-        r.raise_for_status()
-        return r.json()
+# The chat commands call the persona pipeline in-process, the same functions
+# the /persona routes use. A loopback HTTP call would need the API bearer
+# token and could only fail in ways the user can't act on.
+
+
+def _persona_context():
+    """(brain_db, profile name) the /persona routes use (function-local: cycle)."""
+    import app as app_module
+
+    return app_module.brain_db, app_module._current_profile().name
 
 
 async def _handle_persona_command(args: str) -> JSONResponse:
+    import persona_api
+    import persona_learning
+
     args = args.strip()
-    if args.startswith("reflect"):
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.post("http://localhost:5678/persona/reflect")
-                r.raise_for_status()
-        except httpx.HTTPError as exc:
-            return _synthetic_response(
-                f"Persona API unavailable — reflection not queued ({exc})."
-            )
-        return _synthetic_response(
-            "Persona reflection queued — review drafts with !tasks."
-        )
     if not args:
         return _synthetic_response("Usage: !persona <feedback> | !persona reflect")
     try:
-        row = await _post_persona_propose(args)
-    except httpx.HTTPError as exc:
+        brain_db, profile_name = _persona_context()
+    except HTTPException as exc:
+        return _synthetic_response(f"Persona unavailable: {exc.detail}.")
+    if args.startswith("reflect"):
+        try:
+            queued = await asyncio.to_thread(
+                persona_api.reflect_now, brain_db, profile_name
+            )
+        except Exception as exc:
+            logger.exception("!persona reflect failed")
+            return _synthetic_response(
+                f"Persona reflection failed: {type(exc).__name__}: {exc}"
+            )
         return _synthetic_response(
-            f"Persona API unavailable — feedback not queued ({exc})."
+            f"Persona reflection done: {queued} proposal(s) pending. "
+            "Review drafts with !tasks."
         )
+    try:
+        row = await asyncio.to_thread(
+            persona_learning.propose,
+            brain_db,
+            profile_name,
+            "persona",
+            persona_api.Proposal.model_fields["target"].default,
+            args,
+            "feedback",
+        )
+    except ValueError as exc:
+        return _synthetic_response(f"Feedback not queued: {exc}.")
     return _synthetic_response(
         f"Queued persona enhancement as [DRAFT] (id {row.get('id')}). "
         "Approve via /persona/proposals/<id>/approve."

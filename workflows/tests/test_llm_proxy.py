@@ -3794,7 +3794,7 @@ class TestPersonaCommand:
                 {"role": "user", "content": "!persona lead with the recommendation"}
             ]
         }
-        with patch("llm_proxy._post_persona_propose", return_value={"id": "ab12"}) as m:
+        with patch("persona_learning.propose", return_value={"id": "ab12"}) as m:
             r = client.post("/v1/chat/completions", json=body, headers=AUTH_HEADER)
         assert r.status_code == 200
         assert m.called
@@ -3807,57 +3807,42 @@ class TestPersonaCommand:
                 {"role": "user", "content": "!Persona Lead with THE recommendation"}
             ]
         }
-        with patch("llm_proxy._post_persona_propose", return_value={"id": "cd34"}) as m:
+        with patch("persona_learning.propose", return_value={"id": "cd34"}) as m:
             r = client.post("/v1/chat/completions", json=body, headers=AUTH_HEADER)
         assert r.status_code == 200
         assert m.called
         # the proposed content must preserve original casing of the args
-        assert "Lead with THE recommendation" in m.call_args.args[0]
+        assert "Lead with THE recommendation" in m.call_args.args[4]
 
     def test_learn_alias_intercepted(self):
         """Spec §6: !learn <feedback> is an alias for !persona <feedback>."""
         body = {"messages": [{"role": "user", "content": "!learn keep answers short"}]}
-        with patch("llm_proxy._post_persona_propose", return_value={"id": "ef56"}) as m:
+        with patch("persona_learning.propose", return_value={"id": "ef56"}) as m:
             r = client.post("/v1/chat/completions", json=body, headers=AUTH_HEADER)
         assert r.status_code == 200
         assert m.called
-        assert "keep answers short" in m.call_args.args[0]
+        assert "keep answers short" in m.call_args.args[4]
 
-    def test_propose_default_target_matches_api_default(self):
-        """N1: llm_proxy's propose helper and the /persona API must agree on
-        the default target so bare feedback renders under the same heading."""
-        import inspect
-
-        from llm_proxy import _post_persona_propose
-        from persona_api import Proposal
-
-        assert (
-            inspect.signature(_post_persona_propose).parameters["target"].default
-            == Proposal.model_fields["target"].default
-        )
+    # The default-target check (N1) moved to test_fix_proxy.py, where it runs
+    # against a real learning row instead of a helper signature.
 
     def test_persona_propose_failure_degrades_gracefully(self):
-        """N2: persona-API failure must yield a friendly synthetic response,
+        """N2: a rejected proposal yields a friendly synthetic response,
         not a raw 500 to Telegram."""
         body = {"messages": [{"role": "user", "content": "!persona be brief"}]}
-        with patch(
-            "llm_proxy._post_persona_propose",
-            side_effect=httpx.ConnectError("api down"),
-        ):
+        with patch("persona_learning.propose", side_effect=ValueError("too long")):
             r = client.post("/v1/chat/completions", json=body, headers=AUTH_HEADER)
         assert r.status_code == 200
         content = r.json()["choices"][0]["message"]["content"].lower()
-        assert "unavailable" in content or "could not" in content
+        assert "not queued" in content and "too long" in content
 
     def test_persona_reflect_failure_degrades_gracefully(self):
         body = {"messages": [{"role": "user", "content": "!persona reflect"}]}
-        with patch(
-            "httpx.AsyncClient.post", side_effect=httpx.ConnectError("api down")
-        ):
+        with patch("persona_api._run_reflection", side_effect=RuntimeError("down")):
             r = client.post("/v1/chat/completions", json=body, headers=AUTH_HEADER)
         assert r.status_code == 200
         content = r.json()["choices"][0]["message"]["content"].lower()
-        assert "unavailable" in content or "could not" in content
+        assert "failed" in content
 
 
 class TestDigestPersistence:
