@@ -22,6 +22,7 @@ from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+import tenant_profile
 import watchdog
 from generators import GENERATORS, _redact_urls
 from watchdog import register as register_watchdog
@@ -196,14 +197,6 @@ def register_maintenance(scheduler, brain_db) -> None:
     )
 
 
-def _valid_tz(name: str) -> bool:
-    try:
-        ZoneInfo(name)
-    except (ValueError, KeyError):  # ZoneInfoNotFoundError is a KeyError
-        return False
-    return True
-
-
 def _job_error_listener(brain_db):
     """EVENT_JOB_ERROR handler: a crashed tenant job records ``error: ...``
     on its schedule row, so /sched and the dashboard show the failure."""
@@ -237,18 +230,16 @@ def init_scheduler(brain_db) -> AsyncIOScheduler | None:
     and recorded in ``scheduler_state()``. Returns None only when the
     scheduler itself could not start.
     """
-    import tenant_profile
-
     _STATE.update(_new_state())
     tz_name = tenant_profile.operator_timezone()
-    if not _valid_tz(tz_name):
+    if not tenant_profile.valid_timezone(tz_name):
         _startup_error("timezone", f"unknown timezone {tz_name!r}, using UTC")
         tz_name = "UTC"
     _STATE["timezone"] = tz_name
     # watchdog._tz_name() already falls back to a valid zone, so check the raw
     # override: the watchdog keeps running, but /healthz still shows the typo.
     watch_override = os.getenv("HEARTBEAT_WATCH_TZ", "").strip()
-    if watch_override and not _valid_tz(watch_override):
+    if watch_override and not tenant_profile.valid_timezone(watch_override):
         _startup_error(
             "watchdog",
             f"unknown HEARTBEAT_WATCH_TZ {watch_override!r}, "

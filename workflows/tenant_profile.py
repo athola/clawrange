@@ -375,12 +375,8 @@ def _validate_query_template(t: Any) -> None:
 def _validate_timezone(tz: Any) -> None:
     if tz in (None, ""):
         return
-    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
-    try:
-        ZoneInfo(str(tz))
-    except (ZoneInfoNotFoundError, ValueError) as exc:
-        raise ProfileError(f"assistant.timezone '{tz}' is not a known zone") from exc
+    if not valid_timezone(str(tz)):
+        raise ProfileError(f"assistant.timezone '{tz}' is not a known zone")
 
 
 def _validate_ops(block: Any) -> None:
@@ -647,17 +643,46 @@ def hour_in_window(
     return hour >= start_hour or hour < end_hour
 
 
-def operator_timezone(profile: Profile | None = None) -> str:
+def valid_timezone(name: str) -> bool:
+    """True when zoneinfo knows `name`."""
+    try:
+        ZoneInfo(name)
+    except (ValueError, KeyError):  # ZoneInfoNotFoundError is a KeyError
+        return False
+    return True
+
+
+def operator_timezone(
+    profile: Profile | None = None,
+    *,
+    override_env: str | None = None,
+    fallback: str | None = None,
+) -> str:
     """The operator's timezone: SCHEDULER_TZ, else the profile's
     `assistant.timezone`, else UTC. One source for schedules, quiet hours,
-    the heartbeat watchdog and report headers."""
-    env_tz = os.getenv("SCHEDULER_TZ", "").strip()
-    if env_tz:
-        return env_tz
-    profile = profile or active_profile()
-    if profile is None:  # a bad profile must not break a clock
-        return "UTC"
-    return str(profile.assistant.get("timezone") or "UTC")
+    the heartbeat watchdog and report headers.
+
+    `override_env` names a narrower env override checked first (the
+    watchdog's HEARTBEAT_WATCH_TZ); an unknown zone there is skipped.
+    `fallback` replaces an unknown operator zone. Without it the configured
+    value comes back as is, so a caller can report it (the scheduler does).
+    """
+    if override_env:
+        override = os.getenv(override_env, "").strip()
+        if override and valid_timezone(override):
+            return override
+    tz = os.getenv("SCHEDULER_TZ", "").strip()
+    if not tz:
+        profile = profile or active_profile()
+        # a bad profile must not break a clock
+        tz = (
+            "UTC"
+            if profile is None
+            else str(profile.assistant.get("timezone") or "UTC")
+        )
+    if fallback is not None and not valid_timezone(tz):
+        return fallback
+    return tz
 
 
 # Generators that act on one profile's data take it as kwargs.profile_name.

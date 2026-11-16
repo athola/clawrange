@@ -40,25 +40,15 @@ FAILED_PASS_ALERT = 3
 _failed_passes = 0
 
 
-def _valid_tz(name: str) -> bool:
-    try:
-        ZoneInfo(name)
-    except (ValueError, KeyError):  # ZoneInfoNotFoundError is a KeyError
-        return False
-    return True
-
-
 def _tz_name() -> str:
     """HEARTBEAT_WATCH_TZ, else the operator timezone from config.
 
     An invalid HEARTBEAT_WATCH_TZ falls back to the operator timezone (and
     that to UTC) instead of making every pass raise.
     """
-    override = os.getenv("HEARTBEAT_WATCH_TZ", "").strip()
-    if override and _valid_tz(override):
-        return override
-    operator = tenant_profile.operator_timezone()
-    return operator if _valid_tz(operator) else "UTC"
+    return tenant_profile.operator_timezone(
+        override_env="HEARTBEAT_WATCH_TZ", fallback="UTC"
+    )
 
 
 _ACTIVE_START, _ACTIVE_END = (
@@ -249,7 +239,7 @@ def register(scheduler) -> None:
     the passes run on the fallback zone instead of raising every time.
     """
     override = os.getenv("HEARTBEAT_WATCH_TZ", "").strip()
-    if override and not _valid_tz(override):
+    if override and not tenant_profile.valid_timezone(override):
         logger.error(
             "HEARTBEAT_WATCH_TZ=%r is not a valid timezone; watchdog uses %s",
             override,

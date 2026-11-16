@@ -70,6 +70,17 @@ class TestInitScheduler:
         finally:
             s.shutdown(wait=False)
 
+    async def test_valid_timezone_is_used(self, db, monkeypatch, fresh_state):
+        monkeypatch.setenv("SCHEDULER_TZ", "Europe/Berlin")
+        s = sch.init_scheduler(db)
+        try:
+            assert str(s.timezone) == "Europe/Berlin"
+            state = sch.scheduler_state()
+            assert state["timezone"] == "Europe/Berlin"
+            assert not any("timezone" in e for e in state["errors"])
+        finally:
+            s.shutdown(wait=False)
+
     async def test_bad_watchdog_timezone_reported(self, db, monkeypatch, fresh_state):
         monkeypatch.setenv("HEARTBEAT_WATCH_TZ", "Mars/Olympus")
         s = sch.init_scheduler(db)

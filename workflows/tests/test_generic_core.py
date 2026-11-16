@@ -145,6 +145,17 @@ class TestOperatorTimezone:
         starter = tenant_profile.load_profile("starter", env={})
         assert tenant_profile.operator_timezone(starter) == "UTC"
 
+    def test_no_profile_falls_back_to_utc(self, monkeypatch):
+        monkeypatch.delenv("SCHEDULER_TZ", raising=False)
+        monkeypatch.setattr(tenant_profile, "active_profile", lambda: None)
+        assert tenant_profile.operator_timezone() == "UTC"
+
+    def test_report_header_uses_operator_timezone(self, monkeypatch):
+        monkeypatch.setenv("SCHEDULER_TZ", "Asia/Tokyo")
+        now = datetime(2026, 1, 1, 0, 30, tzinfo=UTC)
+        header = rundown.report_header("Rundown", now)
+        assert header == "*Rundown — Thu Jan 01* (09:30 JST)"
+
     def test_unknown_zone_fails_at_load(self, tmp_path):
         _write(tmp_path, "assistant: {name: A, timezone: Mars/Olympus}\n")
         with pytest.raises(ProfileError, match="timezone"):

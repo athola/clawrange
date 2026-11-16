@@ -530,6 +530,18 @@ class TestWatchdogTimezone:
         assert "America/Denvr" in caplog.text
         assert watchdog._tz_name() == "America/Chicago"
 
+    def test_watch_tz_unset_uses_operator_timezone(self, wd):
+        assert watchdog._tz_name() == "America/Chicago"
+
+    def test_valid_watch_tz_overrides_operator_timezone(self, wd, monkeypatch):
+        monkeypatch.setenv("HEARTBEAT_WATCH_TZ", "Europe/Berlin")
+        assert watchdog._tz_name() == "Europe/Berlin"
+
+    def test_bad_watch_tz_and_bad_operator_tz_fall_back_to_utc(self, wd, monkeypatch):
+        monkeypatch.setenv("HEARTBEAT_WATCH_TZ", "Not/AZone")
+        monkeypatch.setenv("SCHEDULER_TZ", "Also/NotAZone")
+        assert watchdog._tz_name() == "UTC"
+
     def test_bad_watch_tz_does_not_break_a_pass(self, wd, monkeypatch):
         monkeypatch.setenv("HEARTBEAT_WATCH_TZ", "Not/AZone")
         _seen(wd, ts=time.time(), done_ts=time.time())
