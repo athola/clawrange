@@ -540,3 +540,87 @@ class TestAuthHardening:
         )
         assert proc.returncode == 0, proc.stderr
         assert marker.exists()
+
+
+# ─── K8 follow-up: make start-prod runs the soul.md render guard ─────
+
+
+class TestStartProdSoulGuard:
+    @pytest.fixture
+    def repo(self, tmp_path):
+        import shutil
+
+        root = tmp_path / "repo"
+        (root / "scripts").mkdir(parents=True)
+        (root / "openclaw").mkdir()
+        shutil.copy(REPO / "Makefile", root / "Makefile")
+        shutil.copy(REPO / "scripts" / "start.sh", root / "scripts" / "start.sh")
+        (root / ".env").write_text("OPENROUTER_API_KEY=sk-test\n")
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        log = tmp_path / "calls.log"
+        stubs = {
+            "docker": f'echo "docker $*" >> "{log}"\n',
+            "curl": "exit 0\n",
+            "uv": "exit 0\n",
+            # The inner `make persona` the guard runs; the outer make is real.
+            "make": (
+                f'echo "make $*" >> "{log}"; echo soul > "{root}/openclaw/soul.md"\n'
+            ),
+        }
+        for name, body in stubs.items():
+            path = bin_dir / name
+            path.write_text("#!/usr/bin/env bash\n" + body)
+            path.chmod(0o755)
+        return root, bin_dir, log
+
+    def test_full_target_runs_the_guard_first(self):
+        """Dry run only: the real target would clone DeerFlow."""
+        proc = subprocess.run(
+            ["make", "-n", "-f", str(REPO / "Makefile"), "start-prod-full"],
+            cwd=REPO,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+        lines = proc.stdout.splitlines()
+        guard = lines.index("./scripts/start.sh --ensure-soul")
+        up = next(i for i, ln in enumerate(lines) if "compose" in ln and " up " in ln)
+        assert guard < up
+
+    def test_soul_rendered_before_prod_compose_up(self, repo):
+        import shutil
+
+        root, bin_dir, log = repo
+        real_make = shutil.which("make")
+        assert real_make
+        proc = subprocess.run(
+            [real_make, "-s", "start-prod"],
+            cwd=root,
+            env={"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+        calls = log.read_text() if log.exists() else ""
+        assert "make persona PROFILE=starter" in calls, proc.stdout + proc.stderr
+        up = calls.index("docker compose -f docker-compose.yml")
+        assert calls.index("make persona") < up
+        assert (root / "openclaw" / "soul.md").is_file()
+
+    def test_ensure_soul_flag_never_starts_compose(self, repo):
+        root, bin_dir, log = repo
+        proc = subprocess.run(
+            ["bash", str(root / "scripts" / "start.sh"), "--ensure-soul"],
+            env={"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        calls = log.read_text()
+        assert "make persona" in calls
+        assert "compose up" not in calls

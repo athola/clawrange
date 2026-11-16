@@ -38,12 +38,16 @@ PROD_COMPOSE := -f docker-compose.yml -f docker-compose.prod.yml
 
 .PHONY: start-prod start-prod-full stop-prod
 
+# Same soul.md render guard as make start: a missing bind source would make
+# Docker create it as a root-owned directory.
 start-prod: ## Start core stack bound to Tailscale + localhost only
+	@./scripts/start.sh --ensure-soul
 	@docker compose $(PROD_COMPOSE) up -d --build
 	@$(LOAD_ENV); \
 	echo "Services bound to 127.0.0.1 + $${TAILSCALE_IP:-<TAILSCALE_IP unset>} (Tailscale)"
 
 start-prod-full: ## Start full stack (prod mode) including DeerFlow
+	@./scripts/start.sh --ensure-soul
 	@docker compose $(PROD_COMPOSE) up -d --build
 	@./scripts/start.sh --with-deerflow --skip-core
 

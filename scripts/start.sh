@@ -14,15 +14,20 @@ usage() {
   echo "  --with-deerflow Also start DeerFlow research layer"
   echo "  --skip-core     Do not (re)start OpenClaw + workflows; use when the"
   echo "                  core stack was already started (e.g. make start-prod-full)"
+  echo "  --ensure-soul   Only run the pre-flight checks and render a missing"
+  echo "                  openclaw/soul.md, then exit (make start-prod runs this"
+  echo "                  before its own compose up)"
 }
 
 WITH_DEERFLOW=false
 SKIP_CORE=false
+ENSURE_SOUL_ONLY=false
 
 for arg in "$@"; do
   case "$arg" in
     --with-deerflow) WITH_DEERFLOW=true ;;
     --skip-core) SKIP_CORE=true ;;
+    --ensure-soul) ENSURE_SOUL_ONLY=true ;;
     -h|--help)
       usage
       exit 0
@@ -98,6 +103,11 @@ ensure_soul() {
     exit 1
   fi
 }
+
+if [ "$ENSURE_SOUL_ONLY" = true ]; then
+  ensure_soul
+  exit 0
+fi
 
 # ─── Start OpenClaw + workflows ────────────────────────────────────
 if [ "$SKIP_CORE" = true ]; then
