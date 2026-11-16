@@ -263,6 +263,32 @@ class TestPersonaReflect:
         assert brain_db.list_learnings(profile="cos") == []
 
 
+class TestResearchRequestChannels:
+    """#46: a typo'd channel is a 422, not a 200 with zero findings."""
+
+    def test_unknown_channel_is_rejected(self, client):
+        resp = client.post("/research", json={"topic": "x", "channels": ["cdoe"]})
+        assert resp.status_code == 422
+
+    def test_known_channels_and_web_alias_are_accepted(self, client, monkeypatch):
+        async def empty(topic, **kw):
+            return []
+
+        for name in ("_fetch_github", "_fetch_web"):
+            monkeypatch.setattr(research, name, empty)
+        resp = client.post(
+            "/research", json={"topic": "x", "channels": ["code", "web"]}
+        )
+        assert resp.status_code == 200
+        assert resp.json()["channels"] == ["code", "discourse_web"]
+
+    def test_literal_matches_the_dispatch_table(self):
+        from typing import get_args
+
+        names = set(get_args(research.ResearchChannel))
+        assert names == set(research._CHANNEL_FETCHER_NAMES) | {"web"}
+
+
 # ─── #26: upstream failures raise instead of returning [] ───────────
 
 

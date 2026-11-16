@@ -665,7 +665,7 @@ async def scan_web(body: dict[str, Any]):
 
 class ResearchRequest(BaseModel):
     topic: str
-    channels: list[str] | None = None
+    channels: list[research.ResearchChannel] | None = None
     subreddits: list[str] | None = None
     limit: int = 10
     since: str = "30d"

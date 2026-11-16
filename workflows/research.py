@@ -25,9 +25,10 @@ import os
 import re
 import sys
 import xml.etree.ElementTree as ET
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
@@ -514,6 +515,12 @@ async def _fetch_web(topic: str, **kwargs: Any) -> list[Finding]:
 
 _DEFAULT_CHANNELS = ("discourse", "code", "discourse_web")
 
+# Channels a request may name ('web' is shorthand for 'discourse_web').
+# Typed so FastAPI rejects a typo with 422 instead of silently dropping it.
+ResearchChannel = Literal[
+    "discourse", "code", "discourse_web", "web", "academic", "triz"
+]
+
 # Channel-to-fetcher-name lookup. Resolved dynamically at call time
 # via module globals so monkeypatch can swap fetchers in tests.
 _CHANNEL_FETCHER_NAMES = {
@@ -527,7 +534,7 @@ _CHANNEL_FETCHER_NAMES = {
 
 async def orchestrate_research(
     topic: str,
-    channels: list[str] | None = None,
+    channels: Sequence[str] | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
     """Run a multi-source research session and return ranked findings.
