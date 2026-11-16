@@ -323,11 +323,16 @@ def cancel_task(task_id: str):
 
 
 @app.get("/healthz")
-def healthz():
+def healthz(request: Request):
     """Always 200 while the process serves requests: the container
     entrypoint restarts the service after repeated non-200s, which would
     not fix a bad profile or a broken table. ``status`` says ``degraded``
-    when the database, scheduler, profile or vector search is broken."""
+    when the database, scheduler, profile or vector search is broken.
+
+    The route is public, so anonymous callers get the problem names but no
+    error text (it can carry paths and config values); the logs and an
+    authenticated request have the detail.
+    """
     problems: list[str] = []
     try:
         counts = brain_db.health_counts()
@@ -350,6 +355,10 @@ def healthz():
     profile_error = getattr(app.state, "profile_error", None)
     if profile_error:
         problems.append("profile")
+    if not auth.is_authenticated(request):
+        vec = {"enabled": vec["enabled"]}
+        sched = {"status": sched["status"]}
+        profile_error = bool(profile_error)
     return {
         "status": "degraded" if problems else "ok",
         "problems": problems,

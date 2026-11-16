@@ -186,6 +186,40 @@ class TestPublicScheduleView:
         assert row["last_status"].startswith("FAILED telegram")
 
 
+@patch("llm_proxy.PROXY_AUTH_TOKEN", "s3cret")
+class TestPublicHealthzView:
+    """/healthz is public. Anonymous callers get the status, the problem
+    names and the counts, never error text: a profile, scheduler or
+    sqlite-vec failure message can carry file paths and config values."""
+
+    SECRET = "/home/operator/private/profile.yaml: bad key"
+
+    @pytest.fixture(autouse=True)
+    def _broken(self, monkeypatch):
+        from app import app, brain_db
+
+        monkeypatch.setattr(app.state, "profile_error", self.SECRET, raising=False)
+        monkeypatch.setattr(
+            brain_db, "vec_status", lambda: {"enabled": False, "reason": self.SECRET}
+        )
+
+    def test_without_token_hides_error_text(self, real_auth):
+        body = real_auth.get("/healthz").json()
+        assert body["status"] == "degraded"
+        assert "profile" in body["problems"]
+        assert "vector_search" in body["problems"]
+        assert self.SECRET not in str(body)
+        assert body["profile"]["error"] is True
+        assert body["brain"]["vector_search"] == {"enabled": False}
+        assert set(body["scheduler"]) == {"status"}
+
+    def test_with_token_keeps_detail(self, real_auth):
+        body = real_auth.get("/healthz", headers=GOOD).json()
+        assert body["profile"]["error"] == self.SECRET
+        assert body["brain"]["vector_search"]["reason"] == self.SECRET
+        assert "errors" in body["scheduler"]
+
+
 class TestHealthzAllowlistIsExact:
     @pytest.mark.parametrize(
         "path", ["/healthz", "/healthz/research", "/healthz/crm", "/healthz/persona"]

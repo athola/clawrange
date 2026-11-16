@@ -485,7 +485,10 @@ class TestHealthz:
             "vec_status",
             lambda: {"enabled": False, "reason": "sqlite_vec missing"},
         )
-        data = client.get("/healthz").json()
+        # Error detail is for authenticated callers (test_auth covers the
+        # anonymous view).
+        monkeypatch.setattr(app_module.llm_proxy, "PROXY_AUTH_TOKEN", "t")
+        data = client.get("/healthz", headers={"Authorization": "Bearer t"}).json()
         assert data["brain"]["vector_search"] == {
             "enabled": False,
             "reason": "sqlite_vec missing",
@@ -506,7 +509,8 @@ class TestHealthz:
         monkeypatch.setattr(
             app_module.app.state, "profile_error", "profile not found: x", raising=False
         )
-        data = client.get("/healthz").json()
+        monkeypatch.setattr(app_module.llm_proxy, "PROXY_AUTH_TOKEN", "t")
+        data = client.get("/healthz", headers={"Authorization": "Bearer t"}).json()
         assert data["profile"]["error"] == "profile not found: x"
         assert data["status"] == "degraded"
 
