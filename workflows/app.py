@@ -155,7 +155,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="ClawRange Workflows",
-    version="3.0.0",
     lifespan=lifespan,
     # Bearer auth on every route except the read-only allowlist in auth.py.
     dependencies=[Depends(auth.require_token)],

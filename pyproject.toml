@@ -1,6 +1,6 @@
 [project]
 name = "clawrange"
-version = "0.1.0"
+version = "0.2.0"
 description = "ClawRange: personal AI ops stack (OpenClaw assistant + FastAPI workflows service)"
 requires-python = ">=3.12"
 # workflows/requirements.txt (the Docker image's install source) is generated
