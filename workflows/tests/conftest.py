@@ -54,18 +54,19 @@ def _reset_proxy_globals(monkeypatch):
     balance cache, debounce) and heartbeat state (proactive timers, focus
     rotation). The breaker's 60s cooldown otherwise leaked across tests,
     depending on how fast the suite ran."""
-    import heartbeat
     import llm_proxy
 
     monkeypatch.setattr(llm_proxy, "_circuit_state", {})
     monkeypatch.setattr(llm_proxy, "_notification_last_sent", {})
-    monkeypatch.setattr(heartbeat, "_proactive_state", {})
+    # String targets: conftest must not import app modules at module level
+    # (the env above is set first), and a second local import is avoided.
+    monkeypatch.setattr("heartbeat._proactive_state", {})
     monkeypatch.setattr(
         llm_proxy, "_balance_cache", {"remaining": None, "checked_at": None}
     )
     monkeypatch.setattr(llm_proxy, "_balance_status", {"ok_at": None, "error": None})
     monkeypatch.setattr(llm_proxy, "_last_tier_used", None)
-    monkeypatch.setattr(heartbeat, "_thinking_focus_index", 0)
+    monkeypatch.setattr("heartbeat._thinking_focus_index", 0)
 
 
 @pytest.fixture(autouse=True)

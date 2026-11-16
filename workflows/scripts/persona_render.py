@@ -16,8 +16,13 @@ import sys
 from pathlib import Path
 
 # Allow running from the repo root: make the workflows package importable.
-# The workflows imports below are function-local so they follow this line.
+# The workflows imports below must follow this line.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import persona_learning as pl
+from brain_db import BrainDB
+from persona import render_all
+from tenant_profile import load_profile
 
 DEFAULT_BRAIN = "data/brain/brain.db"
 DEFAULT_TARGETS = {
@@ -33,8 +38,6 @@ def _warn(msg: str) -> None:
 
 def learnings(name: str, brain_path: str) -> list:
     """Approved learnings to render: brain approvals plus the overlay."""
-    import persona_learning as pl
-
     overlay = pl.load_overlay(name)
     if not os.path.exists(brain_path):
         # BrainDB() would create an empty DB here; never do that from setup.
@@ -44,8 +47,6 @@ def learnings(name: str, brain_path: str) -> list:
         )
         return overlay
     try:
-        from brain_db import BrainDB
-
         return pl.export_overlay(BrainDB(brain_path), name, existing=overlay)
     except Exception as exc:
         _warn(
@@ -56,9 +57,6 @@ def learnings(name: str, brain_path: str) -> list:
 
 
 def render(name: str, brain_path: str = DEFAULT_BRAIN, targets=None) -> dict:
-    from persona import render_all
-    from tenant_profile import load_profile
-
     profile = load_profile(name)
     return render_all(profile, targets or DEFAULT_TARGETS, learnings(name, brain_path))
 
