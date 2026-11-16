@@ -60,7 +60,7 @@ reset: ## Stop, drop containers and the DeerFlow clone; keeps data/ (asks first)
 # ─── Testing ──────────────────────────────────────────────────────
 
 .PHONY: test test-openclaw test-workflows test-deerflow test-ollama test-research \
-	test-unit validate tome-bridge tome-bridge-watch \
+	test-unit coverage validate tome-bridge tome-bridge-watch \
 	retrieval-eval retrieval-eval-refresh retrieval-harvest retrieval-eval-brain \
 	models-check
 
@@ -113,6 +113,11 @@ persona-demo: ## Offline walkthrough of the persona meta-learning loop (PROFILE=
 
 test-unit: ## Run Python unit tests (no containers needed)
 	@uv run pytest workflows/tests/ -v
+
+# Source and omit live in [tool.coverage.run] (pyproject.toml): workflows/
+# only, tests excluded. Fails under 85%, the project's coverage target.
+coverage: ## Unit tests with a source-only coverage report over workflows/
+	@uv run pytest workflows/tests/ -q --cov --cov-report=term-missing:skip-covered --cov-fail-under=85
 
 retrieval-eval: ## Compare search configs on the fixture golden set (offline)
 	@cd workflows && uv run python retrieval_eval.py

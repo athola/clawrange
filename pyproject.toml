@@ -29,6 +29,7 @@ dev = [
     "pytest",
     "pre-commit",
     "pytest-asyncio>=1.5.0",
+    "pytest-cov>=7.1.0",
 ]
 
 [tool.uv]
@@ -86,3 +87,9 @@ exclude = [
 # path explicitly rather than introducing a package boundary.
 pythonpath = ["workflows"]
 testpaths = ["workflows/tests", "tests"]
+
+# ─── coverage (make coverage) ──────────────────────────────────────
+# Source-only: measure the workflows service, not the tests that exercise it.
+[tool.coverage.run]
+source = ["workflows"]
+omit = ["workflows/tests/*"]
