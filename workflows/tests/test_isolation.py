@@ -17,10 +17,12 @@ def test_local_names_still_resolve():
 
 
 def test_proxy_globals_start_clean():
+    import heartbeat
     import llm_proxy
 
     assert llm_proxy._circuit_state == {}
-    assert llm_proxy._proactive_state == {}
+    assert heartbeat._proactive_state == {}
+    assert heartbeat._thinking_focus_index == 0
     assert llm_proxy._notification_last_sent == {}
     assert llm_proxy._balance_cache["checked_at"] is None
     assert llm_proxy._last_tier_used is None

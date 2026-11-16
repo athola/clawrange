@@ -51,19 +51,21 @@ def _block_external_network(monkeypatch):
 @pytest.fixture(autouse=True)
 def _reset_proxy_globals(monkeypatch):
     """Fresh llm_proxy module state for every test (circuit breaker,
-    balance cache, debounce, proactive timers). The breaker's 60s cooldown
-    otherwise leaked across tests, depending on how fast the suite ran."""
+    balance cache, debounce) and heartbeat state (proactive timers, focus
+    rotation). The breaker's 60s cooldown otherwise leaked across tests,
+    depending on how fast the suite ran."""
+    import heartbeat
     import llm_proxy
 
     monkeypatch.setattr(llm_proxy, "_circuit_state", {})
     monkeypatch.setattr(llm_proxy, "_notification_last_sent", {})
-    monkeypatch.setattr(llm_proxy, "_proactive_state", {})
+    monkeypatch.setattr(heartbeat, "_proactive_state", {})
     monkeypatch.setattr(
         llm_proxy, "_balance_cache", {"remaining": None, "checked_at": None}
     )
     monkeypatch.setattr(llm_proxy, "_balance_status", {"ok_at": None, "error": None})
     monkeypatch.setattr(llm_proxy, "_last_tier_used", None)
-    monkeypatch.setattr(llm_proxy, "_thinking_focus_index", 0)
+    monkeypatch.setattr(heartbeat, "_thinking_focus_index", 0)
 
 
 @pytest.fixture(autouse=True)

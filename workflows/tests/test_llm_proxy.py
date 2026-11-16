@@ -2608,12 +2608,11 @@ class TestResearchRouter:
         the heartbeat response stays silent (digest carries it)."""
         import time as _t
 
-        import llm_proxy
         from app import TaskCreate as TC
         from app import create_task
 
-        llm_proxy._proactive_state["stale_tasks"] = _t.monotonic()
-        llm_proxy._proactive_state["llm_thinking"] = _t.monotonic()
+        heartbeat._proactive_state["stale_tasks"] = _t.monotonic()
+        heartbeat._proactive_state["llm_thinking"] = _t.monotonic()
 
         mock_orch.return_value = {
             "findings": [
@@ -2704,11 +2703,9 @@ class TestHeartbeatInterceptor:
         """Heartbeat message should NOT call the LLM provider for basic checks."""
         import time as _time
 
-        import llm_proxy
-
         # Suppress proactive LLM thinking so we only test deterministic path
-        llm_proxy._proactive_state["stale_tasks"] = _time.monotonic()
-        llm_proxy._proactive_state["llm_thinking"] = _time.monotonic()
+        heartbeat._proactive_state["stale_tasks"] = _time.monotonic()
+        heartbeat._proactive_state["llm_thinking"] = _time.monotonic()
 
         mock_caller = AsyncMock(return_value=_mock_response(200))
         with patch("llm_proxy._call_provider", mock_caller):
@@ -2727,13 +2724,12 @@ class TestHeartbeatInterceptor:
         result delivered as the next digest once the hour elapses."""
         import time as _time
 
-        import llm_proxy
         from app import TaskCreate as TC
         from app import create_task
 
         # Suppress proactive layers so only the pending task is processed
-        llm_proxy._proactive_state["stale_tasks"] = _time.monotonic()
-        llm_proxy._proactive_state["llm_thinking"] = _time.monotonic()
+        heartbeat._proactive_state["stale_tasks"] = _time.monotonic()
+        heartbeat._proactive_state["llm_thinking"] = _time.monotonic()
 
         create_task(TC(description="Test task for heartbeat", priority=2))
 
@@ -2799,12 +2795,11 @@ class TestHeartbeatInterceptor:
         the sentinel at char 2,000 must survive, bounded by the send limit."""
         import time as _time
 
-        import llm_proxy
         from app import TaskCreate as TC
         from app import create_task
 
-        llm_proxy._proactive_state["stale_tasks"] = _time.monotonic()
-        llm_proxy._proactive_state["llm_thinking"] = _time.monotonic()
+        heartbeat._proactive_state["stale_tasks"] = _time.monotonic()
+        heartbeat._proactive_state["llm_thinking"] = _time.monotonic()
 
         create_task(TC(description="Long result task", priority=2))
 
@@ -2890,11 +2885,10 @@ class TestHeartbeatInterceptor:
         an alarmist report."""
         import time as _time
 
-        import llm_proxy
         from app import brain_db
 
-        llm_proxy._proactive_state["stale_tasks"] = _time.monotonic()
-        llm_proxy._proactive_state["llm_thinking"] = _time.monotonic()
+        heartbeat._proactive_state["stale_tasks"] = _time.monotonic()
+        heartbeat._proactive_state["llm_thinking"] = _time.monotonic()
 
         mock_balance.return_value = 28.69
         t = brain_db.create_task("Low balance alert: $-1.33 remaining", priority=1)
@@ -2922,11 +2916,10 @@ class TestHeartbeatInterceptor:
         circuit state."""
         import time as _time
 
-        import llm_proxy
         from app import brain_db
 
-        llm_proxy._proactive_state["stale_tasks"] = _time.monotonic()
-        llm_proxy._proactive_state["llm_thinking"] = _time.monotonic()
+        heartbeat._proactive_state["stale_tasks"] = _time.monotonic()
+        heartbeat._proactive_state["llm_thinking"] = _time.monotonic()
 
         mock_balance.return_value = 28.69
         t = brain_db.create_task(
@@ -2952,10 +2945,8 @@ class TestHeartbeatInterceptor:
         # Mark all proactive checks as just-ran so they don't fire
         import time as _time
 
-        import llm_proxy
-
-        llm_proxy._proactive_state["stale_tasks"] = _time.monotonic()
-        llm_proxy._proactive_state["llm_thinking"] = _time.monotonic()
+        heartbeat._proactive_state["stale_tasks"] = _time.monotonic()
+        heartbeat._proactive_state["llm_thinking"] = _time.monotonic()
 
         r = client.post(
             "/v1/chat/completions",
@@ -2971,9 +2962,9 @@ class TestHeartbeatInterceptor:
         import llm_proxy
 
         # Ensure stale_tasks check is ready to fire
-        llm_proxy._proactive_state.pop("stale_tasks", None)
+        heartbeat._proactive_state.pop("stale_tasks", None)
         # Suppress LLM thinking
-        llm_proxy._proactive_state["llm_thinking"] = __import__("time").monotonic()
+        heartbeat._proactive_state["llm_thinking"] = __import__("time").monotonic()
 
         from datetime import timedelta
 
@@ -3026,11 +3017,10 @@ class TestHeartbeatInterceptor:
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
     def test_heartbeat_llm_thinking(self, mock_notify, _subjects):
         """The heartbeat asks the LLM for a task suggestion when due."""
-        import llm_proxy
 
         # Ensure LLM thinking is ready to fire, stale tasks is not
-        llm_proxy._proactive_state.pop("llm_thinking", None)
-        llm_proxy._proactive_state["stale_tasks"] = __import__("time").monotonic()
+        heartbeat._proactive_state.pop("llm_thinking", None)
+        heartbeat._proactive_state["stale_tasks"] = __import__("time").monotonic()
 
         mock_resp = _mock_response(
             200,
@@ -3080,11 +3070,10 @@ class TestHeartbeatInterceptor:
 
     def _think_with(self, suggestion: str) -> list[dict]:
         """Run one heartbeat whose LLM thinking returns `suggestion`."""
-        import llm_proxy
         from app import brain_db
 
-        llm_proxy._proactive_state.pop("llm_thinking", None)
-        llm_proxy._proactive_state["stale_tasks"] = time.monotonic()
+        heartbeat._proactive_state.pop("llm_thinking", None)
+        heartbeat._proactive_state["stale_tasks"] = time.monotonic()
         with (
             patch.dict("os.environ", {"HEARTBEAT_LLM_SUGGEST": "1"}),
             patch(
@@ -3113,11 +3102,10 @@ class TestHeartbeatInterceptor:
             "Query ClawRange FastAPI workflows documentation and best practices "
             "to identify optimization patterns"
         )
-        import llm_proxy
         from app import brain_db
 
-        llm_proxy._proactive_state.pop("llm_thinking", None)
-        llm_proxy._proactive_state["stale_tasks"] = time.monotonic()
+        heartbeat._proactive_state.pop("llm_thinking", None)
+        heartbeat._proactive_state["stale_tasks"] = time.monotonic()
         with patch(
             "heartbeat._llm_suggest_task",
             new_callable=AsyncMock,
@@ -3144,10 +3132,9 @@ class TestHeartbeatInterceptor:
 
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
     def test_heartbeat_skips_thinking_without_subjects(self, _notify):
-        import llm_proxy
 
-        llm_proxy._proactive_state.pop("llm_thinking", None)
-        llm_proxy._proactive_state["stale_tasks"] = time.monotonic()
+        heartbeat._proactive_state.pop("llm_thinking", None)
+        heartbeat._proactive_state["stale_tasks"] = time.monotonic()
         with (
             patch("heartbeat._current_thinking_subjects", return_value=[]),
             patch("heartbeat._llm_suggest_task", new_callable=AsyncMock) as sug,
@@ -3161,10 +3148,9 @@ class TestHeartbeatInterceptor:
 
     def test_heartbeat_llm_thinking_graceful_failure(self):
         """LLM failure during thinking doesn't break the heartbeat."""
-        import llm_proxy
 
-        llm_proxy._proactive_state.pop("llm_thinking", None)
-        llm_proxy._proactive_state["stale_tasks"] = __import__("time").monotonic()
+        heartbeat._proactive_state.pop("llm_thinking", None)
+        heartbeat._proactive_state["stale_tasks"] = __import__("time").monotonic()
 
         mock_caller = AsyncMock(side_effect=Exception("network error"))
         with patch("llm_proxy._call_provider", mock_caller):
@@ -3221,7 +3207,7 @@ class TestSemanticDedup:
     """Tests for keyword-overlap task deduplication."""
 
     def test_extract_keywords_filters_stop_words(self):
-        from llm_proxy import _extract_keywords
+        from heartbeat import _extract_keywords
 
         kw = _extract_keywords(
             "Review the ClawRange tier allocation for current balance"
@@ -3234,7 +3220,7 @@ class TestSemanticDedup:
         assert "balance" in kw
 
     def test_extract_keywords_skips_short_words(self):
-        from llm_proxy import _extract_keywords
+        from heartbeat import _extract_keywords
 
         kw = _extract_keywords("go do it now")
         assert "go" not in kw
@@ -3315,8 +3301,7 @@ class TestSemanticDedup:
     def test_recent_task_dedup_uses_the_shared_overlap_rule(self, existing, suggestion):
         """S11: the heartbeat dedup and the waiting-on-you footer share one
         keyword-overlap rule, so they agree on every pair."""
-        from heartbeat import _has_recent_task
-        from llm_proxy import _descriptions_overlap
+        from heartbeat import _descriptions_overlap, _has_recent_task
 
         task = {"description": existing, "created_at": datetime.now(UTC).isoformat()}
         expected = _descriptions_overlap({"description": suggestion}, task)
@@ -3324,12 +3309,9 @@ class TestSemanticDedup:
 
     def test_recent_task_dedup_delegates_to_descriptions_overlap(self, monkeypatch):
         """S11: _has_recent_task carries no private copy of the rule."""
-        import heartbeat
-        import llm_proxy
-
         calls = []
         monkeypatch.setattr(
-            llm_proxy,
+            heartbeat,
             "_descriptions_overlap",
             lambda a, b: calls.append((a, b)) or True,
         )
@@ -4068,35 +4050,30 @@ class TestNeedsInput:
     """
 
     def test_detects_blocked_result(self):
-        import llm_proxy
 
-        assert llm_proxy._needs_input(BLOCKED_RESULT) is True
+        assert heartbeat._needs_input(BLOCKED_RESULT) is True
 
     def test_detects_hold_for_now_result(self):
-        import llm_proxy
 
         text = (
             "## Recommendation\n**Hold for now.** Before running this canary, "
             "we need:\n1. Confirmation the fix shipped\n\n## What I Need From You\n"
             "Should I wait for this info, or do you want me to dig in first?"
         )
-        assert llm_proxy._needs_input(text) is True
+        assert heartbeat._needs_input(text) is True
 
     def test_real_work_is_not_flagged(self):
-        import llm_proxy
 
-        assert llm_proxy._needs_input(WORKED_RESULT) is False
+        assert heartbeat._needs_input(WORKED_RESULT) is False
 
     def test_empty_result_is_not_flagged(self):
-        import llm_proxy
 
-        assert llm_proxy._needs_input("") is False
+        assert heartbeat._needs_input("") is False
 
     def test_blocked_task_gets_compact_digest_line(self, monkeypatch):
         """The digest carries one line naming what stalled, not the essay."""
-        import llm_proxy
 
-        line = llm_proxy._blocked_digest_line(
+        line = heartbeat._blocked_digest_line(
             {
                 "id": "73d5f106",
                 "description": (
@@ -4162,7 +4139,6 @@ class TestNeedsInputPrecision:
     def test_prepared_work_naming_next_steps_is_not_blocked(self):
         """The work prompt asks the model to say "what Alex needs to do to
         finish it", so that phrasing appears in 208 real results."""
-        import llm_proxy
 
         text = (
             "# Draft comment for r/msp\n"
@@ -4170,11 +4146,10 @@ class TestNeedsInputPrecision:
             "## What I Need From You\n"
             "Post it to the thread; I can't post on your behalf.\n"
         )
-        assert llm_proxy._needs_input(text) is False
+        assert heartbeat._needs_input(text) is False
 
     def test_blocked_subsection_does_not_bin_the_deliverable(self):
         """One blocked angle inside finished work is still finished work."""
-        import llm_proxy
 
         text = (
             "# Draft: Content Package\n"
@@ -4184,7 +4159,7 @@ class TestNeedsInputPrecision:
             + "\n## Angle 2: Reddit comment (BLOCKED—needs live data)\n"
             "**What I need from you:** the positioning.\n"
         )
-        assert llm_proxy._needs_input(text) is False
+        assert heartbeat._needs_input(text) is False
 
 
 # ─── Waiting-on-you digest footer ─────────────────────────────────
@@ -4214,9 +4189,8 @@ def _wtask(
 
 class TestWaitingOnYouLines:
     def _lines(self, *tasks, now=None):
-        import llm_proxy
 
-        return llm_proxy._waiting_on_you_lines(list(tasks), now=now)
+        return heartbeat._waiting_on_you_lines(list(tasks), now=now)
 
     def test_blocked_result_surfaces(self):
         """A recently completed task whose result declares BLOCKED gets a
@@ -4620,12 +4594,11 @@ class TestHeartbeatLeavesForeignTasks:
     def test_tome_task_stays_pending(self, _notify):
         import time as _time
 
-        import llm_proxy
         from app import brain_db
 
-        llm_proxy._proactive_state["stale_tasks"] = _time.monotonic()
-        llm_proxy._proactive_state["llm_thinking"] = _time.monotonic()
-        llm_proxy._proactive_state["pending_reminder"] = _time.monotonic()
+        heartbeat._proactive_state["stale_tasks"] = _time.monotonic()
+        heartbeat._proactive_state["llm_thinking"] = _time.monotonic()
+        heartbeat._proactive_state["pending_reminder"] = _time.monotonic()
         t = brain_db.create_task("research:tome: agent platforms")
         caller = AsyncMock(return_value=_mock_response(200))
         with patch("llm_proxy._call_provider", caller):
@@ -4796,7 +4769,7 @@ class TestHeartbeatRobustness:
         brain_db._conn.execute("DELETE FROM tasks")
         brain_db._conn.commit()
         for key in ("stale_tasks", "llm_thinking", "pending_reminder"):
-            llm_proxy._proactive_state[key] = time.monotonic()
+            heartbeat._proactive_state[key] = time.monotonic()
 
     def _beat(self):
         return client.post(
@@ -4990,7 +4963,7 @@ class TestDigestNotLostOnFailure:
         brain_db._conn.execute("DELETE FROM tasks")
         brain_db._conn.commit()
         for key in ("stale_tasks", "llm_thinking", "pending_reminder"):
-            llm_proxy._proactive_state[key] = time.monotonic()
+            heartbeat._proactive_state[key] = time.monotonic()
         digest._digest_state["last_flush"] = (
             time.time() - digest.HEARTBEAT_DIGEST_INTERVAL - 1
         )

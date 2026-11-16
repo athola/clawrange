@@ -32,8 +32,8 @@ def quiet(monkeypatch):
         llm_proxy, "_check_openrouter_balance", AsyncMock(return_value=50.0)
     )
     now = time.monotonic()
-    llm_proxy._proactive_state["stale_tasks"] = now
-    llm_proxy._proactive_state["llm_thinking"] = now
+    heartbeat._proactive_state["stale_tasks"] = now
+    heartbeat._proactive_state["llm_thinking"] = now
     monkeypatch.setattr(heartbeat, "_llm_retry_counts", {})
     monkeypatch.setattr(heartbeat, "_balance_unknown_since", None)
     monkeypatch.setattr("telegram.notify", AsyncMock(return_value=True))
@@ -282,7 +282,7 @@ class TestStaleNudgeDedup:
 
     def _scan(self):
         # Bypass the 30-minute timer so each heartbeat runs the stale scan.
-        llm_proxy._proactive_state.pop("stale_tasks", None)
+        heartbeat._proactive_state.pop("stale_tasks", None)
         with patch.object(llm_proxy, "_llm_call", AsyncMock(return_value="Looked.")):
             _beat()
 
@@ -300,7 +300,7 @@ class TestStaleNudgeDedup:
         # The only stale pending task is a 30h-old nudge, past the dedup
         # window; it must not trigger a fresh nudge about itself.
         with patch.object(heartbeat, "_next_heartbeat_task", return_value=None):
-            llm_proxy._proactive_state.pop("stale_tasks", None)
+            heartbeat._proactive_state.pop("stale_tasks", None)
             _beat()
         assert len(_nudges(db)) == 1
 

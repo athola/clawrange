@@ -2,9 +2,10 @@
 
 A heartbeat message never reaches a provider. The handler works the next
 pending task, or invents a grounded one, and reports through the digest.
-Proactive timers, the focus rotation index and the LLM call helpers stay in
-`llm_proxy` and are read there at call time, so test resets and patches on
-them keep working and this module never touches `llm_proxy` at import time.
+Heartbeat-only state (proactive timers, the focus rotation index) and the
+task-result helpers live here. The LLM call, balance and circuit helpers stay
+in `llm_proxy` and are read there at call time, so patches on them keep
+working and this module never touches `llm_proxy` at import time.
 """
 
 import asyncio
@@ -54,6 +55,215 @@ _FOREIGN_TASK = re.compile(
     r"|\[DRAFT\]\s*persona\b|\[DRAFT\]\s*income:)",
     re.IGNORECASE,
 )
+
+# ─── Heartbeat State ─────────────────────────────────────────────
+# Reset per test by conftest._reset_proxy_globals.
+
+# Track when proactive checks last fired (survives across heartbeat cycles,
+# resets on container restart which is fine — fresh start, fresh initiative).
+_proactive_state: dict[str, float] = {}
+
+# Rotates the focus subject so consecutive cycles cover different ground.
+_thinking_focus_index = 0
+
+
+# ─── Keyword Matching ─────────────────────────────────────────────
+
+_STOP_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "for",
+        "from",
+        "has",
+        "he",
+        "in",
+        "is",
+        "it",
+        "its",
+        "of",
+        "on",
+        "or",
+        "that",
+        "the",
+        "to",
+        "was",
+        "were",
+        "will",
+        "with",
+        "this",
+        "but",
+        "they",
+        "have",
+        "had",
+        "not",
+        "all",
+        "can",
+        "her",
+        "if",
+        "our",
+        "out",
+        "so",
+        "up",
+        "what",
+        "when",
+        "which",
+        "who",
+        "do",
+        "does",
+        "any",
+        "should",
+        "ensure",
+        "check",
+        "review",
+        "before",
+        "after",
+        "current",
+    }
+)
+
+
+def _extract_keywords(text: str) -> set[str]:
+    """Extract meaningful lowercase words (3+ chars, no stop words)."""
+    words = re.findall(r"[a-z]+", text.lower())
+    return {w for w in words if len(w) >= 3 and w not in _STOP_WORDS}
+
+
+# ─── Task Results Blocked on the Operator ────────────────────────
+
+# A task the model cannot finish without the operator comes back as a long, tidy
+# markdown essay. llm_proxy._is_non_answer() cannot see it: that one only fires
+# under 300 chars and these run past 1000.
+#
+# Match the status declaration in the HEADER, not a request for input
+# anywhere in the body. Checked against the 846 task results stored when
+# this was written:
+#
+#   "what i need from you"  -> 208 hits, nearly all real deliverables. The
+#       work prompt asks for exactly that ("describe what you prepared and
+#       what the operator needs to do to finish it"), so it is not a blocked signal.
+#   header-anchored below   -> 21 hits (2.5%), including both essays that
+#       had reached Telegram.
+#
+# Anchoring to the header also keeps a finished deliverable whose one
+# sub-section is blocked ("Angle 2 (BLOCKED-needs live data)") from being
+# binned whole.
+_NEEDS_INPUT_HEAD = 400
+
+_NEEDS_INPUT_SIGNALS = [
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"status:\s*\**\s*blocked",
+        r"\bblocked\b\s*[^a-z0-9]{0,4}\s*need",
+        r"\bhold for now\b",
+        r"before\s+[^.]{0,60}\bwe need\b",
+    )
+]
+
+
+def _needs_input(text: str) -> bool:
+    """True when a task result declares itself blocked on the operator's input."""
+    if not text:
+        return False
+    head = text[:_NEEDS_INPUT_HEAD]
+    return any(signal.search(head) for signal in _NEEDS_INPUT_SIGNALS)
+
+
+def _blocked_digest_line(task: dict) -> str:
+    """One compact digest line for a task stalled on the operator's input.
+
+    The full text stays on the task (GET /task/{id}); Telegram gets the
+    fact that something stalled and which task it was, not the essay.
+    """
+    return f"Blocked #{task['id']}: needs your input — {task['description'][:60]}"
+
+
+# A blocked task asked the operator a question and left the pending queue; dedup
+# then stops the LLM re-raising it. Without a re-surface, the ask-once
+# design goes mute while waiting on an answer — indistinguishable on the
+# phone from a dead assistant.
+WAITING_ON_YOU_WINDOW_DAYS = 7
+WAITING_ON_YOU_MAX_LINES = 3
+
+
+def _parse_task_time(value: object) -> datetime | None:
+    """Parse a task's created_at/completed_at, or None if unusable."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _descriptions_overlap(a: dict, b: dict) -> bool:
+    """The one keyword-overlap dedup rule: >=2 shared keywords, 30% of the
+    smaller keyword set. _has_recent_task calls it too."""
+    ka = _extract_keywords(a["description"])
+    kb = _extract_keywords(b["description"])
+    if not ka or not kb:
+        return False
+    smaller = min(len(ka), len(kb))
+    return len(ka & kb) >= max(2, int(smaller * 0.3))
+
+
+def _waiting_on_you_lines(
+    all_tasks: list[dict], now: datetime | None = None
+) -> list[str]:
+    """Digest footer lines for tasks blocked on the operator's input.
+
+    A question drops off when it ages past the window, when a later
+    overlapping task completes successfully (the answer landed), or when
+    a newer duplicate question supersedes it. Capped: the footer is a
+    nudge, not a backlog view — more than a handful of open questions
+    is a different problem.
+    """
+    now = now or datetime.now(UTC)
+    cutoff = now - timedelta(days=WAITING_ON_YOU_WINDOW_DAYS)
+
+    answered = [
+        t
+        for t in all_tasks
+        if t.get("status") == "completed"
+        and not _needs_input(t.get("result") or "")
+        and (_parse_task_time(t.get("completed_at")) or now) > cutoff
+    ]
+
+    waiting = []
+    for t in all_tasks:
+        completed = _parse_task_time(t.get("completed_at"))
+        if completed is None or completed < cutoff:
+            continue
+        if t.get("status") != "blocked" and not _needs_input(t.get("result") or ""):
+            continue
+        if any(
+            _descriptions_overlap(t, a)
+            and (_parse_task_time(a.get("completed_at")) or now) > completed
+            for a in answered
+        ):
+            continue
+        waiting.append(t)
+
+    # Newest first so a newer duplicate question replaces the older one.
+    waiting.sort(
+        key=lambda t: _parse_task_time(t.get("completed_at")) or cutoff,
+        reverse=True,
+    )
+    kept: list[dict] = []
+    for t in waiting:
+        if any(_descriptions_overlap(t, k) for k in kept):
+            continue
+        kept.append(t)
+        if len(kept) == WAITING_ON_YOU_MAX_LINES:
+            break
+    kept.reverse()  # oldest first reads better in the digest
+    return [f"Waiting on you: #{t['id']} {t['description'][:60]}" for t in kept]
 
 
 def _next_heartbeat_task(pending: list[dict]) -> dict | None:
@@ -203,7 +413,7 @@ def _build_thinking_prompt(subjects: list[str], context: str = "") -> str:
 
         cutoff = datetime.now(UTC) - timedelta(hours=24)
         for t in brain_db.list_tasks():
-            created = llm_proxy._parse_task_time(t.get("created_at"))
+            created = _parse_task_time(t.get("created_at"))
             if created and created > cutoff:
                 recent_descriptions.append(t["description"])
     except Exception:
@@ -216,8 +426,9 @@ def _build_thinking_prompt(subjects: list[str], context: str = "") -> str:
             "\nTasks already created in the last 24 hours "
             f"(DO NOT repeat or suggest anything similar):\n{recent_list}\n"
         )
-    focus = subjects[llm_proxy._thinking_focus_index % len(subjects)]
-    llm_proxy._thinking_focus_index += 1
+    global _thinking_focus_index
+    focus = subjects[_thinking_focus_index % len(subjects)]
+    _thinking_focus_index += 1
     return (
         (f"{soul}\n\n---\n" if soul else "")
         + "Suggest ONE task for yourself. The only work you can finish is "
@@ -249,13 +460,13 @@ def _is_heartbeat(msg: str) -> bool:
 def _proactive_ready(check_name: str) -> bool:
     """Return True if enough time has passed since the last run of this check."""
     interval = _PROACTIVE_INTERVALS.get(check_name, 3600)
-    last_run = llm_proxy._proactive_state.get(check_name)
+    last_run = _proactive_state.get(check_name)
     return last_run is None or (time.monotonic() - last_run) >= interval
 
 
 def _proactive_mark(check_name: str) -> None:
     """Record that a proactive check just ran."""
-    llm_proxy._proactive_state[check_name] = time.monotonic()
+    _proactive_state[check_name] = time.monotonic()
 
 
 def _has_recent_task(queue: list[dict], keyword: str, hours: int = 24) -> bool:
@@ -274,7 +485,7 @@ def _has_recent_task(queue: list[dict], keyword: str, hours: int = 24) -> bool:
                 continue
         except (ValueError, KeyError):
             continue
-        if llm_proxy._descriptions_overlap(candidate, t):
+        if _descriptions_overlap(candidate, t):
             return True
     return False
 
@@ -292,7 +503,7 @@ def _has_recent_prefix(
     cutoff = datetime.now(UTC) - timedelta(hours=hours)
     want = prefix.strip().lower()
     for t in queue:
-        created = llm_proxy._parse_task_time(t.get("created_at"))
+        created = _parse_task_time(t.get("created_at"))
         if created is None or created <= cutoff:
             continue
         desc = (t.get("description") or "").strip().lower()
@@ -743,13 +954,13 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
                 digest._digest_record(
                     f"[{label}] #{task['id']}: {task['description']}\nFailed: {failure}"
                 )
-            elif llm_proxy._needs_input(result):
+            elif _needs_input(result):
                 # The model asked the operator a question instead of finishing.
                 # Close it as blocked so it leaves the pending queue -- left
                 # pending it is reworked every cycle -- and spend one digest
                 # line on it.
                 brain_db.complete_task(task["id"], result, "blocked")
-                digest._digest_record(llm_proxy._blocked_digest_line(task))
+                digest._digest_record(_blocked_digest_line(task))
             else:
                 brain_db.complete_task(task["id"], result, "completed")
                 # One digest item per task; the result gets most of a Telegram
@@ -856,7 +1067,7 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
             time.time(),
             remaining,
             tripped,
-            waiting=llm_proxy._waiting_on_you_lines(all_tasks),
+            waiting=_waiting_on_you_lines(all_tasks),
             balance=llm_proxy.describe_balance(),
         )
         # Items go straight to Telegram — one message each — before the
