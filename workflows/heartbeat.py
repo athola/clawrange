@@ -854,6 +854,183 @@ async def _run_heartbeat_task(task: dict, brain_db, remaining: float | None) -> 
     return await _llm_work_task(description)
 
 
+def _settle_task(
+    brain_db,
+    task: dict,
+    label: str,
+    result: str,
+    failure: str | None,
+    llm_down: bool,
+    attempts: int,
+) -> None:
+    """Close (or re-queue) the task this cycle worked and record its digest line."""
+    try:
+        if llm_down:
+            # An outage is not a result: put the task back for the next
+            # cycle. One digest line per task per outage, not per cycle.
+            brain_db.release_task(task["id"])
+            _llm_retry_counts[task["id"]] = attempts
+            logger.warning(
+                "heartbeat task #%s re-queued: LLM unreachable (attempt %d/%d)",
+                task["id"],
+                attempts,
+                LLM_RETRY_LIMIT,
+            )
+            if attempts == 1:
+                digest._digest_record(
+                    f"[{label}] #{task['id']}: {task['description']}\n"
+                    "LLM unreachable; re-queued, retrying each heartbeat."
+                )
+        elif failure is not None:
+            logger.warning("heartbeat task #%s failed: %s", task["id"], failure)
+            brain_db.complete_task(task["id"], f"Failed: {failure}", "failed")
+            digest._digest_record(
+                f"[{label}] #{task['id']}: {task['description']}\nFailed: {failure}"
+            )
+        elif _needs_input(result):
+            # The model asked the operator a question instead of finishing.
+            # Close it as blocked so it leaves the pending queue -- left
+            # pending it is reworked every cycle -- and spend one digest
+            # line on it.
+            brain_db.complete_task(task["id"], result, "blocked")
+            digest._digest_record(_blocked_digest_line(task))
+        else:
+            brain_db.complete_task(task["id"], result, "completed")
+            # One digest item per task; the result gets most of a Telegram
+            # message now that items flush as separate messages. The full
+            # result still lives on the task (!tasks / GET /task/{id}).
+            clipped = digest._clip_result(result, limit=digest.DIGEST_RESULT_LIMIT)
+            digest._digest_record(
+                f"[{label}] #{task['id']}: {task['description']}\nResult: {clipped}"
+            )
+    except ValueError as exc:
+        # Task was cancelled or finished elsewhere meanwhile.
+        logger.warning("could not complete task #%s: %s", task["id"], exc)
+
+
+async def _proactive_scan(
+    brain_db,
+    all_tasks: list[dict],
+    tripped: list[str],
+    remaining: float | None,
+    unknown_for: float,
+) -> list[dict]:
+    """The idle-cycle checks: alerts, stale nudge, LLM thinking. Returns the
+    tasks it created."""
+    tasks_created: list[dict] = []
+
+    # Layer 1: Infrastructure — every cycle
+    for name in tripped:
+        desc = f"Investigate tier recovery: {name}"
+        # 24h dedup regardless of status — pending-only dedup had the
+        # same recreate-after-complete loop as the balance alert. Exact
+        # match: each tier gets its own alert.
+        if not _has_recent_prefix(all_tasks, desc, exact=True):
+            t = brain_db.create_task(desc, priority=2)
+            tasks_created.append(t)
+
+    if remaining is not None and remaining < llm_proxy.OPENROUTER_BALANCE_FLOOR:
+        desc = f"Low balance alert: ${remaining:.2f} remaining"
+        # Any alert in the last 24h counts, completed or not. The old
+        # pending-only dedup re-created the alert every cycle once the
+        # previous one completed, spamming Telegram with duplicates.
+        if not _has_recent_prefix(all_tasks, "Low balance alert:"):
+            t = brain_db.create_task(desc, priority=1)
+            tasks_created.append(t)
+
+    if unknown_for >= BALANCE_UNKNOWN_ALERT_SECS:
+        # A balance that cannot be read is not a healthy balance: say
+        # so once a day instead of silently skipping the floor check.
+        lookup_error = llm_proxy._balance_status.get("error")
+        if not _has_recent_prefix(all_tasks, _BALANCE_UNKNOWN_PREFIX):
+            desc = (
+                f"{_BALANCE_UNKNOWN_PREFIX} OpenRouter credits lookup "
+                f"failing ({lookup_error})"
+            )
+            t = brain_db.create_task(desc, priority=1)
+            tasks_created.append(t)
+
+    # Layer 2: Stale task awareness — every 30 min
+    if _proactive_ready("stale_tasks"):
+        _proactive_mark("stale_tasks")
+        stale_cutoff = datetime.now(UTC) - timedelta(hours=4)
+        stale = [
+            t
+            for t in all_tasks
+            if t["status"] == "pending"
+            and datetime.fromisoformat(t["created_at"]) < stale_cutoff
+            and not t["description"].startswith(STALE_NUDGE_PREFIX)
+        ]
+        if stale and not _has_recent_prefix(all_tasks, STALE_NUDGE_PREFIX):
+            desc = (
+                f"{STALE_NUDGE_PREFIX} {len(stale)} task(s) pending over "
+                "4 hours; review the queue"
+            )
+            t = brain_db.create_task(desc, priority=2)
+            tasks_created.append(t)
+
+    # Layer 3: LLM self-directed thinking, grounded in real subjects.
+    # HEARTBEAT_LLM_SUGGEST=0 turns it off.
+    subjects = (
+        _current_thinking_subjects()
+        if os.environ.get("HEARTBEAT_LLM_SUGGEST", "1") != "0"
+        and not tasks_created
+        and _proactive_ready("llm_thinking")
+        else []
+    )
+    if subjects:
+        _proactive_mark("llm_thinking")
+        suggestion = await _llm_suggest_task(subjects, _thinking_context())
+        if suggestion and not _is_grounded_suggestion(suggestion, subjects):
+            # Prompt rules alone never held this line; drop it in code.
+            logger.info("dropped ungrounded task: %r", suggestion)
+            suggestion = None
+        if suggestion and not _has_recent_task(all_tasks, suggestion):
+            t = brain_db.create_task(suggestion, priority=3)
+            tasks_created.append(t)
+    return tasks_created
+
+
+async def _flush_digest(
+    all_tasks: list[dict], tripped: list[str], remaining: float | None
+) -> str:
+    """Send the due digest to Telegram, one message per item, and return the
+    closing summary the heartbeat responds with."""
+    messages, text, owners, taken = digest._digest_take_ex(
+        time.time(),
+        remaining,
+        tripped,
+        waiting=_waiting_on_you_lines(all_tasks),
+        balance=llm_proxy.describe_balance(),
+    )
+    # Items go straight to Telegram — one message each — before the
+    # response returns, so they land ahead of the relayed summary.
+    # Sequential sends keep the burst in order (header, oldest first).
+    failed_idx: set[int] = set()
+    try:
+        for i, msg in enumerate(messages):
+            if not await telegram.notify(msg):
+                failed_idx.add(i)
+    except BaseException:
+        # Interrupted mid-burst: nothing unsent may be lost.
+        failed_idx.update(range(len(messages)))
+        digest._digest_commit(taken, owners, failed_idx)
+        raise
+    digest._digest_commit(taken, owners, failed_idx)
+    failed = len(failed_idx)
+    if failed:
+        text += (
+            f"\n{failed} digest message(s) failed to send — "
+            "they stay buffered for the next digest; full results remain "
+            "in the task queue (GET /task)."
+        )
+    # OpenClaw logs only Telegram *failures*, so a silent digest and a
+    # dropped one look identical downstream. Log the handoff to give the
+    # two logs a correlation point.
+    logger.info("digest flushed: %d message(s), %d failed", len(messages), failed)
+    return text
+
+
 async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse:
     """Run heartbeat checks in Python instead of relying on the LLM.
 
@@ -940,126 +1117,16 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
                 "should handle it manually"
             )
 
-        try:
-            if llm_down:
-                # An outage is not a result: put the task back for the next
-                # cycle. One digest line per task per outage, not per cycle.
-                brain_db.release_task(task["id"])
-                _llm_retry_counts[task["id"]] = attempts
-                logger.warning(
-                    "heartbeat task #%s re-queued: LLM unreachable (attempt %d/%d)",
-                    task["id"],
-                    attempts,
-                    LLM_RETRY_LIMIT,
-                )
-                if attempts == 1:
-                    digest._digest_record(
-                        f"[{label}] #{task['id']}: {task['description']}\n"
-                        "LLM unreachable; re-queued, retrying each heartbeat."
-                    )
-            elif failure is not None:
-                logger.warning("heartbeat task #%s failed: %s", task["id"], failure)
-                brain_db.complete_task(task["id"], f"Failed: {failure}", "failed")
-                digest._digest_record(
-                    f"[{label}] #{task['id']}: {task['description']}\nFailed: {failure}"
-                )
-            elif _needs_input(result):
-                # The model asked the operator a question instead of finishing.
-                # Close it as blocked so it leaves the pending queue -- left
-                # pending it is reworked every cycle -- and spend one digest
-                # line on it.
-                brain_db.complete_task(task["id"], result, "blocked")
-                digest._digest_record(_blocked_digest_line(task))
-            else:
-                brain_db.complete_task(task["id"], result, "completed")
-                # One digest item per task; the result gets most of a Telegram
-                # message now that items flush as separate messages. The full
-                # result still lives on the task (!tasks / GET /task/{id}).
-                clipped = digest._clip_result(result, limit=digest.DIGEST_RESULT_LIMIT)
-                digest._digest_record(
-                    f"[{label}] #{task['id']}: {task['description']}\nResult: {clipped}"
-                )
-        except ValueError as exc:
-            # Task was cancelled or finished elsewhere meanwhile.
-            logger.warning("could not complete task #%s: %s", task["id"], exc)
-
+        _settle_task(brain_db, task, label, result, failure, llm_down, attempts)
         # No direct Telegram notification: the digest line above carries
         # the completion, at most once per hour.
 
     elif not skipped:
-        # ── PROACTIVE SCAN ──────────────────────────────────────
         # (all_tasks is fetched before the pending branch: the digest
         # footer also needs it to re-surface blocked questions.)
-
-        # Layer 1: Infrastructure — every cycle
-        for name in tripped:
-            desc = f"Investigate tier recovery: {name}"
-            # 24h dedup regardless of status — pending-only dedup had the
-            # same recreate-after-complete loop as the balance alert. Exact
-            # match: each tier gets its own alert.
-            if not _has_recent_prefix(all_tasks, desc, exact=True):
-                t = brain_db.create_task(desc, priority=2)
-                tasks_created.append(t)
-
-        if remaining is not None and remaining < llm_proxy.OPENROUTER_BALANCE_FLOOR:
-            desc = f"Low balance alert: ${remaining:.2f} remaining"
-            # Any alert in the last 24h counts, completed or not. The old
-            # pending-only dedup re-created the alert every cycle once the
-            # previous one completed, spamming Telegram with duplicates.
-            if not _has_recent_prefix(all_tasks, "Low balance alert:"):
-                t = brain_db.create_task(desc, priority=1)
-                tasks_created.append(t)
-
-        if unknown_for >= BALANCE_UNKNOWN_ALERT_SECS:
-            # A balance that cannot be read is not a healthy balance: say
-            # so once a day instead of silently skipping the floor check.
-            lookup_error = llm_proxy._balance_status.get("error")
-            if not _has_recent_prefix(all_tasks, _BALANCE_UNKNOWN_PREFIX):
-                desc = (
-                    f"{_BALANCE_UNKNOWN_PREFIX} OpenRouter credits lookup "
-                    f"failing ({lookup_error})"
-                )
-                t = brain_db.create_task(desc, priority=1)
-                tasks_created.append(t)
-
-        # Layer 2: Stale task awareness — every 30 min
-        if _proactive_ready("stale_tasks"):
-            _proactive_mark("stale_tasks")
-            stale_cutoff = datetime.now(UTC) - timedelta(hours=4)
-            stale = [
-                t
-                for t in all_tasks
-                if t["status"] == "pending"
-                and datetime.fromisoformat(t["created_at"]) < stale_cutoff
-                and not t["description"].startswith(STALE_NUDGE_PREFIX)
-            ]
-            if stale and not _has_recent_prefix(all_tasks, STALE_NUDGE_PREFIX):
-                desc = (
-                    f"{STALE_NUDGE_PREFIX} {len(stale)} task(s) pending over "
-                    "4 hours; review the queue"
-                )
-                t = brain_db.create_task(desc, priority=2)
-                tasks_created.append(t)
-
-        # Layer 3: LLM self-directed thinking, grounded in real subjects.
-        # HEARTBEAT_LLM_SUGGEST=0 turns it off.
-        subjects = (
-            _current_thinking_subjects()
-            if os.environ.get("HEARTBEAT_LLM_SUGGEST", "1") != "0"
-            and not tasks_created
-            and _proactive_ready("llm_thinking")
-            else []
+        tasks_created = await _proactive_scan(
+            brain_db, all_tasks, tripped, remaining, unknown_for
         )
-        if subjects:
-            _proactive_mark("llm_thinking")
-            suggestion = await _llm_suggest_task(subjects, _thinking_context())
-            if suggestion and not _is_grounded_suggestion(suggestion, subjects):
-                # Prompt rules alone never held this line; drop it in code.
-                logger.info("dropped ungrounded task: %r", suggestion)
-                suggestion = None
-            if suggestion and not _has_recent_task(all_tasks, suggestion):
-                t = brain_db.create_task(suggestion, priority=3)
-                tasks_created.append(t)
 
     # ── 3. Build response ───────────────────────────────────────
     # Created tasks buffer into the digest alongside completions. The
@@ -1072,41 +1139,11 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
             f"{t['description'][:DESCRIPTION_PREVIEW_CHARS]}"
         )
 
-    if digest._digest_due():
-        messages, text, owners, taken = digest._digest_take_ex(
-            time.time(),
-            remaining,
-            tripped,
-            waiting=_waiting_on_you_lines(all_tasks),
-            balance=llm_proxy.describe_balance(),
-        )
-        # Items go straight to Telegram — one message each — before the
-        # response returns, so they land ahead of the relayed summary.
-        # Sequential sends keep the burst in order (header, oldest first).
-        failed_idx: set[int] = set()
-        try:
-            for i, msg in enumerate(messages):
-                if not await telegram.notify(msg):
-                    failed_idx.add(i)
-        except BaseException:
-            # Interrupted mid-burst: nothing unsent may be lost.
-            failed_idx.update(range(len(messages)))
-            digest._digest_commit(taken, owners, failed_idx)
-            raise
-        digest._digest_commit(taken, owners, failed_idx)
-        failed = len(failed_idx)
-        if failed:
-            text += (
-                f"\n{failed} digest message(s) failed to send — "
-                "they stay buffered for the next digest; full results remain "
-                "in the task queue (GET /task)."
-            )
-        # OpenClaw logs only Telegram *failures*, so a silent digest and a
-        # dropped one look identical downstream. Log the handoff to give the
-        # two logs a correlation point.
-        logger.info("digest flushed: %d message(s), %d failed", len(messages), failed)
-    else:
-        text = ""
+    text = (
+        await _flush_digest(all_tasks, tripped, remaining)
+        if digest._digest_due()
+        else ""
+    )
     resp = llm_proxy._synthetic_response(text)
     # Reached only when the cycle ran to the end; the watchdog alerts when
     # heartbeats keep arriving without this stamp moving.
