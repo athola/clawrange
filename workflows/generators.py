@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
+import re
 import statistics
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -1206,6 +1208,18 @@ def seed_from_profile(brain_db, profile) -> list[dict]:
 # ─── CRM generators (lead-crm profile) ───────────────────────────────
 
 
+_STATUS_URL_RE = re.compile(r"https?://[^\s'\"<>]+")
+
+
+def _redact_urls(text: str) -> str:
+    """Drop URLs from text bound for a stored schedule status.
+
+    httpx errors embed the full request URL, and connector URLs can carry
+    tokens in the query string; /sched readers must not see them.
+    """
+    return _STATUS_URL_RE.sub("<url>", text)
+
+
 def _crm_for(profile, crm):
     """Resolve a CRM adapter: prefer the injected one, else build from profile.
 
@@ -1267,7 +1281,9 @@ async def pipeline_generator(
     except Exception as exc:
         logger.warning("pipeline: connector %s failed: %s", connector, exc)
         if schedule_id:
-            brain_db.update_schedule_status(schedule_id, now, f"error ({exc})")
+            brain_db.update_schedule_status(
+                schedule_id, now, f"error ({_redact_urls(str(exc))})"
+            )
         return None
 
     delivery = ""
@@ -1348,31 +1364,38 @@ async def persona_reflect_generator(brain_db, profile_name=None, **kwargs) -> No
     """Review recent activity and queue persona-enhancement proposals.
 
     Routes the reflection prompt through the LLM proxy and posts any
-    suggestion as a [DRAFT] persona proposal. Degrades to a no-op if the
-    proxy is unavailable.
+    suggestion as a [DRAFT] persona proposal under the active profile.
+    Only the reply's first non-empty line is used (models often add a
+    justification line). Degrades to a no-op if the proxy is unavailable
+    or the suggestion fails validation.
     """
 
-    profile_name = profile_name or "starter"
+    if not profile_name:
+        active = tenant_profile.active_profile()
+        # Same name active_profile() resolves, even when its file won't load.
+        profile_name = (
+            active.name if active else os.environ.get("CLAWRANGE_PROFILE") or "starter"
+        )
     prompt = (
         "From recent operator interactions, suggest at most ONE concrete "
         "persona adjustment (tone/format/priority). Reply with a single "
         "imperative sentence, or 'none'."
     )
-    suggestion = await llm_proxy._llm_call(prompt, max_tokens=80)
-    if not suggestion or suggestion.strip().lower().startswith("none"):
+    reply = await llm_proxy._llm_call(prompt, max_tokens=80)
+    lines = [ln.strip() for ln in (reply or "").splitlines() if ln.strip()]
+    suggestion = lines[0] if lines else ""
+    if not suggestion or suggestion.lower().startswith("none"):
         return
     if brain_db is None:
         from app import brain_db as _bd
 
         brain_db = _bd
-    pl.propose(
-        brain_db,
-        profile_name,
-        "persona",
-        "Reflection",
-        suggestion.strip(),
-        "reflect",
-    )
+    try:
+        pl.propose(
+            brain_db, profile_name, "persona", "Reflection", suggestion, "reflect"
+        )
+    except ValueError as exc:
+        logger.warning("persona_reflect: suggestion skipped: %s", exc)
 
 
 def _hours_since(iso_ts: str | None) -> float:
