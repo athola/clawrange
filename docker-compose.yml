@@ -63,6 +63,10 @@ services:
       # Healthcheck script: gateway /healthz plus the heartbeat-sync failure
       # marker. It cannot detect stuck Telegram polling (see the script).
       - ./scripts/healthcheck-openclaw.sh:/opt/healthcheck.sh:ro
+    tmpfs:
+      # Root-owned (0755) and unwritable by node: holds the heartbeat-sync
+      # failure marker that root writes and the healthcheck reads.
+      - /run:size=1M,mode=0755
     environment:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       # OpenClaw only reads agents.defaults.userTimezone from openclaw.json,

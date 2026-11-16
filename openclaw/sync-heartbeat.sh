@@ -15,12 +15,22 @@
 # Usage: sync-heartbeat.sh <heartbeat-file>
 set -u
 FILE="$1"
-MARKER="${SYNC_HEARTBEAT_MARKER:-/tmp/sync-heartbeat.failed}"
+#
+# This runs as root, so the marker lives in /run: a root-owned tmpfs (see
+# docker-compose.yml) the node user cannot write to. /tmp and the state dir
+# are owned by node, which could plant a symlink there for root to write
+# through. The write still goes via mktemp + mv (mv replaces a symlink
+# rather than following it) as a second line of defence.
+MARKER="${SYNC_HEARTBEAT_MARKER:-/run/sync-heartbeat.failed}"
 rm -f "$MARKER"
 
 fail() {
   echo "sync-heartbeat: $*" >&2
-  printf '%s\n' "$*" > "$MARKER"
+  if tmp=$(mktemp "$MARKER.XXXXXX"); then
+    printf '%s\n' "$*" > "$tmp" && mv -f "$tmp" "$MARKER"
+  else
+    echo "sync-heartbeat: could not write failure marker $MARKER" >&2
+  fi
   exit 1
 }
 

@@ -30,13 +30,16 @@
 
 set -e
 
-MARKER="${SYNC_HEARTBEAT_MARKER:-/tmp/sync-heartbeat.failed}"
+# /run is a root-owned tmpfs (docker-compose.yml), out of the node user's
+# reach. A symlink there is never sync-heartbeat.sh's output, so it is
+# ignored rather than read; the read is bounded either way.
+MARKER="${SYNC_HEARTBEAT_MARKER:-/run/sync-heartbeat.failed}"
 
 # curl, not wget: OpenClaw 2026.8+ images no longer ship wget.
 curl -sf -o /dev/null --max-time 5 http://127.0.0.1:18789/healthz || exit 1
 
-if [ -f "$MARKER" ]; then
-  echo "heartbeat sync failed: $(cat "$MARKER")"
+if [ -f "$MARKER" ] && [ ! -L "$MARKER" ]; then
+  echo "heartbeat sync failed: $(head -c 512 "$MARKER")"
   exit 1
 fi
 

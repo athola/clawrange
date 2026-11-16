@@ -145,8 +145,36 @@ class TestSyncHeartbeat:
         assert proc.returncode != 0
         assert marker.exists()
 
+    def test_marker_symlink_is_not_followed(self, tmp_path, stubs):
+        # The script runs as root; a symlink planted at the marker path must
+        # never turn the failure write into an overwrite of its target.
+        _openclaw(stubs, scratch_ok=False)
+        victim = tmp_path / "victim"
+        victim.write_text("precious\n")
+        marker = tmp_path / "sync-heartbeat.failed"
+        marker.symlink_to(victim)
+        proc = _run(SYNC, stubs, marker, "/opt/HEARTBEAT.md")
+        assert proc.returncode != 0
+        assert victim.read_text() == "precious\n"
+        assert marker.is_file() and not marker.is_symlink()
+
 
 class TestHealthcheck:
+    def test_marker_symlink_is_ignored(self, tmp_path, stubs):
+        secret = tmp_path / "secret"
+        secret.write_text("TOKEN=abc\n")
+        marker = tmp_path / "sync-heartbeat.failed"
+        marker.symlink_to(secret)
+        proc = _run(HEALTH, stubs, marker)
+        assert "TOKEN" not in proc.stdout + proc.stderr
+
+    def test_marker_output_is_bounded(self, tmp_path, stubs):
+        marker = tmp_path / "sync-heartbeat.failed"
+        marker.write_text("x" * 10000)
+        proc = _run(HEALTH, stubs, marker)
+        assert proc.returncode != 0
+        assert len(proc.stdout) < 1024
+
     def test_healthy_without_marker(self, tmp_path, stubs):
         proc = _run(HEALTH, stubs, tmp_path / "absent")
         assert proc.returncode == 0
@@ -179,3 +207,14 @@ def test_openclaw_start_command_stops_on_first_failure():
         if line.strip() and not line.strip().startswith("#")
     ]
     assert lines[0] == "set -e"
+
+
+def test_heartbeat_marker_lives_in_root_owned_tmpfs():
+    """/tmp and the state dir are owned by node (uid 1000), so a marker
+    there could be swapped for a symlink before root writes it. /run is a
+    root-owned tmpfs the node user cannot write to."""
+    compose = yaml.safe_load((ROOT / "docker-compose.yml").read_text())
+    tmpfs = compose["services"]["openclaw"].get("tmpfs") or []
+    assert any(str(t).split(":")[0] == "/run" for t in tmpfs)
+    for script in (SYNC, HEALTH):
+        assert "${SYNC_HEARTBEAT_MARKER:-/run/" in script.read_text()
