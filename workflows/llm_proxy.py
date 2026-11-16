@@ -655,8 +655,8 @@ def _parse_task_time(value: object) -> datetime | None:
 
 
 def _descriptions_overlap(a: dict, b: dict) -> bool:
-    """Same rule as _has_recent_task: >=2 shared keywords, 30% of the
-    smaller keyword set."""
+    """The one keyword-overlap dedup rule: >=2 shared keywords, 30% of the
+    smaller keyword set. heartbeat._has_recent_task calls it too."""
     ka = _extract_keywords(a["description"])
     kb = _extract_keywords(b["description"])
     if not ka or not kb:

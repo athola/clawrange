@@ -261,15 +261,12 @@ def _proactive_mark(check_name: str) -> None:
 def _has_recent_task(queue: list[dict], keyword: str, hours: int = 24) -> bool:
     """Check if a semantically similar task exists in the last N hours.
 
-    Uses keyword overlap: if >=2 meaningful words overlap between the new
-    suggestion and an existing task, it's considered a duplicate.  The
-    threshold scales with the smaller keyword set (at least 30% overlap)
-    so short descriptions aren't unfairly penalised.
+    Similarity is the shared keyword-overlap rule in `_descriptions_overlap`
+    (>=2 shared keywords, at least 30% of the smaller keyword set), the same
+    one the "Waiting on you" footer uses, so the two never disagree.
     """
     cutoff = datetime.now(UTC) - timedelta(hours=hours)
-    new_keywords = llm_proxy._extract_keywords(keyword)
-    if not new_keywords:
-        return False
+    candidate = {"description": keyword}
     for t in queue:
         try:
             created = datetime.fromisoformat(t["created_at"])
@@ -277,10 +274,7 @@ def _has_recent_task(queue: list[dict], keyword: str, hours: int = 24) -> bool:
                 continue
         except (ValueError, KeyError):
             continue
-        existing_keywords = llm_proxy._extract_keywords(t["description"])
-        overlap = new_keywords & existing_keywords
-        smaller = min(len(new_keywords), len(existing_keywords)) or 1
-        if len(overlap) >= max(2, int(smaller * 0.3)):
+        if llm_proxy._descriptions_overlap(candidate, t):
             return True
     return False
 

@@ -3300,6 +3300,43 @@ class TestSemanticDedup:
         similar = "Review ClawRange service tier balance and limits"
         assert _has_recent_task(queue, similar) is False
 
+    @pytest.mark.parametrize(
+        ("existing", "suggestion"),
+        [
+            (
+                "Review ClawRange tier allocation against MSP client load",
+                "Review ClawRange service tier balance and limits",
+            ),
+            ("Send weekly invoice summary", "Draft blog outline on homelab"),
+            ("Draft LinkedIn post", "Draft post"),
+            ("the and of", "Draft LinkedIn post about caching"),
+        ],
+    )
+    def test_recent_task_dedup_uses_the_shared_overlap_rule(self, existing, suggestion):
+        """S11: the heartbeat dedup and the waiting-on-you footer share one
+        keyword-overlap rule, so they agree on every pair."""
+        from heartbeat import _has_recent_task
+        from llm_proxy import _descriptions_overlap
+
+        task = {"description": existing, "created_at": datetime.now(UTC).isoformat()}
+        expected = _descriptions_overlap({"description": suggestion}, task)
+        assert _has_recent_task([task], suggestion) is expected
+
+    def test_recent_task_dedup_delegates_to_descriptions_overlap(self, monkeypatch):
+        """S11: _has_recent_task carries no private copy of the rule."""
+        import heartbeat
+        import llm_proxy
+
+        calls = []
+        monkeypatch.setattr(
+            llm_proxy,
+            "_descriptions_overlap",
+            lambda a, b: calls.append((a, b)) or True,
+        )
+        task = {"description": "zzz", "created_at": datetime.now(UTC).isoformat()}
+        assert heartbeat._has_recent_task([task], "qqq") is True
+        assert calls == [({"description": "qqq"}, task)]
+
     def test_llm_thinking_interval_is_fifteen_minutes(self):
         """Verify LLM thinking interval is 900s (15 min), not 300s."""
         from heartbeat import _PROACTIVE_INTERVALS
