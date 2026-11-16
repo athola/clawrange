@@ -1403,8 +1403,9 @@ async def research_pulse_generator(
 
     Topic selection: an explicit ``topics`` list (from the schedule's
     kwargs) wins; otherwise the tracked projects' topic hints are used.
-    The first candidate not already queued is chosen, giving basic
-    rotation across a list while never double-queuing the same task.
+    Topics with a pending or active task are skipped; of the rest, the one
+    queued least recently (any status, never-queued first) is chosen, so
+    the whole list rotates and no topic is double-queued.
     Never auto-posts -- it only enqueues a research task for review.
     """
     recent = brain_db.list_research_sessions(limit=1)
@@ -1422,15 +1423,27 @@ async def research_pulse_generator(
         logger.info("research_pulse: no topic configured, skipping")
         return
 
-    pending = {t["description"] for t in brain_db.list_tasks(status="pending")}
-    for topic in candidates:
-        desc = f"research:tome: {topic}"
-        if desc not in pending:
-            brain_db.create_task(desc, priority=3, source="schedule")
-            logger.info("research_pulse: enqueued '%s'", desc)
-            return
+    # Every status counts for "when was it last queued"; only pending and
+    # active tasks block a topic. Deduping against pending alone requeued
+    # topic 1 as soon as the bridge claimed it.
+    open_descs: set[str] = set()
+    last_queued: dict[str, str] = {}
+    for task in brain_db.list_tasks():
+        desc = task["description"]
+        if task["status"] in ("pending", "active"):
+            open_descs.add(desc)
+        last_queued[desc] = max(last_queued.get(desc, ""), task["created_at"] or "")
 
-    logger.info("research_pulse: all candidate topics already queued, skipping")
+    descs = [f"research:tome: {t}" for t in dict.fromkeys(candidates)]
+    eligible = [d for d in descs if d not in open_descs]
+    if not eligible:
+        logger.info("research_pulse: all candidate topics already queued, skipping")
+        return
+    # Never-queued topics ("") first, then least recently queued; ties keep
+    # the configured order (min is stable).
+    desc = min(eligible, key=lambda d: last_queued.get(d, ""))
+    brain_db.create_task(desc, priority=3, source="schedule")
+    logger.info("research_pulse: enqueued '%s'", desc)
 
 
 INCOME_REVIEW_DESC = "[DRAFT] income: weekly strategy review"
