@@ -67,7 +67,10 @@ def create_brain_router(db: BrainDB) -> APIRouter:
             # Embed the query with the configured model: the same model whose
             # table search_vector reads, so the vectors are comparable.
             vector = None
-            if not db.has_embeddings():
+            vec = db.vec_status()
+            if not vec["enabled"]:
+                fallback = f"sqlite-vec unavailable: {vec['reason']}"
+            elif not db.has_embeddings():
                 fallback = "no embeddings yet"
             else:
                 vector = await embeddings.embed_query(q)

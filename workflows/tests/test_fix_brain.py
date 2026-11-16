@@ -83,6 +83,15 @@ class TestVecStatus:
         d.init_db()
         assert d.use_vector_table("vec_test_4", 4) is False
 
+        # /brain/search names the real cause, not "no embeddings yet"
+        d.upsert_page("net/wifi", "WiFi", "note", "wireless access points")
+        data = _client(d).get("/brain/search?q=wireless").json()
+        assert data["mode"] == "keyword"
+        assert data["fallback"] == (
+            "sqlite-vec unavailable: RuntimeError: extension blew up"
+        )
+        assert [r["slug"] for r in data["results"]] == ["net/wifi"]
+
 
 # ─── G4: healthz counts through the lock, not brain_db._conn ──────
 
@@ -390,24 +399,43 @@ class TestBackfillResilience:
             assert len(calls) == 1  # no bisecting on a transient failure
             assert len(vec_db.missing_embeddings(10)) == 2
 
+    def test_every_input_refused_marks_nothing(self, vec_db, monkeypatch, caplog):
+        """A 400 on every request blames the request (bad EMBED_URL or
+        model), not the chunks: marking them all would hide every page."""
+        self._pages(vec_db, "alpha", "beta", "gamma")
+        calls: list = []
+        monkeypatch.setattr(
+            embeddings, "request", _provider(4, calls, status_for=lambda n: 400)
+        )
+        with caplog.at_level(logging.ERROR):
+            out = asyncio.run(embeddings.backfill(vec_db, _cfg4()))
+        assert out["stored"] == 0 and out["failed"] == 3
+        assert "rejected" not in out
+        assert len(vec_db.missing_embeddings(10)) == 3
+        assert "refused every input" in caplog.text
+
     def test_rewritten_page_is_retried(self, vec_db, monkeypatch):
-        self._pages(vec_db, "POISON blob")
+        self._pages(vec_db, "POISON blob", "healthy sibling")
         calls: list = []
         monkeypatch.setattr(embeddings, "request", _provider(4, calls))
-        asyncio.run(embeddings.backfill(vec_db, _cfg4()))
+        out = asyncio.run(embeddings.backfill(vec_db, _cfg4()))
+        assert out["rejected"] == 1
         assert vec_db.missing_embeddings(10) == []
         vec_db.upsert_page("p/0", "Page 0", "note", "fixed body")
         assert len(vec_db.missing_embeddings(10)) == 1
         out = asyncio.run(embeddings.backfill(vec_db, _cfg4()))
         assert out["stored"] == 1
+        count = vec_db._conn.execute("SELECT COUNT(*) FROM embedding_rejects")
+        assert count.fetchone()[0] == 0  # stale reject row pruned
 
     def test_rejection_is_per_model_table(self, vec_db, monkeypatch):
-        self._pages(vec_db, "POISON blob")
+        self._pages(vec_db, "POISON blob", "healthy sibling")
         calls: list = []
         monkeypatch.setattr(embeddings, "request", _provider(4, calls))
         asyncio.run(embeddings.backfill(vec_db, _cfg4()))
+        assert vec_db.missing_embeddings(10) == []
         vec_db.use_vector_table("vec_other_4", 4)
-        assert len(vec_db.missing_embeddings(10)) == 1
+        assert len(vec_db.missing_embeddings(10)) == 2
 
     def test_db_created_without_rejects_table_still_opens(self, tmp_path):
         """A brain.db from main has no embedding_rejects table; init_db adds
@@ -422,6 +450,10 @@ class TestBackfillResilience:
 
         d = BrainDB(path)
         d.init_db()
+        tables = {
+            r[0] for r in d._conn.execute("SELECT name FROM sqlite_master").fetchall()
+        }
+        assert "embedding_rejects" in tables
         if not d._has_vec:
             pytest.skip("sqlite-vec unavailable")
         d.use_vector_table("vec_test_4", 4)
@@ -496,5 +528,8 @@ class TestPageTypeValidated:
         db.upsert_page("a", "Alpha", "note", "body")
         client = _client(db)
         assert client.get("/brain/pages?page_type=bogus").status_code == 422
+        # empty is also not a type (it used to mean "all"; omit it instead)
+        assert client.get("/brain/pages?page_type=").status_code == 422
+        assert client.get("/brain/pages").json()["total"] == 1
         r = client.get("/brain/pages?page_type=note")
         assert r.status_code == 200 and r.json()["total"] == 1

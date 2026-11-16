@@ -145,6 +145,10 @@ async def backfill(brain_db, cfg: EmbedConfig | None = None, limit: int = 256) -
     those are marked so ``missing_embeddings`` stops returning them. Any
     other failure (an outage) ends the run; the rest is retried next time.
 
+    Marks are written only when the same run stored at least one vector: if
+    every request is refused, the fault is the request (a wrong EMBED_URL,
+    a bad model), not the chunks, and nothing is marked.
+
     Also drops vectors whose chunk was rewritten (re-chunking replaces chunk
     rows, so the old vector no longer points at anything).
     """
@@ -155,19 +159,34 @@ async def backfill(brain_db, cfg: EmbedConfig | None = None, limit: int = 256) -
     missing = brain_db.missing_embeddings(limit)
     if not missing:
         return {"stored": 0, "pruned": pruned}
-    stored = rejected = 0
+    stored = 0
+    refused: list[int] = []
     out: dict = {"pruned": pruned}
     for start in range(0, len(missing), BATCH):
         s, r, ok = await _store_or_isolate(
             brain_db, missing[start : start + BATCH], cfg
         )
-        stored, rejected = stored + s, rejected + r
+        stored += s
+        refused += r
         if not ok:
-            out["failed"] = len(missing) - start - s - r
+            out["failed"] = len(missing) - start - s - len(r)
             break
+    if refused and stored:
+        brain_db.mark_embedding_rejected(refused)
+        logger.warning(
+            "embeddings: provider refused %d chunk(s) %s; skipping them",
+            len(refused),
+            refused[:10],
+        )
+        out["rejected"] = len(refused)
+    elif refused:
+        logger.error(
+            "embeddings: provider refused every input this run (%d chunks); "
+            "check EMBED_URL / EMBED_MODEL. Nothing marked.",
+            len(refused),
+        )
+        out["failed"] = out.get("failed", 0) + len(refused)
     out["stored"] = stored
-    if rejected:
-        out["rejected"] = rejected
     if stored:
         logger.info("embeddings: stored %d vectors in %s", stored, cfg.table)
     return out
@@ -175,26 +194,20 @@ async def backfill(brain_db, cfg: EmbedConfig | None = None, limit: int = 256) -
 
 async def _store_or_isolate(
     brain_db, rows: list[dict], cfg: EmbedConfig
-) -> tuple[int, int, bool]:
-    """Embed and store ``rows``; isolate and mark the ones the provider refuses.
+) -> tuple[int, list[int], bool]:
+    """Embed and store ``rows``; isolate the ones the provider refuses.
 
-    Returns (stored, rejected, ok); ok is False on a non-input failure, which
-    stops the caller rather than marking healthy chunks during an outage.
+    Returns (stored, refused chunk ids, ok); ok is False on a non-input
+    failure, which stops the caller rather than bisecting during an outage.
     """
     vectors, refused = await _embed_batch([r["content"] for r in rows], cfg)
     if vectors is not None:
         brain_db.store_embeddings([(r["id"], v) for r, v in zip(rows, vectors)])
-        return len(rows), 0, True
+        return len(rows), [], True
     if not refused:
-        return 0, 0, False
+        return 0, [], False
     if len(rows) == 1:
-        brain_db.mark_embedding_rejected([rows[0]["id"]])
-        logger.warning(
-            "embeddings: provider rejected chunk %s (%d words); skipping it",
-            rows[0]["id"],
-            len(rows[0]["content"].split()),
-        )
-        return 0, 1, True
+        return 0, [rows[0]["id"]], True
     mid = len(rows) // 2
     s1, r1, ok = await _store_or_isolate(brain_db, rows[:mid], cfg)
     if not ok:
