@@ -89,29 +89,42 @@ make test-ollama     # local Ollama inference
 **Offline validation** (no services required):
 
 ```bash
-make validate        # tests/validate_stack.py and pytest unit tests
-make test-unit       # workflows/tests/: app, brain, llm_proxy, marketing
+make validate        # tests/: structure, compose, Makefile and config checks
+make test-unit       # workflows/tests/: the service's pytest suite
+make coverage        # the same suite, failing under 85% coverage
+make retrieval-eval  # offline brain-search quality against a golden set
 ```
 
-The Python unit tests under `workflows/tests/` cover the FastAPI app, brain
-database, LLM proxy routing, marketing scanners, and Telegram formatting.
-`tests/test_validate_stack.py` validates project structure and configs.
+`make setup` installs the git hooks: ruff and mypy on every commit, the
+full pytest suite (including the retrieval-eval baseline gate) on push.
 
 ## Make Targets
 
 **Lifecycle:**
 `setup` | `start` | `start-full` | `stop` | `stop-clean` | `restart` |
-`reset` | `start-prod` | `stop-prod`
+`reset` | `start-prod` | `start-prod-full` | `stop-prod` | `clean-volumes`
+
+**Profiles and persona:**
+`profile` | `persona` | `persona-export` | `persona-demo` | `seed-demo`
 
 **Testing:**
 `test` | `test-openclaw` | `test-workflows` | `test-deerflow` |
-`test-ollama` | `test-unit` | `validate`
+`test-ollama` | `test-research` | `test-unit` | `coverage` | `validate`
+
+**Retrieval eval:**
+`retrieval-eval` | `retrieval-eval-refresh` | `retrieval-harvest` |
+`retrieval-eval-brain`
+
+**Research bridge:**
+`tome-bridge` | `tome-bridge-watch`
 
 **Inspection:**
-`health` | `ps` | `logs` | `logs-openclaw` | `logs-workflows`
+`health` | `ps` | `logs` | `logs-openclaw` | `logs-workflows` |
+`models-check`
 
 **Quality:**
-`lint` | `format` | `env-check`
+`lint` | `py-lint` | `typecheck` | `format` | `format-fix` | `hooks` |
+`env-check`
 
 Run `make help` for descriptions of each target.
 
@@ -155,7 +168,7 @@ The loop:
    learnings to `config/profiles/<name>/learned.yaml`, so the evolved
    persona is reproducible for anyone who pulls the repo.
 
-See the loop run end-to-end offline (no keys, no containers):
+See the loop run end-to-end offline, without API keys or containers:
 
 ```bash
 make persona-demo PROFILE=chief-of-staff
@@ -230,19 +243,11 @@ for the full operator guide.
 ### Marketing Orchestrator
 
 Scheduled scans are driven by APScheduler. `workflows/generators.py`
-registers 14 generators in `GENERATORS`; the marketing ones are:
-
-- `morning_scan`: daily Reddit and GitHub scan per tracked project
-- `morning_digest`: 8am outreach rundown (Reddit, Hacker News, GitHub
-  issues, web) with cited action items, always delivered to Telegram
-- `weekly_traffic`: weekly traffic snapshot tasks
-- `awesome_lists_watch`: alerts when projects are missing from
-  curated awesome-lists
-- `custom_scan`: generic topic scan for user-defined schedules
-- `content_idea`: turns recent research findings into one content
-  idea per project (technical post / Reddit comment / X thread)
-- `comment_draft`: drafts a useful, non-promotional reply for a
-  given URL and queues it as a `[DRAFT]` task for human approval
+registers 14 generators in `GENERATORS`, from the 8am `morning_digest`
+outreach rundown to `comment_draft`, which drafts a reply for one URL and
+queues it for approval. The generator table in
+[docs/research-and-marketing.md](docs/research-and-marketing.md) gives
+the marketing ones with a suggested cron for each.
 
 The `marketing` profile seeds five tracked projects
 (`claude-night-market`, `skrills`, `simple-resume`, `clawrange` and
@@ -274,10 +279,5 @@ make profile PROFILE=acme                     # render soul.md/identity.md, set 
 make seed-demo                                # optional: load demo leads offline
 ```
 
-New code modules: `workflows/connectors/` (source/transform/sink registry),
-`workflows/crm/` (pluggable `CRMAdapter` and SQLite/REST backends and query
-templates), `workflows/tenant_profile.py` (loader/validator),
-`workflows/persona.py` (persona renderer), and `workflows/crm_api.py` (the
-`/crm/*` router, mounted only when the profile defines a CRM). See
-[docs/multi-tenant-guide.md](docs/multi-tenant-guide.md) for the full
-operator guide.
+Profile authoring, connector kinds and CRM backends are covered in
+[docs/multi-tenant-guide.md](docs/multi-tenant-guide.md).

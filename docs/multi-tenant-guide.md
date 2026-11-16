@@ -335,6 +335,7 @@ homelab_deals:
       currency: USD
       delivery_country: US
     slickdeals: {}
+    servethehome: {}                  # STH forum "Great Deals" feed
     reddit: {subreddits: [homelabsales]}
   stack_gaps: {vram: what is missing}
   targets:
@@ -346,6 +347,20 @@ Find eBay category ids with the Taxonomy API
 (`get_category_suggestions`). Leave a category unmapped when real listings
 span several eBay categories. The `marketing` profile is a full worked
 example.
+
+Only the sources listed under `sources` are polled. Each one gets its own
+status line in the rundown, so an outage shows as a failed source rather
+than a quiet day:
+
+- **eBay** without `EBAY_CLIENT_ID`/`EBAY_CLIENT_SECRET`, or with a keyset
+  eBay rejects, reports as not configured and names the fix. One failed
+  target search is skipped and counted (`1/3 targets failed`); the source
+  fails only when every target does.
+- **Slickdeals** runs one search per target and fails only when all of
+  them fail. **ServeTheHome** is a single feed and fails when that feed does.
+- **Reddit** reads with OAuth when the `REDDIT_*` credentials are set and
+  falls back to public feeds otherwise. The other subreddits still read
+  when one fails.
 
 ## 9. Extending
 
@@ -419,6 +434,13 @@ This writes `config/profiles/chief-of-staff/learned.yaml`. On boot,
 `seed_from_profile` reads that overlay back into the brain (a bad or partial
 overlay is skipped with a warning, never crashing boot), so the file and the
 live store stay in sync. Edit either side and re-export/re-seed.
+
+`make persona` and `make profile` render on the host from both sides:
+approvals in `data/brain/brain.db` merged with `learned.yaml`, so
+unexported approvals still render. If the brain DB is missing or
+unreadable, they render `learned.yaml` alone and print a warning, leaving
+the DB as it found it. The command exits non-zero when any target file
+could not be written.
 
 > Outcome-signal proposals (the assistant noticing recurring corrections on
 > its own) are off by default. Set `PERSONA_SIGNAL_LEARNING=1` to enable them.
