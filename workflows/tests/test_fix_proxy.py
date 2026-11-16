@@ -573,7 +573,9 @@ class TestStartProdSoulGuard:
         (root / "openclaw").mkdir()
         shutil.copy(REPO / "Makefile", root / "Makefile")
         shutil.copy(REPO / "scripts" / "start.sh", root / "scripts" / "start.sh")
-        (root / ".env").write_text("OPENROUTER_API_KEY=sk-test\n")
+        (root / ".env").write_text(
+            "OPENROUTER_API_KEY=sk-test\nPROXY_AUTH_TOKEN=a-real-token\n"
+        )
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir()
         log = tmp_path / "calls.log"

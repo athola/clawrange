@@ -236,6 +236,7 @@ class TestStartSoul:
         shutil.copy(ROOT / "scripts" / "start.sh", root / "scripts" / "start.sh")
         (root / ".env").write_text(
             "OPENROUTER_API_KEY=sk-test\nCLAWRANGE_PROFILE=starter\n"
+            "PROXY_AUTH_TOKEN=a-real-token\n"
         )
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir()
@@ -290,3 +291,55 @@ class TestStartSoul:
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert "make persona" not in calls
         assert soul.read_text() == "operator persona\n"
+
+
+# ─── PROXY_AUTH_TOKEN: empty or the .env.example placeholder ──────
+
+
+class TestStartToken(TestStartSoul):
+    """.env.example ships PROXY_AUTH_TOKEN empty. A stack started without a
+    real token answers 401 on every protected route (the API fails closed),
+    so start.sh must stop before compose up and say how to fix it."""
+
+    @pytest.mark.parametrize("value", ["", "generate-a-token-here"])
+    def test_missing_or_placeholder_token_stops_before_compose_up(self, repo, value):
+        root = repo[0]
+        (root / "openclaw" / "soul.md").write_text("persona\n")
+        env = (
+            (root / ".env")
+            .read_text()
+            .replace("PROXY_AUTH_TOKEN=a-real-token", f"PROXY_AUTH_TOKEN={value}")
+        )
+        (root / ".env").write_text(env)
+        proc, calls = self._start(repo, "exit 0\n")
+        assert proc.returncode != 0
+        assert "PROXY_AUTH_TOKEN" in proc.stdout + proc.stderr
+        assert "compose up" not in calls
+
+
+@pytest.mark.parametrize(
+    ("value", "ok"),
+    [("", False), ("generate-a-token-here", False), ("a-real-token", True)],
+)
+def test_workflows_auth_init_rejects_placeholder(tmp_path, value, ok):
+    script = (
+        f'. "{ROOT / "scripts" / "workflows_auth.sh"}"; '
+        'workflows_auth_init && cat "$WF_AUTH_HEADER"'
+    )
+    proc = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": os.environ["PATH"],
+            "TMPDIR": str(tmp_path),
+            "PROXY_AUTH_TOKEN": value,
+        },
+        check=False,
+        timeout=30,
+    )
+    assert (proc.returncode == 0) is ok, proc.stderr
+    if ok:
+        assert "Authorization: Bearer a-real-token" in proc.stdout
+    else:
+        assert "PROXY_AUTH_TOKEN" in proc.stderr

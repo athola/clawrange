@@ -19,9 +19,11 @@ workflows_auth_cleanup() {
 }
 
 workflows_auth_init() {
-  if [ -z "${PROXY_AUTH_TOKEN:-}" ]; then
-    echo "FAIL: PROXY_AUTH_TOKEN is empty. Set it in .env; the workflows API" >&2
-    echo "      returns 401 without 'Authorization: Bearer \$PROXY_AUTH_TOKEN'." >&2
+  # The API also rejects the .env.example placeholder (workflows/auth.py).
+  if [ -z "${PROXY_AUTH_TOKEN:-}" ] || [ "${PROXY_AUTH_TOKEN}" = "generate-a-token-here" ]; then
+    echo "FAIL: PROXY_AUTH_TOKEN is empty or the .env.example placeholder. Set a" >&2
+    echo "      real token in .env; the workflows API returns 401 without" >&2
+    echo "      'Authorization: Bearer \$PROXY_AUTH_TOKEN'." >&2
     return 1
   fi
   WF_AUTH_HEADER=$(umask 077 && mktemp "${TMPDIR:-/tmp}/clawrange.XXXXXX")

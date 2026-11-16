@@ -76,6 +76,16 @@ if [ -z "$OPENROUTER_VAL" ] || echo "$OPENROUTER_VAL" | grep -qi "your-key\|exam
   echo "  Get a key at https://openrouter.ai/settings/keys"
 fi
 
+# The workflows API fails closed: without a real token every protected
+# route, and the OpenClaw-to-proxy chat path, answers 401. The API also
+# rejects the .env.example placeholder (workflows/auth.py).
+if [ -z "${PROXY_AUTH_TOKEN:-}" ] || [ "${PROXY_AUTH_TOKEN}" = "generate-a-token-here" ]; then
+  echo "ERROR: PROXY_AUTH_TOKEN is empty or the .env.example placeholder."
+  echo "  Generate one and put it in .env, e.g.:"
+  echo "  echo \"PROXY_AUTH_TOKEN=\$(openssl rand -hex 32)\" >> .env"
+  exit 1
+fi
+
 # ─── Persona (openclaw/soul.md) ────────────────────────────────────
 # soul.md is rendered per operator and gitignored, so a fresh clone has
 # none. Docker would then create the bind-mount source as an empty
