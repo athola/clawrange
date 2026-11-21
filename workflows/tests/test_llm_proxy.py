@@ -781,7 +781,20 @@ class TestNotificationDebouncing:
     def test_debounce_expires(self):
         import llm_proxy
 
-        llm_proxy._notification_last_sent["test-tier"] = 0  # long ago
+        # Relative to the clock, not 0: time.monotonic() counts from boot,
+        # so on a freshly booted CI runner 0 is still inside the window.
+        llm_proxy._notification_last_sent["test-tier"] = (
+            time.monotonic() - llm_proxy._NOTIFICATION_DEBOUNCE_SECONDS - 1
+        )
+        assert llm_proxy._should_notify("test-tier") is True
+
+    def test_debounce_expires_on_freshly_booted_host(self, monkeypatch):
+        import llm_proxy
+
+        monkeypatch.setattr(llm_proxy.time, "monotonic", lambda: 50.0)
+        llm_proxy._notification_last_sent["test-tier"] = (
+            50.0 - llm_proxy._NOTIFICATION_DEBOUNCE_SECONDS - 1
+        )
         assert llm_proxy._should_notify("test-tier") is True
 
 
