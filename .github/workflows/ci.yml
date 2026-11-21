@@ -25,7 +25,7 @@ jobs:
           severity: warning
 
       - name: Gitleaks
-        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7  # v2.3.9
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e  # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -66,9 +66,9 @@ jobs:
 
       # uv installs the Python and the exact tool and runtime versions from
       # uv.lock, so CI runs what pre-push and the Docker image run.
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d  # v10.4.0
         with:
-          version: "0.13.8"
+          version: "0.13.9"
           python-version: "3.12"
           enable-cache: true
 

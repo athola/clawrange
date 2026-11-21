@@ -6,7 +6,7 @@ requires-python = ">=3.12"
 # workflows/requirements.txt (the Docker image's install source) is generated
 # from uv.lock by the uv-export pre-commit hook; never edit it by hand.
 dependencies = [
-    "fastapi==0.163.1",
+    "fastapi==0.165.0",
     "uvicorn[standard]==0.54.0",
     "httpx==0.28.1",
     "sqlite-vec==0.1.9",
@@ -14,10 +14,10 @@ dependencies = [
     "asyncpraw>=8.0.3",
     "githubkit>=0.17.1",
     # githubkit deprecated its httpx transport; httpx2 is the supported one.
-    "httpx2>=2.16.0",
+    "httpx2>=2.16.2",
     "hishel[async,httpx2]>=1.4.0",
     "pytimeparse>=1.1.10",
-    "pyyaml==6.0.3",
+    "pyyaml==6.0.4",
 ]
 
 [dependency-groups]
@@ -34,7 +34,7 @@ dev = [
 
 [tool.uv]
 # The lock file format follows the uv version; keep everyone on one.
-required-version = ">=0.13.8"
+required-version = ">=0.13.9"
 # ClawRange is a collection of scripts run inside Docker, not an importable
 # distribution. Tell uv not to build/install the project root.
 package = false

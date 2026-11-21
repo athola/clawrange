@@ -21,7 +21,7 @@ repos:
   # uv.lock must match pyproject.toml, and the image's requirements.txt must
   # be the export of that lock (hash-pinned; the Dockerfile installs it).
   - repo: https://github.com/astral-sh/uv-pre-commit
-    rev: 0.13.8
+    rev: 0.13.9
     hooks:
       - id: uv-lock
       - id: uv-export
@@ -29,7 +29,7 @@ repos:
 
   # Secret scanning — catches API keys, tokens, passwords
   - repo: https://github.com/gitleaks/gitleaks
-    rev: v8.30.0
+    rev: v8.30.1
     hooks:
       - id: gitleaks
 
