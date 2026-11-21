@@ -325,3 +325,348 @@ class TestRealBrain:
             ' {"query": "b", "relevant": []}]}'
         )
         assert [c.query for c in rev.load_cases(str(golden))] == ["a"]
+
+
+# ─── Edge cases: loaders, ranking modes, harvest ──────────────────
+
+
+class TestLoadersAndEdges:
+    def test_empty_runs_have_zero_delta(self):
+        """GIVEN two runs that scored no queries
+        WHEN they are compared with a paired bootstrap
+        THEN the delta is all zeros instead of a divide-by-zero."""
+        assert rev.paired_bootstrap([], []) == rev.Delta(0.0, 0.0, 0.0)
+
+    def test_load_pages_reads_the_pages_key(self, tmp_path):
+        """GIVEN a corpus file with a pages list
+        WHEN load_pages reads it
+        THEN the list is returned unchanged."""
+        path = tmp_path / "corpus.json"
+        pages = [{"slug": "a", "title": "A", "page_type": "note", "compiled": "x"}]
+        path.write_text(json.dumps({"pages": pages}))
+        assert rev.load_pages(str(path)) == pages
+
+    def test_vector_only_mode_ranks_by_embedding(self, toy_cache):
+        """GIVEN a vector-only config and cached toy vectors
+        WHEN a paraphrase query with no keyword overlap is run
+        THEN the semantically matching page ranks first."""
+        report = rev.evaluate(
+            TOY_PAGES,
+            TOY_CASES,
+            [rev.SearchConfig("vec", mode="vector", dim=4)],
+            toy_cache,
+        )
+        assert report["vec"].per_query["woof animal"]["hit@1"] == 1.0
+
+    def test_no_vector_hybrid_falls_back_to_keywords(self, toy_cache):
+        """GIVEN the hybrid-novec mode (embedding outage)
+        WHEN a lexical query is run
+        THEN keyword matching alone still finds the page."""
+        report = rev.evaluate(
+            TOY_PAGES,
+            TOY_CASES,
+            [rev.SearchConfig("nv", mode="hybrid-novec", dim=4)],
+            toy_cache,
+        )
+        assert report["nv"].per_query["felines"]["hit@1"] == 1.0
+
+    def test_unknown_mode_raises(self, toy_cache):
+        """GIVEN a config with a mode the harness does not know
+        WHEN it is evaluated
+        THEN a ValueError names the mode."""
+        cfg = rev.SearchConfig("bad", mode="telepathy", dim=4)
+        with pytest.raises(ValueError, match="telepathy"):
+            rev.evaluate(TOY_PAGES, TOY_CASES, [cfg], toy_cache)
+
+    def test_unknown_header_recipe_raises(self):
+        """GIVEN a header recipe that does not exist
+        WHEN embed_text is called
+        THEN a ValueError is raised."""
+        with pytest.raises(ValueError, match="header"):
+            rev.embed_text("chunk", "Title", "fancy")
+
+    def test_harvest_skips_noise_and_unreadable_databases(self, tmp_path):
+        """GIVEN a tree with a non-sqlite file, a corrupt .sqlite file, a
+        directory named like a database, and a good transcript containing a
+        '...' placeholder query
+        WHEN queries are harvested
+        THEN only the real query is returned and nothing raises."""
+        (tmp_path / "notes.txt").write_text("brain/search?q=ignored")
+        (tmp_path / "corrupt.sqlite").write_text("this is not a database")
+        (tmp_path / "dir.sqlite").mkdir()
+        good = sqlite3.connect(tmp_path / "ok.sqlite")
+        good.execute(
+            "CREATE TABLE transcript_events (session_id TEXT, seq INTEGER, "
+            "event_json TEXT, event_zstd BLOB)"
+        )
+        for seq, url in enumerate(
+            ["http://x/brain/search?q=...", "http://x/brain/search?q=real+one"]
+        ):
+            good.execute(
+                "INSERT INTO transcript_events VALUES ('s', ?, ?, NULL)",
+                (seq, json.dumps({"url": url})),
+            )
+        good.commit()
+        good.close()
+        assert rev.harvest_queries(str(tmp_path)) == ["real one"]
+
+    def test_harvest_ignores_sqlite_without_transcript_table(self, tmp_path):
+        """GIVEN a valid sqlite file with no transcript_events table
+        WHEN queries are harvested
+        THEN it yields no queries."""
+        other = sqlite3.connect(tmp_path / "other.sqlite")
+        other.execute("CREATE TABLE t (x)")
+        other.commit()
+        other.close()
+        assert rev.harvest_queries(str(tmp_path)) == []
+
+
+# ─── Refresh and truncation check (embedding API mocked) ──────────
+
+
+@pytest.fixture
+def fake_embeddings(monkeypatch):
+    """Replace the embeddings module's config and network call."""
+    import embeddings
+
+    state = {"calls": [], "result": "ok"}
+    cfg = embeddings.EmbedConfig(url="http://x", model="toy", dim=4, api_key="k")
+    monkeypatch.setattr(embeddings, "config", lambda env=None: cfg)
+
+    async def fake_embed(texts, cfg=None, batch=64):
+        state["calls"].append(list(texts))
+        if state["result"] is None:
+            return None
+        return [_toy_vec(t) for t in texts]
+
+    monkeypatch.setattr(embeddings, "embed_texts", fake_embed)
+    state["cfg"] = cfg
+    state["module"] = embeddings
+    return state
+
+
+class TestRefresh:
+    def test_refresh_embeds_only_missing_texts_and_saves(
+        self, tmp_path, fake_embeddings
+    ):
+        """GIVEN a cache holding one of two needed texts
+        WHEN _refresh runs
+        THEN only the missing text is embedded and the cache is persisted."""
+        path = tmp_path / "v.json"
+        cache = rev.VectorCache(str(path), "toy", 4)
+        cache.put("cat", _toy_vec("cat"))
+        assert rev._refresh(cache, ["cat", "dog"]) == 1
+        assert fake_embeddings["calls"] == [["dog"]]
+        assert rev.VectorCache.load(str(path)).missing(["cat", "dog"]) == []
+
+    def test_refresh_with_nothing_missing_makes_no_request(self, fake_embeddings):
+        """GIVEN a cache that already has every text
+        WHEN _refresh runs
+        THEN it returns 0 without calling the API."""
+        cache = rev.VectorCache("unused.json", "toy", 4)
+        cache.put("cat", _toy_vec("cat"))
+        assert rev._refresh(cache, ["cat"]) == 0
+        assert fake_embeddings["calls"] == []
+
+    def test_refresh_without_api_key_exits(self, monkeypatch, fake_embeddings):
+        """GIVEN no OPENROUTER_API_KEY
+        WHEN _refresh runs
+        THEN it exits with a message instead of calling the API."""
+        import dataclasses
+
+        keyless = dataclasses.replace(fake_embeddings["cfg"], api_key="")
+        monkeypatch.setattr(
+            fake_embeddings["module"], "config", lambda env=None: keyless
+        )
+        cache = rev.VectorCache("unused.json", "toy", 4)
+        with pytest.raises(SystemExit, match="OPENROUTER_API_KEY"):
+            rev._refresh(cache, ["cat"])
+        assert fake_embeddings["calls"] == []
+
+    def test_refresh_leaves_cache_unchanged_on_api_failure(
+        self, tmp_path, fake_embeddings
+    ):
+        """GIVEN the embedding request fails
+        WHEN _refresh runs
+        THEN it exits and nothing is written to disk."""
+        fake_embeddings["result"] = None
+        path = tmp_path / "v.json"
+        cache = rev.VectorCache(str(path), "toy", 4)
+        with pytest.raises(SystemExit, match="failed"):
+            rev._refresh(cache, ["cat"])
+        assert not path.exists()
+
+    def test_check_truncation_is_one_for_matching_vectors(self, fake_embeddings):
+        """GIVEN a cached vector equal to the API's native vector
+        WHEN check_truncation compares them
+        THEN the cosine is 1."""
+        cache = rev.VectorCache("unused.json", "toy", 4)
+        cache.put("cat", _toy_vec("cat"))
+        cos = rev.check_truncation(cache, "cat", dim=4)
+        assert cos == pytest.approx(1.0, abs=1e-3)
+
+    def test_check_truncation_exits_on_api_failure(self, fake_embeddings):
+        """GIVEN the native embedding request fails
+        WHEN check_truncation runs
+        THEN it exits instead of returning a bogus score."""
+        fake_embeddings["result"] = None
+        cache = rev.VectorCache("unused.json", "toy", 4)
+        cache.put("cat", _toy_vec("cat"))
+        with pytest.raises(SystemExit, match="failed"):
+            rev.check_truncation(cache, "cat", dim=4)
+
+
+# ─── Report and CLI ───────────────────────────────────────────────
+
+
+@pytest.fixture
+def fixtures_copy(tmp_path):
+    import shutil
+
+    dest = tmp_path / "fx"
+    shutil.copytree(FIXTURES, dest)
+    return dest
+
+
+class TestFormatReport:
+    def test_report_lists_every_config_and_the_significance_legend(self, toy_cache):
+        """GIVEN a report with a baseline and a keyword-only config
+        WHEN it is formatted
+        THEN both rows and the CI legend appear."""
+        report = rev.evaluate(
+            TOY_PAGES,
+            TOY_CASES,
+            [
+                rev.SearchConfig("production", dim=4),
+                rev.SearchConfig("kw", mode="keyword", dim=4),
+            ],
+            toy_cache,
+        )
+        text = rev.format_report(report)
+        assert "production" in text and "kw" in text
+        assert "95% CI excludes zero" in text
+
+
+class TestMain:
+    def test_main_prints_report_for_fixtures(self, fixtures_copy, capsys):
+        """GIVEN a complete fixture directory
+        WHEN main runs with no flags
+        THEN it prints the report and exits 0."""
+        assert rev.main(["--fixtures", str(fixtures_copy)]) == 0
+        out = capsys.readouterr().out
+        assert "production" in out and "no-vectors" in out
+
+    def test_main_reports_cache_misses_and_fails(self, fixtures_copy, capsys):
+        """GIVEN a vector cache missing every text
+        WHEN main runs
+        THEN it returns 1 and tells the operator to refresh."""
+        empty = rev.VectorCache(str(fixtures_copy / "vectors.json"), "toy", 4)
+        empty.save()
+        assert rev.main(["--fixtures", str(fixtures_copy)]) == 1
+        assert "--refresh" in capsys.readouterr().out
+
+    def test_main_write_baseline_matches_committed_baseline(
+        self, fixtures_copy, capsys
+    ):
+        """GIVEN a fixture copy with a damaged baseline
+        WHEN main runs with --write-baseline
+        THEN baseline.json is rewritten with the gated configs and the
+        committed baseline still gates clean against it."""
+        (fixtures_copy / "baseline.json").write_text("{}")
+        assert rev.main(["--fixtures", str(fixtures_copy), "--write-baseline"]) == 0
+        assert "wrote baseline.json" in capsys.readouterr().out
+        body = json.loads((fixtures_copy / "baseline.json").read_text())
+        assert set(body["configs"]) == set(rev.GATED_CONFIGS)
+        with open(os.path.join(FIXTURES, "baseline.json")) as f:
+            committed = json.load(f)
+        for name in rev.GATED_CONFIGS:
+            written = body["configs"][name]["mean"]
+            assert rev.gate(committed["configs"][name]["mean"], written) == []
+
+    def test_main_exits_when_golden_set_is_missing(self, fixtures_copy):
+        """GIVEN no golden set at the expected path
+        WHEN main runs
+        THEN it exits suggesting --harvest."""
+        (fixtures_copy / "golden.json").unlink()
+        with pytest.raises(SystemExit, match="--harvest"):
+            rev.main(["--fixtures", str(fixtures_copy)])
+
+    def test_main_exits_when_no_cases_are_labelled(self, fixtures_copy):
+        """GIVEN a golden set with only unlabelled cases
+        WHEN main runs
+        THEN it exits saying nothing is labelled."""
+        (fixtures_copy / "golden.json").write_text(
+            '{"cases": [{"query": "q", "relevant": []}]}'
+        )
+        with pytest.raises(SystemExit, match="no labelled cases"):
+            rev.main(["--fixtures", str(fixtures_copy)])
+
+    def test_main_harvest_adds_unlabelled_queries_and_exits(self, tmp_path, capsys):
+        """GIVEN an OpenClaw sessions dir with one search transcript
+        WHEN main runs with --harvest
+        THEN the query lands in the golden set unlabelled."""
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        db = sqlite3.connect(sessions / "a.sqlite")
+        db.execute(
+            "CREATE TABLE transcript_events (session_id TEXT, seq INTEGER, "
+            "event_json TEXT, event_zstd BLOB)"
+        )
+        db.execute(
+            "INSERT INTO transcript_events VALUES ('s', 0, ?, NULL)",
+            (json.dumps({"url": "http://x/brain/search?q=pricing"}),),
+        )
+        db.commit()
+        db.close()
+        golden = tmp_path / "golden.json"
+        argv = ["--harvest", str(sessions), "--golden", str(golden)]
+        assert rev.main(argv) == 0
+        assert "added 1" in capsys.readouterr().out
+        assert json.loads(golden.read_text())["cases"][0]["query"] == "pricing"
+
+    def test_main_rejects_write_baseline_in_brain_mode(self, tmp_path):
+        """GIVEN --brain together with --write-baseline
+        WHEN main runs
+        THEN it exits: baselines only apply to committed fixtures."""
+        with pytest.raises(SystemExit, match="committed fixtures"):
+            rev.main(["--brain", str(tmp_path / "b.db"), "--write-baseline"])
+
+    def test_main_brain_mode_evaluates_a_real_brain(
+        self, tmp_path, fake_embeddings, monkeypatch, capsys
+    ):
+        """GIVEN a brain DB, a labelled golden set and no vector cache
+        WHEN main runs in --brain mode with --refresh and --check-truncation
+        THEN the cache is created and filled, truncation is checked and the
+        report is printed."""
+        from brain_db import BrainDB
+
+        brain = tmp_path / "brain.db"
+        db = BrainDB(str(brain))
+        db.init_db()
+        db.upsert_page("n/cats", "Cats", "note", "cats are feline pets")
+        db.upsert_page("n/dogs", "Dogs", "note", "dogs are canine pets")
+        db._conn.close()
+        golden = tmp_path / "golden.json"
+        golden.write_text(
+            json.dumps({"cases": [{"query": "feline", "relevant": ["n/cats"]}]})
+        )
+        vectors = tmp_path / "out" / "vectors.json"
+        # The default matrix asks for dim 512/1024; the toy cache is 4-d.
+        monkeypatch.setattr(
+            rev, "DEFAULT_MATRIX", [rev.SearchConfig("production", dim=4)]
+        )
+        argv = [
+            "--brain",
+            str(brain),
+            "--golden",
+            str(golden),
+            "--vectors",
+            str(vectors),
+            "--refresh",
+            "--check-truncation",
+        ]
+        assert rev.main(argv) == 0
+        out = capsys.readouterr().out
+        assert "embedded" in out and "truncated-vs-native cosine at 512" in out
+        assert "2 pages, 1 queries" in out
+        assert vectors.exists()
