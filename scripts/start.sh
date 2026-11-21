@@ -204,7 +204,7 @@ while [ $TRIES -lt $MAX_TRIES ]; do
       echo "  DeerFlow: http://localhost:${DEERFLOW_PORT:-2026}"
     fi
     echo ""
-    echo "Run ./scripts/test_all.sh to validate the stack."
+    echo "Run ./scripts/tests/all.sh to validate the stack."
     exit 0
   fi
 

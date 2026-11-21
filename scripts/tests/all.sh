@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Run all validation tests and produce a pass/fail report.
-# Usage: ./scripts/test_all.sh
+# Usage: ./scripts/tests/all.sh
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 # Source .env for port configuration
 if [ -f .env ]; then

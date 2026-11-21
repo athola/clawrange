@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# scripts/test_research.sh — smoke test for the multi-source
+# scripts/tests/research.sh — smoke test for the multi-source
 # research orchestrator. Calls /healthz/research, /research, and
 # /research/sessions and reports per-channel readiness.
 #
-# Usage: ./scripts/test_research.sh ["topic"]
+# Usage: ./scripts/tests/research.sh ["topic"]
 # Exits non-zero on any HTTP error so it can be wired into CI.
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 # Load .env first (ports, PROXY_AUTH_TOKEN, ZAI/Reddit/GitHub creds) so the
 # URL below honours WORKFLOWS_PORT from .env.

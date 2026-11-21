@@ -2,7 +2,7 @@
 AI MSP Testbed — Structural and Config Validation
 
 Validates project files, configs, and conventions without running services.
-For live HTTP endpoint tests, use: ./scripts/test_all.sh
+For live HTTP endpoint tests, use: ./scripts/tests/all.sh
 
 Run with: python3 tests/validate_stack.py
 """
@@ -47,11 +47,11 @@ REQUIRED_FILES = (
     "scripts/start.sh",
     "scripts/stop.sh",
     "scripts/reset.sh",
-    "scripts/test_all.sh",
-    "scripts/test_openclaw.sh",
-    "scripts/test_workflows.sh",
-    "scripts/test_deerflow.sh",
-    "scripts/test_ollama.sh",
+    "scripts/tests/all.sh",
+    "scripts/tests/openclaw.sh",
+    "scripts/tests/workflows.sh",
+    "scripts/tests/deerflow.sh",
+    "scripts/tests/ollama.sh",
 )
 
 
@@ -77,14 +77,16 @@ def check_scripts_executable() -> TestResult:
     result = TestResult("Script Permissions")
     scripts_dir = os.path.join(PROJECT_ROOT, "scripts")
     not_exec = []
-    for f in os.listdir(scripts_dir):
-        if f.endswith(".sh"):
-            path = os.path.join(scripts_dir, f)
+    for dirpath, _dirs, files in os.walk(scripts_dir):
+        for f in sorted(files):
+            if not f.endswith(".sh"):
+                continue
+            path = os.path.join(dirpath, f)
             with open(path, "rb") as fh:
                 if fh.read(2) != b"#!":
                     continue
             if not os.access(path, os.X_OK):
-                not_exec.append(f)
+                not_exec.append(os.path.relpath(path, scripts_dir))
     if not_exec:
         result.fail_(f"Not executable: {', '.join(not_exec)}")
     else:

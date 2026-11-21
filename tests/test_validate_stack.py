@@ -198,13 +198,13 @@ class TestCheckRequiredFiles:
         assert "18 required files" in result.message
 
     def test_fail_with_missing_test_script(self, project_tree):
-        """GIVEN test_ollama.sh is missing
+        """GIVEN scripts/tests/ollama.sh is missing
         THEN the check should report it."""
         _create_minimal_project(project_tree)
-        (project_tree / "scripts" / "test_ollama.sh").unlink()
+        (project_tree / "scripts" / "tests" / "ollama.sh").unlink()
         result = validate_stack.check_required_files()
         assert result.passed is False
-        assert "test_ollama.sh" in result.message
+        assert "scripts/tests/ollama.sh" in result.message
 
     def test_fail_with_missing_reset_script(self, project_tree):
         """GIVEN reset.sh is missing
@@ -338,7 +338,8 @@ class TestCheckScriptsExecutable:
         THEN the check should pass."""
         scripts_dir = project_tree / "scripts"
         scripts_dir.mkdir(parents=True, exist_ok=True)
-        for name in ["start.sh", "stop.sh", "test_all.sh"]:
+        for name in ["start.sh", "stop.sh", "tests/all.sh"]:
+            (scripts_dir / name).parent.mkdir(parents=True, exist_ok=True)
             s = scripts_dir / name
             s.write_text("#!/usr/bin/env bash\n")
             s.chmod(0o755)
@@ -360,6 +361,18 @@ class TestCheckScriptsExecutable:
         result = validate_stack.check_scripts_executable()
         assert result.passed is False
         assert "stop.sh" in result.message
+
+    def test_fail_when_nested_test_script_not_executable(self, project_tree):
+        """GIVEN a script under scripts/tests/ lacks execute permission
+        THEN the check should fail naming it by its scripts/ subpath."""
+        tests_dir = project_tree / "scripts" / "tests"
+        tests_dir.mkdir(parents=True, exist_ok=True)
+        bad = tests_dir / "deerflow.sh"
+        bad.write_text("#!/usr/bin/env bash\n")
+        bad.chmod(0o644)
+        result = validate_stack.check_scripts_executable()
+        assert result.passed is False
+        assert "tests/deerflow.sh" in result.message
 
     def test_sourced_library_without_shebang_is_exempt(self, project_tree):
         """GIVEN a .sh file with no shebang (a library meant to be sourced)

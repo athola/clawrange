@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Test workflow service endpoints.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 # Source .env for port configuration
 if [ -f .env ]; then

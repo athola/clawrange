@@ -291,7 +291,7 @@ stack without one. There is no `/docs`, `/redoc` or `/openapi.json`.
   `get_adapter`. Tenant-specific config belongs in a profile YAML, never in
   Python. The generic core/template must stay free of any one operator's
   identity.
-- New test scripts go in `scripts/test_*.sh` and get a Makefile target.
+- New test scripts go in `scripts/tests/<name>.sh` and get a Makefile target.
 - Pytest unit tests go in `workflows/tests/test_*.py`.
 - Persona edits to `openclaw/soul.md` should keep responses tight
   (Telegram is the main channel: short, actionable messages).

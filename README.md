@@ -77,7 +77,7 @@ trade-offs are logged in [docs/tradeoffs.md](docs/tradeoffs.md).
 **Live tests** (require running services):
 
 ```bash
-make test            # full validation suite via scripts/test_all.sh
+make test            # full validation suite via scripts/tests/all.sh
 make test-openclaw   # OpenClaw layer only
 make test-workflows  # Workflows endpoints (health and canary webhook)
 make test-deerflow   # DeerFlow research layer

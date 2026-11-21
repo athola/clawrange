@@ -67,7 +67,7 @@ configured) a `reason` like `GITHUB_PAT not set`. `discourse_web` and
 `OPENROUTER_API_KEY` is set. This route is public. Use it to
 diagnose empty `/research` responses before chasing logic bugs.
 
-The shell wrapper `scripts/test_research.sh` (also exposed as
+The shell wrapper `scripts/tests/research.sh` (also exposed as
 `make test-research`) runs this check, posts a sample `/research`
 query, and dumps the top 3 findings with confidence flags.
 

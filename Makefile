@@ -65,22 +65,22 @@ reset: ## Stop, drop containers and the DeerFlow clone; keeps data/ (asks first)
 	models-check
 
 test: ## Run full validation suite (6 tests)
-	@./scripts/test_all.sh
+	@./scripts/tests/all.sh
 
 test-openclaw: ## Test OpenClaw layer only
-	@./scripts/test_openclaw.sh
+	@./scripts/tests/openclaw.sh
 
 test-workflows: ## Test workflow endpoints
-	@./scripts/test_workflows.sh
+	@./scripts/tests/workflows.sh
 
 test-deerflow: ## Test DeerFlow research layer
-	@./scripts/test_deerflow.sh
+	@./scripts/tests/deerflow.sh
 
 test-ollama: ## Test local Ollama inference
-	@./scripts/test_ollama.sh
+	@./scripts/tests/ollama.sh
 
 test-research: ## Smoke test the /research endpoint with a live topic
-	@./scripts/test_research.sh "$(TOPIC)"
+	@./scripts/tests/research.sh "$(TOPIC)"
 
 # The task queue API requires a bearer token: export PROXY_AUTH_TOKEN from
 # .env (never printed) and refuse to run without it. The old .env.example
@@ -205,7 +205,7 @@ lint: ## Run all linters: ShellCheck (scripts) + ruff + mypy (Python)
 	@command -v shellcheck >/dev/null 2>&1 || { \
 		echo "ERROR: shellcheck not installed (apt install shellcheck / brew install shellcheck)" >&2; \
 		exit 1; }
-	@shellcheck --severity=warning scripts/*.sh workflows/*.sh && echo "All scripts pass ShellCheck"
+	@shellcheck --severity=warning scripts/*.sh scripts/tests/*.sh workflows/*.sh && echo "All scripts pass ShellCheck"
 	@uv run ruff check .
 	@uv run ruff format --check .
 	@uv run mypy workflows scripts tests

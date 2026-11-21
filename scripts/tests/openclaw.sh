@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Test the OpenClaw layer only.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 # Source .env for port and token configuration
 if [ -f .env ]; then

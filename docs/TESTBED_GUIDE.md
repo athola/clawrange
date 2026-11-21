@@ -62,14 +62,14 @@ http://localhost:2026 when started with `--with-deerflow`.
 **Ollama** provides local LLM inference for air-gapped or onsite
 deployment. When the host needs AI responses without internet
 dependency, Ollama runs a small model on the ThinkCentre hardware.
-Test it with `./scripts/test_ollama.sh` to validate the hardware.
+Test it with `./scripts/tests/ollama.sh` to validate the hardware.
 
 ## Testing the Stack
 
 Run the full validation suite:
 
 ```bash
-./scripts/test_all.sh
+./scripts/tests/all.sh
 ```
 
 The suite checks core service health, OpenClaw chat completions, the
@@ -77,10 +77,10 @@ workflows webhook canary, and (optionally) DeerFlow. Individual scripts
 can be run on their own:
 
 ```bash
-./scripts/test_openclaw.sh    # OpenClaw chat-completion path
-./scripts/test_workflows.sh   # Workflows endpoints
-./scripts/test_deerflow.sh    # DeerFlow research layer
-./scripts/test_ollama.sh      # Local Ollama inference
+./scripts/tests/openclaw.sh    # OpenClaw chat-completion path
+./scripts/tests/workflows.sh   # Workflows endpoints
+./scripts/tests/deerflow.sh    # DeerFlow research layer
+./scripts/tests/ollama.sh      # Local Ollama inference
 ```
 
 Use the Python suites for offline validation (no services required):
