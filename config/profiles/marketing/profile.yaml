@@ -621,6 +621,9 @@ homelab:
     flood_threshold: 10
     ignore_entities: []
     actions: []
+    # Operator-private additions to ignore_entities and actions (real entity
+    # ids stay out of git): a YAML file under config/homelab/.
+    local_file: ${HOMELAB_HA_LOCAL}
   kuma:
     url: ${HOMELAB_KUMA_URL}
     slug: home

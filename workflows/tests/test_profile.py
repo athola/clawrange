@@ -456,6 +456,7 @@ def test_homelab_valid_block_loads_with_unset_env(tmp_path):
           token: ${HOMELAB_TEST_UNSET_TOKEN}
           battery_low: 20
           ignore_entities: [sensor.noisy_*]
+          local_file: ${HOMELAB_TEST_UNSET_LOCAL}
           actions:
             - {service: light.turn_on, entities: [light.lamp, "light.*"]}
         kuma: {url: "${HOMELAB_TEST_UNSET_KUMA}", slug: home, ca_cert: ""}
@@ -483,6 +484,7 @@ def test_homelab_valid_block_loads_with_unset_env(tmp_path):
         ("home_assistant: {ignore_entities: x}", "ignore_entities"),
         ("home_assistant: {ignore_entities: [1]}", "ignore_entities"),
         ("kuma: {slug: [a]}", "text"),
+        ("home_assistant: {local_file: [a]}", "text"),
     ],
 )
 def test_homelab_bad_shape_raises(tmp_path, block, match):

@@ -38,7 +38,7 @@ def _compose() -> dict:
 def test_homelab_settings_reach_workflows_but_never_openclaw():
     compose = _compose()
     names = {"HA_URL", "HA_TOKEN", "HOMELAB_KUMA_URL", "HOMELAB_CENSUS_URL"}
-    names.add("HOMELAB_CA_CERT")
+    names |= {"HOMELAB_CA_CERT", "HOMELAB_HA_LOCAL"}
     assert names <= set(_compose_env())
     openclaw_env = compose["services"]["openclaw"]["environment"]
     joined = "\n".join(openclaw_env)

@@ -226,6 +226,9 @@ services:
       - HOMELAB_CENSUS_URL=${HOMELAB_CENSUS_URL:-}
       # Path inside the container, under the read-only mount below.
       - HOMELAB_CA_CERT=${HOMELAB_CA_CERT:-}
+      # Operator-private ignore list and action rules (real entity ids), also
+      # under the read-only mount below.
+      - HOMELAB_HA_LOCAL=${HOMELAB_HA_LOCAL:-}
       # Lead-CRM profile connector credentials (unset -> connector disabled).
       # Passed one by one, never via env_file: that would hand every secret
       # in .env to the container. tests/validate_stack.py checks that each

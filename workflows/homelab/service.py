@@ -276,6 +276,10 @@ def health(
             problems.append(f"{source}_incomplete")
         if detail and configured:
             item["error"] = _short(entry.get("last_error") or "")
+        if source == "ha" and cfg.local_error:
+            problems.append("ha_local_file")
+            if detail:
+                item["local_error"] = cfg.local_error
         if configured and (not ok or item["last_success"] is None):
             problems.append(source)
         out[source] = item
@@ -296,7 +300,7 @@ def health(
                 out["census"]["part_errors"] = {
                     str(k): _short(v) for k, v in parts.items()
                 }
-    if not cfg.configured and not cfg.incomplete:
+    if not cfg.configured and not cfg.incomplete and not problems:
         status = "disabled"
     else:
         status = "degraded" if problems else "ok"

@@ -8,8 +8,12 @@ nothing is fetched, nothing alerts and nothing is an error.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+
+import yaml
 
 from .actions import ActionRule, parse_rules
 from .models import WatchConfig
@@ -33,6 +37,54 @@ def _map(value: Any) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def _str_list(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(x for x in value if isinstance(x, str) and x)
+
+
+LOCAL_KEYS = frozenset({"ignore_entities", "actions"})
+
+
+def _read_local(path: str) -> tuple[tuple[str, ...], tuple[ActionRule, ...], str]:
+    """Load the operator-private ``local_file``: (ignores, rules, error).
+
+    The file holds real entity ids, so it lives under the gitignored
+    ``config/homelab/`` instead of the committed profile. It can only add to
+    the profile's lists. Any problem discards the whole file (fail closed:
+    none of its actions are allowed) and returns an error that names the
+    problem but never the file's contents or path.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return (), (), "local_file cannot be read"
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        mark = getattr(exc, "problem_mark", None)
+        where = f" (line {mark.line + 1})" if mark is not None else ""
+        return (), (), f"local_file is not valid YAML{where}"
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return (), (), "local_file must be a mapping"
+    unknown = set(map(str, data)) - LOCAL_KEYS
+    if unknown:
+        return (), (), f"local_file has unknown keys (known: {sorted(LOCAL_KEYS)})"
+    ignore = data.get("ignore_entities")
+    if ignore is not None and (
+        not isinstance(ignore, list) or not all(isinstance(x, str) for x in ignore)
+    ):
+        return (), (), "local_file ignore_entities must be a list of entity ids"
+    try:
+        rules = parse_rules(data.get("actions"))
+    except ValueError as exc:
+        # parse_rules quotes the offending value; keep the reason, drop it.
+        return (), (), "local_file " + re.sub(r"'[^']*'", "'…'", str(exc))
+    return _str_list(ignore), rules, ""
+
+
 @dataclass(frozen=True)
 class HomelabConfig:
     ha_url: str = ""
@@ -46,6 +98,8 @@ class HomelabConfig:
     # Sources with some but not all of their settings: they stay off, and
     # health names them so a half-set env var is not mistaken for "unused".
     incomplete: frozenset[str] = frozenset()
+    # Why home_assistant.local_file was discarded ("" when fine or unset).
+    local_error: str = ""
 
     @property
     def configured(self) -> frozenset[str]:
@@ -66,19 +120,20 @@ class HomelabConfig:
         kuma = _map(block.get("kuma"))
         census = _map(block.get("census"))
         defaults = WatchConfig()
-        ignore = ha.get("ignore_entities")
-        ignore_entities = (
-            tuple(x for x in ignore if isinstance(x, str) and x)
-            if isinstance(ignore, list)
-            else ()
-        )
+        ignore_entities = _str_list(ha.get("ignore_entities"))
+        local_ignore: tuple[str, ...] = ()
+        local_rules: tuple[ActionRule, ...] = ()
+        local_error = ""
+        local_path = _text(ha.get("local_file"))
+        if local_path:
+            local_ignore, local_rules, local_error = _read_local(local_path)
         watch = WatchConfig(
             battery_low=_int(ha.get("battery_low"), defaults.battery_low),
             unavailable_after_minutes=_int(
                 ha.get("unavailable_after_minutes"), defaults.unavailable_after_minutes
             ),
             flood_threshold=_int(ha.get("flood_threshold"), defaults.flood_threshold),
-            ignore_entities=ignore_entities,
+            ignore_entities=ignore_entities + local_ignore,
             census_max_age_hours=_int(
                 census.get("max_age_hours"), defaults.census_max_age_hours
             ),
@@ -105,8 +160,9 @@ class HomelabConfig:
             kuma_ca_cert=ca_cert,
             census_url=_text(census.get("url")).rstrip("/"),
             watch=watch,
-            rules=rules,
+            rules=rules + local_rules,
             incomplete=frozenset(incomplete),
+            local_error=local_error,
         )
 
     @classmethod

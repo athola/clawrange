@@ -503,6 +503,7 @@ HOMELAB_HA_KEYS = {
     "flood_threshold",
     "ignore_entities",
     "actions",
+    "local_file",
 }
 HOMELAB_KUMA_KEYS = {"url", "slug", "ca_cert"}
 HOMELAB_CENSUS_KEYS = {"url", "max_age_hours"}

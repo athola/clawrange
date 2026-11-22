@@ -665,3 +665,16 @@ async def test_notify_exception_is_logged_with_traceback(caplog):
     with caplog.at_level("ERROR", logger="clawrange.homelab"):
         assert await service._send(boom, "x") is False
     assert caplog.records[0].exc_info is not None
+
+
+def test_bad_local_file_degrades_health_without_leaking_detail(brain_db, tmp_path):
+    cfg = HomelabConfig.from_block(
+        {"home_assistant": {"local_file": str(tmp_path / "missing.yaml")}}
+    )
+    anon = service.health(brain_db, cfg, detail=False, now=T0)
+    assert anon["status"] == "degraded"
+    assert "ha_local_file" in anon["problems"]
+    assert "local_error" not in anon["sources"]["ha"]
+    full = service.health(brain_db, cfg, detail=True, now=T0)
+    assert "cannot be read" in full["sources"]["ha"]["local_error"]
+    assert str(tmp_path) not in json.dumps(full)

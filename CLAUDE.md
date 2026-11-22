@@ -303,7 +303,9 @@ stack without one. There is no `/docs`, `/redoc` or `/openapi.json`.
   <entity_id>` and `!home confirm <code>` (whole message only). Settings:
   `HA_URL`, `HA_TOKEN` (workflows only, never OpenClaw),
   `HOMELAB_KUMA_URL`, `HOMELAB_CA_CERT`, `HOMELAB_CENSUS_URL`; unset means
-  that source is off. Activation runbook: `docs/homelab-guide.md`.
+  that source is off. `HOMELAB_HA_LOCAL` points at a gitignored YAML file
+  under `config/homelab/` that adds real entity ids to `ignore_entities`
+  and `actions` (never put them in a committed profile). Activation runbook: `docs/homelab-guide.md`.
 
 **Canary**
 - `POST /webhook/test`: echo payload back

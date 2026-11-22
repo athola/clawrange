@@ -196,11 +196,18 @@ checkout.
    so no alerts are expected. The Homepage card "Homelab watch (clawrange)"
    (Compute & AI) should read `ok` for each source.
 
-7. **Optional: allow a few actions.** Add rules to the profile's
-   `homelab.home_assistant.actions`, then restart workflows
-   (`docker compose restart workflows`) so the profile reloads:
+7. **Optional: allow a few actions and quiet dead entities.** Real entity
+   ids stay out of the committed profile (the repository is public). Put
+   them in `config/homelab/ha-local.yaml` (gitignored, mounted read-only),
+   set `HOMELAB_HA_LOCAL=/config/homelab/ha-local.yaml` in `.env`, and
+   recreate workflows once (`docker compose up -d --no-deps workflows`).
+   After that the watch and the chat commands re-read the file on every
+   use. The file may hold only `ignore_entities` and `actions`, which are
+   added to the profile's lists and checked by the same rules:
 
    ```yaml
+   ignore_entities:
+     - sensor.<long_dead_entity>     # exact ids: a new failure still alerts
    actions:
      - service: script.turn_on
        entities: [script.<announce_script_id>]   # exact id; script.* is rejected
@@ -209,6 +216,11 @@ checkout.
      - service: light.turn_off
        entities: ["light.*"]
    ```
+
+   If the file is missing or invalid, the whole file is ignored (none of its
+   actions are allowed) and `/healthz/homelab` goes `degraded` with
+   `ha_local_file`. The bearer-token view says why, but never shows the
+   file's contents.
 
    Send `!home do light.turn_on light.<entity_id>`. A code arrives as its own
    message. Reply `!home confirm <code>` within 120 s. With a non-admin HA
