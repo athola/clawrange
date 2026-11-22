@@ -66,11 +66,21 @@ the plan.
     `POST /task` keep one validation rule and both record `source="user"`.
   - uvicorn serves the factory (`uvicorn --factory app:create_app` in
     `entrypoint.sh`), so `app.py` has no module-level app or brain and
-    importing it opens nothing. Most tests share one app built around a
-    temp brain in `tests/testapp.py`, emptied after every test by
-    `conftest.py`.
+    importing it opens nothing.
+  - Tests get a fresh `brain_db`, `app` and `client` per test from
+    `conftest.py` fixtures. The brain is a file copy of one migrated
+    session template (about 1ms; migrating a new file is about 60ms), and
+    the app (about 10ms to build) exists only for tests that name `app` or
+    `client`. No conftest autouse fixture asks for them, so other tests pay
+    nothing. That replaced a shared app whose tables were emptied after
+    every test.
   `test_dependency_injection.py` fails if any non-test module imports
-  `app`; `test_app_factory.py` proves two apps never share a brain.
+  `app`; `test_app_factory.py` proves two apps never share a brain;
+  `test_fresh_app.py` proves each test gets its own and that no test
+  module brings back a shared app or a module-level `TestClient`. The
+  suite passes in reverse file order too; that run found scheduler
+  startup errors leaking between tests, now reset per test in
+  `conftest.py` like the other module globals.
 - **Options weighed**:
   - A: Move only the persona helpers out of `app.py`: two files, but the
     import-time DB and the back-imports stay. Rejected.
@@ -81,13 +91,19 @@ the plan.
     persona routers, were considered; `Depends` was chosen so route
     functions stay importable and the per-request root is the same
     `request.app.state` the chat path uses.
+  - Test freshness: one shared app with a reset fixture (rejected: order
+    coupling, and the reset had to track every table); rebinding each test
+    module's `brain_db` global per test (rejected: implicit); an in-memory
+    brain per test (2ms, but not the WAL file production runs); a template
+    copy per test with lazy app and client fixtures (chosen). Moved with a
+    one-off libcst codemod: tests and fixtures took the fixtures as
+    trailing params (after any `@patch` mocks), helpers keyword-only ones.
 - **Negative consequences**:
   - About 90 test call sites had to pass the brain explicitly.
-  - Most tests still share one app and brain (`tests/testapp.py`), so
-    isolation rests on the reset fixture rather than a fresh app per test.
-    A per-test app fixture would mean rewriting about 600 references and
-    was left alone. `conftest.py` still defaults `BRAIN_DB_PATH` to a temp
-    path, as a guard so a stray `create_app()` never opens `/data`.
+  - Setup costs about 5s more over the suite (24.5s against 19.3s), almost
+    all of it `create_app` for the ~350 tests that use an app.
+    `conftest.py` still defaults `BRAIN_DB_PATH` to a temp path, as a
+    guard so a stray `create_app()` never opens `/data`.
   - A running dev container on the old `uvicorn app:app` command fails to
     reload once `app.py` loses its module-level app; the entrypoint
     supervisor restarts it on the new command.

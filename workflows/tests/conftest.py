@@ -1,10 +1,11 @@
 """Test configuration: shared fixtures and per-test isolation.
 
-The shared app and its brain live in tests/testapp.py; app.py builds
-nothing on import, so test modules can import it in any order.
+`brain_db`, `app` and `client` are fresh per test (see below); app.py
+builds nothing on import, so test modules can import it in any order.
 """
 
 import os
+import pathlib
 import socket
 import tempfile
 
@@ -13,7 +14,7 @@ import tempfile
 # Inside the container /data is also where the watchdog's heartbeat stamp
 # lives, so a test run must never overwrite it either.
 _tmpdir = tempfile.mkdtemp()
-os.environ.setdefault("BRAIN_DB_PATH", os.path.join(_tmpdir, "test_brain.db"))
+os.environ["BRAIN_DB_PATH"] = os.path.join(_tmpdir, "test_brain.db")
 os.environ.setdefault(
     "HEARTBEAT_SEEN_PATH", os.path.join(_tmpdir, "heartbeat_seen.json")
 )
@@ -21,12 +22,66 @@ os.environ.setdefault(
 
 import pytest  # noqa: E402
 
+# ─── Fresh brain, app and client per test ───────────────────────────
+# Lazy on purpose: no autouse fixture asks for these, so a test that never
+# names `brain_db`, `app` or `client` pays nothing. A brain is a file copy of
+# one migrated template (about 1ms, against about 60ms to migrate a new file);
+# the app (about 10ms) is built only for tests that ask for it.
+
+
+@pytest.fixture(scope="session")
+def _brain_template(tmp_path_factory):
+    from app import open_brain
+
+    path = tmp_path_factory.mktemp("brain-template") / "brain.db"
+    db = open_brain(str(path))
+    # Fold the WAL into the main file so a plain copy carries every table.
+    db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    db._conn.close()
+    # The copy must carry the schema: a truncated template would still pass
+    # every test, each one quietly migrating from scratch at ~60ms.
+    import sqlite3
+
+    with sqlite3.connect(path) as conn:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
+    assert {"tasks", "pages"} <= tables, "brain template is missing its schema"
+    return path
+
 
 @pytest.fixture()
-def client():
-    from fastapi.testclient import TestClient
+def brain_db(_brain_template, tmp_path):
+    """A migrated brain of this test's own, removed after the test."""
+    import shutil
 
-    from tests.testapp import app
+    from app import open_brain
+
+    path = tmp_path / "_fixture_brain.db"
+    shutil.copyfile(_brain_template, path)
+    db = open_brain(str(path))
+    yield db
+    db._conn.close()
+    for suffix in ("", "-wal", "-shm"):
+        pathlib.Path(f"{path}{suffix}").unlink(missing_ok=True)
+
+
+@pytest.fixture()
+def app(brain_db):
+    """A fresh app around this test's brain, bearer check skipped.
+
+    Tests of the real check pop ``auth.require_token`` from
+    ``app.dependency_overrides``.
+    """
+    import auth
+    from app import create_app
+
+    api = create_app(brain_db=brain_db)
+    api.dependency_overrides[auth.require_token] = lambda: None
+    return api
+
+
+@pytest.fixture()
+def client(app):
+    from fastapi.testclient import TestClient
 
     return TestClient(app)
 
@@ -72,62 +127,11 @@ def _reset_proxy_globals(monkeypatch):
     monkeypatch.setattr(llm_proxy, "_balance_status", {"ok_at": None, "error": None})
     monkeypatch.setattr(llm_proxy, "_last_tier_used", None)
     monkeypatch.setattr("heartbeat._thinking_focus_index", 0)
+    # Scheduler startup errors are module state too; left over, they turned
+    # a later /healthz "degraded" depending on file order.
+    import scheduler
 
-
-@pytest.fixture(autouse=True)
-def _bypass_api_auth():
-    """Skip the app-wide bearer check so route tests needn't send a token.
-
-    test_auth.py removes this override to exercise the real check.
-    """
-    import auth
-    from tests.testapp import app
-
-    app.dependency_overrides[auth.require_token] = lambda: None
-    yield
-    app.dependency_overrides.pop(auth.require_token, None)
-
-
-def _resettable_tables(conn) -> list[str]:
-    """User tables, derived from the live schema so the list can't drift.
-
-    Skips SQLite internals, FTS/vec shadow tables (PRAGMA table_list marks
-    most as 'shadow'; sqlite-vec's vector chunk tables report as 'table', so
-    anything prefixed by a virtual table's name is skipped too) and the
-    virtual tables themselves, which are rebuilt separately.
-    """
-    rows = conn.execute("PRAGMA table_list").fetchall()
-    main = [r for r in rows if r["schema"] == "main"]
-    virtual = {r["name"] for r in main if r["type"] == "virtual"}
-    return [
-        r["name"]
-        for r in main
-        if r["type"] == "table"
-        and not r["name"].startswith("sqlite_")
-        and not any(r["name"].startswith(v + "_") for v in virtual)
-    ]
-
-
-@pytest.fixture(autouse=True)
-def _reset_brain_db():
-    """Clear all tables between tests for isolation. Errors surface: a
-    failed reset means the next test would see this one's rows."""
-    yield
-    from tests.testapp import brain_db
-
-    conn = brain_db._conn
-    conn.execute("PRAGMA foreign_keys=OFF")
-    try:
-        for table in _resettable_tables(conn):
-            conn.execute(f"DELETE FROM {table}")
-        # Virtual tables: pages_fts plus one sqlite-vec table per model.
-        for (vtable,) in conn.execute(
-            "SELECT name FROM pragma_table_list WHERE type='virtual' AND schema='main'"
-        ).fetchall():
-            conn.execute(f"DELETE FROM {vtable}")
-        conn.commit()
-    finally:
-        conn.execute("PRAGMA foreign_keys=ON")
+    monkeypatch.setattr(scheduler, "_STATE", scheduler._new_state())
 
 
 @pytest.fixture(autouse=True)

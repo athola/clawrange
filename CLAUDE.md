@@ -40,8 +40,7 @@ Tailscale and Caddy gateway.
     (`uvicorn --factory app:create_app` in `entrypoint.sh`), so importing
     `app` builds nothing (no `/docs`, `/redoc` or `/openapi.json`). Only
     tests import `app`: chat commands and the heartbeat get the brain,
-    profile and scheduler from `llm_proxy` off `request.app.state`. Tests
-    share the app in `tests/testapp.py` or build their own
+    profile and scheduler from `llm_proxy` off `request.app.state`
   - `tasks_api.py`: `TaskCreate`/`TaskResult`, shared by `/task` and `!task`
   - `auth.py`: app-wide bearer auth (`PROXY_AUTH_TOKEN`), fails closed on
     an empty token or the old `generate-a-token-here` placeholder; only
@@ -314,7 +313,9 @@ stack without one. There is no `/docs`, `/redoc` or `/openapi.json`.
   Python. The generic core/template must stay free of any one operator's
   identity.
 - New test scripts go in `scripts/tests/<name>.sh` and get a Makefile target.
-- Pytest unit tests go in `workflows/tests/test_*.py`.
+- Pytest unit tests go in `workflows/tests/test_*.py`. Ask for the
+  `brain_db`, `app` and `client` fixtures (fresh per test, from
+  `conftest.py`); never share a module-level app or `TestClient`.
 - Persona edits to `openclaw/soul.md` should keep responses tight
   (Telegram is the main channel: short, actionable messages).
 - DeerFlow config must use `base_url: https://openrouter.ai/api/v1`

@@ -8,11 +8,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 import auth
-from tests.testapp import app, brain_db
 
 
 @pytest.fixture()
-def real_auth():
+def real_auth(app):
     """Undo conftest's global auth bypass for this module's tests."""
     saved = app.dependency_overrides.pop(auth.require_token, None)
     yield TestClient(app)
@@ -151,7 +150,7 @@ class TestPublicScheduleView:
     error detail. Authenticated callers still see full rows."""
 
     @pytest.fixture(autouse=True)
-    def _sched(self):
+    def _sched(self, brain_db):
         brain_db.upsert_schedule(
             "pub_view",
             "pub view",
@@ -192,7 +191,7 @@ class TestPublicHealthzView:
     SECRET = "/home/operator/private/profile.yaml: bad key"
 
     @pytest.fixture(autouse=True)
-    def _broken(self, monkeypatch):
+    def _broken(self, monkeypatch, app, brain_db):
         monkeypatch.setattr(app.state, "profile_error", self.SECRET, raising=False)
         monkeypatch.setattr(
             brain_db, "vec_status", lambda: {"enabled": False, "reason": self.SECRET}

@@ -13,16 +13,15 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 import generators
-from tests.testapp import brain_db
 
 TOME_PREFIX = "research:tome:"
 
 
-def _pending_descs() -> list[str]:
+def _pending_descs(*, brain_db) -> list[str]:
     return [t["description"] for t in brain_db.list_tasks(status="pending")]
 
 
-def _backdate_latest_session(hours: int) -> None:
+def _backdate_latest_session(hours: int, *, brain_db) -> None:
     """Push the most recent research session's created_at into the past."""
     old = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
     sid = brain_db.list_research_sessions(limit=1)[0]["id"]
@@ -37,56 +36,58 @@ def test_registered_in_generators():
 
 
 @pytest.mark.asyncio
-async def test_enqueues_tome_task_when_no_research():
+async def test_enqueues_tome_task_when_no_research(brain_db):
     await generators.research_pulse_generator(
         brain_db, topics=["trade-skill knowledge capture tooling 2025"]
     )
-    pending = _pending_descs()
+    pending = _pending_descs(brain_db=brain_db)
     assert pending == ["research:tome: trade-skill knowledge capture tooling 2025"]
 
 
 @pytest.mark.asyncio
-async def test_skips_when_research_is_fresh():
+async def test_skips_when_research_is_fresh(brain_db):
     # A session created just now is well inside the 24h window.
     brain_db.create_research_session("anything recent", ["discourse"])
     await generators.research_pulse_generator(brain_db, topics=["skrills gaps"])
-    assert _pending_descs() == []
+    assert _pending_descs(brain_db=brain_db) == []
 
 
 @pytest.mark.asyncio
-async def test_enqueues_when_research_is_stale():
+async def test_enqueues_when_research_is_stale(brain_db):
     brain_db.create_research_session("old topic", ["discourse"])
-    _backdate_latest_session(hours=48)
+    _backdate_latest_session(hours=48, brain_db=brain_db)
     await generators.research_pulse_generator(brain_db, topics=["skrills gaps"])
-    assert _pending_descs() == ["research:tome: skrills gaps"]
+    assert _pending_descs(brain_db=brain_db) == ["research:tome: skrills gaps"]
 
 
 @pytest.mark.asyncio
-async def test_dedups_already_pending_tome_task():
+async def test_dedups_already_pending_tome_task(brain_db):
     brain_db.create_task("research:tome: skrills gaps", source="schedule")
     await generators.research_pulse_generator(brain_db, topics=["skrills gaps"])
     # Still exactly one — no duplicate enqueued.
-    assert _pending_descs() == ["research:tome: skrills gaps"]
+    assert _pending_descs(brain_db=brain_db) == ["research:tome: skrills gaps"]
 
 
 @pytest.mark.asyncio
-async def test_rotates_to_next_unqueued_topic():
+async def test_rotates_to_next_unqueued_topic(brain_db):
     brain_db.create_task("research:tome: topic A", source="schedule")
     await generators.research_pulse_generator(brain_db, topics=["topic A", "topic B"])
-    assert "research:tome: topic B" in _pending_descs()
+    assert "research:tome: topic B" in _pending_descs(brain_db=brain_db)
 
 
 @pytest.mark.asyncio
-async def test_falls_back_to_tracked_project_topics():
+async def test_falls_back_to_tracked_project_topics(brain_db):
     brain_db.upsert_project(
         "skrills", "athola", "skrills", topics=["chrome extension knowledge capture"]
     )
     await generators.research_pulse_generator(brain_db)
-    assert _pending_descs() == ["research:tome: chrome extension knowledge capture"]
+    assert _pending_descs(brain_db=brain_db) == [
+        "research:tome: chrome extension knowledge capture"
+    ]
 
 
 @pytest.mark.asyncio
-async def test_skips_when_no_topic_available():
+async def test_skips_when_no_topic_available(brain_db):
     # No explicit topics and no tracked projects -> nothing to research.
     await generators.research_pulse_generator(brain_db)
-    assert _pending_descs() == []
+    assert _pending_descs(brain_db=brain_db) == []

@@ -9,10 +9,9 @@ approval — it never trades or calls exchanges — and pings Telegram.
 import pytest
 
 import generators
-from tests.testapp import brain_db
 
 
-def _pending_descs() -> list[str]:
+def _pending_descs(*, brain_db) -> list[str]:
     return [t["description"] for t in brain_db.list_tasks(status="pending")]
 
 
@@ -21,7 +20,7 @@ def test_registered_in_generators():
 
 
 @pytest.mark.asyncio
-async def test_enqueues_draft_review_task(monkeypatch):
+async def test_enqueues_draft_review_task(monkeypatch, brain_db):
     sent = []
 
     async def fake_notify(text):
@@ -30,7 +29,7 @@ async def test_enqueues_draft_review_task(monkeypatch):
 
     monkeypatch.setattr("telegram.notify", fake_notify)
     await generators.income_review_generator(brain_db)
-    pending = _pending_descs()
+    pending = _pending_descs(brain_db=brain_db)
     assert len(pending) == 1
     assert pending[0].startswith(generators.INCOME_REVIEW_DESC)
     # Review checklist rides in the task description so the agent
@@ -40,7 +39,7 @@ async def test_enqueues_draft_review_task(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_skips_when_review_already_pending(monkeypatch):
+async def test_skips_when_review_already_pending(monkeypatch, brain_db):
     sent = []
 
     async def fake_notify(text):
@@ -50,15 +49,15 @@ async def test_skips_when_review_already_pending(monkeypatch):
     monkeypatch.setattr("telegram.notify", fake_notify)
     await generators.income_review_generator(brain_db)
     await generators.income_review_generator(brain_db)
-    assert len(_pending_descs()) == 1
+    assert len(_pending_descs(brain_db=brain_db)) == 1
     assert len(sent) == 1
 
 
 @pytest.mark.asyncio
-async def test_task_survives_telegram_failure(monkeypatch):
+async def test_task_survives_telegram_failure(monkeypatch, brain_db):
     async def failing_notify(text):
         return False
 
     monkeypatch.setattr("telegram.notify", failing_notify)
     await generators.income_review_generator(brain_db)
-    assert len(_pending_descs()) == 1
+    assert len(_pending_descs(brain_db=brain_db)) == 1

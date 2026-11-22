@@ -19,12 +19,11 @@ from crm.sqlite_adapter import SQLiteCRM
 from errors import UpstreamError
 from reddit_search import RedditPost, SearchHealth
 from tenant_profile import Profile
-from tests.testapp import brain_db
 
 TOPICS = ["topic A", "topic B", "topic C"]
 
 
-def _tome_tasks() -> list[dict]:
+def _tome_tasks(*, brain_db) -> list[dict]:
     tasks = brain_db.list_tasks()
     return [t for t in tasks if t["description"].startswith("research:tome:")]
 
@@ -33,7 +32,7 @@ class TestResearchPulseRotation:
     """#20: a claimed or finished task must not stop the rotation."""
 
     @pytest.mark.asyncio
-    async def test_rotates_through_every_topic_across_claims(self):
+    async def test_rotates_through_every_topic_across_claims(self, brain_db):
         queued: list[str] = []
         for _ in range(len(TOPICS) * 2):
             await generators.research_pulse_generator(brain_db, topics=TOPICS)
@@ -47,18 +46,18 @@ class TestResearchPulseRotation:
         assert queued == TOPICS + TOPICS
 
     @pytest.mark.asyncio
-    async def test_skips_topic_with_an_active_task(self):
+    async def test_skips_topic_with_an_active_task(self, brain_db):
         await generators.research_pulse_generator(brain_db, topics=TOPICS)
         first = brain_db.list_tasks(status="pending")[0]
         brain_db.claim_task(first["id"])  # still running
 
         await generators.research_pulse_generator(brain_db, topics=TOPICS)
-        descs = [t["description"] for t in _tome_tasks()]
+        descs = [t["description"] for t in _tome_tasks(brain_db=brain_db)]
         assert descs.count("research:tome: topic A") == 1
         assert "research:tome: topic B" in descs
 
     @pytest.mark.asyncio
-    async def test_failed_topic_goes_to_the_back_of_the_queue(self):
+    async def test_failed_topic_goes_to_the_back_of_the_queue(self, brain_db):
         for topic in ("topic B", "topic C", "topic A"):
             task = brain_db.create_task(f"research:tome: {topic}", source="schedule")
             brain_db.claim_task(task["id"])
@@ -69,14 +68,14 @@ class TestResearchPulseRotation:
         assert pending == ["research:tome: topic B"]
 
     @pytest.mark.asyncio
-    async def test_all_topics_open_skips(self):
+    async def test_all_topics_open_skips(self, brain_db):
         for topic in TOPICS:
             brain_db.create_task(f"research:tome: {topic}", source="schedule")
         await generators.research_pulse_generator(brain_db, topics=TOPICS)
-        assert len(_tome_tasks()) == len(TOPICS)
+        assert len(_tome_tasks(brain_db=brain_db)) == len(TOPICS)
 
 
-def _emerging_project():
+def _emerging_project(*, brain_db):
     brain_db.upsert_project(
         "clawrange",
         "acme",
@@ -100,7 +99,7 @@ def _emerging_post():
     )
 
 
-def _emerging_hits() -> int:
+def _emerging_hits(*, brain_db) -> int:
     rows = brain_db.list_subreddit_stats(project_slug="clawrange", curated_only=False)
     return sum(r["hits"] for r in rows if r["subreddit"] == "ai_agents")
 
@@ -109,8 +108,8 @@ class TestEmergingHitsAfterDelivery:
     """#38: emerging hits count once, and only for a delivered digest."""
 
     @pytest.mark.asyncio
-    async def test_rerun_does_not_recount_emerging_hits(self, monkeypatch):
-        _emerging_project()
+    async def test_rerun_does_not_recount_emerging_hits(self, monkeypatch, brain_db):
+        _emerging_project(brain_db=brain_db)
         monkeypatch.setattr(
             "reddit_search.search_subreddits", AsyncMock(return_value=[])
         )
@@ -124,13 +123,13 @@ class TestEmergingHitsAfterDelivery:
         assert "AI_Agents" in notify.await_args.args[0]
         await generators.morning_digest_generator(brain_db)
 
-        assert _emerging_hits() == 1
+        assert _emerging_hits(brain_db=brain_db) == 1
         assert brain_db.is_seen("reddit_post", "em1", "clawrange")
         assert "multi-agent orchestration" not in notify.await_args.args[0]
 
     @pytest.mark.asyncio
-    async def test_failed_delivery_records_no_emerging_hit(self, monkeypatch):
-        _emerging_project()
+    async def test_failed_delivery_records_no_emerging_hit(self, monkeypatch, brain_db):
+        _emerging_project(brain_db=brain_db)
         monkeypatch.setattr(
             "reddit_search.search_subreddits", AsyncMock(return_value=[])
         )
@@ -141,7 +140,7 @@ class TestEmergingHitsAfterDelivery:
 
         await generators.morning_digest_generator(brain_db)
 
-        assert _emerging_hits() == 0
+        assert _emerging_hits(brain_db=brain_db) == 0
         assert not brain_db.is_seen("reddit_post", "em1", "clawrange")
 
 
@@ -217,7 +216,7 @@ class TestPersonaReflect:
     """#15: reflect files under the active profile and survives chatty replies."""
 
     @pytest.mark.asyncio
-    async def test_defaults_to_the_active_profile(self, monkeypatch):
+    async def test_defaults_to_the_active_profile(self, monkeypatch, brain_db):
         monkeypatch.setenv("CLAWRANGE_PROFILE", "marketing")
         monkeypatch.setattr(
             "llm_proxy._llm_call", AsyncMock(return_value="Lead with the answer.")
@@ -227,7 +226,7 @@ class TestPersonaReflect:
         assert brain_db.list_learnings(profile="starter") == []
 
     @pytest.mark.asyncio
-    async def test_multi_line_reply_proposes_first_line(self, monkeypatch):
+    async def test_multi_line_reply_proposes_first_line(self, monkeypatch, brain_db):
         reply = "\n  Lead with the answer.\nThis keeps Telegram replies short.\n"
         monkeypatch.setattr("llm_proxy._llm_call", AsyncMock(return_value=reply))
         await generators.persona_reflect_generator(brain_db, profile_name="cos")
@@ -235,14 +234,16 @@ class TestPersonaReflect:
         assert [r["content"] for r in rows] == ["Lead with the answer."]
 
     @pytest.mark.asyncio
-    async def test_none_on_first_line_queues_nothing(self, monkeypatch):
+    async def test_none_on_first_line_queues_nothing(self, monkeypatch, brain_db):
         reply = "None.\nNothing stood out this week."
         monkeypatch.setattr("llm_proxy._llm_call", AsyncMock(return_value=reply))
         await generators.persona_reflect_generator(brain_db, profile_name="cos")
         assert brain_db.list_learnings(profile="cos") == []
 
     @pytest.mark.asyncio
-    async def test_invalid_suggestion_is_skipped_not_raised(self, monkeypatch):
+    async def test_invalid_suggestion_is_skipped_not_raised(
+        self, monkeypatch, brain_db
+    ):
 
         too_long = "x" * (persona_learning.CONTENT_MAX + 1)
         monkeypatch.setattr("llm_proxy._llm_call", AsyncMock(return_value=too_long))
@@ -689,7 +690,7 @@ class TestGeneratorsSurviveScannerOutage:
     """Generators keep running and record the outage when scanners raise."""
 
     @pytest.mark.asyncio
-    async def test_hot_pulse_records_outage(self, monkeypatch):
+    async def test_hot_pulse_records_outage(self, monkeypatch, brain_db):
         brain_db.upsert_project(
             "p", "o", "r", topics=["x"], subreddits=["a"], search_terms=["x"]
         )
@@ -707,7 +708,9 @@ class TestGeneratorsSurviveScannerOutage:
         notify.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_morning_digest_reports_reddit_and_github_down(self, monkeypatch):
+    async def test_morning_digest_reports_reddit_and_github_down(
+        self, monkeypatch, brain_db
+    ):
         brain_db.upsert_project(
             "p", "o", "r", topics=["x"], subreddits=["a"], search_terms=["x"]
         )

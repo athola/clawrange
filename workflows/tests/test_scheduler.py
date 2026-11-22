@@ -84,7 +84,7 @@ class TestValidate:
         with pytest.raises(ValueError, match="brain_db"):
             sch.validate_schedule("morning_scan", "0 9 * * *", {"brain_db": 1})
 
-    def test_unknown_kwarg_rejected_for_strict_generator(self, monkeypatch):
+    def test_unknown_kwarg_rejected_for_strict_generator(self, monkeypatch, brain_db):
         async def strict(brain_db, only=None):
             return None
 
@@ -95,8 +95,7 @@ class TestValidate:
 
 
 class TestRoutes:
-    def test_create_rejects_bad_input_without_persisting(self, client):
-        from tests.testapp import brain_db
+    def test_create_rejects_bad_input_without_persisting(self, client, brain_db):
 
         for body in (
             {"id": "x1", "name": "x", "kind": "nope", "cron": "0 9 * * *"},
@@ -105,8 +104,7 @@ class TestRoutes:
             assert client.post("/sched", json=body).status_code == 400
         assert brain_db.get_schedule("x1") is None
 
-    def test_patch_rejects_bad_cron(self, client):
-        from tests.testapp import brain_db
+    def test_patch_rejects_bad_cron(self, client, brain_db):
 
         brain_db.upsert_schedule("p1", "p", "morning_scan", "0 9 * * *")
         r = client.patch("/sched/p1", json={"cron": "bad"})

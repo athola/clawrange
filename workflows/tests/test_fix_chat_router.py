@@ -20,7 +20,6 @@ import research
 import research_router
 import tenant_profile
 from errors import UpstreamError
-from tests.testapp import brain_db
 
 
 def _post(i: int) -> reddit_search.RedditPost:
@@ -60,7 +59,7 @@ def _text(resp) -> str:
 
 
 @pytest.fixture()
-def project():
+def project(brain_db):
     brain_db.upsert_project(
         "skrills",
         "athola",
@@ -77,7 +76,9 @@ def project():
 
 class TestGeneratorRouterContract:
     @pytest.mark.asyncio
-    async def test_morning_scan_tasks_reach_the_scanners(self, project, monkeypatch):
+    async def test_morning_scan_tasks_reach_the_scanners(
+        self, project, monkeypatch, brain_db
+    ):
         reddit = AsyncMock(return_value=[_post(1)])
         repos = AsyncMock(return_value=[_repo(1)])
         issues = AsyncMock(return_value=[])
@@ -102,7 +103,7 @@ class TestGeneratorRouterContract:
 
     @pytest.mark.asyncio
     async def test_weekly_traffic_task_reaches_the_traffic_api(
-        self, project, monkeypatch
+        self, project, monkeypatch, brain_db
     ):
         traffic = AsyncMock(return_value=_traffic())
         monkeypatch.setattr(github_search, "get_self_traffic", traffic)
@@ -121,7 +122,7 @@ class TestGeneratorRouterContract:
 
 class TestRouterUpstreamFailures:
     @pytest.mark.asyncio
-    async def test_reddit_failure_propagates(self, project, monkeypatch):
+    async def test_reddit_failure_propagates(self, project, monkeypatch, brain_db):
         monkeypatch.setattr(
             reddit_search,
             "search_subreddits",
@@ -175,7 +176,7 @@ class TestRouterUpstreamFailures:
         assert "https://x/1" in result and "rate limit" in result
 
     @pytest.mark.asyncio
-    async def test_traffic_without_pat_says_so(self, monkeypatch):
+    async def test_traffic_without_pat_says_so(self, monkeypatch, brain_db):
         monkeypatch.setattr(github_search, "GITHUB_PAT", "")
         monkeypatch.setattr(
             github_search, "get_self_traffic", AsyncMock(return_value=None)
@@ -186,7 +187,7 @@ class TestRouterUpstreamFailures:
         assert result is not None and "GITHUB_PAT" in result
 
     @pytest.mark.asyncio
-    async def test_traffic_api_failure_with_pat_raises(self, monkeypatch):
+    async def test_traffic_api_failure_with_pat_raises(self, monkeypatch, brain_db):
         monkeypatch.setattr(github_search, "GITHUB_PAT", "test-pat")
         monkeypatch.setattr(
             github_search, "get_self_traffic", AsyncMock(return_value=None)
@@ -200,7 +201,7 @@ class TestRouterUpstreamFailures:
 
 class TestMarkSeenOnlyShown:
     @pytest.mark.asyncio
-    async def test_reddit_marks_only_shown_posts(self, project, monkeypatch):
+    async def test_reddit_marks_only_shown_posts(self, project, monkeypatch, brain_db):
         monkeypatch.setattr(
             reddit_search,
             "search_subreddits",
@@ -213,7 +214,7 @@ class TestMarkSeenOnlyShown:
         assert not brain_db.is_seen("reddit_post", "p8", "skrills")
 
     @pytest.mark.asyncio
-    async def test_github_marks_only_shown_repos(self, project, monkeypatch):
+    async def test_github_marks_only_shown_repos(self, project, monkeypatch, brain_db):
         monkeypatch.setattr(
             github_search,
             "search_repos",
@@ -229,7 +230,7 @@ class TestMarkSeenOnlyShown:
 
 class TestChatScanFailures:
     @pytest.mark.asyncio
-    async def test_reddit_unavailable(self, monkeypatch):
+    async def test_reddit_unavailable(self, monkeypatch, brain_db):
         monkeypatch.setattr(
             reddit_search,
             "search_subreddits",
@@ -241,7 +242,7 @@ class TestChatScanFailures:
         assert text.startswith("Reddit search unavailable: 403 everywhere")
 
     @pytest.mark.asyncio
-    async def test_github_unavailable(self, monkeypatch):
+    async def test_github_unavailable(self, monkeypatch, brain_db):
         monkeypatch.setattr(
             github_search,
             "search_repos",
@@ -253,7 +254,7 @@ class TestChatScanFailures:
         assert text.startswith("GitHub search unavailable: rate limited")
 
     @pytest.mark.asyncio
-    async def test_web_search_failure_is_not_no_results(self, monkeypatch):
+    async def test_web_search_failure_is_not_no_results(self, monkeypatch, brain_db):
         monkeypatch.setattr(llm_proxy, "_llm_call", AsyncMock(return_value=None))
         text = await chat_commands._handle_scan_command(
             "web", "mcp servers", brain_db=brain_db
@@ -266,7 +267,7 @@ class TestChatScanFailures:
 
 class TestScanGithubTraffic:
     @pytest.mark.asyncio
-    async def test_traffic_is_reachable(self, project, monkeypatch):
+    async def test_traffic_is_reachable(self, project, monkeypatch, brain_db):
         traffic = AsyncMock(return_value=_traffic())
         repos = AsyncMock(return_value=[])
         monkeypatch.setattr(github_search, "get_self_traffic", traffic)
@@ -279,7 +280,7 @@ class TestScanGithubTraffic:
         assert "Views: 10" in text
 
     @pytest.mark.asyncio
-    async def test_traffic_prefix_word_is_a_topic(self, monkeypatch):
+    async def test_traffic_prefix_word_is_a_topic(self, monkeypatch, brain_db):
         traffic = AsyncMock(return_value=_traffic())
         repos = AsyncMock(return_value=[])
         monkeypatch.setattr(github_search, "get_self_traffic", traffic)
@@ -292,7 +293,7 @@ class TestScanGithubTraffic:
 
     @pytest.mark.asyncio
     async def test_traffic_api_failure_with_pat_does_not_blame_pat(
-        self, project, monkeypatch
+        self, project, monkeypatch, brain_db
     ):
         monkeypatch.setattr(github_search, "GITHUB_PAT", "test-pat")
         monkeypatch.setattr(
@@ -365,7 +366,7 @@ async def live_scheduler():
 
 class TestSchedLiveScheduler:
     @pytest.mark.asyncio
-    async def test_add_pause_resume_rm_by_name(self, live_scheduler):
+    async def test_add_pause_resume_rm_by_name(self, live_scheduler, brain_db):
         text = await chat_commands._handle_sched_command(
             "add",
             'myscan cron "0 9 * * *" -- morning_scan',
@@ -397,7 +398,7 @@ class TestSchedLiveScheduler:
         assert brain_db.get_schedule("myscan") is None
 
     @pytest.mark.asyncio
-    async def test_add_validates_cron(self, live_scheduler):
+    async def test_add_validates_cron(self, live_scheduler, brain_db):
         text = await chat_commands._handle_sched_command(
             "add",
             'bad cron "not a cron" -- morning_scan',
@@ -408,7 +409,7 @@ class TestSchedLiveScheduler:
         assert brain_db.get_schedule("bad") is None
 
     @pytest.mark.asyncio
-    async def test_list_paused_filters(self):
+    async def test_list_paused_filters(self, brain_db):
         brain_db.upsert_schedule("a", "Alpha", "morning_scan", "0 9 * * *")
         brain_db.upsert_schedule("b", "Beta", "morning_scan", "0 9 * * *")
         brain_db.set_schedule_paused("b", True)
@@ -419,7 +420,7 @@ class TestSchedLiveScheduler:
 
     @pytest.mark.asyncio
     async def test_marketing_alias_runs_generator_without_schedule(
-        self, project, monkeypatch
+        self, project, monkeypatch, brain_db
     ):
         cmd = chat_commands._extract_marketing_command("/marketing")
         text = await chat_commands._handle_sched_command(
@@ -432,7 +433,7 @@ class TestSchedLiveScheduler:
 # ─── #51: RECENT / tail order and blocked tasks ────────────────────
 
 
-def _close(desc: str, status: str, when: str, priority: int = 3) -> str:
+def _close(desc: str, status: str, when: str, priority: int = 3, *, brain_db) -> str:
     t = brain_db.create_task(desc, priority=priority)
     brain_db.complete_task(t["id"], f"result {desc}", status=status)
     brain_db._conn.execute(
@@ -443,17 +444,25 @@ def _close(desc: str, status: str, when: str, priority: int = 3) -> str:
 
 
 class TestRecentTasks:
-    def _seed(self):
+    def _seed(self, *, brain_db):
         # Priority order would put "old-urgent" last-shown; completion
         # order puts "newest" first.
-        _close("old-urgent", "completed", "2026-01-01T00:00:00", priority=1)
-        _close("middle", "failed", "2026-01-02T00:00:00", priority=5)
-        _close("asked", "blocked", "2026-01-03T00:00:00", priority=5)
-        _close("newest", "completed", "2026-01-04T00:00:00", priority=5)
+        _close(
+            "old-urgent",
+            "completed",
+            "2026-01-01T00:00:00",
+            priority=1,
+            brain_db=brain_db,
+        )
+        _close("middle", "failed", "2026-01-02T00:00:00", priority=5, brain_db=brain_db)
+        _close("asked", "blocked", "2026-01-03T00:00:00", priority=5, brain_db=brain_db)
+        _close(
+            "newest", "completed", "2026-01-04T00:00:00", priority=5, brain_db=brain_db
+        )
 
     @pytest.mark.asyncio
-    async def test_tail_newest_first_and_includes_blocked(self):
-        self._seed()
+    async def test_tail_newest_first_and_includes_blocked(self, brain_db):
+        self._seed(brain_db=brain_db)
         text = _text(
             await chat_commands._dispatch_task_command(
                 {"type": "tail"}, brain_db=brain_db
@@ -463,8 +472,8 @@ class TestRecentTasks:
         assert text.index("newest") < text.index("asked") < text.index("middle")
 
     @pytest.mark.asyncio
-    async def test_list_recent_shows_last_three_by_completion(self):
-        self._seed()
+    async def test_list_recent_shows_last_three_by_completion(self, brain_db):
+        self._seed(brain_db=brain_db)
         text = _text(
             await chat_commands._dispatch_task_command(
                 {"type": "list"}, brain_db=brain_db
@@ -486,7 +495,7 @@ class TestHelpAndText:
         assert "/marketing" in text
 
     @pytest.mark.asyncio
-    async def test_task_created_names_configured_ops_agent(self, monkeypatch):
+    async def test_task_created_names_configured_ops_agent(self, monkeypatch, brain_db):
         prof = SimpleNamespace(assistant={"ops": {"agent": "ops", "name": "Ops Bot"}})
         monkeypatch.setattr(tenant_profile, "active_profile", lambda: prof)
         text = _text(
@@ -498,7 +507,7 @@ class TestHelpAndText:
         assert "Max Ops" not in text
 
     @pytest.mark.asyncio
-    async def test_task_created_without_ops_name(self, monkeypatch):
+    async def test_task_created_without_ops_name(self, monkeypatch, brain_db):
         monkeypatch.setattr(tenant_profile, "active_profile", lambda: None)
         text = _text(
             await chat_commands._dispatch_task_command(
@@ -509,7 +518,9 @@ class TestHelpAndText:
         assert "pick this up" in text
 
     @pytest.mark.asyncio
-    async def test_dispatch_error_logged_with_traceback(self, monkeypatch, caplog):
+    async def test_dispatch_error_logged_with_traceback(
+        self, monkeypatch, caplog, brain_db
+    ):
         monkeypatch.setattr(
             chat_commands,
             "_handle_projects_command",
@@ -541,7 +552,7 @@ class TestHelpAndText:
 
 class TestTaskHandlersEndToEnd:
     @pytest.mark.asyncio
-    async def test_stream_wraps_once(self):
+    async def test_stream_wraps_once(self, brain_db):
         resp = await chat_commands._dispatch_task_command(
             {"type": "list"}, is_stream=True, brain_db=brain_db
         )
@@ -554,7 +565,7 @@ class TestTaskHandlersEndToEnd:
         assert isinstance(resp, StreamingResponse)
 
     @pytest.mark.asyncio
-    async def test_cancel_and_priority(self):
+    async def test_cancel_and_priority(self, brain_db):
         t = brain_db.create_task("x", priority=3)
         cmd = chat_commands._extract_task_command(f"!task priority {t['id']} 1")
         text = _text(await chat_commands._dispatch_task_command(cmd, brain_db=brain_db))
@@ -567,7 +578,7 @@ class TestTaskHandlersEndToEnd:
         assert brain_db.get_task(t["id"])["status"] == "cancelled"
 
     @pytest.mark.asyncio
-    async def test_list_shows_active_and_queued(self):
+    async def test_list_shows_active_and_queued(self, brain_db):
         a = brain_db.create_task("being done")
         brain_db.claim_task(a["id"])
         brain_db.create_task("waiting")

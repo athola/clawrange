@@ -27,14 +27,13 @@ import research_router
 import scheduler as sch
 import tenant_profile
 from errors import UpstreamError
-from tests.testapp import app, brain_db
 
 TOKEN = "k43-test-token"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
 
 @pytest.fixture()
-def chat(monkeypatch):
+def chat(monkeypatch, app):
     """POST one user message through the real proxy router; return the reply."""
     monkeypatch.setattr(llm_proxy, "PROXY_AUTH_TOKEN", TOKEN)
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "")
@@ -115,7 +114,7 @@ class TestToolCallSingleTier:
         assert data["choices"][0]["message"]["tool_calls"] == [TOOL_CALL]
         assert "zai-direct" not in llm_proxy._circuit_state
 
-    def test_tool_call_reaches_a_streaming_client(self, keys, monkeypatch):
+    def test_tool_call_reaches_a_streaming_client(self, keys, monkeypatch, app):
         monkeypatch.setattr(llm_proxy, "PROXY_AUTH_TOKEN", TOKEN)
         call = AsyncMock(return_value=_tool_call_reply())
         with _balance(50.0), patch.object(llm_proxy, "_call_provider", call):
@@ -207,17 +206,17 @@ def quiet(monkeypatch):
     monkeypatch.setattr("telegram.notify", AsyncMock(return_value=True))
 
 
-def _beat() -> None:
+def _beat(*, brain_db) -> None:
     asyncio.run(heartbeat._handle_heartbeat(False, brain_db=brain_db))
 
 
 @pytest.mark.usefixtures("quiet")
 class TestHeartbeatBlocked:
-    def test_needs_input_result_closes_the_task_as_blocked(self, monkeypatch):
+    def test_needs_input_result_closes_the_task_as_blocked(self, monkeypatch, brain_db):
         task = brain_db.create_task("Draft the onboarding email for new clients")
         answer = "Status: BLOCKED - need your preferred sender name first."
         monkeypatch.setattr(heartbeat, "_llm_work_task", AsyncMock(return_value=answer))
-        _beat()
+        _beat(brain_db=brain_db)
         done = brain_db.get_task(task["id"])
         assert done["status"] == "blocked"
         assert done["result"] == answer
@@ -227,16 +226,16 @@ class TestHeartbeatBlocked:
         # The full answer stays on the task; the digest gets the short line.
         assert not any(answer in ln for ln in lines)
 
-    def test_finished_result_still_completes(self, monkeypatch):
+    def test_finished_result_still_completes(self, monkeypatch, brain_db):
         task = brain_db.create_task("Draft the onboarding email for new clients")
         monkeypatch.setattr(
             heartbeat, "_llm_work_task", AsyncMock(return_value="Subject: Welcome")
         )
-        _beat()
+        _beat(brain_db=brain_db)
         assert brain_db.get_task(task["id"])["status"] == "completed"
 
 
-def _low_alerts() -> list[dict]:
+def _low_alerts(*, brain_db) -> list[dict]:
     return [
         t
         for t in brain_db.list_tasks()
@@ -246,15 +245,15 @@ def _low_alerts() -> list[dict]:
 
 @pytest.mark.usefixtures("quiet")
 class TestLowBalanceAlert:
-    def _beat_with_balance(self, monkeypatch, value):
+    def _beat_with_balance(self, monkeypatch, value, *, brain_db):
         monkeypatch.setattr(
             llm_proxy, "_check_openrouter_balance", AsyncMock(return_value=value)
         )
-        _beat()
+        _beat(brain_db=brain_db)
 
-    def test_below_floor_creates_one_priority_one_alert(self, monkeypatch):
-        self._beat_with_balance(monkeypatch, 3.0)
-        alerts = _low_alerts()
+    def test_below_floor_creates_one_priority_one_alert(self, monkeypatch, brain_db):
+        self._beat_with_balance(monkeypatch, 3.0, brain_db=brain_db)
+        alerts = _low_alerts(brain_db=brain_db)
         assert [a["description"] for a in alerts] == [
             "Low balance alert: $3.00 remaining"
         ]
@@ -264,18 +263,20 @@ class TestLowBalanceAlert:
         )
 
     @pytest.mark.parametrize("value", [llm_proxy.OPENROUTER_BALANCE_FLOOR, 50.0, None])
-    def test_at_or_above_floor_or_unknown_creates_none(self, monkeypatch, value):
-        self._beat_with_balance(monkeypatch, value)
-        assert _low_alerts() == []
+    def test_at_or_above_floor_or_unknown_creates_none(
+        self, monkeypatch, value, brain_db
+    ):
+        self._beat_with_balance(monkeypatch, value, brain_db=brain_db)
+        assert _low_alerts(brain_db=brain_db) == []
 
 
 @pytest.mark.usefixtures("quiet")
 class TestTierRecovery:
-    def test_tripped_tier_gets_a_priority_two_alert(self, monkeypatch):
+    def test_tripped_tier_gets_a_priority_two_alert(self, monkeypatch, brain_db):
         monkeypatch.setattr(
             llm_proxy, "_circuit_open", lambda name, probe=True: name == "zai-direct"
         )
-        _beat()
+        _beat(brain_db=brain_db)
         alerts = [
             t
             for t in brain_db.list_tasks()
@@ -283,20 +284,20 @@ class TestTierRecovery:
         ]
         assert len(alerts) == 1 and alerts[0]["priority"] == 2
 
-    def test_alert_for_a_still_tripped_tier_says_so(self, monkeypatch):
+    def test_alert_for_a_still_tripped_tier_says_so(self, monkeypatch, brain_db):
         task = brain_db.create_task("Investigate tier recovery: zai-direct", 2)
         monkeypatch.setattr(
             llm_proxy, "_circuit_open", lambda name, probe=True: name == "zai-direct"
         )
-        _beat()
+        _beat(brain_db=brain_db)
         done = brain_db.get_task(task["id"])
         assert done["status"] == "completed"
         assert "TRIPPED (circuit open)" in done["result"]
 
-    def test_alert_after_recovery_says_recovered(self, monkeypatch):
+    def test_alert_after_recovery_says_recovered(self, monkeypatch, brain_db):
         task = brain_db.create_task("Investigate tier recovery: zai-direct", 2)
         monkeypatch.setattr(llm_proxy, "_circuit_open", lambda name, probe=True: False)
-        _beat()
+        _beat(brain_db=brain_db)
         assert "recovered (circuit closed)" in brain_db.get_task(task["id"])["result"]
 
 
@@ -333,7 +334,7 @@ class TestInterruptedDigestBurst:
 
 
 class TestCatchUpSkips:
-    def _queue(self, monkeypatch, schedules, opted_in):
+    def _queue(self, monkeypatch, schedules, opted_in, *, brain_db):
         monkeypatch.setattr(sch, "catch_up_ids", lambda: opted_in)
         fake = MagicMock()
         sch._queue_catch_ups(fake, schedules, brain_db, "UTC")
@@ -346,35 +347,42 @@ class TestCatchUpSkips:
         fire = (now - timedelta(minutes=1)).strftime("%M %H")
         return {"kind": "morning_scan", "cron": f"{fire} * * *", "last_run": None}
 
-    def test_missed_opted_in_schedule_is_queued(self, monkeypatch):
-        ids = self._queue(monkeypatch, [{"id": "a", **self._missed()}], {"a"})
+    def test_missed_opted_in_schedule_is_queued(self, monkeypatch, brain_db):
+        ids = self._queue(
+            monkeypatch, [{"id": "a", **self._missed()}], {"a"}, brain_db=brain_db
+        )
         assert ids == ["catchup_a"]
 
-    def test_paused_schedule_is_skipped(self, monkeypatch):
+    def test_paused_schedule_is_skipped(self, monkeypatch, brain_db):
         rows = [{"id": "a", "paused": 1, **self._missed()}]
-        assert self._queue(monkeypatch, rows, {"a"}) == []
+        assert self._queue(monkeypatch, rows, {"a"}, brain_db=brain_db) == []
 
-    def test_schedule_not_opted_in_is_skipped(self, monkeypatch):
-        assert self._queue(monkeypatch, [{"id": "a", **self._missed()}], set()) == []
+    def test_schedule_not_opted_in_is_skipped(self, monkeypatch, brain_db):
+        assert (
+            self._queue(
+                monkeypatch, [{"id": "a", **self._missed()}], set(), brain_db=brain_db
+            )
+            == []
+        )
 
-    def test_schedule_that_already_ran_is_skipped(self, monkeypatch):
+    def test_schedule_that_already_ran_is_skipped(self, monkeypatch, brain_db):
         row = {"id": "a", **self._missed(), "last_run": datetime.now(UTC).isoformat()}
         row["last_status"] = "ok"
-        assert self._queue(monkeypatch, [row], {"a"}) == []
+        assert self._queue(monkeypatch, [row], {"a"}, brain_db=brain_db) == []
 
 
 @pytest.mark.asyncio
 class TestRunScheduleNowErrors:
-    async def test_unknown_schedule_raises(self):
+    async def test_unknown_schedule_raises(self, brain_db):
         with pytest.raises(ValueError, match="Schedule not found"):
             await sch.run_schedule_now(None, brain_db, "missing")
 
-    async def test_unknown_kind_raises(self):
+    async def test_unknown_kind_raises(self, brain_db):
         brain_db.upsert_schedule("odd", "Odd", "no_such_kind", "0 9 * * *")
         with pytest.raises(ValueError, match="Unknown generator kind"):
             await sch.run_schedule_now(None, brain_db, "odd")
 
-    async def test_generator_error_is_recorded_as_error(self, monkeypatch):
+    async def test_generator_error_is_recorded_as_error(self, monkeypatch, brain_db):
         async def boom(brain_db, **kw):
             raise RuntimeError("feed down")
 
@@ -419,7 +427,7 @@ class TestDurationAliases:
         with pytest.raises(ValueError, match="evenly"):
             sch._parse_cron(expr)
 
-    def test_uneven_alias_never_reaches_the_schedule_table(self, chat):
+    def test_uneven_alias_never_reaches_the_schedule_table(self, chat, brain_db):
         text = chat('/sched add bad cron "every 7h" -- morning_scan')
         assert text.startswith("Schedule not added")
         assert brain_db.list_schedules() == []
@@ -493,7 +501,7 @@ class TestSchedCommand:
     def test_list_empty_explains_how_to_add(self, chat):
         assert chat("/sched").startswith("No schedules configured")
 
-    def test_list_shows_status_and_paused_filter(self, chat):
+    def test_list_shows_status_and_paused_filter(self, chat, brain_db):
         brain_db.upsert_schedule("a1", "Morning", "morning_scan", "0 9 * * *")
         brain_db.upsert_schedule("b2", "Evening", "morning_scan", "0 18 * * *")
         assert "No paused schedules." == chat("/sched list --paused")
@@ -504,13 +512,13 @@ class TestSchedCommand:
         paused = chat("/sched list --paused")
         assert "Evening" in paused and "Morning" not in paused
 
-    def test_show_by_name_and_unknown(self, chat):
+    def test_show_by_name_and_unknown(self, chat, brain_db):
         brain_db.upsert_schedule("a1", "Morning", "morning_scan", "0 9 * * *")
         text = chat("/sched show a1")
         assert "Schedule: Morning (a1)" in text and "Cron: 0 9 * * *" in text
         assert chat("/sched info nope") == "Schedule not found: nope"
 
-    def test_add_persists_a_valid_schedule(self, chat):
+    def test_add_persists_a_valid_schedule(self, chat, brain_db):
         text = chat('/sched add nightly cron "0 2 * * *" -- morning_scan')
         assert text.startswith("Schedule added: nightly")
         rows = brain_db.list_schedules()
@@ -527,11 +535,11 @@ class TestSchedCommand:
             ('/sched add x cron "0 2 * * *" -- no_such_kind', "Schedule not added"),
         ],
     )
-    def test_add_rejects_bad_input_without_writing(self, chat, msg, reply):
+    def test_add_rejects_bad_input_without_writing(self, chat, msg, reply, brain_db):
         assert chat(msg).startswith(reply)
         assert brain_db.list_schedules() == []
 
-    def test_pause_resume_remove(self, chat):
+    def test_pause_resume_remove(self, chat, brain_db):
         brain_db.upsert_schedule("a1", "Morning", "morning_scan", "0 9 * * *")
         assert chat("/sched pause a1") == "Paused: Morning (a1)"
         assert brain_db.get_schedule("a1")["paused"]
@@ -541,7 +549,7 @@ class TestSchedCommand:
         assert brain_db.get_schedule("a1") is None
         assert chat("/sched pause a1") == "Schedule not found: a1"
 
-    def test_run_reports_error_status(self, chat, monkeypatch):
+    def test_run_reports_error_status(self, chat, monkeypatch, brain_db):
         async def boom(brain_db, **kw):
             raise RuntimeError("feed down")
 
@@ -628,7 +636,9 @@ class TestScanCommand:
         assert chat("/scan github traffic").startswith("No projects tracked")
         assert chat("/scan github traffic ghost") == "Project not found: ghost"
 
-    def test_github_traffic_unavailable_names_the_cause(self, chat, monkeypatch):
+    def test_github_traffic_unavailable_names_the_cause(
+        self, chat, monkeypatch, brain_db
+    ):
         brain_db.upsert_project("skrills", "athola", "skrills", [], [])
         monkeypatch.setattr(
             github_search, "get_self_traffic", AsyncMock(return_value=None)
@@ -665,7 +675,7 @@ class TestProjectsCommand:
     def test_empty_list(self, chat):
         assert chat("/projects").startswith("No projects tracked")
 
-    def test_add_show_list_remove(self, chat):
+    def test_add_show_list_remove(self, chat, brain_db):
         text = chat(
             "/projects add tool acme/tool --topics mcp,agents --subs ClaudeAI "
             '--posture "helpful first"'
@@ -692,13 +702,13 @@ class TestProjectsCommand:
             ("/projects frobnicate", "Usage:\n  /projects list"),
         ],
     )
-    def test_bad_input(self, chat, msg, reply):
+    def test_bad_input(self, chat, msg, reply, brain_db):
         assert chat(msg).startswith(reply)
         assert brain_db.list_projects() == []
 
 
 class TestTaskCommand:
-    def test_list_shows_active_queued_and_recent(self, chat):
+    def test_list_shows_active_queued_and_recent(self, chat, brain_db):
         active = brain_db.create_task("index the brain")
         brain_db.claim_task(active["id"])
         brain_db.create_task("draft the post", source="user")
@@ -715,7 +725,7 @@ class TestTaskCommand:
         assert chat("!tasks").startswith("Task queue is empty")
         assert chat("!task tail") == "No finished tasks yet."
 
-    def test_tail_is_newest_first(self, chat):
+    def test_tail_is_newest_first(self, chat, brain_db):
         for desc in ("first job", "second job"):
             t = brain_db.create_task(desc)
             brain_db.claim_task(t["id"])
@@ -724,7 +734,7 @@ class TestTaskCommand:
         assert text.startswith("Recent Tasks (last 2 finished)")
         assert text.index("second job") < text.index("first job")
 
-    def test_cancel_and_priority(self, chat):
+    def test_cancel_and_priority(self, chat, brain_db):
         t = brain_db.create_task("tidy the queue")
         assert chat(f"!task priority {t['id']} 9") == (
             f"Usage: !task priority {t['id']} <1-5>"
@@ -737,7 +747,7 @@ class TestTaskCommand:
         assert brain_db.get_task(t["id"])["status"] == "cancelled"
         assert chat("!task cancel nope") == "Task #nope not found."
 
-    def test_cancel_keeps_a_finished_result(self, chat):
+    def test_cancel_keeps_a_finished_result(self, chat, brain_db):
         t = brain_db.create_task("check the feeds")
         brain_db.claim_task(t["id"])
         brain_db.complete_task(t["id"], "all feeds healthy")
@@ -746,7 +756,7 @@ class TestTaskCommand:
         )
         assert brain_db.get_task(t["id"])["status"] == "completed"
 
-    def test_create_failure_is_reported(self, chat, monkeypatch):
+    def test_create_failure_is_reported(self, chat, monkeypatch, brain_db):
         monkeypatch.setattr(
             brain_db, "create_task", MagicMock(side_effect=RuntimeError("disk full"))
         )
@@ -765,39 +775,39 @@ class TestTierCommand:
 # ─── research_router: marketing scan branches ───────────────────────
 
 
-def _scan(description: str):
+def _scan(description: str, *, brain_db):
     return asyncio.run(research_router._try_marketing_scan(description, brain_db))
 
 
 class TestMarketingScanRouting:
-    def test_unknown_project_falls_through(self):
-        assert _scan("Scan reddit for ghost: weekly") is None
-        assert _scan("Scan github for ghost: weekly") is None
+    def test_unknown_project_falls_through(self, brain_db):
+        assert _scan("Scan reddit for ghost: weekly", brain_db=brain_db) is None
+        assert _scan("Scan github for ghost: weekly", brain_db=brain_db) is None
 
-    def test_reddit_scan_without_results(self, monkeypatch):
+    def test_reddit_scan_without_results(self, monkeypatch, brain_db):
         brain_db.upsert_project("tool", "acme", "tool", ["mcp"], ["ClaudeAI"])
         search = AsyncMock(return_value=[])
         monkeypatch.setattr(reddit_search, "search_subreddits", search)
-        assert _scan("Scan reddit for tool") == (
+        assert _scan("Scan reddit for tool", brain_db=brain_db) == (
             "Reddit scan for tool: no new relevant posts found."
         )
         # No search terms: the topics make the query.
         assert search.await_args.args == ("mcp", ["ClaudeAI"])
 
-    def test_reddit_scan_marks_only_shown_posts_seen(self, monkeypatch):
+    def test_reddit_scan_marks_only_shown_posts_seen(self, monkeypatch, brain_db):
         brain_db.upsert_project(
             "tool", "acme", "tool", [], ["ClaudeAI"], search_terms=["a", "b"]
         )
         posts = [_post(i) for i in range(1, 11)]
         search = AsyncMock(return_value=posts)
         monkeypatch.setattr(reddit_search, "search_subreddits", search)
-        text = _scan("Scan reddit for tool")
+        text = _scan("Scan reddit for tool", brain_db=brain_db)
         assert text.startswith("Reddit scan for tool (10 results)")
         assert search.await_args.args[0] == "a OR b"
         assert brain_db.is_seen("reddit_post", "p8", "tool")
         assert not brain_db.is_seen("reddit_post", "p9", "tool")
 
-    def test_github_scan_lists_repos_and_issues(self, monkeypatch):
+    def test_github_scan_lists_repos_and_issues(self, monkeypatch, brain_db):
         brain_db.upsert_project("tool", "acme", "tool", ["mcp"], [])
         monkeypatch.setattr(
             github_search, "search_repos", AsyncMock(return_value=[_repo(1, "x")])
@@ -805,22 +815,22 @@ class TestMarketingScanRouting:
         monkeypatch.setattr(
             github_search, "search_issues", AsyncMock(return_value=[_issue(3)])
         )
-        text = _scan("Scan github for tool")
+        text = _scan("Scan github for tool", brain_db=brain_db)
         assert text.startswith("GitHub scan for tool (1 repos, 1 issues)")
         assert "o/r1 (11*) — x" in text and "issue 3 — o/r#3" in text
         assert brain_db.is_seen("github_repo", "1", "tool")
 
-    def test_traffic_without_pat_is_an_answer(self, monkeypatch):
+    def test_traffic_without_pat_is_an_answer(self, monkeypatch, brain_db):
         monkeypatch.setattr(
             github_search, "get_self_traffic", AsyncMock(return_value=None)
         )
         monkeypatch.setattr(
             github_search, "is_configured", AsyncMock(return_value=False)
         )
-        text = _scan("Weekly traffic snapshot for acme/tool")
+        text = _scan("Weekly traffic snapshot for acme/tool", brain_db=brain_db)
         assert "needs GITHUB_PAT" in text
 
-    def test_traffic_api_failure_with_pat_is_a_failure(self, monkeypatch):
+    def test_traffic_api_failure_with_pat_is_a_failure(self, monkeypatch, brain_db):
         monkeypatch.setattr(
             github_search, "get_self_traffic", AsyncMock(return_value=None)
         )
@@ -828,10 +838,12 @@ class TestMarketingScanRouting:
             github_search, "is_configured", AsyncMock(return_value=True)
         )
         with pytest.raises(UpstreamError, match="API call failed"):
-            _scan("Weekly traffic snapshot for acme/tool")
+            _scan("Weekly traffic snapshot for acme/tool", brain_db=brain_db)
 
-    def test_awesome_list_watch_goes_to_the_llm(self):
-        assert _scan("Awesome-list watch: tool not yet listed") is None
+    def test_awesome_list_watch_goes_to_the_llm(self, brain_db):
+        assert (
+            _scan("Awesome-list watch: tool not yet listed", brain_db=brain_db) is None
+        )
 
-    def test_unmatched_description(self):
-        assert _scan("Write the weekly summary") is None
+    def test_unmatched_description(self, brain_db):
+        assert _scan("Write the weekly summary", brain_db=brain_db) is None

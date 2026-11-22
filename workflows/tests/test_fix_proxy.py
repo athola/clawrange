@@ -19,7 +19,6 @@ import chat_commands
 import llm_proxy
 import persona_api
 from persona_api import Proposal
-from tests import testapp
 
 TOKEN = "k1-test-token"
 GOOD = {"Authorization": f"Bearer {TOKEN}"}
@@ -40,31 +39,32 @@ def _reply(resp) -> str:
 # ─── #18 / B1: !persona and !learn run in-process ────────────────────
 
 
-class _Loopback(httpx.AsyncClient):
-    """An AsyncClient wired to the workflows app in-process."""
+def _loopback_to(app):
+    """An AsyncClient class wired to ``app`` in-process."""
 
-    def __init__(self, *args, **kwargs):
+    real = httpx.AsyncClient
 
-        kwargs["transport"] = httpx.ASGITransport(app=testapp.app)
-        super().__init__(*args, **kwargs)
+    class _Loopback(real):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.ASGITransport(app=app)
+            super().__init__(*args, **kwargs)
+
+    return _Loopback
 
 
 @pytest.fixture()
-def authed_app(monkeypatch):
-    """The real app with the real bearer check (conftest's bypass undone).
+def authed_app(monkeypatch, app, brain_db):
+    """This test's app with the real bearer check (conftest's bypass undone).
 
     Plain httpx clients are pointed at the same app in-process, so a
     loopback HTTP self-call (the old implementation) reaches the real auth
     dependency instead of a closed port: reverting the fix fails with 401.
     """
 
-    app = testapp.app
-    saved = app.dependency_overrides.pop(auth.require_token, None)
+    app.dependency_overrides.pop(auth.require_token, None)
     monkeypatch.setattr(llm_proxy, "PROXY_AUTH_TOKEN", TOKEN)
-    monkeypatch.setattr(httpx, "AsyncClient", _Loopback)
-    yield TestClient(app), testapp.brain_db
-    if saved is not None:
-        app.dependency_overrides[auth.require_token] = saved
+    monkeypatch.setattr(httpx, "AsyncClient", _loopback_to(app))
+    return TestClient(app), brain_db
 
 
 def _learnings(db, content: str) -> list[dict]:
@@ -361,11 +361,11 @@ class TestFailureReporting:
             text = _text(asyncio.run(llm_proxy._handle_non_streaming(BODY)))
         assert "rate-limited" in text
 
-    def test_chat_reply_lists_reasons_end_to_end(self, keys, monkeypatch):
+    def test_chat_reply_lists_reasons_end_to_end(self, keys, monkeypatch, app):
         monkeypatch.setattr(llm_proxy, "PROXY_AUTH_TOKEN", TOKEN)
         call = AsyncMock(return_value=httpx.Response(404, text="no such model"))
         with _balance(50.0), patch.object(llm_proxy, "_call_provider", call):
-            r = _chat(TestClient(testapp.app), "hello")
+            r = _chat(TestClient(app), "hello")
         assert "HTTP 404" in _reply(r)
 
     def test_background_notify_logs_every_event(self, caplog):
@@ -379,7 +379,7 @@ class TestFailureReporting:
 
 
 class TestToolCallHistory:
-    def test_assistant_tool_call_turn_survives_cleanup(self, keys, monkeypatch):
+    def test_assistant_tool_call_turn_survives_cleanup(self, keys, monkeypatch, app):
         monkeypatch.setattr(llm_proxy, "PROXY_AUTH_TOKEN", TOKEN)
         preamble = "Let me search the web for that first, then I'll gather context."
         assert llm_proxy._is_non_answer(preamble)  # would be stripped as a deferral
@@ -406,7 +406,7 @@ class TestToolCallHistory:
             return _ok()
 
         with _balance(50.0), patch.object(llm_proxy, "_call_provider", capture):
-            r = TestClient(testapp.app).post(
+            r = TestClient(app).post(
                 "/v1/chat/completions", json={"messages": messages}, headers=GOOD
             )
         assert r.status_code == 200
@@ -507,17 +507,17 @@ class TestAuthHardening:
         assert auth.warn_if_unset(PLACEHOLDER) is True
         assert "placeholder" in caplog.text
 
-    def test_placeholder_rejected_through_the_app(self, monkeypatch):
+    def test_placeholder_rejected_through_the_app(self, monkeypatch, app):
 
         monkeypatch.setattr(llm_proxy, "PROXY_AUTH_TOKEN", PLACEHOLDER)
-        saved = testapp.app.dependency_overrides.pop(auth.require_token, None)
+        saved = app.dependency_overrides.pop(auth.require_token, None)
         try:
-            r = TestClient(testapp.app).get(
+            r = TestClient(app).get(
                 "/task", headers={"Authorization": f"Bearer {PLACEHOLDER}"}
             )
         finally:
             if saved is not None:
-                testapp.app.dependency_overrides[auth.require_token] = saved
+                app.dependency_overrides[auth.require_token] = saved
         assert r.status_code == 401
 
     def test_env_example_ships_no_token_value(self):

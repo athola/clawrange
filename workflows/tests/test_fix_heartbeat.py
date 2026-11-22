@@ -20,11 +20,10 @@ import research_router
 import watchdog
 from brain_db import BrainDB
 from errors import UpstreamError
-from tests.testapp import brain_db
 
 
 @pytest.fixture()
-def db():
+def db(brain_db):
     return brain_db
 
 
@@ -43,7 +42,7 @@ def quiet(monkeypatch):
     monkeypatch.setattr("telegram.notify", AsyncMock(return_value=True))
 
 
-def _beat() -> None:
+def _beat(*, brain_db) -> None:
     asyncio.run(heartbeat._handle_heartbeat(False, brain_db=brain_db))
 
 
@@ -99,7 +98,7 @@ class TestWebKeywordsWordBoundary:
 
 
 class TestLlmUnavailable:
-    def test_work_task_raises_when_llm_unreachable(self):
+    def test_work_task_raises_when_llm_unreachable(self, brain_db):
         with (
             patch.object(llm_proxy, "_llm_call", AsyncMock(return_value=None)),
             patch.object(heartbeat, "_build_work_prompt", AsyncMock(return_value="P")),
@@ -109,11 +108,11 @@ class TestLlmUnavailable:
         assert isinstance(info.value, UpstreamError)
 
     @pytest.mark.usefixtures("quiet")
-    def test_outage_repends_task_with_one_digest_line(self, db):
+    def test_outage_repends_task_with_one_digest_line(self, db, brain_db):
         task = db.create_task("Summarize standup notes", source="user")
         with patch.object(llm_proxy, "_llm_call", AsyncMock(return_value=None)):
-            _beat()
-            _beat()
+            _beat(brain_db=brain_db)
+            _beat(brain_db=brain_db)
         after = db.get_task(task["id"])
         assert after["status"] == "pending"
         lines = [ln for ln in digest._digest_state["lines"] if task["id"] in ln]
@@ -121,40 +120,40 @@ class TestLlmUnavailable:
         assert "Could not reach" not in (after["result"] or "")
 
     @pytest.mark.usefixtures("quiet")
-    def test_outage_gives_up_after_retry_limit(self, db):
+    def test_outage_gives_up_after_retry_limit(self, db, brain_db):
         task = db.create_task("Summarize standup notes")
         with patch.object(llm_proxy, "_llm_call", AsyncMock(return_value=None)):
             for _ in range(heartbeat.LLM_RETRY_LIMIT):
-                _beat()
+                _beat(brain_db=brain_db)
         after = db.get_task(task["id"])
         assert after["status"] == "failed"
         assert "LLM" in after["result"]
 
     @pytest.mark.usefixtures("quiet")
-    def test_recovery_completes_and_resets_counter(self, db):
+    def test_recovery_completes_and_resets_counter(self, db, brain_db):
         task = db.create_task("Summarize standup notes")
         with patch.object(llm_proxy, "_llm_call", AsyncMock(return_value=None)):
-            _beat()
+            _beat(brain_db=brain_db)
         with patch.object(llm_proxy, "_llm_call", AsyncMock(return_value="done")):
-            _beat()
+            _beat(brain_db=brain_db)
         assert db.get_task(task["id"])["status"] == "completed"
         assert task["id"] not in heartbeat._llm_retry_counts
 
     @pytest.mark.usefixtures("quiet")
-    def test_scanner_upstream_error_marks_failed(self, db):
+    def test_scanner_upstream_error_marks_failed(self, db, brain_db):
         task = db.create_task("Scan reddit for skrills: pain points")
         with patch.object(
             heartbeat.research_router,
             "_try_marketing_scan",
             AsyncMock(side_effect=UpstreamError("reddit unreachable")),
         ):
-            _beat()
+            _beat(brain_db=brain_db)
         after = db.get_task(task["id"])
         assert after["status"] == "failed"
         assert "reddit unreachable" in after["result"]
 
     @pytest.mark.usefixtures("quiet")
-    def test_research_upstream_error_marks_failed(self, db):
+    def test_research_upstream_error_marks_failed(self, db, brain_db):
         """A plain UpstreamError from the research path is a failure, not
         an LLM outage: never re-pended."""
         task = db.create_task("Research sqlite-vec on GitHub")
@@ -170,14 +169,14 @@ class TestLlmUnavailable:
                 AsyncMock(side_effect=UpstreamError("all channels failed")),
             ),
         ):
-            _beat()
+            _beat(brain_db=brain_db)
         after = db.get_task(task["id"])
         assert after["status"] == "failed"
         assert "all channels failed" in after["result"]
         assert task["id"] not in heartbeat._llm_retry_counts
 
     @pytest.mark.usefixtures("quiet")
-    def test_falsy_scanner_result_is_not_repended(self, db):
+    def test_falsy_scanner_result_is_not_repended(self, db, brain_db):
         """Only the LLM-unreachable path re-pends; an empty scan result is a
         result."""
         task = db.create_task("Scan reddit for skrills: pain points")
@@ -186,7 +185,7 @@ class TestLlmUnavailable:
             "_try_marketing_scan",
             AsyncMock(return_value=""),
         ):
-            _beat()
+            _beat(brain_db=brain_db)
         assert db.get_task(task["id"])["status"] == "completed"
 
 
@@ -253,11 +252,11 @@ class TestTaskReleaseAndReap:
         assert "claimed_at" in old.claim_task(task["id"])
 
     @pytest.mark.usefixtures("quiet")
-    def test_heartbeat_reaps_with_digest_line(self, db):
+    def test_heartbeat_reaps_with_digest_line(self, db, brain_db):
         task = db.create_task("research:tome: stuck dig")
         db.claim_task(task["id"])
         _backdate(db, task["id"], "claimed_at", 30)
-        _beat()
+        _beat(brain_db=brain_db)
         assert db.get_task(task["id"])["status"] == "failed"
         assert any(
             task["id"] in ln and "active" in ln for ln in digest._digest_state["lines"]
@@ -280,28 +279,28 @@ class TestStaleNudgeDedup:
     def _setup(self, quiet, monkeypatch):
         monkeypatch.setenv("HEARTBEAT_LLM_SUGGEST", "0")
 
-    def _scan(self):
+    def _scan(self, *, brain_db):
         # Bypass the 30-minute timer so each heartbeat runs the stale scan.
         heartbeat._proactive_state.pop("stale_tasks", None)
         with patch.object(llm_proxy, "_llm_call", AsyncMock(return_value="Looked.")):
-            _beat()
+            _beat(brain_db=brain_db)
 
-    def test_three_heartbeats_create_one_nudge(self, db):
+    def test_three_heartbeats_create_one_nudge(self, db, brain_db):
         stale = db.create_task("research:tome: waits for the bridge")
         _backdate(db, stale["id"], "created_at", 5)
-        self._scan()  # creates the nudge
-        self._scan()  # works the nudge (heartbeat-owned)
-        self._scan()  # scans again: must not re-create it
+        self._scan(brain_db=brain_db)  # creates the nudge
+        self._scan(brain_db=brain_db)  # works the nudge (heartbeat-owned)
+        self._scan(brain_db=brain_db)  # scans again: must not re-create it
         assert len(_nudges(db)) == 1
 
-    def test_nudge_does_not_count_itself(self, db):
+    def test_nudge_does_not_count_itself(self, db, brain_db):
         old_nudge = db.create_task(f"{heartbeat.STALE_NUDGE_PREFIX} 1 task(s) old")
         _backdate(db, old_nudge["id"], "created_at", 30)
         # The only stale pending task is a 30h-old nudge, past the dedup
         # window; it must not trigger a fresh nudge about itself.
         with patch.object(heartbeat, "_next_heartbeat_task", return_value=None):
             heartbeat._proactive_state.pop("stale_tasks", None)
-            _beat()
+            _beat(brain_db=brain_db)
         assert len(_nudges(db)) == 1
 
 
@@ -314,7 +313,7 @@ class TestStaleNudgeClosesWithLiveQueue:
     def _setup(self, quiet, monkeypatch):
         monkeypatch.setenv("HEARTBEAT_LLM_SUGGEST", "0")
 
-    def test_nudge_names_each_waiting_task_by_owner_without_the_llm(self, db):
+    def test_nudge_names_each_waiting_task_by_owner_without_the_llm(self, db, brain_db):
         """GIVEN a tome task and an operator draft waiting over 4 hours
         WHEN the heartbeat creates and then works the stale nudge
         THEN it closes from the live queue, naming who each task waits on,
@@ -326,8 +325,8 @@ class TestStaleNudgeClosesWithLiveQueue:
         llm = AsyncMock(return_value="First, let me check the queue")
         with patch.object(llm_proxy, "_llm_call", llm):
             heartbeat._proactive_state.pop("stale_tasks", None)
-            _beat()  # creates the nudge
-            _beat()  # works it
+            _beat(brain_db=brain_db)  # creates the nudge
+            _beat(brain_db=brain_db)  # works it
         (nudge,) = _nudges(db)
         assert nudge["status"] == "completed"
         result = nudge["result"].lower()
@@ -363,7 +362,7 @@ class TestStaleNudgeClosesWithLiveQueue:
 
 class TestAlertDedup:
     @pytest.mark.usefixtures("quiet")
-    def test_each_tripped_tier_gets_its_own_alert(self, db, monkeypatch):
+    def test_each_tripped_tier_gets_its_own_alert(self, db, monkeypatch, brain_db):
         monkeypatch.setenv("HEARTBEAT_LLM_SUGGEST", "0")
         done = db.create_task("Investigate tier recovery: openrouter-free")
         db.claim_task(done["id"])
@@ -373,7 +372,7 @@ class TestAlertDedup:
             "_circuit_open",
             lambda name, probe=True: name in {"openrouter-free", "zai-direct"},
         )
-        _beat()
+        _beat(brain_db=brain_db)
         descs = [t["description"] for t in db.list_tasks()]
         assert descs.count("Investigate tier recovery: zai-direct") == 1
         assert descs.count("Investigate tier recovery: openrouter-free") == 1
@@ -400,10 +399,10 @@ class TestUnknownBalanceAlert:
             time.monotonic() - heartbeat.BALANCE_UNKNOWN_ALERT_SECS - 1,
         )
 
-    def test_brief_lookup_failure_does_not_alert(self, db, monkeypatch):
+    def test_brief_lookup_failure_does_not_alert(self, db, monkeypatch, brain_db):
         monkeypatch.setattr(heartbeat, "_balance_unknown_since", None)
         with patch.object(heartbeat, "_next_heartbeat_task", return_value=None):
-            _beat()
+            _beat(brain_db=brain_db)
         assert self._alerts(db) == []
 
     def _alerts(self, db):
@@ -413,27 +412,27 @@ class TestUnknownBalanceAlert:
             if t["description"].lower().startswith("balance unknown alert:")
         ]
 
-    def test_failed_lookup_creates_one_alert(self, db):
+    def test_failed_lookup_creates_one_alert(self, db, brain_db):
         with patch.object(heartbeat, "_next_heartbeat_task", return_value=None):
-            _beat()
-            _beat()
+            _beat(brain_db=brain_db)
+            _beat(brain_db=brain_db)
         alerts = self._alerts(db)
         assert len(alerts) == 1
         assert heartbeat._is_status_alert(alerts[0]["description"])
 
-    def test_no_key_means_no_alert(self, db, monkeypatch):
+    def test_no_key_means_no_alert(self, db, monkeypatch, brain_db):
         monkeypatch.delenv("OPENROUTER_API_KEY")
         with patch.object(heartbeat, "_next_heartbeat_task", return_value=None):
-            _beat()
+            _beat(brain_db=brain_db)
         assert self._alerts(db) == []
 
-    def test_unknown_alert_does_not_suppress_low_alert(self, db, monkeypatch):
+    def test_unknown_alert_does_not_suppress_low_alert(self, db, monkeypatch, brain_db):
         with patch.object(heartbeat, "_next_heartbeat_task", return_value=None):
-            _beat()
+            _beat(brain_db=brain_db)
             monkeypatch.setattr(
                 llm_proxy, "_check_openrouter_balance", AsyncMock(return_value=1.0)
             )
-            _beat()
+            _beat(brain_db=brain_db)
         assert any(
             t["description"].startswith("Low balance alert:") for t in db.list_tasks()
         )
@@ -442,7 +441,7 @@ class TestUnknownBalanceAlert:
         text = heartbeat._status_alert_result("Balance unknown alert: x", None)
         assert "HTTP 503" in text
 
-    def test_system_state_shows_lookup_error(self, db):
+    def test_system_state_shows_lookup_error(self, db, brain_db):
         text = asyncio.run(heartbeat._gather_system_state(brain_db))
         assert "unknown (lookup failed: HTTP 503)" in text
         assert "not configured" not in text
@@ -536,18 +535,18 @@ class TestWatchdogCompletionStamp:
         assert data == {"ts": 200.0, "done_ts": 100.0}
 
     @pytest.mark.usefixtures("quiet")
-    def test_handler_stamps_completion(self, wd):
-        _beat()
+    def test_handler_stamps_completion(self, wd, brain_db):
+        _beat(brain_db=brain_db)
         data = json.loads((wd / "seen.json").read_text())
         assert data["done_ts"] is not None
 
     @pytest.mark.usefixtures("quiet")
-    def test_handler_failure_leaves_completion_stale(self, wd, monkeypatch):
+    def test_handler_failure_leaves_completion_stale(self, wd, monkeypatch, brain_db):
         monkeypatch.setattr(
             digest, "_digest_due", lambda now=None: (_ for _ in ()).throw(OSError())
         )
         with pytest.raises(OSError):
-            _beat()
+            _beat(brain_db=brain_db)
         data = json.loads((wd / "seen.json").read_text())
         assert data.get("done_ts") is None
         assert data["ts"] is not None
@@ -705,7 +704,9 @@ class TestModuleLoggers:
         assert "llm_proxy.logger" not in source
         assert "print(" not in source
 
-    def test_heartbeat_suggestion_logs_under_heartbeat(self, monkeypatch, caplog):
+    def test_heartbeat_suggestion_logs_under_heartbeat(
+        self, monkeypatch, caplog, brain_db
+    ):
         monkeypatch.setattr(
             heartbeat, "_build_thinking_prompt", lambda s, c="", brain_db=None: "p"
         )

@@ -12,14 +12,10 @@ from chat_commands import _extract_task_command
 from persona_api import create_persona_router
 from research import Finding
 from tenant_profile import Profile
-from tests import testapp
-from tests.testapp import app
-
-client = TestClient(app)
 
 
 class TestHealthz:
-    def test_returns_ok(self):
+    def test_returns_ok(self, client):
         r = client.get("/healthz")
         assert r.status_code == 200
         data = r.json()
@@ -31,16 +27,16 @@ class TestHealthz:
 
 
 class TestWebhook:
-    def test_echo_contains_received(self):
+    def test_echo_contains_received(self, client):
         r = client.post("/webhook/test", json={"message": "ping"})
         assert r.status_code == 200
         assert "received" in r.json()["message"]
 
-    def test_echo_returns_keys(self):
+    def test_echo_returns_keys(self, client):
         r = client.post("/webhook/test", json={"a": 1, "b": 2})
         assert set(r.json()["payloadKeys"]) == {"a", "b"}
 
-    def test_empty_payload(self):
+    def test_empty_payload(self, client):
         r = client.post("/webhook/test", json={})
         assert "empty payload" in r.json()["message"]
 
@@ -59,7 +55,7 @@ class TestTierStatus:
         return_value=12.50,
     )
     @patch("llm_proxy._last_tier_used", "zai-direct")
-    def test_returns_tier_list(self, _mock_balance, monkeypatch):
+    def test_returns_tier_list(self, _mock_balance, monkeypatch, client):
         # /tier renders llm_proxy.describe_balance(), which reads the cache
         # the (mocked) balance check would have filled.
         monkeypatch.setenv("OPENROUTER_API_KEY", "k")
@@ -82,7 +78,7 @@ class TestTierStatus:
         "llm_proxy._check_openrouter_balance", new_callable=AsyncMock, return_value=None
     )
     @patch("llm_proxy._last_tier_used", None)
-    def test_handles_unconfigured_balance(self, _mock_balance):
+    def test_handles_unconfigured_balance(self, _mock_balance, client):
         r = client.get("/tier")
         data = r.json()
         assert data["balance_remaining"] == "not configured"
@@ -92,7 +88,7 @@ class TestTierStatus:
         "llm_proxy._check_openrouter_balance", new_callable=AsyncMock, return_value=5.0
     )
     @patch("llm_proxy._last_tier_used", None)
-    def test_tripped_tier_shows_tripped(self, _mock_balance):
+    def test_tripped_tier_shows_tripped(self, _mock_balance, client):
         # Trip the circuit breaker for a tier
         llm_proxy._circuit_state["openrouter-free"] = {
             "failures": llm_proxy.CIRCUIT_FAILURE_THRESHOLD,
@@ -119,7 +115,7 @@ class TestTierNotify:
         "llm_proxy._check_openrouter_balance", new_callable=AsyncMock, return_value=8.00
     )
     @patch("llm_proxy._last_tier_used", "zai-direct")
-    def test_sends_notification(self, _mock_balance, mock_notify):
+    def test_sends_notification(self, _mock_balance, mock_notify, client):
         r = client.post("/tier/notify")
         assert r.status_code == 200
         data = r.json()
@@ -133,7 +129,9 @@ class TestTierNotify:
         "llm_proxy._check_openrouter_balance", new_callable=AsyncMock, return_value=None
     )
     @patch("llm_proxy._last_tier_used", None)
-    def test_reports_failure_when_telegram_down(self, _mock_balance, mock_notify):
+    def test_reports_failure_when_telegram_down(
+        self, _mock_balance, mock_notify, client
+    ):
         r = client.post("/tier/notify")
         data = r.json()
         assert data["sent"] is False
@@ -148,7 +146,7 @@ class TestTaskQueue:
     WHEN tasks are created, listed, claimed, completed, and cancelled
     THEN the queue manages state transitions correctly with persistence."""
 
-    def test_create_task(self):
+    def test_create_task(self, client):
         r = client.post("/task", json={"description": "check z.ai models"})
         assert r.status_code == 200
         task = r.json()
@@ -157,11 +155,11 @@ class TestTaskQueue:
         assert task["priority"] == 3
         assert task["id"]
 
-    def test_list_empty_queue(self):
+    def test_list_empty_queue(self, client):
         r = client.get("/task")
         assert r.json() == {"tasks": [], "total": 0}
 
-    def test_list_with_filter(self):
+    def test_list_with_filter(self, client):
         client.post("/task", json={"description": "task a"})
         client.post("/task", json={"description": "task b"})
         r = client.get("/task?status=pending")
@@ -169,29 +167,29 @@ class TestTaskQueue:
         r = client.get("/task?status=completed")
         assert r.json()["total"] == 0
 
-    def test_get_task_by_id(self):
+    def test_get_task_by_id(self, client):
         task = client.post("/task", json={"description": "lookup"}).json()
         r = client.get(f"/task/{task['id']}")
         assert r.status_code == 200
         assert r.json()["description"] == "lookup"
 
-    def test_get_nonexistent_task(self):
+    def test_get_nonexistent_task(self, client):
         r = client.get("/task/nope")
         assert r.status_code == 404
 
-    def test_claim_task(self):
+    def test_claim_task(self, client):
         task = client.post("/task", json={"description": "work"}).json()
         r = client.post(f"/task/{task['id']}/claim")
         assert r.status_code == 200
         assert r.json()["status"] == "active"
 
-    def test_claim_non_pending_task_fails(self):
+    def test_claim_non_pending_task_fails(self, client):
         task = client.post("/task", json={"description": "work"}).json()
         client.post(f"/task/{task['id']}/claim")
         r = client.post(f"/task/{task['id']}/claim")
         assert r.status_code == 409
 
-    def test_complete_task_with_result(self):
+    def test_complete_task_with_result(self, client):
         task = client.post("/task", json={"description": "research"}).json()
         client.post(f"/task/{task['id']}/claim")
         r = client.post(
@@ -203,7 +201,7 @@ class TestTaskQueue:
         assert r.json()["result"] == "found 3 new models"
         assert r.json()["completed_at"] is not None
 
-    def test_fail_task(self):
+    def test_fail_task(self, client):
         task = client.post("/task", json={"description": "impossible"}).json()
         client.post(f"/task/{task['id']}/claim")
         r = client.post(
@@ -212,13 +210,13 @@ class TestTaskQueue:
         )
         assert r.json()["status"] == "failed"
 
-    def test_cancel_task(self):
+    def test_cancel_task(self, client):
         task = client.post("/task", json={"description": "nevermind"}).json()
         r = client.delete(f"/task/{task['id']}")
         assert r.status_code == 200
         assert r.json()["status"] == "cancelled"
 
-    def test_cancel_completed_task_fails(self):
+    def test_cancel_completed_task_fails(self, client):
         task = client.post("/task", json={"description": "done"}).json()
         client.post(f"/task/{task['id']}/claim")
         client.post(
@@ -228,7 +226,7 @@ class TestTaskQueue:
         r = client.delete(f"/task/{task['id']}")
         assert r.status_code == 409
 
-    def test_priority_ordering(self):
+    def test_priority_ordering(self, client):
         client.post("/task", json={"description": "low", "priority": 5})
         client.post("/task", json={"description": "urgent", "priority": 1})
         client.post("/task", json={"description": "normal", "priority": 3})
@@ -236,7 +234,7 @@ class TestTaskQueue:
         descriptions = [t["description"] for t in tasks]
         assert descriptions == ["urgent", "normal", "low"]
 
-    def test_priority_clamped(self):
+    def test_priority_clamped(self, client):
         task = client.post("/task", json={"description": "x", "priority": 99}).json()
         assert task["priority"] == 5
 
@@ -278,7 +276,7 @@ class TestTaskCommandDetection:
 class TestResearchEndpoint:
     """End-to-end tests for /research and /research/sessions."""
 
-    def test_post_research_persists_session(self, monkeypatch):
+    def test_post_research_persists_session(self, monkeypatch, client):
         async def fake_orch(topic, channels=None, **kwargs):
             return {
                 "topic": topic,
@@ -323,15 +321,15 @@ class TestResearchEndpoint:
         assert detail["findings"][0]["title"] == "Hit 1"
         assert detail["findings"][0]["metadata"]["score"] == 80
 
-    def test_empty_topic_returns_400(self):
+    def test_empty_topic_returns_400(self, client):
         r = client.post("/research", json={"topic": "   "})
         assert r.status_code == 400
 
-    def test_unknown_session_returns_404(self):
+    def test_unknown_session_returns_404(self, client):
         r = client.get("/research/sessions/no-such-session")
         assert r.status_code == 404
 
-    def test_healthz_research_lists_channels(self):
+    def test_healthz_research_lists_channels(self, client):
         r = client.get("/healthz/research")
         assert r.status_code == 200
         body = r.json()
@@ -350,7 +348,7 @@ class TestCurrentProfileGuard:
     """B1 regression: a broken profile.yaml must never resolve to the
     placeholder starter profile and render it over real persona files."""
 
-    def _persona_app(self, tmp_path):
+    def _persona_app(self, tmp_path, *, app):
         db = BrainDB(str(tmp_path / "b.db"))
         db.init_db()
         soul = tmp_path / "soul.md"
@@ -369,19 +367,21 @@ class TestCurrentProfileGuard:
         monkeypatch.setenv("CLAWRANGE_PROFILES_DIR", str(tmp_path / "profiles"))
         monkeypatch.setenv("CLAWRANGE_PROFILE", "broken")
 
-    def test_broken_profile_is_5xx_and_writes_nothing(self, tmp_path, monkeypatch):
+    def test_broken_profile_is_5xx_and_writes_nothing(self, tmp_path, monkeypatch, app):
         self._break_profile(tmp_path, monkeypatch)
-        monkeypatch.delattr(testapp.app.state, "profile", raising=False)
-        persona_client, soul = self._persona_app(tmp_path)
+        monkeypatch.delattr(app.state, "profile", raising=False)
+        persona_client, soul = self._persona_app(tmp_path, app=app)
         r = persona_client.post("/persona/render")
         assert r.status_code >= 500
         assert not soul.exists()
 
-    def test_broken_profile_falls_back_to_boot_profile(self, tmp_path, monkeypatch):
+    def test_broken_profile_falls_back_to_boot_profile(
+        self, tmp_path, monkeypatch, app
+    ):
         self._break_profile(tmp_path, monkeypatch)
         boot = Profile(name="cos", raw={"profile": "cos", "assistant": {"name": "Max"}})
-        monkeypatch.setattr(testapp.app.state, "profile", boot, raising=False)
-        persona_client, soul = self._persona_app(tmp_path)
+        monkeypatch.setattr(app.state, "profile", boot, raising=False)
+        persona_client, soul = self._persona_app(tmp_path, app=app)
         r = persona_client.post("/persona/render")
         assert r.status_code == 200
         assert soul.exists()
@@ -392,34 +392,33 @@ class TestTaskInputBounds:
     """POST /task is the queue's public entry: callers may not spoof an
     internal source (persona, schedule, ...) or submit unbounded text."""
 
-    def test_rejects_internal_source(self):
+    def test_rejects_internal_source(self, client):
         r = client.post("/task", json={"description": "x", "source": "persona"})
         assert r.status_code == 422
 
-    def test_accepts_user_and_system(self):
+    def test_accepts_user_and_system(self, client):
         for src in ("user", "system"):
             r = client.post("/task", json={"description": "x", "source": src})
             assert r.status_code == 200, src
 
-    def test_rejects_oversized_description(self):
+    def test_rejects_oversized_description(self, client):
         r = client.post("/task", json={"description": "x" * 4001})
         assert r.status_code == 422
 
-    def test_rejects_empty_description(self):
+    def test_rejects_empty_description(self, client):
         r = client.post("/task", json={"description": "   "})
         assert r.status_code == 422
 
 
 class TestEmbeddingWiring:
-    def test_startup_uses_configured_model_table(self):
+    def test_startup_uses_configured_model_table(self, brain_db):
         import embeddings
-        from tests.testapp import brain_db
 
         if not brain_db._has_vec:
             pytest.skip("sqlite-vec unavailable")
         assert brain_db._vec_table == embeddings.config().table
 
-    def test_healthz_reports_embedding_model(self):
+    def test_healthz_reports_embedding_model(self, client):
         import embeddings
 
         data = client.get("/healthz").json()["brain"]

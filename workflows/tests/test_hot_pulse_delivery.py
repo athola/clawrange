@@ -7,11 +7,10 @@ import pytest
 import generators
 import reddit_search
 from reddit_search import RedditPost
-from tests.testapp import brain_db
 
 
 @pytest.fixture(autouse=True)
-def _pulse_state(monkeypatch):
+def _pulse_state(monkeypatch, brain_db):
     monkeypatch.setattr(generators, "_is_quiet_hours", lambda *a, **kw: False)
     monkeypatch.setattr(generators, "_HOT_PULSE_IN_QUIET_HOURS", False)
     monkeypatch.setattr(generators, "_LAST_HOT_PULSE_DELIVERY_AT", None)
@@ -51,7 +50,7 @@ def _wire(monkeypatch, posts, sent):
 
 
 @pytest.mark.asyncio
-async def test_title_cannot_break_or_inject_markdown_link(monkeypatch):
+async def test_title_cannot_break_or_inject_markdown_link(monkeypatch, brain_db):
     sent: list[str] = []
     evil = "claude code plugin](http://evil.test) *bold* _x_ [y"
     _wire(monkeypatch, [_post(1, evil)], sent)
@@ -62,7 +61,7 @@ async def test_title_cannot_break_or_inject_markdown_link(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_long_pulse_is_split_and_nothing_over_limit(monkeypatch):
+async def test_long_pulse_is_split_and_nothing_over_limit(monkeypatch, brain_db):
     sent: list[str] = []
     _wire(monkeypatch, [_post(i) for i in range(25)], sent)
     await generators.hot_pulse_generator(brain_db)
@@ -72,7 +71,7 @@ async def test_long_pulse_is_split_and_nothing_over_limit(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_only_rendered_picks_are_marked_seen(monkeypatch):
+async def test_only_rendered_picks_are_marked_seen(monkeypatch, brain_db):
     sent: list[str] = []
     _wire(monkeypatch, [_post(i) for i in range(5)], sent)
     await generators.hot_pulse_generator(brain_db, max_per_project=2)
@@ -84,7 +83,9 @@ async def test_only_rendered_picks_are_marked_seen(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_partial_delivery_marks_nothing_and_records_failure(monkeypatch):
+async def test_partial_delivery_marks_nothing_and_records_failure(
+    monkeypatch, brain_db
+):
     monkeypatch.setattr(
         "telegram.notify_long", AsyncMock(return_value=(1, 2)), raising=True
     )
@@ -101,7 +102,7 @@ async def test_partial_delivery_marks_nothing_and_records_failure(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_reddit_outage_is_visible_in_status(monkeypatch):
+async def test_reddit_outage_is_visible_in_status(monkeypatch, brain_db):
     seen_kwargs: dict = {}
 
     async def blocked(*a, **kw):

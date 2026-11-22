@@ -9,16 +9,12 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 from fastapi.responses import JSONResponse
-from fastapi.testclient import TestClient
 
 import digest
 import heartbeat
 import llm_proxy
 import research_router
 import telegram
-from tests.testapp import app, brain_db
-
-client = TestClient(app)
 
 CHAT_BODY = {
     "messages": [{"role": "user", "content": "hello"}],
@@ -106,11 +102,11 @@ async def _openrouter_502(provider, models, body, api_key):
 class TestProxyAuth:
     """Verify auth is enforced."""
 
-    def test_rejects_missing_auth(self):
+    def test_rejects_missing_auth(self, client):
         r = client.post("/v1/chat/completions", json=CHAT_BODY)
         assert r.status_code == 401
 
-    def test_rejects_wrong_token(self):
+    def test_rejects_wrong_token(self, client):
         r = client.post(
             "/v1/chat/completions",
             json=CHAT_BODY,
@@ -120,7 +116,7 @@ class TestProxyAuth:
 
     @patch("llm_proxy._background_notify")
     @patch("llm_proxy._call_provider", side_effect=_all_succeed)
-    def test_accepts_valid_token(self, _mock_call, _mock_bg):
+    def test_accepts_valid_token(self, _mock_call, _mock_bg, client):
         _reset_state()
         r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
         assert r.status_code == 200
@@ -139,7 +135,7 @@ class TestProxyTierFallback:
 
     @patch("llm_proxy._background_notify")
     @patch("llm_proxy._call_provider", side_effect=_all_succeed)
-    def test_all_succeed_returns_a_free_tier(self, mock_call, mock_bg):
+    def test_all_succeed_returns_a_free_tier(self, mock_call, mock_bg, client):
         """With concurrent dispatch, any available free tier can win the race."""
         r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
         assert r.status_code == 200
@@ -151,7 +147,9 @@ class TestProxyTierFallback:
 
     @patch("llm_proxy._background_notify")
     @patch("llm_proxy._call_provider", side_effect=_openrouter_rate_limited)
-    def test_default_routes_to_zai_skipping_openrouter(self, mock_call, mock_bg):
+    def test_default_routes_to_zai_skipping_openrouter(
+        self, mock_call, mock_bg, client
+    ):
         """Default forces zai-direct; openrouter is never tried."""
         r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
         assert r.status_code == 200
@@ -162,7 +160,7 @@ class TestProxyTierFallback:
     @patch("llm_proxy._check_openrouter_balance", new_callable=AsyncMock)
     @patch("llm_proxy._call_provider", side_effect=_all_succeed)
     def test_zero_balance_routes_around_openrouter(
-        self, mock_call, mock_balance, mock_tg, _mock_bg
+        self, mock_call, mock_balance, mock_tg, _mock_bg, client
     ):
         """A zero/negative balance blocks every OpenRouter model (free
         included) with 402s — skip the provider entirely so zai-direct
@@ -185,7 +183,7 @@ class TestProxyTierFallback:
     @patch("llm_proxy._check_openrouter_balance", new_callable=AsyncMock)
     @patch("llm_proxy._call_provider", side_effect=_all_succeed)
     def test_balance_guard_notify_throttled(
-        self, mock_call, mock_balance, mock_tg, _mock_bg
+        self, mock_call, mock_balance, mock_tg, _mock_bg, client
     ):
         """The skip notice fires at most once per debounce window, not
         once per skipped tier per request."""
@@ -210,7 +208,7 @@ class TestProxyTierFallback:
 
     @patch("llm_proxy._background_notify")
     @patch("llm_proxy._call_provider", side_effect=_all_rate_limited)
-    def test_all_tiers_exhausted_returns_synthetic(self, mock_call, mock_bg):
+    def test_all_tiers_exhausted_returns_synthetic(self, mock_call, mock_bg, client):
         """When all tiers are rate limited, return a friendly synthetic response."""
         r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
         assert r.status_code == 200
@@ -222,13 +220,13 @@ class TestProxyTierFallback:
 
     @patch("llm_proxy._background_notify")
     @patch("llm_proxy._call_provider", side_effect=_openrouter_502)
-    def test_tier1_500_falls_back(self, mock_call, _mock_bg):
+    def test_tier1_500_falls_back(self, mock_call, _mock_bg, client):
         r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
         assert r.status_code == 200
         assert r.json()["_clawrange_tier"] == "zai-direct"
 
     @patch("llm_proxy._background_notify")
-    def test_synthetic_response_stripped_from_history(self, _mock_bg):
+    def test_synthetic_response_stripped_from_history(self, _mock_bg, client):
         """Synthetic 'on pause' messages in chat history must be stripped so the LLM
         doesn't parrot them back."""
         messages = [
@@ -260,7 +258,7 @@ class TestProxyTierFallback:
             assert not any(m["role"] == "assistant" for m in sent_messages)
 
     @patch("llm_proxy._background_notify")
-    def test_hallucinated_tool_calls_stripped_from_history(self, _mock_bg):
+    def test_hallucinated_tool_calls_stripped_from_history(self, _mock_bg, client):
         """Assistant messages with hallucinated <exec> tags must be stripped."""
         messages = [
             {"role": "user", "content": "research some skills"},
@@ -287,7 +285,9 @@ class TestProxyTierFallback:
 
     @patch("llm_proxy._background_notify")
     @patch("llm_proxy._call_provider")
-    def test_reasoning_content_used_when_content_empty(self, mock_call, _mock_bg):
+    def test_reasoning_content_used_when_content_empty(
+        self, mock_call, _mock_bg, client
+    ):
         """GLM 5.1 reasoning models put output in reasoning_content — proxy merges
         it."""
         reasoning_body = {
@@ -315,7 +315,9 @@ class TestProxyTierFallback:
 
     @patch("llm_proxy._background_notify")
     @patch("llm_proxy._call_provider")
-    def test_reasoning_content_used_when_content_null(self, mock_call, _mock_bg):
+    def test_reasoning_content_used_when_content_null(
+        self, mock_call, _mock_bg, client
+    ):
         """Z.AI sometimes returns content: null — proxy merges reasoning_content."""
         reasoning_body = {
             "id": "test",
@@ -384,7 +386,7 @@ class TestProxyTierFallback:
         assert "tool_call" not in cleaned
 
     @patch("llm_proxy._background_notify")
-    def test_hallucinated_tool_call_response_falls_to_next_tier(self, _mock_bg):
+    def test_hallucinated_tool_call_response_falls_to_next_tier(self, _mock_bg, client):
         """When a tier returns *only* hallucinated <tool_call:NAME> XML
         (the John-117 ops-task failure mode), sanitization empties the
         response and the race must skip to the next tier — not return the
@@ -427,7 +429,9 @@ class TestProxyTierFallback:
             assert "Stack is healthy" in data["choices"][0]["message"]["content"]
 
     @patch("llm_proxy._background_notify")
-    def test_anti_hallucination_injected_even_when_tools_present(self, _mock_bg):
+    def test_anti_hallucination_injected_even_when_tools_present(
+        self, _mock_bg, client
+    ):
         """The original gate skipped anti-hallucination when body.tools
         existed, trusting the model to use real function calls. Free-tier
         upstreams fake tool calls instead — the rule must always run, with
@@ -457,7 +461,7 @@ class TestProxyTierFallback:
             assert "tool_call" in last or "xml" in last or "bracket" in last
 
     @patch("llm_proxy._background_notify")
-    def test_garbled_response_falls_to_next_tier(self, _mock_bg):
+    def test_garbled_response_falls_to_next_tier(self, _mock_bg, client):
         """If a tier returns garbled (no-space) text, skip it and try next."""
         garbled_body = {
             "id": "test",
@@ -498,7 +502,7 @@ class TestProxyBodyAllowlist:
         _reset_state()
 
     @patch("llm_proxy._background_notify")
-    def test_strips_dangerous_fields_but_keeps_tools(self, _mock_bg):
+    def test_strips_dangerous_fields_but_keeps_tools(self, _mock_bg, client):
         """Dangerous fields (model override, route) are stripped.
         tools/tool_choice are allowed through for heartbeat tool use."""
         mock_caller = AsyncMock(return_value=_mock_response(200))
@@ -531,7 +535,7 @@ class TestProxyCircuitBreaker:
         _reset_state()
 
     @patch("llm_proxy._background_notify")
-    def test_rate_limit_trips_circuit_immediately(self, _mock_bg):
+    def test_rate_limit_trips_circuit_immediately(self, _mock_bg, client):
         """A single 429 should trip the circuit — no need for 3 failures.
 
         With concurrent racing, OpenRouter-free still serves when ZAI is tripped.
@@ -557,7 +561,7 @@ class TestProxyCircuitBreaker:
             assert call_count["zai"] == 1  # NOT called again
 
     @patch("llm_proxy._background_notify")
-    def test_transient_errors_still_need_threshold(self, _mock_bg):
+    def test_transient_errors_still_need_threshold(self, _mock_bg, client):
         """Non-rate-limit errors should require CIRCUIT_FAILURE_THRESHOLD failures.
 
         With concurrent racing, OpenRouter-free serves while ZAI accumulates
@@ -638,7 +642,7 @@ class TestBalanceGuard:
 class TestTierCommand:
     """Verify /tier command interception returns synthetic response."""
 
-    def test_tier_command_intercepted(self):
+    def test_tier_command_intercepted(self, client):
         for cmd in [
             "/tier",
             "!tier",
@@ -662,7 +666,7 @@ class TestTierCommand:
             content = r.json()["choices"][0]["message"]["content"]
             assert "Tier Status" in content, f"Missing status for command: {cmd}"
 
-    def test_command_with_metadata_prefix(self):
+    def test_command_with_metadata_prefix(self, client):
         """Status command works even with OpenClaw metadata prefix."""
         msg = (
             'Context (untrusted metadata):\n```json\n{"channel": "telegram"}'
@@ -677,7 +681,7 @@ class TestTierCommand:
         content = r.json()["choices"][0]["message"]["content"]
         assert "Tier Status" in content
 
-    def test_command_with_unknown_prefix(self):
+    def test_command_with_unknown_prefix(self, client):
         """Status command matches via last-line fallback even if metadata regex
         fails."""
         msg = "some unrecognized metadata block\nclaw status"
@@ -690,7 +694,7 @@ class TestTierCommand:
         content = r.json()["choices"][0]["message"]["content"]
         assert "Tier Status" in content
 
-    def test_normal_message_not_intercepted(self):
+    def test_normal_message_not_intercepted(self, client):
         """A normal message should NOT trigger the tier command."""
         r = client.post(
             "/v1/chat/completions",
@@ -705,7 +709,7 @@ class TestTierCommand:
 class TestHelpCommand:
     """Verify !help command returns full command reference."""
 
-    def test_help_command_intercepted(self):
+    def test_help_command_intercepted(self, client):
         for cmd in ["!help", "/help", "help", "!commands", "/commands"]:
             r = client.post(
                 "/v1/chat/completions",
@@ -718,7 +722,7 @@ class TestHelpCommand:
                 f"Missing reference for: {cmd}"
             )
 
-    def test_help_includes_all_sections(self):
+    def test_help_includes_all_sections(self, client):
         r = client.post(
             "/v1/chat/completions",
             json={"messages": [{"role": "user", "content": "!help"}]},
@@ -741,7 +745,7 @@ class TestHelpCommand:
         assert "!persona reflect" in content
         assert "!learn" in content
 
-    def test_help_with_metadata_prefix(self):
+    def test_help_with_metadata_prefix(self, client):
         msg = "some metadata block\n!help"
         r = client.post(
             "/v1/chat/completions",
@@ -837,7 +841,7 @@ class TestAutoRetry:
 
     @patch("llm_proxy._background_notify")
     @patch("llm_proxy.asyncio.sleep", new_callable=AsyncMock)
-    def test_auto_retries_on_short_rate_limit(self, mock_sleep, _mock_bg):
+    def test_auto_retries_on_short_rate_limit(self, mock_sleep, _mock_bg, client):
         """When ALL free tiers 429 with short reset, proxy waits and retries."""
         attempt = {"n": 0}
 
@@ -858,7 +862,7 @@ class TestAutoRetry:
             mock_sleep.assert_awaited_once_with(5)
 
     @patch("llm_proxy._background_notify")
-    def test_no_retry_when_reset_too_long(self, _mock_bg):
+    def test_no_retry_when_reset_too_long(self, _mock_bg, client):
         """When reset time exceeds MAX_AUTO_RETRY_WAIT, return synthetic immediately."""
 
         async def mock_call(provider, models, body, api_key):
@@ -876,7 +880,7 @@ class TestAutoRetry:
 
     @patch("llm_proxy._background_notify")
     @patch("llm_proxy.asyncio.sleep", new_callable=AsyncMock)
-    def test_retry_fails_returns_synthetic(self, mock_sleep, _mock_bg):
+    def test_retry_fails_returns_synthetic(self, mock_sleep, _mock_bg, client):
         """If retry also fails, return synthetic response (no infinite loop)."""
 
         async def mock_call(provider, models, body, api_key):
@@ -906,7 +910,7 @@ class TestConcurrentDispatch:
         _reset_state()
 
     @patch("llm_proxy._background_notify")
-    def test_slow_tier_loses_to_fast_tier(self, _mock_bg):
+    def test_slow_tier_loses_to_fast_tier(self, _mock_bg, client):
         """When one tier is slow and another is fast, the fast one wins."""
         import asyncio
 
@@ -922,7 +926,7 @@ class TestConcurrentDispatch:
             assert r.json()["_clawrange_tier"] == "zai-direct"
 
     @patch("llm_proxy._background_notify")
-    def test_request_deadline_returns_synthetic(self, _mock_bg):
+    def test_request_deadline_returns_synthetic(self, _mock_bg, client):
         """When all tiers exceed the request deadline, return a timeout response."""
         import asyncio
 
@@ -946,7 +950,7 @@ class TestConcurrentDispatch:
             __import__("llm_proxy").REQUEST_DEADLINE = original_deadline
 
     @patch("llm_proxy._background_notify")
-    def test_one_tier_fails_other_succeeds(self, _mock_bg):
+    def test_one_tier_fails_other_succeeds(self, _mock_bg, client):
         """When one tier errors and another succeeds, the success wins."""
 
         async def mock_call(provider, models, body, api_key):
@@ -1104,7 +1108,7 @@ class TestNonAnswerDetection:
     @patch.dict("os.environ", FAKE_ENV)
     @patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
     @patch("llm_proxy._background_notify")
-    def test_non_answer_falls_to_next_tier(self, _mock_bg):
+    def test_non_answer_falls_to_next_tier(self, _mock_bg, client):
         """If one tier returns a deferral, the other tier's response wins."""
         _reset_state()
 
@@ -1380,7 +1384,7 @@ class TestWorkPromptPersonaRouting:
 
     @patch.dict("os.environ", FAKE_ENV)
     @patch("heartbeat._load_soul")
-    def test_search_prompt_omits_halo_character_tokens(self, mock_soul):
+    def test_search_prompt_omits_halo_character_tokens(self, mock_soul, brain_db):
         import asyncio
 
         from heartbeat import _build_work_prompt
@@ -1409,7 +1413,7 @@ class TestWorkPromptPersonaRouting:
 
     @patch.dict("os.environ", FAKE_ENV)
     @patch("heartbeat._load_soul")
-    def test_non_search_prompt_keeps_full_persona(self, mock_soul):
+    def test_non_search_prompt_keeps_full_persona(self, mock_soul, brain_db):
         """Regression guard: direct chat (no web search) still needs the
         full John-117 character for in-character replies. The strip only
         applies to search-tier routes."""
@@ -1598,7 +1602,7 @@ class TestStreamingReturnsSSE:
 
     @patch("llm_proxy._background_notify")
     @patch("llm_proxy._call_provider", side_effect=_all_succeed)
-    def test_stream_request_returns_sse(self, _mock_call, _mock_bg):
+    def test_stream_request_returns_sse(self, _mock_call, _mock_bg, client):
         """A stream=true request should return text/event-stream with valid SSE."""
         r = client.post(
             "/v1/chat/completions",
@@ -1611,7 +1615,7 @@ class TestStreamingReturnsSSE:
 
     @patch("llm_proxy._background_notify")
     @patch("llm_proxy._call_provider", side_effect=_all_succeed)
-    def test_non_stream_request_returns_json(self, _mock_call, _mock_bg):
+    def test_non_stream_request_returns_json(self, _mock_call, _mock_bg, client):
         """A stream=false request should return regular JSON."""
         r = client.post(
             "/v1/chat/completions",
@@ -1623,7 +1627,7 @@ class TestStreamingReturnsSSE:
         assert "choices" in r.json()
 
     @patch("llm_proxy._background_notify")
-    def test_stream_sanitizes_garbled_and_tool_tags(self, _mock_bg):
+    def test_stream_sanitizes_garbled_and_tool_tags(self, _mock_bg, client):
         """Streaming requests get full sanitization (garbled + tool tag removal)."""
         garbled_tool_body = {
             "id": "test",
@@ -2663,7 +2667,9 @@ class TestResearchRouter:
         assert result is None
 
     @patch("research.orchestrate_research", new_callable=AsyncMock)
-    def test_heartbeat_processes_research_task_via_orchestrator(self, mock_orch):
+    def test_heartbeat_processes_research_task_via_orchestrator(
+        self, mock_orch, app, brain_db, client
+    ):
         """A queued research task completes with real citable URLs, and
         the heartbeat response stays silent (digest carries it)."""
         import time as _t
@@ -2736,11 +2742,6 @@ class TestHeartbeatInterceptor:
 
     def setup_method(self):
         _reset_state()
-        # Clear persistent task queue via brain_db
-
-        for table in ("tasks",):
-            brain_db._conn.execute(f"DELETE FROM {table}")
-        brain_db._conn.commit()
 
     def _heartbeat_body(self):
         return {
@@ -2757,7 +2758,7 @@ class TestHeartbeatInterceptor:
             ],
         }
 
-    def test_heartbeat_intercepted_no_llm_call(self):
+    def test_heartbeat_intercepted_no_llm_call(self, client):
         """Heartbeat message should NOT call the LLM provider for basic checks."""
         import time as _time
 
@@ -2775,7 +2776,7 @@ class TestHeartbeatInterceptor:
             assert r.status_code == 200
             mock_caller.assert_not_called()
 
-    def test_automation_job_heartbeat_is_intercepted(self):
+    def test_automation_job_heartbeat_is_intercepted(self, client):
         """GIVEN the heartbeat as OpenClaw 2026.11.6 automations send it,
         tagged [cron:<id> <name>]
         WHEN it reaches the proxy with nothing to report
@@ -2800,7 +2801,9 @@ class TestHeartbeatInterceptor:
         assert r.json()["choices"][0]["message"]["content"] == "NO_REPLY"
 
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
-    def test_heartbeat_processes_pending_task_hourly_digest(self, mock_notify):
+    def test_heartbeat_processes_pending_task_hourly_digest(
+        self, mock_notify, app, brain_db, client
+    ):
         """Task completions buffer into the hourly digest: no per-completion
         Telegram notification, silent heartbeat response, and the buffered
         result delivered as the next digest once the hour elapses."""
@@ -2871,7 +2874,9 @@ class TestHeartbeatInterceptor:
         )
 
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
-    def test_digest_carries_long_results_unclipped(self, mock_notify):
+    def test_digest_carries_long_results_unclipped(
+        self, mock_notify, app, brain_db, client
+    ):
         """Research-shaped results ran past the old 500-char digest clip and
         arrived cut mid-word. A result now gets most of a Telegram message:
         the sentinel at char 2,000 must survive, bounded by the send limit."""
@@ -2919,7 +2924,7 @@ class TestHeartbeatInterceptor:
     @patch("heartbeat._llm_suggest_task", new_callable=AsyncMock, return_value=None)
     @patch("llm_proxy._check_openrouter_balance", new_callable=AsyncMock)
     def test_low_balance_alert_not_recreated_after_completion(
-        self, mock_balance, _mock_suggest
+        self, mock_balance, _mock_suggest, brain_db, client
     ):
         """A completed alert within 24h suppresses new alerts: the old
         pending-only dedup recreated the alert every cycle, spamming
@@ -2957,7 +2962,7 @@ class TestHeartbeatInterceptor:
     @patch("llm_proxy._call_provider", new_callable=AsyncMock)
     @patch("llm_proxy._check_openrouter_balance", new_callable=AsyncMock)
     def test_status_alert_closes_with_live_facts_not_llm(
-        self, mock_balance, mock_caller
+        self, mock_balance, mock_caller, brain_db, client
     ):
         """A queued balance alert (e.g. a phantom negative recorded before
         the credits-API fix) completes with the LIVE balance from Python —
@@ -2988,7 +2993,7 @@ class TestHeartbeatInterceptor:
     @patch("llm_proxy._call_provider", new_callable=AsyncMock)
     @patch("llm_proxy._check_openrouter_balance", new_callable=AsyncMock)
     def test_tier_recovery_alert_closes_with_live_state(
-        self, mock_balance, mock_caller
+        self, mock_balance, mock_caller, brain_db, client
     ):
         """Tier-recovery alert tasks also close in Python with the current
         circuit state."""
@@ -3015,7 +3020,7 @@ class TestHeartbeatInterceptor:
         assert "openrouter-free" in done["result"]
         assert "recovered (circuit closed)" in done["result"]
 
-    def test_heartbeat_silent_when_no_issues(self):
+    def test_heartbeat_silent_when_no_issues(self, client):
         """With no pending tasks, no infra issues, and proactive checks
         not yet due, reply NO_REPLY: the token OpenClaw automations treat
         as a quiet result (an empty reply can surface a missing-answer notice)."""
@@ -3034,7 +3039,7 @@ class TestHeartbeatInterceptor:
         assert content == "NO_REPLY"
 
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
-    def test_heartbeat_stale_task_detection(self, mock_notify):
+    def test_heartbeat_stale_task_detection(self, mock_notify, brain_db, client):
         """Heartbeat processes stale pending tasks and creates nudge tasks."""
         import llm_proxy
 
@@ -3090,7 +3095,7 @@ class TestHeartbeatInterceptor:
         return_value=["Strix Halo 128GB"],
     )
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
-    def test_heartbeat_llm_thinking(self, mock_notify, _subjects):
+    def test_heartbeat_llm_thinking(self, mock_notify, _subjects, brain_db, client):
         """The heartbeat asks the LLM for a task suggestion when due."""
 
         # Ensure LLM thinking is ready to fire, stale tasks is not
@@ -3141,7 +3146,7 @@ class TestHeartbeatInterceptor:
         llm_tasks = [t for t in all_tasks if "Strix Halo 128GB" in t["description"]]
         assert len(llm_tasks) == 1
 
-    def _think_with(self, suggestion: str) -> list[dict]:
+    def _think_with(self, suggestion: str, *, brain_db, client) -> list[dict]:
         """Run one heartbeat whose LLM thinking returns `suggestion`."""
 
         heartbeat._proactive_state.pop("llm_thinking", None)
@@ -3167,7 +3172,9 @@ class TestHeartbeatInterceptor:
         return [t for t in brain_db.list_tasks() if t["description"] == suggestion]
 
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
-    def test_heartbeat_thinking_off_switch(self, _notify, monkeypatch):
+    def test_heartbeat_thinking_off_switch(
+        self, _notify, monkeypatch, brain_db, client
+    ):
         """HEARTBEAT_LLM_SUGGEST=0 stops self-invented work entirely."""
         monkeypatch.setenv("HEARTBEAT_LLM_SUGGEST", "0")
         suggestion = (
@@ -3191,18 +3198,18 @@ class TestHeartbeatInterceptor:
         assert not [t for t in brain_db.list_tasks() if t["description"] == suggestion]
 
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
-    def test_heartbeat_drops_ungrounded_task(self, _notify):
+    def test_heartbeat_drops_ungrounded_task(self, _notify, brain_db, client):
         """The real 23d5f755: needs internal docs no worker path can read."""
         suggestion = TestGroundedThinking.INVENTED[0]
-        assert self._think_with(suggestion) == []
+        assert self._think_with(suggestion, brain_db=brain_db, client=client) == []
 
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
-    def test_heartbeat_queues_grounded_task(self, _notify):
+    def test_heartbeat_queues_grounded_task(self, _notify, brain_db, client):
         suggestion = TestGroundedThinking.LEGIT[0]
-        assert len(self._think_with(suggestion)) == 1
+        assert len(self._think_with(suggestion, brain_db=brain_db, client=client)) == 1
 
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
-    def test_heartbeat_skips_thinking_without_subjects(self, _notify):
+    def test_heartbeat_skips_thinking_without_subjects(self, _notify, client):
 
         heartbeat._proactive_state.pop("llm_thinking", None)
         heartbeat._proactive_state["stale_tasks"] = time.monotonic()
@@ -3217,7 +3224,7 @@ class TestHeartbeatInterceptor:
             )
         sug.assert_not_awaited()
 
-    def test_heartbeat_llm_thinking_graceful_failure(self):
+    def test_heartbeat_llm_thinking_graceful_failure(self, client):
         """LLM failure during thinking doesn't break the heartbeat."""
 
         heartbeat._proactive_state.pop("llm_thinking", None)
@@ -3564,7 +3571,7 @@ class TestLlmWorkTaskRouting:
     """_llm_work_task wires _task_needs_web into _llm_call with the right max_tokens."""
 
     @patch.dict("os.environ", FAKE_ENV)
-    def test_web_task_uses_1500_max_tokens_and_zai_search(self):
+    def test_web_task_uses_1500_max_tokens_and_zai_search(self, brain_db):
         """
         GIVEN a task description that triggers web search
         WHEN _llm_work_task runs
@@ -3599,7 +3606,7 @@ class TestLlmWorkTaskRouting:
         assert captured["web_search"] is True
 
     @patch.dict("os.environ", FAKE_ENV)
-    def test_non_web_task_uses_500_max_tokens(self):
+    def test_non_web_task_uses_500_max_tokens(self, brain_db):
         """
         GIVEN a task description without web keywords
         WHEN _llm_work_task runs
@@ -3633,7 +3640,7 @@ class TestLlmWorkTaskRouting:
 
     @patch.dict("os.environ", FAKE_ENV)
     @pytest.mark.usefixtures("marketing_persona")
-    def test_empty_llm_response_raises_llm_unavailable(self):
+    def test_empty_llm_response_raises_llm_unavailable(self, brain_db):
         """
         GIVEN _llm_call returns an empty string (all tiers down)
         WHEN _llm_work_task runs
@@ -3663,7 +3670,7 @@ class TestBuildWorkPromptFormatting:
     is enabled."""
 
     @patch.dict("os.environ", FAKE_ENV)
-    def test_web_search_branch_includes_telegram_format_rules(self):
+    def test_web_search_branch_includes_telegram_format_rules(self, brain_db):
         """
         GIVEN web_search=True
         WHEN _build_work_prompt runs
@@ -3692,7 +3699,7 @@ class TestBuildWorkPromptFormatting:
         assert "numbered items" in prompt.lower()
 
     @patch.dict("os.environ", FAKE_ENV)
-    def test_non_web_search_branch_omits_telegram_format_rules(self):
+    def test_non_web_search_branch_omits_telegram_format_rules(self, brain_db):
         """
         GIVEN web_search=False
         WHEN _build_work_prompt runs
@@ -3719,7 +3726,7 @@ class TestBuildWorkPromptFormatting:
         assert "suggested comment" not in prompt
 
     @patch.dict("os.environ", FAKE_ENV)
-    def test_url_invention_guard_always_present(self):
+    def test_url_invention_guard_always_present(self, brain_db):
         """
         Anti-hallucination guard for URLs is in the shared RULES block, so it
         must appear regardless of web_search flag. Locks in the wording the
@@ -3754,7 +3761,9 @@ class TestAntiHallucinationTrailer:
 
     @patch("llm_proxy._background_notify")
     @patch("llm_proxy._call_provider", side_effect=_all_succeed)
-    def test_trailing_message_blocks_fake_tool_syntax(self, mock_call, _mock_bg):
+    def test_trailing_message_blocks_fake_tool_syntax(
+        self, mock_call, _mock_bg, client
+    ):
         """
         GIVEN a chat request without tool schemas
         WHEN the proxy forwards the request
@@ -3782,7 +3791,7 @@ class TestAntiHallucinationTrailer:
     @patch("llm_proxy._background_notify")
     @patch("llm_proxy._call_provider", side_effect=_all_succeed)
     def test_trailing_message_present_with_tools_demands_openai_format(
-        self, mock_call, _mock_bg
+        self, mock_call, _mock_bg, client
     ):
         """
         GIVEN a chat request that includes a tools schema
@@ -3837,16 +3846,16 @@ class TestEmbeddings:
     Plan Z.AI key cannot embed: error 1211). The configured model is always
     used, so every stored vector is comparable."""
 
-    def test_rejects_missing_auth(self):
+    def test_rejects_missing_auth(self, client):
         r = client.post("/v1/embeddings", json=EMBED_BODY)
         assert r.status_code == 401
 
-    def test_missing_input_returns_400(self):
+    def test_missing_input_returns_400(self, client):
         r = client.post("/v1/embeddings", json={"model": "x"}, headers=AUTH_HEADER)
         assert r.status_code == 400
 
     @patch("embeddings.request", new_callable=AsyncMock)
-    def test_returns_embeddings_via_openrouter(self, mock_req):
+    def test_returns_embeddings_via_openrouter(self, mock_req, client):
         mock_req.return_value = _mock_response(200, FAKE_EMBED_RESPONSE)
         r = client.post("/v1/embeddings", json=EMBED_BODY, headers=AUTH_HEADER)
         assert r.status_code == 200
@@ -3858,13 +3867,13 @@ class TestEmbeddings:
         assert cfg.api_key == "test-key"
         assert inputs == [EMBED_BODY["input"]] or inputs == EMBED_BODY["input"]
 
-    def test_missing_key_returns_503(self):
+    def test_missing_key_returns_503(self, client):
         with patch.dict("os.environ", {"OPENROUTER_API_KEY": ""}, clear=False):
             r = client.post("/v1/embeddings", json=EMBED_BODY, headers=AUTH_HEADER)
         assert r.status_code == 503
 
     @patch("embeddings.request", new_callable=AsyncMock)
-    def test_upstream_non_200_maps_to_same_status(self, mock_req):
+    def test_upstream_non_200_maps_to_same_status(self, mock_req, client):
         """Upstream errors must surface as errors, never as HTTP 200 bodies
         that a client would ingest as embeddings."""
         mock_req.return_value = _mock_response(429, {"error": "rate limited"})
@@ -3873,7 +3882,7 @@ class TestEmbeddings:
         assert "429" in r.json()["detail"]
 
     @patch("embeddings.request", new_callable=AsyncMock)
-    def test_upstream_transport_error_is_502(self, mock_req):
+    def test_upstream_transport_error_is_502(self, mock_req, client):
         mock_req.side_effect = httpx.ConnectError("boom")
         r = client.post("/v1/embeddings", json=EMBED_BODY, headers=AUTH_HEADER)
         assert r.status_code == 502
@@ -3882,7 +3891,7 @@ class TestEmbeddings:
 @patch.dict("os.environ", FAKE_ENV)
 @patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
 class TestPersonaCommand:
-    def test_persona_feedback_intercepted(self):
+    def test_persona_feedback_intercepted(self, client):
         body = {
             "messages": [
                 {"role": "user", "content": "!persona lead with the recommendation"}
@@ -3895,7 +3904,7 @@ class TestPersonaCommand:
         content = r.json()["choices"][0]["message"]["content"].lower()
         assert "draft" in content or "queued" in content
 
-    def test_persona_command_case_insensitive(self):
+    def test_persona_command_case_insensitive(self, client):
         body = {
             "messages": [
                 {"role": "user", "content": "!Persona Lead with THE recommendation"}
@@ -3908,7 +3917,7 @@ class TestPersonaCommand:
         # the proposed content must preserve original casing of the args
         assert "Lead with THE recommendation" in m.call_args.args[4]
 
-    def test_learn_alias_intercepted(self):
+    def test_learn_alias_intercepted(self, client):
         """Spec §6: !learn <feedback> is an alias for !persona <feedback>."""
         body = {"messages": [{"role": "user", "content": "!learn keep answers short"}]}
         with patch("persona_learning.propose", return_value={"id": "ef56"}) as m:
@@ -3920,7 +3929,7 @@ class TestPersonaCommand:
     # The default-target check (N1) moved to test_fix_proxy.py, where it runs
     # against a real learning row instead of a helper signature.
 
-    def test_persona_propose_failure_degrades_gracefully(self):
+    def test_persona_propose_failure_degrades_gracefully(self, client):
         """N2: a rejected proposal yields a friendly synthetic response,
         not a raw 500 to Telegram."""
         body = {"messages": [{"role": "user", "content": "!persona be brief"}]}
@@ -3930,7 +3939,7 @@ class TestPersonaCommand:
         content = r.json()["choices"][0]["message"]["content"].lower()
         assert "not queued" in content and "too long" in content
 
-    def test_persona_reflect_failure_degrades_gracefully(self):
+    def test_persona_reflect_failure_degrades_gracefully(self, client):
         body = {"messages": [{"role": "user", "content": "!persona reflect"}]}
         with patch("persona_api._run_reflection", side_effect=RuntimeError("down")):
             r = client.post("/v1/chat/completions", json=body, headers=AUTH_HEADER)
@@ -4166,7 +4175,7 @@ class TestThinkingPromptDoesNotAskAlex:
     empty brain -> suggest -> blocked -> brain still empty -> repeat hourly.
     """
 
-    def _prompt(self, monkeypatch):
+    def _prompt(self, monkeypatch, *, brain_db):
         # _load_soul() reads /app/soul.md, absent under test -- without a soul
         # _build_thinking_prompt falls back to a short branch that carries
         # neither rule, so the assertions would pass vacuously.
@@ -4174,23 +4183,25 @@ class TestThinkingPromptDoesNotAskAlex:
         monkeypatch.setattr(heartbeat, "_load_soul", lambda: "You are Max.")
         return heartbeat._build_thinking_prompt(["skrills"], brain_db=brain_db)
 
-    def test_prompt_does_not_ask_for_knowledge_building(self, monkeypatch):
-        assert "suggest tasks that BUILD knowledge" not in self._prompt(monkeypatch)
+    def test_prompt_does_not_ask_for_knowledge_building(self, monkeypatch, brain_db):
+        assert "suggest tasks that BUILD knowledge" not in self._prompt(
+            monkeypatch, brain_db=brain_db
+        )
 
     @pytest.mark.usefixtures("marketing_persona")
-    def test_prompt_forbids_tasks_needing_alex(self, monkeypatch):
-        assert "only Alex can supply" in self._prompt(monkeypatch)
+    def test_prompt_forbids_tasks_needing_alex(self, monkeypatch, brain_db):
+        assert "only Alex can supply" in self._prompt(monkeypatch, brain_db=brain_db)
 
 
 class TestBlockedTaskStatus:
-    def test_complete_task_accepts_blocked(self):
+    def test_complete_task_accepts_blocked(self, brain_db):
 
         t = brain_db.create_task("needs alex input", priority=3)
         brain_db.complete_task(t["id"], "BLOCKED — Need Input", "blocked")
         got = brain_db.get_task(t["id"])
         assert got["status"] == "blocked"
 
-    def test_blocked_task_is_not_pending(self):
+    def test_blocked_task_is_not_pending(self, brain_db):
         """A blocked task must leave the pending queue or the heartbeat
         reworks it every cycle -- the loop this fix exists to break."""
 
@@ -4532,7 +4543,7 @@ class TestGroundedThinking:
 
         assert _thinking_subjects([{"slug": "skrills"}], None) == ["skrills"]
 
-    def test_prompt_lists_subjects_and_capabilities(self, monkeypatch):
+    def test_prompt_lists_subjects_and_capabilities(self, monkeypatch, brain_db):
 
         monkeypatch.setattr(heartbeat, "_load_soul", lambda: "You are Max.")
         prompt = heartbeat._build_thinking_prompt(
@@ -4559,7 +4570,7 @@ class TestGenericOperatorWording:
         yield
         tenant_profile._ACTIVE.clear()
 
-    def test_fallback_names_the_operator_generically(self, monkeypatch):
+    def test_fallback_names_the_operator_generically(self, monkeypatch, brain_db):
         """The give-up note after the LLM retry limit names the operator."""
 
         task = brain_db.create_task("Send weekly invoice")
@@ -4656,11 +4667,8 @@ class TestHeartbeatLeavesForeignTasks:
     def setup_method(self):
         _reset_state()
 
-        brain_db._conn.execute("DELETE FROM tasks")
-        brain_db._conn.commit()
-
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
-    def test_tome_task_stays_pending(self, _notify):
+    def test_tome_task_stays_pending(self, _notify, brain_db, client):
         import time as _time
 
         heartbeat._proactive_state["stale_tasks"] = _time.monotonic()
@@ -4940,12 +4948,10 @@ class TestFailureReasons:
     @patch.dict("os.environ", FAKE_ENV)
     @patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
-    def test_requeue_digest_line_says_why(self, _n):
+    def test_requeue_digest_line_says_why(self, _n, brain_db, client):
         """GIVEN every tier fails with known causes
         WHEN the heartbeat re-queues a task
         THEN its digest line names those causes instead of "LLM unreachable"."""
-        brain_db._conn.execute("DELETE FROM tasks")
-        brain_db._conn.commit()
         for key in ("stale_tasks", "llm_thinking", "pending_reminder"):
             heartbeat._proactive_state[key] = time.monotonic()
         t = brain_db.create_task("Summarize the open deals")
@@ -4977,13 +4983,10 @@ class TestFailureReasons:
 class TestHeartbeatRobustness:
     def setup_method(self):
         _reset_state()
-
-        brain_db._conn.execute("DELETE FROM tasks")
-        brain_db._conn.commit()
         for key in ("stale_tasks", "llm_thinking", "pending_reminder"):
             heartbeat._proactive_state[key] = time.monotonic()
 
-    def _beat(self):
+    def _beat(self, *, client):
         return client.post(
             "/v1/chat/completions",
             json=TestHeartbeatInterceptor._heartbeat_body(None),
@@ -4991,20 +4994,20 @@ class TestHeartbeatRobustness:
         )
 
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
-    def test_work_exception_fails_task_and_beat_continues(self, _n):
+    def test_work_exception_fails_task_and_beat_continues(self, _n, brain_db, client):
 
         t = brain_db.create_task("Test task for heartbeat")
         with patch(
             "heartbeat._llm_work_task", AsyncMock(side_effect=RuntimeError("boom"))
         ):
-            r = self._beat()
+            r = self._beat(client=client)
         assert r.status_code == 200
         got = brain_db.get_task(t["id"])
         assert got["status"] == "failed"
         assert "boom" in got["result"]
 
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
-    def test_claim_valueerror_skips_task_without_failing_it(self, _n):
+    def test_claim_valueerror_skips_task_without_failing_it(self, _n, brain_db, client):
 
         t = brain_db.create_task("Test task for heartbeat")
         work = AsyncMock(return_value="done")
@@ -5012,13 +5015,13 @@ class TestHeartbeatRobustness:
             patch.object(brain_db, "claim_task", side_effect=ValueError("claimed")),
             patch("heartbeat._llm_work_task", work),
         ):
-            r = self._beat()
+            r = self._beat(client=client)
         assert r.status_code == 200
         work.assert_not_called()
         assert brain_db.get_task(t["id"])["status"] == "pending"
 
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
-    def test_claim_falsy_skips_task(self, _n):
+    def test_claim_falsy_skips_task(self, _n, brain_db, client):
 
         brain_db.create_task("Test task for heartbeat")
         work = AsyncMock(return_value="done")
@@ -5026,21 +5029,21 @@ class TestHeartbeatRobustness:
             patch.object(brain_db, "claim_task", return_value=None),
             patch("heartbeat._llm_work_task", work),
         ):
-            assert self._beat().status_code == 200
+            assert self._beat(client=client).status_code == 200
         work.assert_not_called()
 
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
-    def test_complete_valueerror_tolerated(self, _n):
+    def test_complete_valueerror_tolerated(self, _n, brain_db, client):
 
         brain_db.create_task("Test task for heartbeat")
         with (
             patch("heartbeat._llm_work_task", AsyncMock(return_value="ok")),
             patch.object(brain_db, "complete_task", side_effect=ValueError("gone")),
         ):
-            assert self._beat().status_code == 200
+            assert self._beat(client=client).status_code == 200
 
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
-    def test_overall_work_deadline(self, _n, monkeypatch):
+    def test_overall_work_deadline(self, _n, monkeypatch, brain_db, client):
 
         monkeypatch.setenv("HEARTBEAT_WORK_DEADLINE", "0.05")
         t = brain_db.create_task("Test task for heartbeat")
@@ -5049,7 +5052,7 @@ class TestHeartbeatRobustness:
             await asyncio.sleep(10)
 
         with patch("heartbeat._llm_work_task", hang):
-            r = self._beat()
+            r = self._beat(client=client)
         assert r.status_code == 200
         assert brain_db.get_task(t["id"])["status"] == "failed"
 
@@ -5079,7 +5082,7 @@ class TestAutoRetryPopsOnlyElapsedTiers:
     @patch.dict("os.environ", FAKE_ENV)
     @patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
     @patch("llm_proxy._background_notify")
-    def test_long_reset_tier_stays_tripped(self, _bg):
+    def test_long_reset_tier_stays_tripped(self, _bg, client):
         _reset_state()
         phase = {"retry": False}
         retry_providers: list[str] = []
@@ -5144,7 +5147,7 @@ class TestBackgroundTasksHeld:
 
     @patch.dict("os.environ", FAKE_ENV)
     @patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
-    def test_status_message_deleted_even_on_error(self):
+    def test_status_message_deleted_even_on_error(self, client):
         delete = AsyncMock()
         with (
             patch("telegram.send_status", AsyncMock(return_value=42)),
@@ -5165,39 +5168,36 @@ class TestBackgroundTasksHeld:
 class TestDigestNotLostOnFailure:
     def setup_method(self):
         _reset_state()
-
-        brain_db._conn.execute("DELETE FROM tasks")
-        brain_db._conn.commit()
         for key in ("stale_tasks", "llm_thinking", "pending_reminder"):
             heartbeat._proactive_state[key] = time.monotonic()
         digest._digest_state["last_flush"] = (
             time.time() - digest.HEARTBEAT_DIGEST_INTERVAL - 1
         )
 
-    def _beat(self):
+    def _beat(self, *, client):
         return client.post(
             "/v1/chat/completions",
             json=TestHeartbeatInterceptor._heartbeat_body(None),
             headers=AUTH_HEADER,
         )
 
-    def test_failed_send_rebuffers_line(self):
+    def test_failed_send_rebuffers_line(self, client):
         digest._digest_record("[SYSTEM] #1: important")
         with patch("telegram.notify", AsyncMock(return_value=False)):
-            assert self._beat().status_code == 200
+            assert self._beat(client=client).status_code == 200
         assert digest._digest_state["lines"] == ["[SYSTEM] #1: important"]
 
-    def test_successful_send_clears_buffer(self):
+    def test_successful_send_clears_buffer(self, client):
         digest._digest_record("[SYSTEM] #1: important")
         with patch("telegram.notify", AsyncMock(return_value=True)):
-            self._beat()
+            self._beat(client=client)
         assert digest._digest_state["lines"] == []
 
-    def test_overflow_items_carry_over(self):
+    def test_overflow_items_carry_over(self, client):
         for i in range(30):
             digest._digest_record(f"[SYSTEM] #{i}: item")
         with patch("telegram.notify", AsyncMock(return_value=True)):
-            self._beat()
+            self._beat(client=client)
         assert len(digest._digest_state["lines"]) == 11
         assert digest._digest_state["lines"][0] == "[SYSTEM] #19: item"
 
@@ -5214,7 +5214,7 @@ class TestRequestValidation:
             {"json": {"messages": [1, "a"]}},
         ],
     )
-    def test_chat_bad_body_is_400(self, kwargs):
+    def test_chat_bad_body_is_400(self, kwargs, client):
         r = client.post(
             "/v1/chat/completions",
             headers={**AUTH_HEADER, "Content-Type": "application/json"},
@@ -5225,7 +5225,7 @@ class TestRequestValidation:
     @patch.dict("os.environ", FAKE_ENV)
     @patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
     @pytest.mark.parametrize("kwargs", [{"content": b"nope"}, {"json": ["x"]}])
-    def test_embeddings_bad_body_is_400(self, kwargs):
+    def test_embeddings_bad_body_is_400(self, kwargs, client):
         r = client.post(
             "/v1/embeddings",
             headers={**AUTH_HEADER, "Content-Type": "application/json"},
@@ -5376,7 +5376,7 @@ class TestTierSnapshot:
         assert snap[tiers[1]["name"]] == "ACTIVE"
         assert all(t["description"] for t in llm_proxy.tier_snapshot())
 
-    def test_get_tier_route_does_not_claim_probe(self):
+    def test_get_tier_route_does_not_claim_probe(self, client):
         import llm_proxy
 
         name = llm_proxy.CONFIG["tiers"][0]["name"]
