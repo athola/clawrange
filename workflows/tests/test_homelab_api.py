@@ -121,7 +121,11 @@ def test_healthz_anonymous_has_no_error_text_or_urls(api, failing_ha):
     body = resp.json()
     blob = json.dumps(body)
     assert body["status"] == "degraded"
-    assert "error" not in blob and "401" not in blob
+    # Structural, not substring: the 401 reason must not reach an anonymous
+    # caller, but a bare "401" can appear in a timestamp.
+    for name, entry in body["sources"].items():
+        assert "error" not in entry, name
+        assert all(not isinstance(v, str) or "://" not in v for v in entry.values())
     assert "192.0.2" not in blob and HA_TOKEN not in blob and "http" not in blob
 
 

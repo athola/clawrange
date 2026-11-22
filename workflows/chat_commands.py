@@ -31,6 +31,7 @@ import telegram
 import tenant_profile
 from brain_db import TaskStatus, project_list
 from errors import UpstreamError
+from homelab import HOMELAB_REPLY_MARKER
 from homelab import report as homelab_report
 from homelab import service as homelab_service
 from homelab.config import HomelabConfig
@@ -859,14 +860,20 @@ async def _dispatch_persona_command(
 HOME_NOT_CONFIGURED = "Homelab watch is not configured."
 HOME_DO_USAGE = "Usage: !home do <domain.service> <entity_id>"
 HOME_CONFIRM_USAGE = "Usage: !home confirm <6-digit code>"
+HOME_OWN_MESSAGE = (
+    "Send `!home do`/`!home confirm` as its own message; nothing was run."
+)
 
 _ID = r"[a-z0-9_]+\.[a-z0-9_]+"
 # Actions must be the WHOLE message: a command quoted or buried in a longer
 # message (forwarded text, a pasted log) must never start or confirm a call.
 # Single-line on purpose ([ \t], never \s) so a newline cannot hide extra text.
-_HOME_DO_RE = re.compile(rf"!home[ \t]+do[ \t]+({_ID})[ \t]+({_ID})", re.IGNORECASE)
-_HOME_CONFIRM_RE = re.compile(r"!home[ \t]+confirm[ \t]+(\d{6})", re.IGNORECASE)
-_HOME_READ_RE = re.compile(r"!(home|net)(?:[ \t]+(.*))?", re.IGNORECASE)
+# ASCII-only: Unicode ignore-case would let "\u017f" pass for "s", and \d
+# accepts any script's digits.
+_HOME_FLAGS = re.IGNORECASE | re.ASCII
+_HOME_DO_RE = re.compile(rf"!home[ \t]+do[ \t]+({_ID})[ \t]+({_ID})", _HOME_FLAGS)
+_HOME_CONFIRM_RE = re.compile(r"!home[ \t]+confirm[ \t]+([0-9]{6})", _HOME_FLAGS)
+_HOME_READ_RE = re.compile(r"!(home|net)(?:[ \t]+(.*))?", _HOME_FLAGS)
 _HOME_ACTION_WORDS = frozenset({"do", "confirm"})
 
 
@@ -884,6 +891,12 @@ def _extract_home_command(msg: str) -> tuple[str, ...] | None:
     if m := _HOME_CONFIRM_RE.fullmatch(text):
         return ("confirm", m.group(1))
     last_line = text.rsplit("\n", 1)[-1].strip()
+    if last_line != text and (
+        _HOME_DO_RE.fullmatch(last_line) or _HOME_CONFIRM_RE.fullmatch(last_line)
+    ):
+        # Never fall through to the LLM with an action sitting in a longer
+        # message: say so, and run nothing.
+        return ("usage", HOME_OWN_MESSAGE)
     for candidate, whole in ((text, True), (last_line, False)):
         m = _HOME_READ_RE.fullmatch(candidate)
         if not m:
@@ -936,4 +949,6 @@ async def _dispatch_home_command(
     cmd: tuple[str, ...], is_stream: bool = False, *, brain_db, profile
 ) -> JSONResponse | StreamingResponse:
     text = await _handle_home_command(cmd, brain_db=brain_db, profile=profile)
-    return _reply(text, is_stream)
+    # The marker leads every reply (usage and denials too) so llm_proxy can
+    # keep these turns out of the history it forwards upstream.
+    return _reply(f"{HOMELAB_REPLY_MARKER}\n{text}", is_stream)

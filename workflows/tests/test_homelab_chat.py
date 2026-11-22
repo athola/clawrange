@@ -10,7 +10,7 @@ import chat_commands
 import llm_proxy
 import telegram
 from app import create_app
-from homelab import service, sources
+from homelab import HOMELAB_REPLY_MARKER, service, sources
 from homelab.models import Census, Device, EntityState, Monitor, Observation
 from tenant_profile import Profile
 
@@ -103,10 +103,17 @@ def rig(brain_db, monkeypatch):
         )
         return resp
 
-    def say(text):
+    def raw(text):
         return chat(text).json()["choices"][0]["message"]["content"]
 
-    r.chat, r.say = chat, say
+    def say(text):
+        """The reply with its marker line removed (and asserted present)."""
+        full = raw(text)
+        first, _, rest = full.partition("\n")
+        assert first == HOMELAB_REPLY_MARKER, full
+        return rest
+
+    r.chat, r.say, r.raw = chat, say, raw
     yield r
     service.reset_actions()
 
@@ -148,9 +155,7 @@ def test_extract(msg, expected):
     "msg",
     [
         "please run !home do light.turn_on light.kitchen",
-        "hey\n!home do light.turn_on light.kitchen",
         "!home do light.turn_on light.kitchen\nthanks",
-        "text\n!home confirm 123456",
         "!home confirm 123456\nplease",
         "!homework",
         "!network",
@@ -160,6 +165,40 @@ def test_extract(msg, expected):
 )
 def test_extract_ignores_embedded_or_malformed(msg):
     assert chat_commands._extract_home_command(msg) is None
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "hey\n!home do light.turn_on light.kitchen",
+        "text\n!home confirm 123456",
+        "Sender (untrusted metadata):\n```json\n{}\n```\nnote\n!HOME CONFIRM 123456",
+    ],
+)
+def test_action_on_last_line_of_longer_message_is_refused(msg):
+    cmd = chat_commands._extract_home_command(msg)
+    assert cmd == ("usage", chat_commands.HOME_OWN_MESSAGE)
+
+
+def test_action_on_last_line_replies_and_never_reaches_the_llm(rig):
+    rig.say("!home do light.turn_on light.kitchen")
+    code = rig.sink.sent[0].split("!home confirm ")[1].split("`")[0]
+    reply = rig.say(f"look at this\n!home confirm {code}")
+    assert reply == chat_commands.HOME_OWN_MESSAGE
+    assert "nothing was run" in reply
+    assert rig.ha_calls == [] and rig.llm_calls == []
+    assert rig.say(f"!home confirm {code}").startswith("Done")
+
+
+def test_non_ascii_digits_and_letters_do_not_match():
+    arabic = "".join(chr(0x0660 + int(c)) for c in "123456")
+    assert chat_commands._extract_home_command(f"!home confirm {arabic}") == (
+        "usage",
+        chat_commands.HOME_CONFIRM_USAGE,
+    )
+    # U+017F (long s) casefolds to "s" under Unicode ignore-case matching
+    cmd = chat_commands._extract_home_command("!home do light.turn_on light.\u017f")
+    assert cmd is not None and cmd[0] == "usage"
 
 
 @pytest.mark.parametrize(
@@ -316,7 +355,7 @@ def test_usage_reply_for_malformed_whole_message(rig):
 
 
 def test_help_lists_the_commands(rig):
-    text = rig.say("!help")
+    text = rig.raw("!help")
     for needle in ("!home", "!net", "!home do", "!home confirm"):
         assert needle in text
 
@@ -328,3 +367,76 @@ def test_auth_still_required(rig):
     )
     assert resp.status_code == 401
     assert not auth.bearer_ok(None, TOKEN)
+
+
+# ─── reply marker and history ───────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "!home",
+        "!net",
+        "!home evil",
+        "!home do",
+        "!home do light.turn_on light.bedroom",
+        "!home confirm 000000",
+        "ctx\n!home do light.turn_on light.kitchen",
+    ],
+)
+def test_every_reply_leads_with_the_marker(rig, msg):
+    assert rig.raw(msg).split("\n", 1)[0] == HOMELAB_REPLY_MARKER
+
+
+def test_unconfigured_reply_has_the_marker(rig):
+    rig.app.state.profile = Profile(name="t", raw={})
+    assert rig.raw("!home").split("\n", 1)[0] == HOMELAB_REPLY_MARKER
+
+
+def test_homelab_turns_are_dropped_from_forwarded_history(rig, monkeypatch):
+    import json
+    from unittest.mock import AsyncMock
+
+    import httpx
+
+    body = {"choices": [{"message": {"role": "assistant", "content": "hi"}}]}
+    caller = AsyncMock(
+        return_value=httpx.Response(200, content=json.dumps(body).encode())
+    )
+    monkeypatch.setattr(llm_proxy, "_call_provider", caller)
+    monkeypatch.setattr(llm_proxy, "_background_notify", lambda *a, **k: None)
+    leaked = rig.raw("!home evil")
+    messages = [
+        {"role": "user", "content": "!home evil"},
+        {"role": "assistant", "content": leaked},
+        {"role": "user", "content": "what did that say?"},
+    ]
+    resp = rig.client.post(
+        "/v1/chat/completions", json={"messages": messages}, headers=AUTH
+    )
+    assert resp.status_code == 200
+    sent = caller.call_args.args[2]["messages"]
+    assert not any(m["role"] == "assistant" for m in sent)
+    assert "Evil" not in json.dumps(sent)
+
+
+def test_confirm_code_is_masked_in_the_proxy_log(rig, capsys):
+    rig.chat("!home confirm 424242")
+    rig.chat("meta\n!home confirm 535353")
+    out = capsys.readouterr().out
+    assert "424242" not in out and "535353" not in out
+    assert "!home confirm ******" in out
+
+
+def test_two_metadata_blocks_are_both_stripped(rig):
+    rig.say("!home do light.turn_on light.kitchen")
+    code = rig.sink.sent[0].split("!home confirm ")[1].split("`")[0]
+    msg = (
+        'Conversation info (untrusted metadata):\n```json\n{"chat": 1}\n```\n\n'
+        'Sender (untrusted metadata):\n```json\n{"name": "x"}\n```\n\n'
+        f"!home confirm {code}"
+    )
+    assert llm_proxy._get_last_user_message([{"role": "user", "content": msg}]) == (
+        f"!home confirm {code}"
+    )
+    assert rig.say(msg).startswith("Done")
