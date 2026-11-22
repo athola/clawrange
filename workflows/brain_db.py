@@ -1450,27 +1450,43 @@ class BrainDB:
         )
         self._conn.commit()
 
-    def homelab_get(self, key: str) -> dict | None:
-        """The stored JSON object for ``key``, or None (absent or unreadable)."""
+    def homelab_load(self, key: str) -> tuple[dict | None, bool]:
+        """(value, unreadable): absent is (None, False), a row that is not a
+        JSON object is (None, True)."""
         row = self._conn.execute(
             "SELECT value FROM homelab_state WHERE key = ?", (key,)
         ).fetchone()
         if row is None:
-            return None
+            return None, False
         try:
             value = json.loads(row[0])
         except ValueError:
-            return None
-        return value if isinstance(value, dict) else None
+            return None, True
+        return (value, False) if isinstance(value, dict) else (None, True)
+
+    def homelab_get(self, key: str) -> dict | None:
+        """The stored JSON object for ``key``, or None (absent or unreadable)."""
+        return self.homelab_load(key)[0]
 
     def homelab_put(self, key: str, value: dict) -> None:
-        self._conn.execute(
-            """INSERT INTO homelab_state (key, value, updated_at) VALUES (?, ?, ?)
-               ON CONFLICT(key) DO UPDATE SET
-                 value = excluded.value, updated_at = excluded.updated_at""",
-            (key, json.dumps(value), utcnow_iso()),
-        )
-        self._conn.commit()
+        self.homelab_put_many({key: value})
+
+    def homelab_put_many(self, items: dict[str, dict]) -> None:
+        """Store several keys in one transaction: all land or none do."""
+        now = utcnow_iso()
+        try:
+            for key, value in items.items():
+                self._conn.execute(
+                    """INSERT INTO homelab_state (key, value, updated_at)
+                       VALUES (?, ?, ?)
+                       ON CONFLICT(key) DO UPDATE SET
+                         value = excluded.value, updated_at = excluded.updated_at""",
+                    (key, json.dumps(value), now),
+                )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
 
     def deal_observations(self) -> list[dict]:
         rows = self._conn.execute(

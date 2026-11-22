@@ -18,7 +18,7 @@ from fastapi import APIRouter, Request
 import auth
 import telegram
 from homelab import service
-from homelab.config import HomelabConfig
+from homelab.config import HomelabConfig, warn_incomplete
 from homelab.findings import UNAVAILABLE_STATES
 from homelab.models import SOURCES, Observation
 
@@ -48,13 +48,22 @@ def _summarize(obs: Observation) -> dict[str, Any]:
         )
         if obs.census.kev is not None:
             counts["kev_entries"] = len(obs.census.kev)
-    return {"when": obs.now.isoformat(), "sources": sources, "counts": counts}
+    out: dict[str, Any] = {
+        "when": obs.now.isoformat(),
+        "sources": sources,
+        "counts": counts,
+    }
+    parts = {k: v for k, v in obs.errors.items() if k.startswith("census.")}
+    if parts:
+        out["census_parts"] = parts
+    return out
 
 
 def create_homelab_router(profile) -> APIRouter:
     """Build the homelab router bound to ``profile``'s ``homelab`` block."""
     router = APIRouter(tags=["homelab"])
     cfg = HomelabConfig.from_profile(profile)
+    warn_incomplete(cfg)
 
     @router.get("/homelab/status")
     async def status():

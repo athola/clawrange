@@ -241,3 +241,80 @@ async def test_report_generator_sends_a_digest(brain_db, gen_rig):
     use({"census": {"url": "http://192.0.2.7"}})
     await generators.homelab_report_generator(brain_db)
     assert len(sent) == 1 and sent[0].startswith("Homelab daily report")
+
+
+@pytest.fixture()
+def recorded(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        generators,
+        "_record_status",
+        lambda db, sid, status, when=None: seen.update({sid: status}),
+    )
+    return seen
+
+
+def _failing(monkeypatch, sources_failed):
+    async def fake(cfg, now, **kw):
+        return Observation(
+            now=NOW,
+            configured=frozenset({"ha", "census"}),
+            census=None if "census" in sources_failed else CENSUS,
+            errors={s: "HTTP 401" for s in sources_failed},
+        )
+
+    monkeypatch.setattr(sources, "observe", fake)
+
+
+TWO = {
+    "home_assistant": {"url": "http://192.0.2.5:8123", "token": HA_TOKEN},
+    "census": {"url": "http://192.0.2.7"},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["homelab_watch", "homelab_report"])
+async def test_schedule_status_is_error_when_every_source_failed(
+    brain_db, gen_rig, monkeypatch, recorded, kind
+):
+    from scheduler import status_kind
+
+    use, _sent, _obs = gen_rig
+    use(TWO)
+    _failing(monkeypatch, {"ha", "census"})
+    await generators.GENERATORS[kind](brain_db, schedule_id=kind)
+    text = recorded[kind]
+    assert status_kind(text) == "error"
+    assert "census" in text and "ha" in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["homelab_watch", "homelab_report"])
+async def test_schedule_status_names_a_partial_outage(
+    brain_db, gen_rig, monkeypatch, recorded, kind
+):
+    from scheduler import status_kind
+
+    use, _sent, _obs = gen_rig
+    use(TWO)
+    _failing(monkeypatch, {"ha"})
+    await generators.GENERATORS[kind](brain_db, schedule_id=kind)
+    text = recorded[kind]
+    assert status_kind(text) == "ok" and "sources failed: ha" in text
+
+
+def test_half_configured_source_is_warned_once_at_mount(brain_db, caplog, tmp_path):
+    app = create_app(brain_db=brain_db)
+    block = {"home_assistant": {"url": "http://192.0.2.5:8123", "token": ""}}
+    with caplog.at_level("WARNING", logger="clawrange.homelab"):
+        init_profile(
+            app,
+            brain_db,
+            profile=Profile(name="t", raw={"homelab": block}),
+            soul_path=str(tmp_path / "soul.md"),
+        )
+    msgs = [
+        r.getMessage() for r in caplog.records if "partly configured" in r.getMessage()
+    ]
+    assert len(msgs) == 1 and "ha" in msgs[0]
+    assert "192.0.2" not in caplog.text

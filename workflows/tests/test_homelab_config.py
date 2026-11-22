@@ -72,3 +72,21 @@ def test_bad_actions_fail_closed_to_no_rules():
         }
     )
     assert cfg.rules == ()
+
+
+def test_half_set_sources_are_recorded_as_incomplete():
+    only_url = HomelabConfig.from_block({"home_assistant": {"url": "http://192.0.2.5"}})
+    only_token = HomelabConfig.from_block({"home_assistant": {"token": "t"}})
+    cert = HomelabConfig.from_block({"kuma": {"url": "", "ca_cert": "/x/ca.pem"}})
+    for cfg, name in ((only_url, "ha"), (only_token, "ha"), (cert, "kuma")):
+        assert cfg.incomplete == frozenset({name})
+        assert name not in cfg.configured
+
+
+def test_complete_or_untouched_sources_are_not_incomplete():
+    assert HomelabConfig.from_block(None).incomplete == frozenset()
+    both = HomelabConfig.from_block(
+        {"home_assistant": {"url": "http://x", "token": "t"}}
+    )
+    assert both.incomplete == frozenset()
+    assert HomelabConfig.from_block({"census": {"url": ""}}).incomplete == frozenset()

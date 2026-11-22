@@ -1707,6 +1707,21 @@ def _homelab_config(profile_name: str | None) -> HomelabConfig:
     return HomelabConfig.from_profile(tenant_profile.load_profile(profile_name))
 
 
+def _homelab_outage_status(cfg: HomelabConfig, errors: dict, base: str) -> str:
+    """Schedule status naming failed sources.
+
+    When every configured source failed it starts with ``error`` so the
+    schedule reads as an error; otherwise the failed names ride in the text.
+    """
+    failed = sorted(src for src in cfg.configured if src in errors)
+    if not failed:
+        return base
+    names = ", ".join(failed)
+    if set(failed) == set(cfg.configured):
+        return f"error: all sources failed ({names}); {base}"
+    return f"{base}; sources failed: {names}"
+
+
 async def homelab_watch_generator(
     brain_db,
     profile_name: str | None = None,
@@ -1727,6 +1742,7 @@ async def homelab_watch_generator(
     status = f"ok ({out.get('alerts', 0)} alerts, {len(errors)} source errors)"
     if out.get("delivered") is False:
         status = f"FAILED telegram alert delivery ({status})"
+    status = _homelab_outage_status(cfg, errors, status)
     _record_status(brain_db, schedule_id, status)
     logger.info("homelab_watch: %s", status)
 
@@ -1751,6 +1767,7 @@ async def homelab_report_generator(
     )
     sent, total = await telegram.notify_long(text)
     status = _delivery_status(sent, total, f"{len(obs.errors)} source errors")
+    status = _homelab_outage_status(cfg, dict(obs.errors), status)
     _record_status(brain_db, schedule_id, status)
     logger.info("homelab_report: %s", status)
 

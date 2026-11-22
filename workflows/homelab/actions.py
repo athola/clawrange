@@ -6,6 +6,7 @@ deny-all; a profile can only allow-list narrower than the hard deny list.
 
 from __future__ import annotations
 
+import logging
 import re
 import secrets
 from collections import OrderedDict
@@ -14,6 +15,8 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from .parse import safe_label
+
+logger = logging.getLogger("clawrange.homelab.actions")
 
 HARD_DENY_DOMAINS = frozenset(
     {
@@ -144,6 +147,12 @@ class PendingActions:
         self._pending[code] = (service, entity_id, now + self._ttl)
         while len(self._pending) > self._max:
             self._pending.popitem(last=False)
+            # The operator's still-valid code stops working; say so in the log.
+            logger.warning(
+                "homelab: dropped the oldest unredeemed confirmation code "
+                "(more than %d pending)",
+                self._max,
+            )
         return code
 
     def redeem(self, code: str, now: datetime) -> tuple[str, str] | None:

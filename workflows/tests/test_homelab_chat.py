@@ -84,6 +84,11 @@ def rig(brain_db, monkeypatch):
 
     monkeypatch.setattr(sources, "call_ha_service", fake_ha)
 
+    async def fake_states(cfg, **kw):
+        return OBS.ha
+
+    monkeypatch.setattr(sources, "fetch_ha_states", fake_states)
+
     app = create_app(brain_db=brain_db)
     app.state.profile = Profile(name="t", raw={"homelab": BLOCK})
     client = TestClient(app, raise_server_exceptions=False)
@@ -300,7 +305,7 @@ def test_do_then_confirm_runs_exactly_once(rig):
     code = rig.sink.sent[0].split("!home confirm ")[1].split("`")[0]
     assert rig.say(f"!home confirm {code}").startswith("Done")
     assert rig.ha_calls == [("light", "turn_on", "light.kitchen")]
-    assert rig.say(f"!home confirm {code}").startswith("Invalid")
+    assert rig.say(f"!home confirm {code}").startswith("That code was already used")
     assert len(rig.ha_calls) == 1
 
 
@@ -440,3 +445,21 @@ def test_two_metadata_blocks_are_both_stripped(rig):
         f"!home confirm {code}"
     )
     assert rig.say(msg).startswith("Done")
+
+
+def test_do_for_an_unknown_entity_gets_no_code(rig, monkeypatch):
+    rig.app.state.profile = Profile(
+        name="t",
+        raw={
+            "homelab": {
+                **BLOCK,
+                "home_assistant": {
+                    **BLOCK["home_assistant"],
+                    "actions": [{"service": "light.turn_on", "entities": ["light.*"]}],
+                },
+            }
+        },
+    )
+    reply = rig.say("!home do light.turn_on light.nowhere")
+    assert reply.startswith("Denied") and "no entity" in reply
+    assert rig.sink.sent == []

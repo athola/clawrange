@@ -7,6 +7,7 @@ nothing is fetched, nothing alerts and nothing is an error.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -14,6 +15,8 @@ from .actions import ActionRule, parse_rules
 from .models import WatchConfig
 
 DEFAULT_KUMA_SLUG = "home"
+
+logger = logging.getLogger("clawrange.homelab")
 
 
 def _text(value: Any) -> str:
@@ -40,6 +43,9 @@ class HomelabConfig:
     census_url: str = ""
     watch: WatchConfig = field(default_factory=WatchConfig)
     rules: tuple[ActionRule, ...] = ()
+    # Sources with some but not all of their settings: they stay off, and
+    # health names them so a half-set env var is not mistaken for "unused".
+    incomplete: frozenset[str] = frozenset()
 
     @property
     def configured(self) -> frozenset[str]:
@@ -84,17 +90,41 @@ class HomelabConfig:
             rules = parse_rules(ha.get("actions"))
         except ValueError:
             rules = ()  # validation rejects this at load; fail closed here
+        ha_url, ha_token = _text(ha.get("url")), _text(ha.get("token"))
+        kuma_url, ca_cert = _text(kuma.get("url")), _text(kuma.get("ca_cert"))
+        incomplete = set()
+        if bool(ha_url) != bool(ha_token):
+            incomplete.add("ha")
+        if ca_cert and not kuma_url:
+            incomplete.add("kuma")
         return cls(
-            ha_url=_text(ha.get("url")).rstrip("/"),
-            ha_token=_text(ha.get("token")),
-            kuma_url=_text(kuma.get("url")).rstrip("/"),
+            ha_url=ha_url.rstrip("/"),
+            ha_token=ha_token,
+            kuma_url=kuma_url.rstrip("/"),
             kuma_slug=_text(kuma.get("slug")) or DEFAULT_KUMA_SLUG,
-            kuma_ca_cert=_text(kuma.get("ca_cert")),
+            kuma_ca_cert=ca_cert,
             census_url=_text(census.get("url")).rstrip("/"),
             watch=watch,
             rules=rules,
+            incomplete=frozenset(incomplete),
         )
 
     @classmethod
     def from_profile(cls, profile: Any) -> HomelabConfig:
         return cls.from_block(getattr(profile, "homelab", None))
+
+
+_MISSING = {
+    "ha": "needs both a url and a token",
+    "kuma": "has a ca_cert but no url",
+}
+
+
+def warn_incomplete(cfg: HomelabConfig) -> None:
+    """Log (never the values) each half-configured source; call once at mount."""
+    for source in sorted(cfg.incomplete):
+        logger.warning(
+            "homelab: %s is only partly configured (%s); it stays disabled",
+            source,
+            _MISSING[source],
+        )
