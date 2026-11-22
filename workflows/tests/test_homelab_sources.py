@@ -1,5 +1,6 @@
 """Homelab sources: mocked transports, synthetic data only."""
 
+import asyncio
 import json
 import ssl
 from datetime import UTC, datetime
@@ -339,3 +340,174 @@ async def test_observe_unexpected_exception_is_contained(monkeypatch):
     obs = await sources.observe(cfg, NOW)
     assert obs.ha is None
     assert obs.errors["ha"] == "unexpected error (RuntimeError)"
+
+
+# ─── review fixes ───────────────────────────────────────────────────
+
+FULL_ROUTES = {
+    "/devices.json": (200, DEVICES),
+    "/rustscan-hex.json": (200, SCAN),
+    "/router.json": (200, ROUTER),
+    "/kev-mikrotik.json": (200, KEV),
+}
+
+
+@pytest.mark.parametrize(
+    "raw, match",
+    [
+        ("garbage the router printed\r\n", "no lease/ARP table"),
+        ("", "no lease/ARP table"),
+        (" #    ADDRESS       STATUS\r\n 0    192.0.2.10    bound\r\n", "no lease"),
+        (
+            " #    ADDRESS       MAC-ADDRESS        HOST-NAME\r\n"
+            " 0    192.0.2.10    not-a-mac          printer-1\r\n",
+            "parsed no devices",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_census_garbage_is_an_outage_not_an_empty_network(raw, match):
+    body = {"when": DEVICES["when"], "raw": raw}
+    t = transport({"/devices.json": (200, body)})
+    with pytest.raises(UpstreamError, match=match):
+        await sources.fetch_census(CFG, transport=t)
+
+
+def test_kuma_heartbeat_must_be_a_dict_with_a_heartbeat_list():
+    for beats in ([], '"x"', {"uptimeList": {}}, {"heartbeatList": []}):
+        t = transport(
+            {
+                "/api/status-page/home": (200, PAGE),
+                "/api/status-page/heartbeat/home": (200, beats),
+            }
+        )
+        with pytest.raises(UpstreamError, match="heartbeat shape"):
+            asyncio.run(sources.fetch_kuma(CFG, transport=t))
+
+
+@pytest.mark.asyncio
+async def test_kuma_monitors_without_any_heartbeat_are_a_failure():
+    t = transport(
+        {
+            "/api/status-page/home": (200, PAGE),
+            "/api/status-page/heartbeat/home": (200, {"heartbeatList": {}}),
+        }
+    )
+    with pytest.raises(UpstreamError, match="no heartbeat"):
+        await sources.fetch_kuma(CFG, transport=t)
+
+
+@pytest.mark.asyncio
+async def test_census_optional_404_means_not_published_and_is_no_error():
+    t = transport({"/devices.json": (200, DEVICES)})
+    census = await sources.fetch_census(CFG, transport=t)
+    assert census.part_errors == {}
+
+
+@pytest.mark.asyncio
+async def test_census_optional_failures_are_recorded_as_part_errors():
+    t = transport(
+        {
+            "/devices.json": (200, DEVICES),
+            "/rustscan-hex.json": (500, "boom"),
+            "/router.json": (200, "<html>"),
+            "/kev-mikrotik.json": (200, {"entries": "nope"}),
+        }
+    )
+    census = await sources.fetch_census(CFG, transport=t)
+    assert (census.mgmt_ports, census.router_version, census.kev) == (None, None, None)
+    assert census.part_errors == {
+        "ports": "HTTP 500",
+        "router": "response was not valid JSON",
+        "kev": "unexpected response shape",
+    }
+
+
+@pytest.mark.asyncio
+async def test_census_optional_timeout_is_a_part_error():
+    def slow(request):
+        raise httpx.ReadTimeout("slow", request=request)
+
+    t = transport({"/devices.json": (200, DEVICES), "/router.json": slow})
+    census = await sources.fetch_census(CFG, transport=t)
+    assert census.part_errors == {"router": "timed out"}
+
+
+@pytest.mark.asyncio
+async def test_census_parts_carry_their_own_when():
+    scan = {**SCAN, "when": "2026-01-01T08:00:00+00:00"}
+    router = {**ROUTER, "when": "2026-01-01T09:00:00+00:00"}
+    kev = {**KEV, "when": "2026-01-01T10:00:00+00:00"}
+    t = transport(
+        {
+            **FULL_ROUTES,
+            "/rustscan-hex.json": (200, scan),
+            "/router.json": (200, router),
+            "/kev-mikrotik.json": (200, kev),
+        }
+    )
+    census = await sources.fetch_census(CFG, transport=t)
+    assert census.ports_when == datetime(2026, 1, 1, 8, tzinfo=UTC)
+    assert census.router_when == datetime(2026, 1, 1, 9, tzinfo=UTC)
+    assert census.kev_when == datetime(2026, 1, 1, 10, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_one_malformed_open_entry_is_skipped_not_fatal():
+    scan = {
+        "when": "x",
+        "open": ["192.0.2.1 -> [22]", "garbage", "192.0.2.1 -> [99999]"],
+    }
+    t = transport({"/devices.json": (200, DEVICES), "/rustscan-hex.json": (200, scan)})
+    census = await sources.fetch_census(CFG, transport=t)
+    assert census.mgmt_ports == (22,)
+    assert "2 malformed" in census.part_errors["ports"]
+
+
+@pytest.mark.asyncio
+async def test_observe_surfaces_part_errors_and_logs_failures(caplog):
+    cfg = HomelabConfig.from_block(
+        {
+            "home_assistant": {"url": "http://192.0.2.5", "token": TOKEN},
+            "census": {"url": "http://192.0.2.7"},
+        }
+    )
+    t = transport(
+        {
+            "/api/states": (401, "no"),
+            "/devices.json": (200, DEVICES),
+            "/kev-mikrotik.json": (503, "down"),
+        }
+    )
+    with caplog.at_level("WARNING", logger="clawrange.homelab.sources"):
+        obs = await sources.observe(cfg, NOW, transport=t)
+    assert obs.errors["ha"] == "HTTP 401"
+    assert obs.errors["census.kev"] == "HTTP 503"
+    assert "census.ports" not in obs.errors
+    assert "HTTP 401" in caplog.text and "HTTP 503" in caplog.text
+    assert TOKEN not in caplog.text and "192.0.2" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_observe_unexpected_error_is_logged_with_traceback(monkeypatch, caplog):
+    async def boom(cfg, **kw):
+        raise RuntimeError("kaput")
+
+    monkeypatch.setattr(sources, "fetch_ha_states", boom)
+    cfg = HomelabConfig.from_block(
+        {"home_assistant": {"url": "http://192.0.2.5", "token": TOKEN}}
+    )
+    with caplog.at_level("ERROR", logger="clawrange.homelab.sources"):
+        await sources.observe(cfg, NOW)
+    record = next(r for r in caplog.records if r.levelname == "ERROR")
+    assert record.exc_info is not None and TOKEN not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_get_json_does_not_swallow_programming_errors():
+    def bad(request):
+        raise RuntimeError("not an httpx error")
+
+    t = transport({"/api/states": bad})
+    with pytest.raises(RuntimeError):
+        await sources.fetch_ha_states(CFG, transport=t)

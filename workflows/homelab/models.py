@@ -44,6 +44,12 @@ class Census:
     mgmt_ports: tuple[int, ...] | None = None
     router_version: str | None = None
     kev: tuple[KevEntry, ...] | None = None
+    # Each optional file's own ``when`` (None: not published or no usable time).
+    ports_when: datetime | None = None
+    router_when: datetime | None = None
+    kev_when: datetime | None = None
+    # Optional parts that exist but could not be read: part name -> reason.
+    part_errors: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -142,6 +148,7 @@ class WatchState:
     kev_learned: bool = False
     seen_kev: list[str] = field(default_factory=list)
     stale_alerted_when: str | None = None
+    stale_parts: dict[str, str] = field(default_factory=dict)  # part -> when alerted
     # kuma
     kuma_status: dict[str, int] = field(default_factory=dict)
     # ha
@@ -166,6 +173,7 @@ class WatchState:
             "kev_learned": self.kev_learned,
             "seen_kev": list(self.seen_kev),
             "stale_alerted_when": self.stale_alerted_when,
+            "stale_parts": dict(self.stale_parts),
             "kuma_status": dict(self.kuma_status),
             "ha_unavailable_since": dict(self.ha_unavailable_since),
             "ha_alerted": list(self.ha_alerted),
@@ -187,6 +195,9 @@ class WatchState:
             kev_learned=bool(d.get("kev_learned", False)),
             seen_kev=[str(x) for x in _list(d.get("seen_kev"))],
             stale_alerted_when=_opt_str(d.get("stale_alerted_when")),
+            stale_parts={
+                str(k): str(v) for k, v in _dict(d.get("stale_parts")).items()
+            },
             kuma_status={
                 str(k): v for k, v in _dict(d.get("kuma_status")).items() if _is_int(v)
             },

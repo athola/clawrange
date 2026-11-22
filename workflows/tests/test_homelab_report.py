@@ -278,3 +278,33 @@ def test_report_text_has_no_unescaped_markdown_from_data():
     assert "x\\_y" in text
     assert "m\\*n" in text
     assert "`" not in text
+
+
+# ─── review fixes ───────────────────────────────────────────────────
+
+
+def test_monitor_without_a_heartbeat_is_no_data_not_pending():
+    kuma = (Monitor("1", "Router", 1), Monitor("2", "Cam", 2), Monitor("3", "X", None))
+    text = render_home(full_obs(kuma=kuma), CFG)
+    assert "Uptime Kuma: 1 of 3 up, 1 pending or in maintenance, 1 no data" in text
+
+
+def test_only_no_data_monitors_do_not_claim_pending():
+    text = render_home(full_obs(kuma=(Monitor("3", "X", None),)), CFG)
+    assert "pending or in maintenance" not in text and "1 no data" in text
+
+
+def test_net_shows_census_part_errors():
+    obs = full_obs(errors={"census.ports": "HTTP 500", "census.kev": "timed out"})
+    text = render_net(obs, state())
+    assert "Census parts unreadable: kev timed out; ports HTTP 500" in text
+
+
+def test_report_carries_census_part_errors():
+    obs = full_obs(errors={"census.router": "HTTP 502"})
+    assert "router HTTP 502" in render_report(obs, state(), CFG)
+
+
+def test_unknown_entities_are_counted_in_reports():
+    ha = (ent("sensor.a", "unknown", "A"), ent("sensor.b", "unavailable", "B"))
+    assert "2 unavailable" in render_home(full_obs(ha=ha), CFG)

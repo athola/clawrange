@@ -321,3 +321,21 @@ def test_kev_entries_accepts_scanner_file_shape():
     }
     assert [e.cve_id for e in kev_entries(doc)] == ["CVE-2000-0002"]
     assert kev_entries({"when": "x", "entries": "nope"}) == ()
+
+
+def test_mgmt_ports_skipping_counts_malformed_entries():
+    from homelab.parse import mgmt_ports_skipping
+
+    scan = {"open": ["192.0.2.1 -> [22,53]", "junk", "192.0.2.1 -> [99999]"]}
+    assert mgmt_ports_skipping(scan) == ((22, 53), 2)
+    assert mgmt_ports_skipping({"open": "22"}) == (None, 0)
+    assert parse_mgmt_ports(scan) is None  # strict form unchanged
+
+
+def test_has_mac_table():
+    from homelab.parse import has_mac_table
+
+    assert not has_mac_table("")
+    assert not has_mac_table("login banner\nwelcome")
+    assert not has_mac_table(" #  ADDRESS  STATUS\n 0  192.0.2.1  up\n")
+    assert has_mac_table(" #  ADDRESS  MAC-ADDRESS\n")

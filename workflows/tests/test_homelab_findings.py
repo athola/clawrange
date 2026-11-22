@@ -3,6 +3,8 @@
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from homelab.findings import evaluate
 from homelab.models import (
     Census,
@@ -643,3 +645,102 @@ def test_state_from_dict_tolerates_missing_unknown_and_mistyped():
     assert odd.seen_kev == []
     assert odd.failures == {"kuma": 2}
     assert odd.learned == {"ha": True}
+
+
+# ─── review fixes ───────────────────────────────────────────────────
+
+
+def test_empty_census_does_not_learn_a_baseline():
+    empty = obs(configured={"census"}, cen=census([], k=None))
+    state, alerts = run(WatchState(), empty)
+    assert alerts == [] and not state.learned.get("census")
+    assert state.census_baseline_at is None
+    # the first real census is the baseline, so its devices stay silent
+    real = obs(configured={"census"}, cen=census([dev(1), dev(2)], k=None))
+    state, alerts = run(state, real)
+    assert alerts == [] and state.learned["census"] is True
+    assert set(state.known_macs) == {"00:00:5E:00:53:01", "00:00:5E:00:53:02"}
+
+
+def flood_obs(n, now=T0):
+    devices = [dev(i, host=f"host-{i:02d}") for i in range(1, n + 1)]
+    return obs(now=now, configured={"census"}, cen=census(devices, k=None))
+
+
+def test_new_device_flood_collapses_to_one_alert():
+    state, _ = run(WatchState(), flood_obs(1))
+    state, alerts = run(state, flood_obs(13))
+    assert len(alerts) == 1
+    assert "12" in alerts[0].text
+    assert alerts[0].text.count("host-") <= 5
+    assert len(state.known_macs) == 13
+
+
+def test_new_devices_at_the_threshold_still_alert_individually():
+    state, _ = run(WatchState(), flood_obs(1))
+    state, alerts = run(state, flood_obs(11))  # 10 new == threshold
+    assert len(alerts) == 10
+
+
+def part_census(**whens):
+    return replace(census([dev(1)], k=[kev(1)]), **whens)
+
+
+def test_stale_optional_parts_alert_once_per_when_with_distinct_keys():
+    base = obs(configured={"census"}, cen=part_census())
+    state, _ = run(WatchState(), base)
+    old = at(hours=-30)
+    stale = obs(
+        now=at(hours=1),
+        configured={"census"},
+        cen=part_census(ports_when=old, router_when=old, kev_when=at(hours=0)),
+    )
+    state, alerts = run(state, stale)
+    assert {a.key for a in alerts} == {"census:stale:ports", "census:stale:router"}
+    state, alerts = run(state, stale)
+    assert alerts == []
+    newer_old = obs(
+        now=at(hours=2),
+        configured={"census"},
+        cen=part_census(
+            ports_when=at(hours=-29), router_when=old, kev_when=at(hours=0)
+        ),
+    )
+    state, alerts = run(state, newer_old)
+    assert [a.key for a in alerts] == ["census:stale:ports"]
+
+
+def test_unknown_state_never_alerts():
+    state, _ = run(WatchState(), baseline_obs())
+    state, _ = run(state, ha_obs(T0, sensor__a="unknown"))
+    state, alerts = run(state, ha_obs(at(minutes=120), sensor__a="unknown"))
+    assert alerts == []
+
+
+def test_entity_down_at_baseline_is_known_down_until_it_recovers():
+    first = ha_obs(T0, sensor__a="unavailable")
+    state, _ = run(WatchState(), first)
+    state, alerts = run(state, ha_obs(at(minutes=60), sensor__a="unavailable"))
+    assert alerts == []
+    state, _ = run(state, ha_obs(at(minutes=61), sensor__a="3"))
+    state, _ = run(state, ha_obs(at(minutes=62), sensor__a="unavailable"))
+    state, alerts = run(state, ha_obs(at(minutes=93), sensor__a="unavailable"))
+    assert [a.key for a in alerts] == ["ha:unavailable:sensor.a"]
+
+
+@pytest.mark.parametrize(
+    "error, phrase",
+    [
+        ("HTTP 401", "rejected the credentials (HTTP 401)"),
+        ("HTTP 403", "rejected the credentials (HTTP 403)"),
+        ("TLS verification failed", "TLS verification failed"),
+        ("connection failed", "unreachable"),
+        ("timed out", "unreachable"),
+    ],
+)
+def test_source_down_alert_names_the_reason_class(error, phrase):
+    state, _ = run(WatchState(), baseline_obs())
+    state, alerts = run(state, *[failed("ha", error)] * 3)
+    assert phrase in alerts[0].text
+    if phrase != "unreachable":
+        assert "unreachable" not in alerts[0].text

@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import copy
 import fnmatch
+import re
 from datetime import UTC, datetime, timedelta
 
 from .models import (
     SOURCES,
     Alert,
+    Census,
+    Device,
     Observation,
     WatchConfig,
     WatchState,
@@ -25,7 +28,15 @@ SOURCE_LABELS = {
     "kuma": "Uptime Kuma",
     "census": "Network census",
 }
+# Reports count both; only "unavailable" ever alerts ("unknown" is routine
+# for a sensor that has not reported yet).
 UNAVAILABLE_STATES = frozenset({"unavailable", "unknown"})
+ALERT_STATES = frozenset({"unavailable"})
+STALE_PARTS = {
+    "ports": "Router port scan",
+    "router": "Router info",
+    "kev": "KEV feed",
+}
 FLOOD_NAMES = 5
 KEV_NOTE = "KEV lists no affected versions; check MikroTik's advisory."
 
@@ -60,7 +71,7 @@ def evaluate(
         if source not in obs.configured:
             continue
         if getattr(obs, source) is None:
-            _source_failed(new, source, cfg, alerts)
+            _source_failed(new, source, cfg, alerts, obs.errors.get(source, ""))
             continue
         _source_ok(new, source, alerts)
         handlers[source](new, obs, cfg, alerts)
@@ -70,21 +81,39 @@ def evaluate(
 # ─── source health ──────────────────────────────────────────────────
 
 
+_CREDENTIAL_ERROR = re.compile(r"HTTP (401|403)\b")
+
+
+def _down_text(source: str, count: int, reason: str) -> str:
+    """Say why, by class only: the raw reason is never echoed into chat."""
+    label = SOURCE_LABELS[source]
+    streak = f"{count} failed checks in a row"
+    if m := _CREDENTIAL_ERROR.match(reason):
+        return (
+            f"{label} rejected the credentials (HTTP {m.group(1)}); {streak}. "
+            "Check the token and its permissions."
+        )
+    if reason.startswith("TLS verification failed"):
+        return (
+            f"{label} TLS verification failed; {streak}. "
+            "Check the certificate or ca_cert."
+        )
+    return f"{label} is unreachable ({streak}). Check the workflows logs."
+
+
 def _source_failed(
-    st: WatchState, source: str, cfg: WatchConfig, alerts: list[Alert]
+    st: WatchState,
+    source: str,
+    cfg: WatchConfig,
+    alerts: list[Alert],
+    reason: str = "",
 ) -> None:
     st.failures[source] = st.failures.get(source, 0) + 1
     count = st.failures[source]
     if count >= cfg.source_down_after and source not in st.down_alerted:
         st.down_alerted.append(source)
-        # No error text: it can carry URLs, which stay out of chat.
         alerts.append(
-            Alert(
-                source,
-                f"{source}:down",
-                f"{SOURCE_LABELS[source]} is unreachable "
-                f"({count} failed checks in a row). Check the workflows logs.",
-            )
+            Alert(source, f"{source}:down", _down_text(source, count, reason))
         )
 
 
@@ -107,8 +136,7 @@ def _ha(st: WatchState, obs: Observation, cfg: WatchConfig, alerts: list[Alert])
     names = {
         e.entity_id: e.name
         for e in obs.ha
-        if e.state in UNAVAILABLE_STATES
-        and not is_ignored(e.entity_id, cfg.ignore_entities)
+        if e.state in ALERT_STATES and not is_ignored(e.entity_id, cfg.ignore_entities)
     }
     bad = set(names)
     st.ha_unavailable_since = {
@@ -119,6 +147,9 @@ def _ha(st: WatchState, obs: Observation, cfg: WatchConfig, alerts: list[Alert])
     for entity_id in bad:
         st.ha_unavailable_since.setdefault(entity_id, now_iso)
     if first:
+        # Already down when the baseline was learned: known-down. It alerts
+        # only after it recovers and fails again (recovery clears the mark).
+        st.ha_alerted = sorted(bad)
         return
     limit = timedelta(minutes=cfg.unavailable_after_minutes)
     crossed = sorted(
@@ -184,26 +215,23 @@ def _census(st: WatchState, obs: Observation, cfg: WatchConfig, alerts: list[Ale
     cen = obs.census
     assert cen is not None
     first = not st.learned.get("census")
-    st.learned["census"] = True
     now_iso = obs.now.isoformat()
-    if first:
-        st.census_baseline_at = now_iso
+    if cen.devices:
+        # An empty census is no baseline: the first real one is learned
+        # quietly instead of alerting on every device.
+        st.learned["census"] = True
+        if first:
+            st.census_baseline_at = now_iso
 
+    new_devices: list[Device] = []
     for device in sorted(cen.devices, key=lambda d: d.mac):
         if device.mac in st.known_macs:
             continue
         st.known_macs[device.mac] = now_iso
         if first or device.randomized:
             continue
-        host = safe_label(device.hostname) or "no hostname"
-        alerts.append(
-            Alert(
-                "census",
-                f"census:new:{device.mac}",
-                f"New device: {host} ({device.mac}) at {safe_label(device.ip)} "
-                f"on {safe_label(device.interface) or 'unknown interface'}",
-            )
-        )
+        new_devices.append(device)
+    _new_devices(new_devices, cfg, alerts)
 
     _ports(st, cen.mgmt_ports, alerts)
 
@@ -252,6 +280,60 @@ def _census(st: WatchState, obs: Observation, cfg: WatchConfig, alerts: list[Ale
                 "census:stale",
                 f"Network census is stale: last run {age.total_seconds() / 3600:.0f}h "
                 f"ago (limit {cfg.census_max_age_hours}h). Is the scanner running?",
+            )
+        )
+    _stale_parts(st, cen, obs.now, cfg, alerts)
+
+
+def _stale_parts(
+    st: WatchState,
+    cen: Census,
+    now: datetime,
+    cfg: WatchConfig,
+    alerts: list[Alert],
+) -> None:
+    """Each optional file has its own ``when``; alert once per stale value."""
+    limit = timedelta(hours=cfg.census_max_age_hours)
+    for part, label in STALE_PARTS.items():
+        when = getattr(cen, f"{part}_when")
+        if when is None:
+            continue
+        when_iso = _aware(when).isoformat()
+        age = now - _aware(when)
+        if age <= limit or st.stale_parts.get(part) == when_iso:
+            continue
+        st.stale_parts[part] = when_iso
+        alerts.append(
+            Alert(
+                "census",
+                f"census:stale:{part}",
+                f"{label} is stale: last run {age.total_seconds() / 3600:.0f}h "
+                f"ago (limit {cfg.census_max_age_hours}h). Is the scanner running?",
+            )
+        )
+
+
+def _new_devices(fresh: list[Device], cfg: WatchConfig, alerts: list[Alert]) -> None:
+    if len(fresh) > cfg.flood_threshold:
+        shown = ", ".join(safe_label(d.hostname) or d.mac for d in fresh[:FLOOD_NAMES])
+        more = len(fresh) - FLOOD_NAMES
+        tail = f" and {more} more" if more > 0 else ""
+        alerts.append(
+            Alert(
+                "census",
+                "census:new:flood",
+                f"{len(fresh)} new devices on the network: {shown}{tail}",
+            )
+        )
+        return
+    for device in fresh:
+        host = safe_label(device.hostname) or "no hostname"
+        alerts.append(
+            Alert(
+                "census",
+                f"census:new:{device.mac}",
+                f"New device: {host} ({device.mac}) at {safe_label(device.ip)} "
+                f"on {safe_label(device.interface) or 'unknown interface'}",
             )
         )
 

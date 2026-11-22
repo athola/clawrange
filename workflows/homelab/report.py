@@ -88,8 +88,10 @@ def render_home(obs: Observation, cfg: WatchConfig) -> str:
         assert obs.kuma is not None
         up = sum(1 for m in obs.kuma if m.status == 1)
         down_mons = [m for m in obs.kuma if m.status == 0]
-        other = sum(1 for m in obs.kuma if m.status not in (0, 1))
-        extra = f", {other} pending or in maintenance" if other else ""
+        waiting = sum(1 for m in obs.kuma if m.status in (2, 3))
+        no_data = sum(1 for m in obs.kuma if m.status not in (0, 1, 2, 3))
+        extra = f", {waiting} pending or in maintenance" if waiting else ""
+        extra += f", {no_data} no data" if no_data else ""
         lines.append(f"Uptime Kuma: {up} of {len(obs.kuma)} up{extra}")
         if down_mons:
             names = [safe_label(m.name) for m in down_mons]
@@ -190,6 +192,13 @@ def render_net(obs: Observation, state: WatchState) -> str:
         if len(cen.kev) > KEV_CAP:
             lines.append(f"...and {len(cen.kev) - KEV_CAP} more")
         lines.append(KEV_NOTE)
+    broken = sorted(
+        f"{key.removeprefix('census.')} {safe_label(reason, 60)}"
+        for key, reason in obs.errors.items()
+        if key.startswith("census.")
+    )
+    if broken:
+        lines.append("Census parts unreadable: " + "; ".join(broken))
     return "\n".join(lines)
 
 

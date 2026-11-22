@@ -125,6 +125,11 @@ def devices_from_census(raw: str) -> tuple[Device, ...]:
     return tuple(devices)
 
 
+def has_mac_table(raw: str) -> bool:
+    """True when the output holds at least one table with a MAC-ADDRESS column."""
+    return any("MAC-ADDRESS" in columns for columns, _ in _tables(raw))
+
+
 def parse_system_resource(raw: str) -> dict[str, str]:
     """``key: value`` lines of ``/system resource print``."""
     out: dict[str, str] = {}
@@ -144,23 +149,47 @@ def router_version(raw: str) -> str | None:
 _OPEN_ENTRY = re.compile(r"->\s*\[([^\]]*)\]")
 
 
-def parse_mgmt_ports(scan: Any) -> tuple[int, ...] | None:
-    """Sorted unique open ports from ``{"open": ["<ip> -> [22,53]"]}``."""
-    if not isinstance(scan, dict) or not isinstance(scan.get("open"), list):
+def _entry_ports(entry: Any) -> set[int] | None:
+    """The ports of one ``"<ip> -> [22,53]"`` entry, None when malformed."""
+    match = _OPEN_ENTRY.search(entry) if isinstance(entry, str) else None
+    if not match:
         return None
     ports: set[int] = set()
-    for entry in scan["open"]:
-        match = _OPEN_ENTRY.search(entry) if isinstance(entry, str) else None
-        if not match:
+    for part in match.group(1).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if not (part.isascii() and part.isdigit()) or not 0 < int(part) < 65536:
             return None
-        for part in match.group(1).split(","):
-            part = part.strip()
-            if not part:
-                continue
-            if not part.isdigit() or not 0 < int(part) < 65536:
-                return None
-            ports.add(int(part))
-    return tuple(sorted(ports))
+        ports.add(int(part))
+    return ports
+
+
+def mgmt_ports_skipping(scan: Any) -> tuple[tuple[int, ...] | None, int]:
+    """Open ports plus the number of malformed entries that were skipped.
+
+    The ports are None when the payload itself has the wrong shape.
+    """
+    if not isinstance(scan, dict) or not isinstance(scan.get("open"), list):
+        return None, 0
+    ports: set[int] = set()
+    skipped = 0
+    for entry in scan["open"]:
+        found = _entry_ports(entry)
+        if found is None:
+            skipped += 1
+        else:
+            ports |= found
+    return tuple(sorted(ports)), skipped
+
+
+def parse_mgmt_ports(scan: Any) -> tuple[int, ...] | None:
+    """Sorted unique open ports from ``{"open": ["<ip> -> [22,53]"]}``.
+
+    None when the payload or any entry is malformed.
+    """
+    ports, skipped = mgmt_ports_skipping(scan)
+    return None if skipped else ports
 
 
 def kev_entries(feed: Any) -> tuple[KevEntry, ...]:
