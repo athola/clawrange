@@ -64,3 +64,7 @@ docs/research/
 # Local scratch for finished plans and specs. Lasting decisions go in
 # docs/tradeoffs.md; the old archive is in git history (git log -- docs/archive).
 docs/archive/
+
+# Homelab: private CA certificate for Uptime Kuma TLS (keep the README)
+config/homelab/*
+!config/homelab/README.md
