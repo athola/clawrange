@@ -30,6 +30,13 @@ than commit by commit; `git log v0.1.0..v0.2.0` has the detail.
   OpenClaw" in `docs/DEPLOYMENT_GUIDE.md`); otherwise `render-config.js`
   exits non-zero and the container stops at start. The heartbeat's cadence
   and active hours are edited with `openclaw automations edit`.
+- **The proxy token leaves OpenClaw's state.** On an install set up before
+  0.2.0's SecretRef change, the startup secrets audit reports a plaintext
+  `profiles.clawrange-proxy:default.key`. Run "Moving the proxy token out
+  of OpenClaw's state" in `docs/DEPLOYMENT_GUIDE.md` once. It also
+  recreates the heartbeat job, whose history is lost. Then rotate
+  `PROXY_AUTH_TOKEN` ("Rotating PROXY_AUTH_TOKEN"), since older backups
+  hold the old value.
 - **Smoke-test scripts moved.** `scripts/test_*.sh` are now
   `scripts/tests/*.sh` without the `test_` prefix. The make targets are
   unchanged; update anything that calls the scripts by path.
@@ -73,7 +80,8 @@ than commit by commit; `git log v0.1.0..v0.2.0` has the detail.
   routing across OpenRouter and Z.AI, an anti-hallucination guard and a
   balance circuit breaker.
 - **Ops**: a heartbeat that OpenClaw runs as an automation job
-  (`openclaw/sync-heartbeat.sh` ensures it and caps its tools) and the
+  (`openclaw/sync-heartbeat.sh` ensures it, caps its tools and flags any
+  other enabled heartbeat job as unhealthy) and the
   proxy answers in Python: it works one task per cycle, sends an hourly
   digest whose outage lines name each tier's cause (`out of credit`,
   `rate-limited`, `empty reply`), and closes its `Stale queue:` nudge from
@@ -81,6 +89,11 @@ than commit by commit; `git log v0.1.0..v0.2.0` has the detail.
   stall, and a `/healthz` that names the degraded part (`db`,
   `vector_search`, `scheduler`, `profile`).
 - Secure gateway deployment via Tailscale and Caddy (`make start-prod`).
+- **Credential hygiene for OpenClaw**: the proxy `apiKey` is an env
+  SecretRef that is never written to disk, agents' file tools are
+  confined to their workspace (`tools.fs.workspaceOnly`), and a startup
+  `openclaw secrets audit` marks the container unhealthy on any plaintext
+  credential at rest.
 
 ### Changed
 

@@ -308,7 +308,18 @@ make start-prod
 
 Read `doctor.log` even when doctor exits 0. A run can exit 0 and still
 report a failed plugin install or an unfinished state migration. If it
-does, run doctor again: the second run completes them. On the first start,
+does, run doctor again: the second run completes them. Two warnings are
+expected on this stack and need no action:
+
+- `Gateway bound to "lan" (0.0.0.0)`: that is inside the container.
+  Docker publishes it only on `127.0.0.1`, docker0 and, in prod,
+  `TAILSCALE_IP` (`docker port msp-openclaw`).
+- `Failed to generate completion cache`: the container rootfs is read-only.
+
+A `plaintext secret-bearing config` warning means the install still holds
+the proxy token in plaintext: run the one-time migration below.
+
+On the first start,
 `sync-heartbeat.sh` caps the migrated job's tools to the `max-ops` allow
 list and loads `HEARTBEAT.md` into its scratch. Then check:
 
@@ -321,6 +332,54 @@ To roll back, stop the container, restore the tarball over the state
 dir, and check out the previous commit. The old image also needs the old
 `openclaw.json` and `sync-heartbeat.sh`, so reverting only the pin is not
 enough.
+
+### Moving the proxy token out of OpenClaw's state (one time)
+
+The template's proxy `apiKey` is an env SecretRef, so `openclaw.json`
+holds a reference and OpenClaw resolves `PROXY_AUTH_TOKEN` from its own
+environment. `tools.fs.workspaceOnly` keeps every agent's file tools in
+its workspace, away from that file and from `/proc/*/environ`. An install
+set up before this change still has a plaintext copy in the gateway's
+auth-profile store, which the startup secrets audit reports as unhealthy.
+
+Removing that copy also strands the heartbeat job: 2026.11.6 pins an
+automation job to the account it was created with and stops it ("was
+removed or signed out") rather than fall back. So the job is recreated in
+the same step. The plan needs the gateway stopped, because the running
+gateway holds a write lock on its state DB:
+
+```bash
+docker compose stop openclaw
+tar -czf "data/backups/openclaw-state-$(date +%Y%m%d-%H%M%S).tar.gz" \
+  -C data openclaw-state
+docker compose run --rm --no-deps -T --entrypoint sh openclaw -c \
+  'chown 1000:1000 /home/node/.openclaw /tmp &&
+   node /opt/render-config.js /opt/openclaw.json.template /home/node/.openclaw/openclaw.json &&
+   chown 1000:1000 /home/node/.openclaw/openclaw.json &&
+   runuser -u node -- node dist/index.js secrets apply --from /opt/secrets-plan.json'
+docker compose up -d openclaw
+OC="docker exec msp-openclaw runuser -u node -- openclaw"
+$OC automations list --all            # note the old heartbeat job's id
+$OC automations rm <old-heartbeat-id>
+docker compose restart openclaw       # sync-heartbeat.sh creates a new job
+$OC secrets audit                     # expect: clean, plaintext=0, shadowed=0
+```
+
+Never add this plan to the container start: on an existing install, every
+start would delete the profile the heartbeat job depends on.
+
+### Rotating PROXY_AUTH_TOKEN
+
+Nothing inside OpenClaw stores the value, so a rotation is env only:
+
+1. Put the new value (`openssl rand -hex 32`) in `.env` and in the tome
+   bridge's token file (`~/.config/clawrange/tome-bridge.env`).
+2. `docker compose up -d --force-recreate workflows openclaw`.
+3. `systemctl --user restart clawrange-tome-bridge`, once it has no
+   `claude` child running; otherwise that task stays `active` until the
+   6-hour reaper fails it.
+4. Check that the old token gets 401 on `GET /task`, and watch the
+   workflows log for 401s from anything still holding it.
 
 ## Troubleshooting
 
@@ -336,6 +395,9 @@ enough.
 | `/docs` or `/openapi.json` returns 404 | Expected: the interactive docs are turned off. Routes are listed in `CLAUDE.md` and `workflows/app.py` |
 | `/scan/*` or `/research` returns 502 | The upstream (Reddit, GitHub, the search tier) failed; `detail` carries the reason. Not an empty result |
 | OpenClaw container unhealthy, heartbeats never reach the proxy | `docker inspect --format '{{json .State.Health}}' msp-openclaw`: a `heartbeat sync failed: ...` line means `sync-heartbeat.sh` could not find or create the heartbeat automation job, or load `HEARTBEAT.md` into its scratch, and wrote `/run/sync-heartbeat.failed`. The script's output is in `docker logs msp-openclaw`; restart the container to retry |
+| OpenClaw unhealthy with `heartbeat sync failed: foreign heartbeat job(s) enabled` | An enabled heartbeat that is not ClawRange's exists (named `heartbeat-*` or "Heartbeat (...)"). It would DM you on its own schedule and bypass the proxy. Ours still runs. Turn the other off with `docker exec msp-openclaw runuser -u node -- openclaw automations disable <id>` and restart the container |
+| OpenClaw unhealthy with `heartbeat sync failed: secrets audit: [PLAINTEXT_FOUND] ...` | A credential is stored in plaintext in OpenClaw's state. For `profiles.clawrange-proxy:default.key`, run [the one-time token migration](#moving-the-proxy-token-out-of-openclaws-state-one-time); for anything else, `openclaw secrets configure` |
+| Heartbeat runs fail with `Automation inference account ... was removed or signed out` (or `was replaced`) | The auth profile the job was pinned to is gone. Remove the job (`openclaw automations rm <id>`) and restart the container; `sync-heartbeat.sh` creates a new one |
 | OpenClaw exits at start with `render-config: ... still has retired keys` | The state dir predates 2026.11.5. Run the doctor step in [Upgrading OpenClaw](#upgrading-openclaw) |
 | A task stays `active` | A worker claimed it and died. The heartbeat fails it after `HEARTBEAT_ACTIVE_REAP_HOURS` (default 6) with a digest line; re-create it to retry |
 | Heartbeat tasks fail with the LLM down | During an outage a task goes back to pending each heartbeat and is failed on its 6th outage cycle (about an hour), so it cannot block the queue. The digest line says why per tier, e.g. `No LLM answered (openrouter-free: empty reply; zai-direct: out of credit)`. `out of credit` will not clear by waiting: top up that provider. Z.AI sends it as HTTP 429 with code 1113 |

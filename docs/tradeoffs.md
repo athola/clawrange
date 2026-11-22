@@ -6,6 +6,7 @@ Decisions, the alternatives weighed, and what was given up. Newest first.
 
 | ID | Phase | Status | Decision |
 |----|-------|--------|----------|
+| TR-015 | execute | accepted | Proxy token: env SecretRef, workspace-only file tools, one-time state migration, startup secrets audit |
 | TR-014 | specify | accepted | Income loop reuses the task queue and tome bridge; every trade is a `[DRAFT]`, benchmarked against holding |
 | TR-013 | specify | accepted | Persona config and meta-learning: git profile, brain learning store, approval-gated `## Learned` overlay |
 | TR-012 | execute | accepted | OpenClaw 2026.11.6: heartbeat is an automation job that `sync-heartbeat.sh` ensures; render refuses retired keys |
@@ -40,6 +41,52 @@ and TR-014 were recovered the same way from the design specs and plans in
 checked against the code when it was written here, and the
 **Changed since** lines record where the shipped design moved away from
 the plan.
+
+## TR-015: Keep the proxy token out of what agents can read
+
+- **Phase**: execute
+- **Status**: accepted
+- **Decision (Y-statement)**: In the context of `openclaw doctor` and
+  `openclaw secrets audit` reporting `PROXY_AUTH_TOKEN` in plaintext in
+  `openclaw.json` and in the gateway's auth-profile store, while `max-ops`
+  runs unsandboxed with a `read` tool that could open any path the `node`
+  user can, we decided on **four layers**:
+  - **Reference, not value:** the template's proxy `apiKey` is an env
+    SecretRef, and `render-config.js` never writes the token.
+  - **Confined file tools:** `tools.fs.workspaceOnly: true` keeps every
+    agent's `read` in its workspace, away from config, rollback copies and
+    `/proc/*/environ`.
+  - **One-time migration:** `openclaw/secrets-plan.json` scrubs the
+    auth-profile copy, and the heartbeat job is recreated in the same step.
+  - **Startup audit:** `sync-heartbeat.sh` runs `secrets audit --check` and
+    fails the healthcheck on any finding.
+
+  The aim is that no file or process an agent can reach yields the token,
+  accepting a one-time manual step on existing installs.
+- **Options weighed**:
+  - **SecretRef alone.** Rejected: an unsandboxed `read` can still open
+    `/proc/self/environ`, where the env ref resolves.
+  - **Applying the plan on every start.** Rejected after it took prod's
+    heartbeat down: 2026.11.6 pins an automation job to its inference
+    account and stops the job when that profile is deleted ("was removed or
+    signed out"). Recreating the profile under the same id does not help
+    ("was replaced").
+  - **Keeping the plaintext profile** behind `workspaceOnly`. Rejected: a
+    single layer, and the audit would need an exception.
+- **Negative consequences**:
+  - The migration deletes the heartbeat job's run history.
+  - The gateway process env still holds the token. That is by design for
+    an env ref, and `workspaceOnly` is what keeps agents from it.
+  - Rollback copies (`openclaw.json.bak.*`) and state tarballs made before
+    the change hold the old value, so the change ended with a token
+    rotation.
+- **Evidence**: `workflows/tests/test_openclaw_template.py` (ref, fs
+  confinement, plan), `tests/test_openclaw_scripts.py` (no token on disk,
+  audit guard, the start command never applying the plan). On prod, a
+  `max-ops` turn asked to read `openclaw.json` and `/proc/self/environ` got
+  "Path escapes sandbox root" for both. The audit was clean (`plaintext=0,
+  shadowed=0`), the recreated job and a `max` chat turn worked, and after
+  rotation the old token got 401.
 
 ## TR-014: Income loop reuses the existing pipeline, approval-gated
 
@@ -162,6 +209,13 @@ the plan.
     `npm_config_cache=/tmp/.npm`.
   - A world-writable state dir stops the gateway at start ("No safe
     OpenClaw temp root").
+  - The retired `agents.defaults.heartbeat.every: "0m"` was what stopped
+    2026.8+ giving every agent its own heartbeat DM, and no config can say
+    that now. `sync-heartbeat.sh` guards the outcome instead: an enabled
+    `heartbeat-*` job that is not ClawRange's marks the container
+    unhealthy, naming it. It reports rather than disables, and it ignores
+    other automations, because `max-ops` has the `cron` tool and the
+    operator's own reminders must not trip it.
 - **Evidence**: `tests/test_openclaw_scripts.py` (`TestSyncHeartbeat`,
   `test_retired_heartbeat_keys_stop_the_render`) and `TestGetLastUserMessage`
   in `workflows/tests/test_llm_proxy.py`. On the local install, doctor

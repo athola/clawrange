@@ -57,6 +57,12 @@ services:
       # into its scratch once the gateway is up.
       - ./openclaw/HEARTBEAT.md:/opt/HEARTBEAT.md:ro
       - ./openclaw/sync-heartbeat.sh:/opt/sync-heartbeat.sh:ro
+      # One-time `openclaw secrets apply` plan (docs/DEPLOYMENT_GUIDE.md):
+      # points the proxy apiKey at the PROXY_AUTH_TOKEN env SecretRef and
+      # scrubs the plaintext copy OpenClaw kept in its auth-profile store.
+      # Never run it on an ordinary start: the scrub deletes the profile an
+      # existing heartbeat job is pinned to. scrubEnv is off.
+      - ./openclaw/secrets-plan.json:/opt/secrets-plan.json:ro
       - ./openclaw/config/openclaw.json:/opt/openclaw.json.template:ro
       - ./openclaw/render-config.js:/opt/render-config.js:ro
       # Host home — read-only access for agent file reads

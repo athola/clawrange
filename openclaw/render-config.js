@@ -1,24 +1,26 @@
 // Render openclaw.json from the template on every container start.
 //
-// Template-owned keys (provider URL, PROXY_AUTH_TOKEN, timezone, tool
-// policy) are refreshed so a rotated token or a changed SCHEDULER_TZ takes
-// effect on restart. Keys OpenClaw adds at runtime (commands, controlUi,
-// meta, ...) survive, because the rendered template is deep-merged over the
-// existing file instead of replacing it. Arrays are replaced, not merged.
+// Template-owned keys (provider URL, timezone, tool policy) are refreshed so
+// a changed SCHEDULER_TZ takes effect on restart. Keys OpenClaw adds at
+// runtime (commands, controlUi, meta, ...) survive, because the rendered
+// template is deep-merged over the existing file instead of replacing it.
+// Arrays are replaced, not merged.
+//
+// The proxy token is never written: the template's apiKey is an env
+// SecretRef that OpenClaw resolves from PROXY_AUTH_TOKEN in its own process
+// env, so a rotated token still takes effect on restart, and an agent tool
+// that can read files finds a reference, not the value.
 //
 // Usage: node render-config.js <template> <target>
-// Env:   PROXY_AUTH_TOKEN, OPENCLAW_TZ (default UTC)
+// Env:   OPENCLAW_TZ (default UTC); PROXY_AUTH_TOKEN is only checked
 "use strict";
 const fs = require("fs");
 
 function substitute(text, env) {
-  // split/join on already-parsed string values: a token may contain any
-  // character, including quotes and backslashes, without breaking the JSON.
-  return text
-    .split("${PROXY_AUTH_TOKEN}")
-    .join(env.PROXY_AUTH_TOKEN || "")
-    .split("${OPENCLAW_TZ}")
-    .join(env.OPENCLAW_TZ || "UTC");
+  // split/join on already-parsed string values, so a value may contain any
+  // character without breaking the JSON. ${PROXY_AUTH_TOKEN} is deliberately
+  // left alone: OpenClaw reads that shorthand as an env SecretRef.
+  return text.split("${OPENCLAW_TZ}").join(env.OPENCLAW_TZ || "UTC");
 }
 
 function render(value, env) {
@@ -46,11 +48,11 @@ function merge(base, over) {
 
 function main(templatePath, targetPath, env) {
   if (!env.PROXY_AUTH_TOKEN) {
-    // Rendered anyway so the gateway still starts, but every proxied LLM
-    // call will get 401 from workflows until the token is set.
+    // Rendered anyway so the gateway still starts, but the apiKey SecretRef
+    // cannot resolve, so every proxied LLM call fails until the token is set.
     console.error(
       "render-config: WARNING PROXY_AUTH_TOKEN is empty; the provider apiKey " +
-        "will be blank and the workflows proxy will reject every request"
+        "SecretRef cannot resolve and the workflows proxy will reject every request"
     );
   }
   const rendered = render(JSON.parse(fs.readFileSync(templatePath, "utf8")), env);

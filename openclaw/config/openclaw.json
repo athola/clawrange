@@ -118,7 +118,11 @@
     "providers": {
       "clawrange-proxy": {
         "baseUrl": "http://msp-workflows:5678/v1",
-        "apiKey": "${PROXY_AUTH_TOKEN}",
+        "apiKey": {
+          "source": "env",
+          "provider": "default",
+          "id": "PROXY_AUTH_TOKEN"
+        },
         "authHeader": true,
         "models": [
           {
@@ -175,6 +179,9 @@
           "subagents"
         ]
       }
+    },
+    "fs": {
+      "workspaceOnly": true
     },
     "elevated": {
       "enabled": false

@@ -24,11 +24,25 @@
 # config stays the one place the agent's tools are listed.
 #
 # Usage: sync-heartbeat.sh <heartbeat-file>
+# It also fails the healthcheck if `openclaw secrets audit` finds any
+# plaintext credential at rest, such as the proxy token's auth-profile copy
+# on an install that has not run the one-time openclaw/secrets-plan.json
+# migration (docs/DEPLOYMENT_GUIDE.md), or a credential added later.
+#
 # Env:   TELEGRAM_CHAT_ID (delivery target for a newly created job)
 #        OPENCLAW_CONFIG (default /home/node/.openclaw/openclaw.json)
 set -u
 FILE="$1"
 CONFIG="${OPENCLAW_CONFIG:-/home/node/.openclaw/openclaw.json}"
+# Problems that must not stop the heartbeat from loading: collected here and
+# reported together at the end.
+problems=""
+problem() { problems="${problems:+$problems; }$*"; }
+# The last meaningful line of CLI output: Node prints deprecation warnings
+# after the real error, and they would otherwise become the reported cause.
+cli_error() {
+  printf '%s\n' "$1" | grep -vE 'DeprecationWarning|--trace-deprecation|^[[:space:]]*$' | tail -n 1
+}
 
 # The message the job sends each cycle. It must start with the proxy's
 # heartbeat marker, and NO_REPLY is the token OpenClaw automations treat as a
@@ -69,10 +83,13 @@ until curl -sf -o /dev/null --max-time 5 http://127.0.0.1:18789/healthz; do
   sleep 5
 done
 
+
 # Print the id of every heartbeat job, enabled or not, suffixed "+cap" when
-# its tool cap differs from $TOOLS. Fails (non-zero) when the CLI or its JSON
-# fails, so a gateway still warming up is retried rather than read as "no
-# job". stderr is left on the container log.
+# its tool cap differs from $TOOLS, and "foreign:<id>:<name>" for each
+# enabled heartbeat that is not ClawRange's (named heartbeat-* or "Heartbeat
+# (...)", as OpenClaw names its own). Fails (non-zero) when the CLI or its
+# JSON fails, so a gateway still warming up is retried rather than read as
+# "no job". stderr is left on the container log.
 heartbeat_ids() {
   out=$(runuser -u node -- openclaw automations list --all --json) || return 1
   printf '%s' "$out" | TOOLS="$TOOLS" node -e '
@@ -83,19 +100,35 @@ process.stdin.on("data", (d) => (t += d)).on("end", () => {
   for (const j of JSON.parse(t.slice(i)).jobs || []) {
     const p = j.payload || {};
     const msg = String(p.message || "").trim().toLowerCase();
-    if (p.kind !== "agentTurn" || !msg.startsWith("clawrange heartbeat:")) continue;
+    if (p.kind !== "agentTurn") continue;
+    if (!msg.startsWith("clawrange heartbeat:")) {
+      const name = String(j.name || "");
+      const looksHeartbeat =
+        name.toLowerCase().startsWith("heartbeat-") ||
+        String(j.displayName || "").toLowerCase().startsWith("heartbeat");
+      if (j.enabled !== false && looksHeartbeat) console.log("foreign:" + j.id + ":" + name);
+      continue;
+    }
     const capped = (p.toolsAllow || []).join(",") === process.env.TOOLS;
     console.log(capped ? j.id : j.id + "+cap");
   }
 });'
 }
 
+# Split heartbeat_ids output into our job tokens ($ids) and foreign
+# heartbeats ($foreign).
+split_ids() {
+  foreign=$(printf '%s\n' "$1" | grep '^foreign:' || true)
+  ids=$(printf '%s\n' "$1" | grep -v '^foreign:' || true)
+}
+
 i=0
-until ids=$(heartbeat_ids); do
+until listed=$(heartbeat_ids); do
   i=$((i + 1))
   [ "$i" -ge 24 ] && fail "could not list automation jobs"
   sleep 5
 done
+split_ids "$listed"
 
 if [ -z "$ids" ]; then
   [ -n "${TELEGRAM_CHAT_ID:-}" ] ||
@@ -115,9 +148,10 @@ if [ -z "$ids" ]; then
     echo "sync-heartbeat: created heartbeat job: $out"
   else
     echo "sync-heartbeat: failed to create heartbeat job: $out" >&2
-    fail "heartbeat job create failed: $(printf '%s\n' "$out" | tail -n 1)"
+    fail "heartbeat job create failed: $(cli_error "$out")"
   fi
-  ids=$(heartbeat_ids) || fail "could not list automation jobs"
+  listed=$(heartbeat_ids) || fail "could not list automation jobs"
+  split_ids "$listed"
   [ -n "$ids" ] || fail "heartbeat job missing after create"
 fi
 
@@ -140,4 +174,24 @@ for tok in $ids; do
     failed="$failed $id"
   fi
 done
-[ -z "$failed" ] || fail "tool cap or scratch load failed for:$failed"
+[ -z "$failed" ] || problem "tool cap or scratch load failed for:$failed"
+
+# OpenClaw 2026.8+ gave every agent its own heartbeat unless config turned it
+# off; 2026.11.5 retired that config, so guard the outcome instead. A foreign
+# heartbeat DMs the operator on its own schedule and bypasses the proxy's
+# interceptor. Ours is loaded above either way; disabling the other is the
+# operator's call, so report it rather than touch it.
+if [ -n "$foreign" ]; then
+  names=$(printf '%s\n' "$foreign" | sed 's/^foreign://' | tr '\n' ' ')
+  problem "foreign heartbeat job(s) enabled: ${names}(id:name); turn off with: openclaw automations disable <id>"
+fi
+
+# Any plaintext credential at rest is readable by whatever can read the state
+# dir. Migrating is the operator's step (the proxy token: the one-time plan;
+# anything else: openclaw secrets configure), so report it.
+if ! out=$(runuser -u node -- openclaw secrets audit --check 2>&1); then
+  findings=$(printf '%s\n' "$out" | grep -E '^- \[' | sed 's/^- //' | tr '\n' ' ')
+  problem "secrets audit: ${findings:-$(cli_error "$out")}"
+fi
+
+[ -z "$problems" ] || fail "$problems"

@@ -19,14 +19,20 @@ Tailscale and Caddy gateway.
   agent's heartbeat checklist), `sync-heartbeat.sh` (on every container
   start, ensures the heartbeat automation job exists, creating it on a fresh
   state dir with the message the proxy intercepts, caps its tools to the
-  `max-ops` allow list and reloads `HEARTBEAT.md` into its scratch;
+  `max-ops` allow list and reloads `HEARTBEAT.md` into its scratch, then
+  marks the container unhealthy if any other heartbeat job is enabled or
+  `openclaw secrets audit` finds a plaintext credential;
   OpenClaw 2026.11.5+ runs heartbeats as ordinary `agentTurn` automations,
   not config; upgrade an older state dir with `doctor --fix` first, see
   `docs/DEPLOYMENT_GUIDE.md`),
   `config/openclaw.json` (rendered over the live config on start by
   `render-config.js`: agents, Telegram binding, tool policy; no heartbeat
   keys, which 2026.11.5+ rejects; keeps dreaming, self-learning and
-  cross-conversation recall off)
+  cross-conversation recall off; the proxy `apiKey` is an env SecretRef,
+  never the token, and `tools.fs.workspaceOnly` keeps agents' file tools in
+  their workspace), `secrets-plan.json` (one-time migration of the
+  plaintext auth-profile copy; never run on start, see
+  `docs/DEPLOYMENT_GUIDE.md`)
 - `workflows/`: FastAPI service:
   - `app.py`: FastAPI entrypoint and route registration (no `/docs`,
     `/redoc` or `/openapi.json`)

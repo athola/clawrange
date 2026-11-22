@@ -47,10 +47,38 @@ def _render(tmp_path, target_text=None, token="tok"):
 @needs_node
 class TestRenderConfig:
     def test_renders_and_keeps_runtime_keys(self, tmp_path):
+        """GIVEN a template whose apiKey is the ${PROXY_AUTH_TOKEN} shorthand
+        WHEN rendered over a live file with runtime keys
+        THEN runtime keys survive and the shorthand stays literal: OpenClaw
+        resolves it as an env SecretRef, so the value never lands on disk."""
         proc, target = _render(tmp_path, json.dumps({"meta": {"x": 1}}))
         assert proc.returncode == 0, proc.stderr
         data = json.loads(target.read_text())
-        assert data == {"meta": {"x": 1}, "provider": {"apiKey": "tok"}}
+        assert data == {"meta": {"x": 1}, "provider": {"apiKey": "${PROXY_AUTH_TOKEN}"}}
+
+    def test_token_value_is_never_written(self, tmp_path):
+        """GIVEN a live file still holding a plaintext apiKey (pre-SecretRef)
+        and a template with a structured env SecretRef
+        WHEN rendered with the token in the environment
+        THEN the ref replaces the old value and the token appears nowhere."""
+        ref = {"source": "env", "provider": "default", "id": "PROXY_AUTH_TOKEN"}
+        template = tmp_path / "template.json"
+        template.write_text(json.dumps({"provider": {"apiKey": ref}}))
+        target = tmp_path / "openclaw.json"
+        target.write_text(json.dumps({"provider": {"apiKey": "old-plaintext-tok"}}))
+        env = {"PATH": os.environ["PATH"], "PROXY_AUTH_TOKEN": "s3cret-token-value"}
+        proc = subprocess.run(
+            ["node", str(RENDER), str(template), str(target)],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        text = target.read_text()
+        assert json.loads(text)["provider"]["apiKey"] == ref
+        assert "s3cret-token-value" not in text
+        assert "old-plaintext-tok" not in text
 
     def test_empty_token_warns(self, tmp_path):
         proc, target = _render(tmp_path, token="")
@@ -113,6 +141,25 @@ HEARTBEAT_JOB = {
         "message": "ClawRange heartbeat: run the scheduled checks. Reply NO_REPLY.",
     },
 }
+# A heartbeat OpenClaw created itself (the shape doctor gave the migrated
+# job: heartbeat-<agent>, "Heartbeat (<agent>)"), not ClawRange's: it would
+# DM the operator on its own schedule and bypass the proxy's interceptor.
+FOREIGN_HEARTBEAT = {
+    "id": "hb-max",
+    "name": "heartbeat-max",
+    "displayName": "Heartbeat (max)",
+    "enabled": True,
+    "payload": {"kind": "agentTurn", "message": "Read HEARTBEAT.md. Reply NO_REPLY."},
+    "delivery": {"mode": "announce", "channel": "telegram", "to": "4242"},
+}
+# Something the operator (or the agent's cron tool) scheduled on purpose.
+REMINDER_JOB = {
+    "id": "remind1",
+    "name": "standup-reminder",
+    "enabled": True,
+    "payload": {"kind": "agentTurn", "message": "Remind me about standup."},
+    "delivery": {"mode": "announce", "channel": "telegram", "to": "4242"},
+}
 # OpenClaw ships its own agentTurn jobs (memory dreaming); never touch them.
 OTHER_JOB = {
     "id": "dream1",
@@ -121,12 +168,21 @@ OTHER_JOB = {
 }
 
 
-def _openclaw(bin_dir: Path, jobs=None, scratch_ok=True, add_ok=True) -> Path:
+def _openclaw(
+    bin_dir: Path,
+    jobs=None,
+    scratch_ok=True,
+    add_ok=True,
+    audit_findings=(),
+) -> Path:
     """Stateful `openclaw automations` stub: list/add/scratch over a JSON file.
 
     `add` records its argv in add.log and appends a job (id hb-new) carrying
     its --message, so a later `list` returns it like the real gateway does.
     `edit` appends its argv to edit.log and stores --tools as toolsAllow.
+    `secrets audit --check` prints `audit_findings` and exits 1 when there
+    are any. A failed `add` ends with Node deprecation noise, as the real
+    CLI's errors do.
     """
     state = bin_dir.parent / "jobs.json"
     state.write_text(json.dumps([HEARTBEAT_JOB] if jobs is None else jobs))
@@ -136,6 +192,12 @@ def _openclaw(bin_dir: Path, jobs=None, scratch_ok=True, add_ok=True) -> Path:
 import json, sys
 state = {str(state)!r}
 args = sys.argv[1:]
+if args[0] == "secrets":
+    assert args[1:] == ["audit", "--check"], args
+    findings = {list(audit_findings)!r}
+    for f in findings:
+        print("- [PLAINTEXT_FOUND] " + f)
+    sys.exit(1 if findings else 0)
 assert args[0] == "automations", args
 jobs = json.load(open(state))
 if args[1] == "list":
@@ -145,7 +207,10 @@ if args[1] == "list":
 elif args[1] == "add":
     open({str(bin_dir.parent / "add.log")!r}, "w").write(json.dumps(args[2:]))
     if not {add_ok!r}:
-        sys.exit("invalid cron.add params: no route for telegram")
+        sys.exit(
+            "invalid cron.add params: no route for telegram\\n"
+            "(node:1) [DEP_PLUGIN_SDK] DeprecationWarning: x is deprecated"
+        )
     msg = args[args.index("--message") + 1]
     jobs.append({{"id": "hb-new", "enabled": True,
                  "payload": {{"kind": "agentTurn", "message": msg}}}})
@@ -259,6 +324,65 @@ class TestSyncHeartbeat:
         assert opt["--active-hours-timezone"] == "user"
         assert "--idle-only" in add
         assert _scratched(root) == ["hb-new"]
+
+    def test_foreign_heartbeat_marks_unhealthy_but_ours_still_loads(
+        self, tmp_path, stubs
+    ):
+        """GIVEN an enabled heartbeat job that is not ClawRange's (what the
+        retired agents.defaults.heartbeat "0m" used to prevent)
+        WHEN sync-heartbeat runs
+        THEN our heartbeat still gets its scratch, and the marker names the
+        foreign job and how to turn it off."""
+        root = _openclaw(stubs, jobs=[HEARTBEAT_JOB, FOREIGN_HEARTBEAT])
+        marker = tmp_path / "sync-heartbeat.failed"
+        proc = _run(SYNC, stubs, marker, "/opt/HEARTBEAT.md")
+        assert proc.returncode != 0
+        assert _scratched(root) == ["hb1"]
+        text = marker.read_text()
+        assert "hb-max" in text and "automations disable" in text
+
+    @pytest.mark.parametrize(
+        "job",
+        [{**FOREIGN_HEARTBEAT, "enabled": False}, REMINDER_JOB, OTHER_JOB],
+        ids=["disabled-foreign-heartbeat", "operator-reminder", "openclaw-dream"],
+    )
+    def test_other_jobs_do_not_trip_the_guard(self, tmp_path, stubs, job):
+        """GIVEN a disabled foreign heartbeat, an operator's own reminder or
+        an OpenClaw housekeeping job beside ours
+        WHEN sync-heartbeat runs
+        THEN nothing is flagged."""
+        root = _openclaw(stubs, jobs=[HEARTBEAT_JOB, job])
+        marker = tmp_path / "sync-heartbeat.failed"
+        proc = _run(SYNC, stubs, marker, "/opt/HEARTBEAT.md")
+        assert proc.returncode == 0, proc.stderr
+        assert not marker.exists()
+        assert _scratched(root) == ["hb1"]
+
+    def test_plaintext_secret_at_rest_marks_unhealthy(self, tmp_path, stubs):
+        """GIVEN the secrets audit still finds a plaintext credential
+        WHEN sync-heartbeat runs
+        THEN the heartbeat is still loaded and the marker names the finding."""
+        finding = "openclaw.json:channels.telegram.botToken is stored as plaintext."
+        root = _openclaw(stubs, audit_findings=[finding])
+        marker = tmp_path / "sync-heartbeat.failed"
+        proc = _run(SYNC, stubs, marker, "/opt/HEARTBEAT.md")
+        assert proc.returncode != 0
+        assert _scratched(root) == ["hb1"]
+        text = marker.read_text()
+        assert "plaintext" in text and "channels.telegram.botToken" in text
+
+    def test_cli_error_skips_node_deprecation_noise(self, tmp_path, stubs):
+        """GIVEN the job create fails and the CLI prints a Node deprecation
+        warning after its error
+        WHEN sync-heartbeat reports it
+        THEN the marker carries the error, not the warning."""
+        _openclaw(stubs, jobs=[], add_ok=False)
+        marker = tmp_path / "sync-heartbeat.failed"
+        proc = _run(SYNC, stubs, marker, "/opt/HEARTBEAT.md")
+        assert proc.returncode != 0
+        text = marker.read_text()
+        assert "no route for telegram" in text
+        assert "DeprecationWarning" not in text
 
     def test_caps_existing_job_tools_from_config(self, tmp_path, stubs):
         """GIVEN a doctor-migrated heartbeat job with no tool cap
@@ -406,6 +530,18 @@ def test_openclaw_start_command_stops_on_first_failure():
         if line.strip() and not line.strip().startswith("#")
     ]
     assert lines[0] == "set -e"
+
+
+def test_start_command_never_applies_the_secrets_plan():
+    """The plan deletes the auth profile an existing heartbeat job is pinned
+    to as its inference account, and 2026.11.6 then stops that job ("was
+    removed or signed out") instead of falling back. It is a one-time step
+    that recreates the job too (docs/DEPLOYMENT_GUIDE.md), never part of an
+    ordinary start; the startup secrets audit reports what it would fix."""
+    compose = yaml.safe_load((ROOT / "docker-compose.yml").read_text())
+    command = compose["services"]["openclaw"]["command"][2]
+    code = [ln for ln in command.splitlines() if not ln.strip().startswith("#")]
+    assert not [ln for ln in code if "secrets apply" in ln]
 
 
 def test_heartbeat_marker_lives_in_root_owned_tmpfs():

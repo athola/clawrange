@@ -54,3 +54,41 @@ def test_compose_pins_an_openclaw_without_heartbeat_config():
     )
     version = tuple(int(p) for p in image.rsplit(":", 1)[1].split("."))
     assert version >= (2026, 11, 5), image
+
+
+TOKEN_REF = {"source": "env", "provider": "default", "id": "PROXY_AUTH_TOKEN"}
+PLAN = ROOT / "openclaw" / "secrets-plan.json"
+
+
+def test_proxy_api_key_is_an_env_secret_ref():
+    """GIVEN the template render-config.js writes on every start
+    THEN the proxy apiKey is an env SecretRef, so openclaw.json never holds
+    the token (OpenClaw's secrets audit flagged the plaintext value)."""
+    providers = json.loads(TEMPLATE.read_text())["models"]["providers"]
+    assert providers["clawrange-proxy"]["apiKey"] == TOKEN_REF
+
+
+def test_fs_tools_are_confined_to_the_workspace():
+    """GIVEN sandboxing is off and max-ops may use `read`
+    THEN fs tools are workspace-only, so no agent can read openclaw.json,
+    its rollback copies or /proc/<pid>/environ (where the env ref resolves)."""
+    tools = json.loads(TEMPLATE.read_text())["tools"]
+    assert tools["fs"]["workspaceOnly"] is True
+
+
+def test_secrets_plan_moves_the_token_out_of_state_and_leaves_env_files():
+    """GIVEN the one-time migration in docs/DEPLOYMENT_GUIDE.md
+    THEN the plan points the proxy apiKey at the template's env ref, scrubs
+    the plaintext auth-profile copy OpenClaw kept in its state DB, and never
+    edits .env files."""
+    plan = json.loads(PLAN.read_text())
+    (target,) = plan["targets"]
+    assert target["path"] == "models.providers.clawrange-proxy.apiKey"
+    assert target["ref"] == TOKEN_REF
+    assert plan["options"]["scrubEnv"] is False
+    assert plan["options"]["scrubAuthProfilesForProviderTargets"] is True
+
+
+def test_compose_mounts_the_secrets_plan_read_only():
+    mount = "./openclaw/secrets-plan.json:/opt/secrets-plan.json:ro"
+    assert mount in COMPOSE.read_text()
