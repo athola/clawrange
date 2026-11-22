@@ -26,8 +26,8 @@ import reddit_search
 import research_router
 import scheduler as sch
 import tenant_profile
-from app import app, brain_db
 from errors import UpstreamError
+from tests.testapp import app, brain_db
 
 TOKEN = "k43-test-token"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}

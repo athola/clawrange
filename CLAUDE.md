@@ -36,10 +36,12 @@ Tailscale and Caddy gateway.
 - `workflows/`: FastAPI service:
   - `app.py`: FastAPI entrypoint. `create_app(brain_db=None)` builds an
     app around its own brain (`app.state.brain_db`, routes read it via
-    `Depends`) and mounts the routers; `app = create_app()` is what
-    uvicorn serves (no `/docs`, `/redoc` or `/openapi.json`). Only `app.py`
-    imports `app`: chat commands and the heartbeat get the brain, profile
-    and scheduler from `llm_proxy` off `request.app.state`
+    `Depends`) and mounts the routers; uvicorn serves it as a factory
+    (`uvicorn --factory app:create_app` in `entrypoint.sh`), so importing
+    `app` builds nothing (no `/docs`, `/redoc` or `/openapi.json`). Only
+    tests import `app`: chat commands and the heartbeat get the brain,
+    profile and scheduler from `llm_proxy` off `request.app.state`. Tests
+    share the app in `tests/testapp.py` or build their own
   - `tasks_api.py`: `TaskCreate`/`TaskResult`, shared by `/task` and `!task`
   - `auth.py`: app-wide bearer auth (`PROXY_AUTH_TOKEN`), fails closed on
     an empty token or the old `generate-a-token-here` placeholder; only

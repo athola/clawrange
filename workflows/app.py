@@ -833,9 +833,3 @@ def create_app(brain_db: BrainDB | None = None) -> FastAPI:
     )
     app.include_router(router)
     return app
-
-
-# The served app (`uvicorn app:app`) and its brain. Tests that need an app
-# of their own call create_app() instead.
-app = create_app()
-brain_db: BrainDB = app.state.brain_db

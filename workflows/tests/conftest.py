@@ -1,16 +1,19 @@
-"""Test configuration — sets up temp BrainDB before app module is imported."""
+"""Test configuration: shared fixtures and per-test isolation.
+
+The shared app and its brain live in tests/testapp.py; app.py builds
+nothing on import, so test modules can import it in any order.
+"""
 
 import os
 import socket
 import tempfile
 
-# Set BRAIN_DB_PATH BEFORE any test module imports app.py.
-# This must happen at module level (not in a fixture) because
-# test_app.py does `from app import app` at collection time.
+# Safety net, not an ordering requirement: a test that calls create_app() or
+# open_brain() without a path gets a temp brain, never the live /data one.
+# Inside the container /data is also where the watchdog's heartbeat stamp
+# lives, so a test run must never overwrite it either.
 _tmpdir = tempfile.mkdtemp()
-os.environ["BRAIN_DB_PATH"] = os.path.join(_tmpdir, "test_brain.db")
-# Inside the container /data is the live brain directory: a test run there
-# must never overwrite the watchdog's real heartbeat stamp.
+os.environ.setdefault("BRAIN_DB_PATH", os.path.join(_tmpdir, "test_brain.db"))
 os.environ.setdefault(
     "HEARTBEAT_SEEN_PATH", os.path.join(_tmpdir, "heartbeat_seen.json")
 )
@@ -23,7 +26,7 @@ import pytest  # noqa: E402
 def client():
     from fastapi.testclient import TestClient
 
-    from app import app
+    from tests.testapp import app
 
     return TestClient(app)
 
@@ -60,8 +63,8 @@ def _reset_proxy_globals(monkeypatch):
     monkeypatch.setattr(llm_proxy, "_tier_failure_reason", {})
     monkeypatch.setattr(llm_proxy, "_last_call_failures", {})
     monkeypatch.setattr(llm_proxy, "_notification_last_sent", {})
-    # String targets: conftest must not import app modules at module level
-    # (the env above is set first), and a second local import is avoided.
+    # String targets: conftest imports no app modules at module level, so
+    # the env above is in place before anything reads it.
     monkeypatch.setattr("heartbeat._proactive_state", {})
     monkeypatch.setattr(
         llm_proxy, "_balance_cache", {"remaining": None, "checked_at": None}
@@ -78,7 +81,7 @@ def _bypass_api_auth():
     test_auth.py removes this override to exercise the real check.
     """
     import auth
-    from app import app
+    from tests.testapp import app
 
     app.dependency_overrides[auth.require_token] = lambda: None
     yield
@@ -110,7 +113,7 @@ def _reset_brain_db():
     """Clear all tables between tests for isolation. Errors surface: a
     failed reset means the next test would see this one's rows."""
     yield
-    from app import brain_db
+    from tests.testapp import brain_db
 
     conn = brain_db._conn
     conn.execute("PRAGMA foreign_keys=OFF")

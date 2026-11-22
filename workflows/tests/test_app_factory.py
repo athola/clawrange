@@ -4,6 +4,10 @@ Two apps in one process must not share a database: a task queued through
 one app's chat endpoint or task API is invisible to the other.
 """
 
+import os
+import pathlib
+import subprocess
+import sys
 from unittest.mock import AsyncMock
 
 import pytest
@@ -94,3 +98,43 @@ def test_heartbeat_gets_the_apps_brain_and_profile(two_apps, monkeypatch):
     monkeypatch.setattr(heartbeat, "_handle_heartbeat", spy)
     assert _chat(client_b, "ClawRange heartbeat: check in").status_code == 200
     spy.assert_awaited_once_with(False, brain_db=db_b, profile=profile)
+
+
+# `uvicorn --factory app:create_app` serves the app: importing the module
+# builds nothing, and the factory with no argument opens BRAIN_DB_PATH.
+
+
+def test_importing_app_opens_no_brain(tmp_path):
+    workflows = pathlib.Path(__file__).resolve().parents[1]
+    brain = tmp_path / "brain.db"
+    code = (
+        "import app; "
+        "assert not hasattr(app, 'app'); assert not hasattr(app, 'brain_db')"
+    )
+    env = {
+        **os.environ,
+        "BRAIN_DB_PATH": str(brain),
+        "HEARTBEAT_SEEN_PATH": str(tmp_path / "seen.json"),
+        "PYTHONPATH": str(workflows),
+    }
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert not brain.exists()
+
+
+def test_factory_without_a_brain_opens_brain_db_path(tmp_path, monkeypatch):
+    brain = tmp_path / "served.db"
+    monkeypatch.setenv("BRAIN_DB_PATH", str(brain))
+    served = create_app()
+    try:
+        assert served.state.brain_db._db_path == str(brain)
+        assert brain.exists()
+    finally:
+        served.state.brain_db._conn.close()

@@ -64,8 +64,11 @@ the plan.
   - `!task` writes through `brain_db` with the `TaskCreate` model (now in
     `tasks_api.py`) instead of calling the route function, so chat and
     `POST /task` keep one validation rule and both record `source="user"`.
-  - `app.py` keeps `app = create_app()` and `brain_db` at module level, so
-    `uvicorn app:app` and the existing tests are unchanged.
+  - uvicorn serves the factory (`uvicorn --factory app:create_app` in
+    `entrypoint.sh`), so `app.py` has no module-level app or brain and
+    importing it opens nothing. Most tests share one app built around a
+    temp brain in `tests/testapp.py`, emptied after every test by
+    `conftest.py`.
   `test_dependency_injection.py` fails if any non-test module imports
   `app`; `test_app_factory.py` proves two apps never share a brain.
 - **Options weighed**:
@@ -73,16 +76,21 @@ the plan.
     import-time DB and the back-imports stay. Rejected.
   - B: `runtime.py` holder that `create_app` sets and callers read: small,
     but still a global, only renamed. Rejected for DI.
-  - C (chosen, first half): factory and DI, module-level `app` kept.
+  - C (chosen): factory and DI, served with `uvicorn --factory`.
   - Routes as `create_*_router(brain_db)` closures, like the brain and
     persona routers, were considered; `Depends` was chosen so route
     functions stay importable and the per-request root is the same
     `request.app.state` the chat path uses.
 - **Negative consequences**:
   - About 90 test call sites had to pass the brain explicitly.
-  - Importing `app` still opens a brain at `BRAIN_DB_PATH`, so `conftest.py`
-    keeps its env-before-import setup. Dropping that (`uvicorn --factory`,
-    a per-test app fixture) is the follow-up.
+  - Most tests still share one app and brain (`tests/testapp.py`), so
+    isolation rests on the reset fixture rather than a fresh app per test.
+    A per-test app fixture would mean rewriting about 600 references and
+    was left alone. `conftest.py` still defaults `BRAIN_DB_PATH` to a temp
+    path, as a guard so a stray `create_app()` never opens `/data`.
+  - A running dev container on the old `uvicorn app:app` command fails to
+    reload once `app.py` loses its module-level app; the entrypoint
+    supervisor restarts it on the new command.
 - **Reversibility**: HIGH. Internal refactor, no API or schema change.
 
 ## TR-015: Keep the proxy token out of what agents can read

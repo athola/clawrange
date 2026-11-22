@@ -16,7 +16,7 @@ import heartbeat
 import llm_proxy
 import research_router
 import telegram
-from app import app, brain_db
+from tests.testapp import app, brain_db
 
 client = TestClient(app)
 

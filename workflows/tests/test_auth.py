@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import auth
-from app import app, brain_db
+from tests.testapp import app, brain_db
 
 
 @pytest.fixture()

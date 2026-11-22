@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 import generators
-from app import brain_db
+from tests.testapp import brain_db
 
 TOME_PREFIX = "research:tome:"
 

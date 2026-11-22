@@ -18,9 +18,9 @@ import heartbeat
 import llm_proxy
 import research_router
 import watchdog
-from app import brain_db
 from brain_db import BrainDB
 from errors import UpstreamError
+from tests.testapp import brain_db
 
 
 @pytest.fixture()

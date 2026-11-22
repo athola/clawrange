@@ -30,8 +30,9 @@ import scheduler as sch
 from brain_db import BrainDB
 from errors import UpstreamError
 from tenant_profile import load_profile
+from tests import testapp
 
-client = TestClient(app_module.app)
+client = TestClient(testapp.app)
 APP_SRC = Path(app_module.__file__).read_text()
 
 
@@ -172,7 +173,7 @@ class TestJobErrorListener:
 def _bare_app() -> FastAPI:
     """An app with only the state the lifespan reads (its brain)."""
     api = FastAPI()
-    api.state.brain_db = app_module.brain_db
+    api.state.brain_db = testapp.brain_db
     return api
 
 
@@ -412,10 +413,10 @@ class TestJobLookupOnly:
 @pytest.fixture()
 def real_auth(monkeypatch):
     monkeypatch.setattr(llm_proxy, "PROXY_AUTH_TOKEN", "s3cret")
-    saved = app_module.app.dependency_overrides.pop(auth.require_token, None)
-    yield TestClient(app_module.app, raise_server_exceptions=False)
+    saved = testapp.app.dependency_overrides.pop(auth.require_token, None)
+    yield TestClient(testapp.app, raise_server_exceptions=False)
     if saved is not None:
-        app_module.app.dependency_overrides[auth.require_token] = saved
+        testapp.app.dependency_overrides[auth.require_token] = saved
 
 
 @pytest.mark.parametrize("path", ["/docs", "/redoc", "/openapi.json"])
@@ -441,10 +442,10 @@ def _all_operations() -> set[tuple[str, str]]:
     """
     ops = {
         (method.upper(), path)
-        for path, item in app_module.app.openapi()["paths"].items()
+        for path, item in testapp.app.openapi()["paths"].items()
         for method in item
     }
-    for route in app_module.app.routes:
+    for route in testapp.app.routes:
         if isinstance(route, APIRoute):
             ops |= {(m, route.path) for m in route.methods or () if m != "HEAD"}
     return ops
@@ -478,7 +479,7 @@ class TestHealthz:
             calls.append(1)
             return {"pages": 7, "vectors": 3}
 
-        monkeypatch.setattr(app_module.brain_db, "health_counts", counts)
+        monkeypatch.setattr(testapp.brain_db, "health_counts", counts)
         data = client.get("/healthz").json()
         assert calls
         assert data["brain"]["pages"] == 7
@@ -489,7 +490,7 @@ class TestHealthz:
         def broken():
             raise RuntimeError("disk I/O error")
 
-        monkeypatch.setattr(app_module.brain_db, "health_counts", broken)
+        monkeypatch.setattr(testapp.brain_db, "health_counts", broken)
         r = client.get("/healthz")
         assert r.status_code == 200
         data = r.json()
@@ -498,7 +499,7 @@ class TestHealthz:
 
     def test_reports_vector_status(self, monkeypatch):
         monkeypatch.setattr(
-            app_module.brain_db,
+            testapp.brain_db,
             "vec_status",
             lambda: {"enabled": False, "reason": "sqlite_vec missing"},
         )
@@ -524,7 +525,7 @@ class TestHealthz:
 
     def test_reports_profile(self, monkeypatch):
         monkeypatch.setattr(
-            app_module.app.state, "profile_error", "profile not found: x", raising=False
+            testapp.app.state, "profile_error", "profile not found: x", raising=False
         )
         monkeypatch.setattr(app_module.llm_proxy, "PROXY_AUTH_TOKEN", "t")
         data = client.get("/healthz", headers={"Authorization": "Bearer t"}).json()
@@ -692,7 +693,7 @@ def test_projects_listed_once(monkeypatch):
         calls.append(1)
         return [{"slug": "a"}]
 
-    monkeypatch.setattr(app_module.brain_db, "list_projects", list_projects)
+    monkeypatch.setattr(testapp.brain_db, "list_projects", list_projects)
     assert client.get("/projects").json() == {"projects": [{"slug": "a"}], "total": 1}
     assert len(calls) == 1
 

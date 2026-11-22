@@ -6,14 +6,14 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-import app as app_module
 import llm_proxy
-from app import app
 from brain_db import BrainDB
 from chat_commands import _extract_task_command
 from persona_api import create_persona_router
 from research import Finding
 from tenant_profile import Profile
+from tests import testapp
+from tests.testapp import app
 
 client = TestClient(app)
 
@@ -371,7 +371,7 @@ class TestCurrentProfileGuard:
 
     def test_broken_profile_is_5xx_and_writes_nothing(self, tmp_path, monkeypatch):
         self._break_profile(tmp_path, monkeypatch)
-        monkeypatch.delattr(app_module.app.state, "profile", raising=False)
+        monkeypatch.delattr(testapp.app.state, "profile", raising=False)
         persona_client, soul = self._persona_app(tmp_path)
         r = persona_client.post("/persona/render")
         assert r.status_code >= 500
@@ -380,7 +380,7 @@ class TestCurrentProfileGuard:
     def test_broken_profile_falls_back_to_boot_profile(self, tmp_path, monkeypatch):
         self._break_profile(tmp_path, monkeypatch)
         boot = Profile(name="cos", raw={"profile": "cos", "assistant": {"name": "Max"}})
-        monkeypatch.setattr(app_module.app.state, "profile", boot, raising=False)
+        monkeypatch.setattr(testapp.app.state, "profile", boot, raising=False)
         persona_client, soul = self._persona_app(tmp_path)
         r = persona_client.post("/persona/render")
         assert r.status_code == 200
@@ -413,7 +413,7 @@ class TestTaskInputBounds:
 class TestEmbeddingWiring:
     def test_startup_uses_configured_model_table(self):
         import embeddings
-        from app import brain_db
+        from tests.testapp import brain_db
 
         if not brain_db._has_vec:
             pytest.skip("sqlite-vec unavailable")

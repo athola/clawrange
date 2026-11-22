@@ -19,8 +19,8 @@ import reddit_search
 import research
 import research_router
 import tenant_profile
-from app import brain_db
 from errors import UpstreamError
+from tests.testapp import brain_db
 
 
 def _post(i: int) -> reddit_search.RedditPost:

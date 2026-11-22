@@ -9,7 +9,7 @@ approval — it never trades or calls exchanges — and pings Telegram.
 import pytest
 
 import generators
-from app import brain_db
+from tests.testapp import brain_db
 
 
 def _pending_descs() -> list[str]:

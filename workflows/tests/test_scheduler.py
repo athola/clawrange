@@ -96,7 +96,7 @@ class TestValidate:
 
 class TestRoutes:
     def test_create_rejects_bad_input_without_persisting(self, client):
-        from app import brain_db
+        from tests.testapp import brain_db
 
         for body in (
             {"id": "x1", "name": "x", "kind": "nope", "cron": "0 9 * * *"},
@@ -106,7 +106,7 @@ class TestRoutes:
         assert brain_db.get_schedule("x1") is None
 
     def test_patch_rejects_bad_cron(self, client):
-        from app import brain_db
+        from tests.testapp import brain_db
 
         brain_db.upsert_schedule("p1", "p", "morning_scan", "0 9 * * *")
         r = client.patch("/sched/p1", json={"cron": "bad"})

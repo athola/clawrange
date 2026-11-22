@@ -7,7 +7,7 @@ import pytest
 
 import generators
 import github_search
-from app import brain_db
+from tests.testapp import brain_db
 
 
 @pytest.fixture()

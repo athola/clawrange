@@ -38,9 +38,9 @@ PY
 # file). Prod runs the baked image without it: every reload wiped the
 # in-memory scheduler jobs and module state.
 if [ "${UVICORN_RELOAD:-0}" = "1" ]; then
-  uvicorn app:app --host 0.0.0.0 --port "$PORT" --reload &
+  uvicorn --factory app:create_app --host 0.0.0.0 --port "$PORT" --reload &
 else
-  uvicorn app:app --host 0.0.0.0 --port "$PORT" &
+  uvicorn --factory app:create_app --host 0.0.0.0 --port "$PORT" &
 fi
 UVICORN_PID=$!
 

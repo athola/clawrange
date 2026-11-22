@@ -15,11 +15,11 @@ import persona_learning
 import reddit_search
 import research
 import rundown
-from app import brain_db
 from crm.sqlite_adapter import SQLiteCRM
 from errors import UpstreamError
 from reddit_search import RedditPost, SearchHealth
 from tenant_profile import Profile
+from tests.testapp import brain_db
 
 TOPICS = ["topic A", "topic B", "topic C"]
 

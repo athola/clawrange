@@ -6,8 +6,8 @@ import pytest
 
 import generators
 import reddit_search
-from app import brain_db
 from reddit_search import RedditPost
+from tests.testapp import brain_db
 
 
 @pytest.fixture(autouse=True)

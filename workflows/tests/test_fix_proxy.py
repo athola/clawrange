@@ -14,12 +14,12 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-import app as app_module
 import auth
 import chat_commands
 import llm_proxy
 import persona_api
 from persona_api import Proposal
+from tests import testapp
 
 TOKEN = "k1-test-token"
 GOOD = {"Authorization": f"Bearer {TOKEN}"}
@@ -45,7 +45,7 @@ class _Loopback(httpx.AsyncClient):
 
     def __init__(self, *args, **kwargs):
 
-        kwargs["transport"] = httpx.ASGITransport(app=app_module.app)
+        kwargs["transport"] = httpx.ASGITransport(app=testapp.app)
         super().__init__(*args, **kwargs)
 
 
@@ -58,11 +58,11 @@ def authed_app(monkeypatch):
     dependency instead of a closed port: reverting the fix fails with 401.
     """
 
-    app = app_module.app
+    app = testapp.app
     saved = app.dependency_overrides.pop(auth.require_token, None)
     monkeypatch.setattr(llm_proxy, "PROXY_AUTH_TOKEN", TOKEN)
     monkeypatch.setattr(httpx, "AsyncClient", _Loopback)
-    yield TestClient(app), app_module.brain_db
+    yield TestClient(app), testapp.brain_db
     if saved is not None:
         app.dependency_overrides[auth.require_token] = saved
 
@@ -365,7 +365,7 @@ class TestFailureReporting:
         monkeypatch.setattr(llm_proxy, "PROXY_AUTH_TOKEN", TOKEN)
         call = AsyncMock(return_value=httpx.Response(404, text="no such model"))
         with _balance(50.0), patch.object(llm_proxy, "_call_provider", call):
-            r = _chat(TestClient(app_module.app), "hello")
+            r = _chat(TestClient(testapp.app), "hello")
         assert "HTTP 404" in _reply(r)
 
     def test_background_notify_logs_every_event(self, caplog):
@@ -406,7 +406,7 @@ class TestToolCallHistory:
             return _ok()
 
         with _balance(50.0), patch.object(llm_proxy, "_call_provider", capture):
-            r = TestClient(app_module.app).post(
+            r = TestClient(testapp.app).post(
                 "/v1/chat/completions", json={"messages": messages}, headers=GOOD
             )
         assert r.status_code == 200
@@ -510,14 +510,14 @@ class TestAuthHardening:
     def test_placeholder_rejected_through_the_app(self, monkeypatch):
 
         monkeypatch.setattr(llm_proxy, "PROXY_AUTH_TOKEN", PLACEHOLDER)
-        saved = app_module.app.dependency_overrides.pop(auth.require_token, None)
+        saved = testapp.app.dependency_overrides.pop(auth.require_token, None)
         try:
-            r = TestClient(app_module.app).get(
+            r = TestClient(testapp.app).get(
                 "/task", headers={"Authorization": f"Bearer {PLACEHOLDER}"}
             )
         finally:
             if saved is not None:
-                app_module.app.dependency_overrides[auth.require_token] = saved
+                testapp.app.dependency_overrides[auth.require_token] = saved
         assert r.status_code == 401
 
     def test_env_example_ships_no_token_value(self):

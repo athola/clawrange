@@ -8,8 +8,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 import llm_proxy
-from app import brain_db
 from errors import UpstreamError
+from tests.testapp import brain_db
 
 
 @pytest.fixture(autouse=True)
