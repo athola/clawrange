@@ -30,6 +30,7 @@ dev = [
     "pre-commit",
     "pytest-asyncio>=1.5.0",
     "pytest-cov>=7.1.0",
+    "pytest-xdist>=3.8.0",
 ]
 
 [tool.uv]
@@ -83,7 +84,7 @@ exclude = [
 # ─── pytest ────────────────────────────────────────────────────────
 [tool.pytest.ini_options]
 # workflows/ has no __init__.py on purpose: the app modules use flat imports
-# (from app import app, from tenant_profile import ...). Put workflows/ on the
+# (from app import create_app, from tenant_profile import ...). Put workflows/ on the
 # path explicitly rather than introducing a package boundary.
 pythonpath = ["workflows"]
 testpaths = ["workflows/tests", "tests"]

@@ -155,7 +155,7 @@ make start            # bring up OpenClaw and workflows
 make start-full       # include DeerFlow
 make start-prod       # bind to 127.0.0.1 and Tailscale IP only
 make test             # run validation suite
-make test-unit        # uv run pytest workflows/tests/
+make test-unit        # pytest workflows/tests/ in parallel (PYTEST_WORKERS=0: serial)
 make retrieval-eval   # compare search configs offline (fixture golden set)
 make retrieval-harvest   # real brain searches -> data/retrieval/golden.json
 make retrieval-eval-brain # same matrix on the real brain (label queries first)
@@ -315,7 +315,10 @@ stack without one. There is no `/docs`, `/redoc` or `/openapi.json`.
 - New test scripts go in `scripts/tests/<name>.sh` and get a Makefile target.
 - Pytest unit tests go in `workflows/tests/test_*.py`. Ask for the
   `brain_db`, `app` and `client` fixtures (fresh per test, from
-  `conftest.py`); never share a module-level app or `TestClient`.
+  `conftest.py`); never share a module-level app or `TestClient`. The
+  suite runs in parallel (pytest-xdist: `make test-unit`, the pre-push
+  hook and CI pass `-n auto`), so a test must not write a fixed path
+  outside `tmp_path` or depend on another test's state.
 - Persona edits to `openclaw/soul.md` should keep responses tight
   (Telegram is the main channel: short, actionable messages).
 - DeerFlow config must use `base_url: https://openrouter.ai/api/v1`

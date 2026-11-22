@@ -3259,8 +3259,10 @@ class TestHeartbeatInterceptor:
         import llm_proxy
 
         async def _hang(provider, models, body, api_key):
-            # Slower than the (shrunk) deadline — simulates a hung provider.
-            await asyncio.sleep(2)
+            # Far slower than the (shrunk) deadline: a hung provider. One tier
+            # alone takes 5s without the cap, so the 2s bound below leaves a
+            # loaded machine (parallel tests) 1.7s of scheduling headroom.
+            await asyncio.sleep(5)
             return _mock_response(200)
 
         original = llm_proxy.LLM_CALL_DEADLINE
@@ -3275,8 +3277,8 @@ class TestHeartbeatInterceptor:
 
         # Deadline hit -> no usable text, treated as a graceful miss upstream.
         assert result is None
-        # Bounded by the deadline, NOT 3 tiers x 2s sequential.
-        assert elapsed < 1.0, (
+        # Bounded by the deadline, NOT even one 5s tier (3 tiers x 5s before).
+        assert elapsed < 2.0, (
             f"_llm_call blocked {elapsed:.2f}s — deadline not enforced"
         )
 

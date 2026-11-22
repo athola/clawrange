@@ -81,6 +81,11 @@ the plan.
   suite passes in reverse file order too; that run found scheduler
   startup errors leaking between tests, now reset per test in
   `conftest.py` like the other module globals.
+  - With nothing shared, the suite runs under pytest-xdist: `make
+    test-unit` (`PYTEST_WORKERS`, default `auto`), `make coverage`, the
+    pre-push hook and CI pass `-n`. On a 16-core host the full run went
+    from about 86s to 27-37s; `-n auto` is not in `addopts`, so a single
+    test run from the shell starts no workers.
 - **Options weighed**:
   - A: Move only the persona helpers out of `app.py`: two files, but the
     import-time DB and the back-imports stay. Rejected.

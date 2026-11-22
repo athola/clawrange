@@ -97,4 +97,4 @@ jobs:
         run: uv run python tests/validate_stack.py
 
       - name: Run test suite
-        run: uv run pytest -q -rf
+        run: uv run pytest -q -rf -n auto

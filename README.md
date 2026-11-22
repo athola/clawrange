@@ -121,7 +121,7 @@ make test-research TOPIC="..."   # one /research fan-out
 
 ```bash
 make validate        # tests/: structure, compose, Makefile and config checks
-make test-unit       # workflows/tests/: the service's pytest suite
+make test-unit       # workflows/tests/: the service's pytest suite, in parallel
 make coverage        # the same suite, failing under 85% coverage
 make retrieval-eval  # offline brain-search quality against a golden set
 make persona-demo    # the persona learning loop, no keys or containers

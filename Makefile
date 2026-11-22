@@ -118,13 +118,18 @@ persona: ## Render soul.md + identity.md from a profile, brain approvals and lea
 persona-demo: ## Offline walkthrough of the persona meta-learning loop (PROFILE=<name>)
 	@uv run python workflows/scripts/persona_demo.py "$${PROFILE:-chief-of-staff}"
 
-test-unit: ## Run Python unit tests (no containers needed)
-	@uv run pytest workflows/tests/ -v
+# Parallel by default (pytest-xdist): every test gets its own brain and app,
+# so workers share nothing. PYTEST_WORKERS=0 runs serially, e.g. to debug
+# one test; a number pins the worker count.
+PYTEST_WORKERS ?= auto
+
+test-unit: ## Run Python unit tests in parallel (PYTEST_WORKERS=0 for serial)
+	@uv run pytest workflows/tests/ -q -n $(PYTEST_WORKERS)
 
 # Source and omit live in [tool.coverage.run] (pyproject.toml): workflows/
 # only, tests excluded. Fails under 85%, the project's coverage target.
 coverage: ## Unit tests with a source-only coverage report over workflows/
-	@uv run pytest workflows/tests/ -q --cov --cov-report=term-missing:skip-covered --cov-fail-under=85
+	@uv run pytest workflows/tests/ -q -n $(PYTEST_WORKERS) --cov --cov-report=term-missing:skip-covered --cov-fail-under=85
 
 retrieval-eval: ## Compare search configs on the fixture golden set (offline)
 	@cd workflows && uv run python retrieval_eval.py
