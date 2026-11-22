@@ -384,6 +384,17 @@ seeds:
     cron: 30 8 * * *
     catch_up: true
     kwargs: {}
+  - id: homelab_watch
+    name: Homelab watch (Home Assistant, Uptime Kuma, network census)
+    kind: homelab_watch
+    cron: '*/5 * * * *'
+    kwargs: {}
+  - id: homelab_report
+    name: Daily homelab report
+    kind: homelab_report
+    cron: 30 7 * * *
+    catch_up: true
+    kwargs: {}
   - id: daily-research-pulse
     name: Daily research freshness pulse via tome bridge
     kind: research_pulse
@@ -598,3 +609,23 @@ homelab_deals:
   - {name: Supermicro 4028GR GPU server, query: 4028gr, category: server,
      need: watch, fills: [inference_host],
      max_price_great: 5000, note: 8-GPU chassis; loud, 240V}  # verify
+
+# Home and network watch: the homelab_watch and homelab_report schedules.
+# Addresses come from .env only; an unset variable turns that source off.
+homelab:
+  home_assistant:
+    url: ${HA_URL}
+    token: ${HA_TOKEN}
+    battery_low: 20
+    unavailable_after_minutes: 30
+    flood_threshold: 10
+    ignore_entities: []
+    actions: []
+  kuma:
+    url: ${HOMELAB_KUMA_URL}
+    slug: home
+    ca_cert: ${HOMELAB_CA_CERT}
+  census:
+    url: ${HOMELAB_CENSUS_URL}
+    max_age_hours: 13
+  source_down_after: 3

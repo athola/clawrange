@@ -466,6 +466,16 @@ class BrainDB:
             )
         """)
 
+        # Homelab watch state (watcher memory, source health, alert outbox).
+        # Private topology: never stored as brain pages, which get embedded.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS homelab_state (
+                key         TEXT PRIMARY KEY,
+                value       TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            )
+        """)
+
         # Databases created before claimed_at existed: add it in place. The
         # stale-active reaper needs the claim time, not the creation time.
         task_cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
@@ -1437,6 +1447,28 @@ class BrainDB:
                (source, listing_id, target, price, observed_at, title)
                VALUES (?, ?, ?, ?, ?, ?)""",
             (source, listing_id, target, float(price), utcnow_iso(), title),
+        )
+        self._conn.commit()
+
+    def homelab_get(self, key: str) -> dict | None:
+        """The stored JSON object for ``key``, or None (absent or unreadable)."""
+        row = self._conn.execute(
+            "SELECT value FROM homelab_state WHERE key = ?", (key,)
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            value = json.loads(row[0])
+        except ValueError:
+            return None
+        return value if isinstance(value, dict) else None
+
+    def homelab_put(self, key: str, value: dict) -> None:
+        self._conn.execute(
+            """INSERT INTO homelab_state (key, value, updated_at) VALUES (?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET
+                 value = excluded.value, updated_at = excluded.updated_at""",
+            (key, json.dumps(value), utcnow_iso()),
         )
         self._conn.commit()
 

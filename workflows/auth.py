@@ -21,7 +21,7 @@ _PUBLIC: tuple[tuple[str, re.Pattern[str]], ...] = (
     # Exact health paths: a new /healthz/* route stays private until it is
     # reviewed and added here.
     # Matched with fullmatch: "$" would also accept a trailing newline.
-    ("GET", re.compile(r"/healthz(/(research|crm|persona))?")),
+    ("GET", re.compile(r"/healthz(/(research|crm|persona|homelab))?")),
     ("GET", re.compile(r"/tier")),
     ("GET", re.compile(r"/sched")),
     ("GET", re.compile(r"/sched/[^/\s]+")),

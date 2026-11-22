@@ -24,6 +24,7 @@ from crm import get_adapter
 from crm_api import create_crm_router
 from errors import UpstreamError
 from generators import seed_from_profile
+from homelab_api import create_homelab_router
 from llm_proxy import router as llm_router
 from persona import render_all
 from persona_api import create_persona_router
@@ -141,6 +142,10 @@ def init_profile(
         app.state.crm = crm
         app.include_router(create_crm_router(profile, crm, http_client=http_client))
         logger.info("init_profile: CRM mounted (%s)", crm.health().get("adapter"))
+
+    if profile.homelab is not None:
+        app.include_router(create_homelab_router(profile))
+        logger.info("init_profile: homelab mounted")
 
     return profile
 

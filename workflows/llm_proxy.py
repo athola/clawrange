@@ -1565,6 +1565,18 @@ async def chat_completions(
             profile_provider=state.profile_provider,
         )
 
+    # Intercept !home / !net: answered from live homelab state by
+    # deterministic code. Hostnames and entity names are attacker-chosen,
+    # so these never reach an LLM.
+    home_cmd = chat_commands._extract_home_command(last_user_msg)
+    if home_cmd is not None:
+        return await chat_commands._dispatch_home_command(
+            home_cmd,
+            is_stream,
+            brain_db=brain_db,
+            profile=getattr(state, "profile", None),
+        )
+
     # Strip poisoned assistant messages from conversation history.
     # Uses both static markers (synthetic responses, tool hallucinations)
     # AND the deferral detector — any assistant message that would fail

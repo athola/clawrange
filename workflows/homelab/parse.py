@@ -169,7 +169,11 @@ def kev_entries(feed: Any) -> tuple[KevEntry, ...]:
     KEV carries no affected-version data, so nothing here says a router is
     vulnerable; callers must only report that an entry exists.
     """
-    rows = feed.get("vulnerabilities") if isinstance(feed, dict) else feed
+    if isinstance(feed, dict):
+        # CISA's own feed, or the scanner's {"when", "entries": [...]} file.
+        rows = feed.get("vulnerabilities", feed.get("entries"))
+    else:
+        rows = feed
     if not isinstance(rows, list):
         return ()
     out = []
@@ -198,6 +202,9 @@ def _parse_time(value: Any) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+parse_time = _parse_time
 
 
 def entities_from_states(states: Any) -> tuple[EntityState, ...]:

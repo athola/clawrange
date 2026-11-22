@@ -309,3 +309,15 @@ def test_safe_label_caps_length_with_ellipsis():
 def test_safe_label_non_string_and_empty():
     assert safe_label("") == ""
     assert safe_label(None) == ""
+
+
+def test_kev_entries_accepts_scanner_file_shape():
+    doc = {
+        "when": "2026-01-01T00:00:00+00:00",
+        "entries": [
+            {"cveID": "CVE-2000-0002", "vendorProject": " MikroTik ", "dateAdded": "d"},
+            {"cveID": "CVE-2000-0003", "vendorProject": "Other"},
+        ],
+    }
+    assert [e.cve_id for e in kev_entries(doc)] == ["CVE-2000-0002"]
+    assert kev_entries({"when": "x", "entries": "nope"}) == ()

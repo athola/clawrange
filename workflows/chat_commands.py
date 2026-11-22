@@ -14,6 +14,8 @@ plain text or a synthetic response.
 import asyncio
 import hashlib
 import logging
+import re
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import HTTPException
@@ -25,9 +27,13 @@ import llm_proxy
 import persona_learning
 import reddit_search
 import research_router
+import telegram
 import tenant_profile
 from brain_db import TaskStatus, project_list
 from errors import UpstreamError
+from homelab import report as homelab_report
+from homelab import service as homelab_service
+from homelab.config import HomelabConfig
 from tasks_api import TaskCreate
 
 logger = logging.getLogger("clawrange.chat_commands")
@@ -76,6 +82,15 @@ TASK MANAGEMENT
   !task tail               Show recently finished tasks (newest first)
   !task cancel <id>        Cancel a pending/active task
   !task priority <id> <1-5> Change priority (1=urgent, 5=low)
+
+HOMELAB (needs a profile with a homelab block)
+  !home                    Home Assistant and Uptime Kuma summary
+  !home <text>             Search entities by name or id (max 15)
+  !net                     Census, ports, router version, KEV, Kuma monitors
+  !home do <domain.service> <entity_id>
+                           Ask to run an allowlisted action; the code
+                           arrives as a separate Telegram message
+  !home confirm <code>     Run it (code lasts 2 minutes, one use)
 
 PERSONA
   !persona <feedback>      Queue a persona enhancement as a [DRAFT] proposal
@@ -837,3 +852,88 @@ async def _dispatch_persona_command(
         args, brain_db=brain_db, profile_provider=profile_provider
     )
     return llm_proxy._wrap_json_as_sse(resp) if is_stream else resp
+
+
+# ─── !home / !net Commands ──────────────────────────────────────
+
+HOME_NOT_CONFIGURED = "Homelab watch is not configured."
+HOME_DO_USAGE = "Usage: !home do <domain.service> <entity_id>"
+HOME_CONFIRM_USAGE = "Usage: !home confirm <6-digit code>"
+
+_ID = r"[a-z0-9_]+\.[a-z0-9_]+"
+# Actions must be the WHOLE message: a command quoted or buried in a longer
+# message (forwarded text, a pasted log) must never start or confirm a call.
+# Single-line on purpose ([ \t], never \s) so a newline cannot hide extra text.
+_HOME_DO_RE = re.compile(rf"!home[ \t]+do[ \t]+({_ID})[ \t]+({_ID})", re.IGNORECASE)
+_HOME_CONFIRM_RE = re.compile(r"!home[ \t]+confirm[ \t]+(\d{6})", re.IGNORECASE)
+_HOME_READ_RE = re.compile(r"!(home|net)(?:[ \t]+(.*))?", re.IGNORECASE)
+_HOME_ACTION_WORDS = frozenset({"do", "confirm"})
+
+
+def _extract_home_command(msg: str) -> tuple[str, ...] | None:
+    """A parsed !home / !net command, or None.
+
+    Returns ("do", service, entity_id), ("confirm", code), ("usage", text),
+    ("home", search_text) or ("net",). Read commands match the whole message
+    or its last line, like the other commands; ``do`` and ``confirm`` match
+    only the whole stripped message, so on the last line they are ignored.
+    """
+    text = msg.strip()
+    if m := _HOME_DO_RE.fullmatch(text):
+        return ("do", m.group(1).lower(), m.group(2).lower())
+    if m := _HOME_CONFIRM_RE.fullmatch(text):
+        return ("confirm", m.group(1))
+    last_line = text.rsplit("\n", 1)[-1].strip()
+    for candidate, whole in ((text, True), (last_line, False)):
+        m = _HOME_READ_RE.fullmatch(candidate)
+        if not m:
+            continue
+        word, arg = m.group(1).lower(), (m.group(2) or "").strip()
+        if word == "net":
+            return ("net",)
+        first = (arg.lower().split(None, 1) or [""])[0]
+        if first in _HOME_ACTION_WORDS:
+            # Malformed action: help only when it is the entire message.
+            if not whole:
+                return None
+            return ("usage", HOME_DO_USAGE if first == "do" else HOME_CONFIRM_USAGE)
+        return ("home", arg)
+    return None
+
+
+async def _handle_home_command(cmd: tuple[str, ...], *, brain_db, profile) -> str:
+    """Answer a !home / !net command. Deterministic text, never an LLM."""
+    cfg = HomelabConfig.from_profile(profile) if profile is not None else None
+    if cfg is None or not cfg.configured:
+        return HOME_NOT_CONFIGURED
+    kind = cmd[0]
+    if kind == "usage":
+        return cmd[1]
+    now = datetime.now(UTC)
+    try:
+        if kind == "do":
+            return await homelab_service.request_action(
+                cfg, cmd[1], cmd[2], now, telegram.notify
+            )
+        if kind == "confirm":
+            return await homelab_service.confirm_action(
+                cfg, cmd[1], now, telegram.notify
+            )
+        obs = await homelab_service.live_observation(cfg, now)
+        if kind == "net":
+            return homelab_service.render_net_full(
+                obs, homelab_service.load_state(brain_db)
+            )
+        if cmd[1]:
+            return homelab_report.render_entity_search(obs, cmd[1])
+        return homelab_report.render_home(obs, cfg.watch)
+    except Exception as exc:
+        logger.exception("!home %s failed", kind)
+        return f"Homelab command failed ({type(exc).__name__}); see the workflows logs."
+
+
+async def _dispatch_home_command(
+    cmd: tuple[str, ...], is_stream: bool = False, *, brain_db, profile
+) -> JSONResponse | StreamingResponse:
+    text = await _handle_home_command(cmd, brain_db=brain_db, profile=profile)
+    return _reply(text, is_stream)
