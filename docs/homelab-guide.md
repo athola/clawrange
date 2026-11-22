@@ -15,16 +15,22 @@ unset source is skipped silently.
 |---|---|---|
 | Alerts | `homelab_watch`, every 5 min, only on a change | new device (universally administered MAC), router management ports differ from the learned baseline, new MikroTik KEV entry, RouterOS version change, census older than 13 h, Kuma monitor up/down, HA entity `unavailable` for 30 min (`unknown` is report-only; entities already down at baseline wait until they recover and fail again; more than 10 at once collapse into one line, and so do more than 10 new devices), a source failing 3 times in a row and its recovery |
 | Daily report | `homelab_report`, once a day (re-runs after a missed day) | low batteries (< 20 %), pending `update.*` entities, randomized-MAC count, Kuma 24 h uptime, the MikroTik KEV list |
-| `!home` | on demand | HA summary; `!home <text>` searches entities (15 lines max) |
-| `!net` | on demand | census, router ports, RouterOS version, KEV, Kuma |
-| `!home do <domain.service> <entity_id>` | on demand | asks to run one allowlisted HA action; the confirmation code arrives as a separate message |
-| `!home confirm <code>` | within 120 s | runs that action |
+| `/home` | on demand | HA summary; `/home <text>` searches entities (15 lines max) |
+| `/net` | on demand | census, router ports, RouterOS version, KEV, Kuma |
+| `/home do <domain.service> <entity_id>` | on demand | asks to run one allowlisted HA action; the confirmation code arrives as a separate message |
+| `/home confirm <code>` | within 120 s | runs that action |
 
 The first successful read of each source learns a baseline and sends no
 alerts. A failed read never counts as a change, so an outage does not read
 as "every device left". KEV entries carry no affected-version field, so a KEV
 alert names the CVE and the running RouterOS version and points you at
 MikroTik's advisory. It never says the router is vulnerable.
+
+In Telegram, use the `/` forms (`/home`, `/net`, `/home do`, `/home
+confirm`). OpenClaw takes any message that starts with `!` as its host-shell
+shortcut and answers "bash is disabled" without passing it on. Leave
+`commands.bash` off: turning it on would give the chat a shell. The `!` forms
+still work for direct API callers on port 5678.
 
 ## Trust Model
 
@@ -52,7 +58,7 @@ MikroTik's advisory. It never says the router is vulnerable.
   `hassio`, `shell_command`, `rest_command`, `python_script`, `pyscript`,
   `recorder`, `system_log`. `script.*` and `automation.*` globs fail profile
   validation, so name scripts by exact entity id.
-- **Confirmation codes bypass the model.** `!home do` and `!home confirm`
+- **Confirmation codes bypass the model.** `/home do` and `/home confirm`
   must each be the whole message. The 6-digit code goes straight to Telegram
   from workflows, never through the assistant's reply. It is valid for
   120 s and works once.
@@ -192,7 +198,7 @@ checkout.
    Expect `status: "ok"`, and `configured: true` and `ok: true` for `ha`,
    `kuma` and `census` once the first watch has run (within 5 min).
    `POST /homelab/watch` with the bearer token runs one immediately. Then
-   send `!net` and `!home` in Telegram. The first run only learns baselines,
+   send `/net` and `/home` in Telegram. The first run only learns baselines,
    so no alerts are expected. The Homepage card "Homelab watch (clawrange)"
    (Compute & AI) should read `ok` for each source.
 
@@ -222,8 +228,8 @@ checkout.
    `ha_local_file`. The bearer-token view says why, but never shows the
    file's contents.
 
-   Send `!home do light.turn_on light.<entity_id>`. A code arrives as its own
-   message. Reply `!home confirm <code>` within 120 s. With a non-admin HA
+   Send `/home do light.turn_on light.<entity_id>`. A code arrives as its own
+   message. Reply `/home confirm <code>` within 120 s. With a non-admin HA
    user, try one allowed action once to confirm HA permits the call.
 
 ## Rollback

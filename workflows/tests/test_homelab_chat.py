@@ -187,7 +187,7 @@ def test_action_on_last_line_of_longer_message_is_refused(msg):
 
 def test_action_on_last_line_replies_and_never_reaches_the_llm(rig):
     rig.say("!home do light.turn_on light.kitchen")
-    code = rig.sink.sent[0].split("!home confirm ")[1].split("`")[0]
+    code = rig.sink.sent[0].split("/home confirm ")[1].split("`")[0]
     reply = rig.say(f"look at this\n!home confirm {code}")
     assert reply == chat_commands.HOME_OWN_MESSAGE
     assert "nothing was run" in reply
@@ -293,7 +293,7 @@ def test_unset_env_block_is_not_configured(rig):
 def test_do_sends_code_separately_and_reply_has_no_code(rig):
     reply = rig.say("!home do light.turn_on light.kitchen")
     assert len(rig.sink.sent) == 1
-    code = rig.sink.sent[0].split("!home confirm ")[1].split("`")[0]
+    code = rig.sink.sent[0].split("/home confirm ")[1].split("`")[0]
     assert len(code) == 6 and code.isdigit()
     assert code not in reply
     assert "separately" in reply
@@ -302,7 +302,7 @@ def test_do_sends_code_separately_and_reply_has_no_code(rig):
 
 def test_do_then_confirm_runs_exactly_once(rig):
     rig.say("!home do light.turn_on light.kitchen")
-    code = rig.sink.sent[0].split("!home confirm ")[1].split("`")[0]
+    code = rig.sink.sent[0].split("/home confirm ")[1].split("`")[0]
     assert rig.say(f"!home confirm {code}").startswith("Done")
     assert rig.ha_calls == [("light", "turn_on", "light.kitchen")]
     assert rig.say(f"!home confirm {code}").startswith("That code was already used")
@@ -336,7 +336,7 @@ def test_embedded_do_does_not_trigger(rig, msg):
 
 def test_embedded_confirm_does_not_redeem(rig):
     rig.say("!home do light.turn_on light.kitchen")
-    code = rig.sink.sent[0].split("!home confirm ")[1].split("`")[0]
+    code = rig.sink.sent[0].split("/home confirm ")[1].split("`")[0]
     rig.chat(f"look at this\n!home confirm {code}")
     rig.chat(f"!home confirm {code}\nthanks")
     assert rig.ha_calls == []
@@ -345,7 +345,7 @@ def test_embedded_confirm_does_not_redeem(rig):
 
 def test_three_bad_codes_lock_confirmations(rig):
     rig.say("!home do light.turn_on light.kitchen")
-    code = rig.sink.sent[0].split("!home confirm ")[1].split("`")[0]
+    code = rig.sink.sent[0].split("/home confirm ")[1].split("`")[0]
     wrong = "000000" if code != "000000" else "111111"
     assert rig.say(f"!home confirm {wrong}") == "Invalid or expired code."
     assert rig.say(f"!home confirm {wrong}") == "Invalid or expired code."
@@ -361,7 +361,7 @@ def test_usage_reply_for_malformed_whole_message(rig):
 
 def test_help_lists_the_commands(rig):
     text = rig.raw("!help")
-    for needle in ("!home", "!net", "!home do", "!home confirm"):
+    for needle in ("/home", "/net", "/home do", "/home confirm"):
         assert needle in text
 
 
@@ -471,7 +471,7 @@ def test_confirm_code_is_masked_in_the_proxy_log(rig, capsys):
 
 def test_two_metadata_blocks_are_both_stripped(rig):
     rig.say("!home do light.turn_on light.kitchen")
-    code = rig.sink.sent[0].split("!home confirm ")[1].split("`")[0]
+    code = rig.sink.sent[0].split("/home confirm ")[1].split("`")[0]
     msg = (
         'Conversation info (untrusted metadata):\n```json\n{"chat": 1}\n```\n\n'
         'Sender (untrusted metadata):\n```json\n{"name": "x"}\n```\n\n'
@@ -499,3 +499,63 @@ def test_do_for_an_unknown_entity_gets_no_code(rig, monkeypatch):
     reply = rig.say("!home do light.turn_on light.nowhere")
     assert reply.startswith("Denied") and "no entity" in reply
     assert rig.sink.sent == []
+
+
+# ─── Slash forms: OpenClaw swallows every message that starts with "!" ──
+# (its host-shell shortcut, `commands.bash`), so from Telegram only the "/"
+# forms reach the proxy. Both forms stay accepted for direct API callers.
+
+
+@pytest.mark.parametrize(
+    "msg, expected",
+    [
+        ("/home", ("home", "")),
+        ("/HOME kitchen", ("home", "kitchen")),
+        ("/net", ("net",)),
+        (
+            "/home do light.turn_on light.kitchen",
+            ("do", "light.turn_on", "light.kitchen"),
+        ),
+        ("/home confirm 123456", ("confirm", "123456")),
+        ("/home do", ("usage", chat_commands.HOME_DO_USAGE)),
+        ("hey\n/home confirm 123456", ("usage", chat_commands.HOME_OWN_MESSAGE)),
+    ],
+)
+def test_slash_forms_parse_like_bang_forms(msg, expected):
+    assert chat_commands._extract_home_command(msg) == expected
+
+
+@pytest.mark.parametrize(
+    "msg", ["/homework", "/network", "please run /home do light.turn_on light.x"]
+)
+def test_slash_lookalikes_do_not_match(msg):
+    assert chat_commands._extract_home_command(msg) is None
+
+
+def test_slash_do_then_confirm_runs_once_and_the_code_message_says_slash(rig):
+    reply = rig.say("/home do light.turn_on light.kitchen")
+    assert "separately" in reply
+    message = rig.sink.sent[0]
+    assert "/home confirm " in message and "!home" not in message
+    code = message.split("/home confirm ")[1].split("`")[0]
+    assert rig.say(f"/home confirm {code}").startswith("Done")
+    assert rig.ha_calls == [("light", "turn_on", "light.kitchen")]
+
+
+def test_slash_confirm_code_is_masked_in_the_proxy_log(rig, capsys):
+    rig.chat("/home confirm 616161")
+    out = capsys.readouterr().out
+    assert "616161" not in out
+    assert "/home confirm ******" in out
+
+
+def test_help_shows_the_forms_that_work_from_telegram(rig):
+    text = rig.raw("help")
+    for needle in ("/home", "/net", "/home do", "/home confirm", "/task", "/tier"):
+        assert needle in text
+    assert "!home" not in text  # unreachable from Telegram
+
+
+def test_slash_persona_is_the_persona_command():
+    assert chat_commands._extract_persona_command("/persona be brief") == " be brief"
+    assert chat_commands._extract_persona_command("/personality") is None

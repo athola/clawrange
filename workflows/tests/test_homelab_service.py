@@ -337,7 +337,7 @@ async def test_code_goes_to_notify_never_the_reply():
         CFG, "light.turn_on", "light.kitchen", T0, sink
     )
     (message,) = sink.sent
-    code = message.split("!home confirm ")[1].split("`")[0]
+    code = message.split("/home confirm ")[1].split("`")[0]
     assert len(code) == 6 and code.isdigit()
     assert "`light.turn_on`" in message and "`light.kitchen`" in message
     assert "2 minutes" in message
@@ -363,7 +363,7 @@ async def test_undeliverable_code_is_discarded(ha_calls):
         CFG, "light.turn_on", "light.kitchen", T0, sink
     )
     assert "nothing was run" in reply
-    code = sink.sent[0].split("!home confirm ")[1].split("`")[0]
+    code = sink.sent[0].split("/home confirm ")[1].split("`")[0]
     out = await service.confirm_action(CFG, code, T0, Sink())
     assert out.startswith("Invalid") and ha_calls == []
 
@@ -371,7 +371,7 @@ async def test_undeliverable_code_is_discarded(ha_calls):
 async def _issue(cfg=CFG, service_name="light.turn_on", entity="light.kitchen"):
     sink = Sink()
     await service.request_action(cfg, service_name, entity, T0, sink)
-    return sink.sent[0].split("!home confirm ")[1].split("`")[0]
+    return sink.sent[0].split("/home confirm ")[1].split("`")[0]
 
 
 @pytest.mark.asyncio
@@ -436,7 +436,7 @@ async def test_lockout_after_three_bad_codes(ha_calls):
     later = T0 + timedelta(minutes=11)
     fresh = Sink()
     await service.request_action(CFG, "light.turn_on", "light.kitchen", later, fresh)
-    new_code = fresh.sent[0].split("!home confirm ")[1].split("`")[0]
+    new_code = fresh.sent[0].split("/home confirm ")[1].split("`")[0]
     out = await service.confirm_action(CFG, new_code, later, sink)
     assert out.startswith("Done")
 
@@ -486,21 +486,21 @@ async def test_outbox_overflow_keeps_a_note_and_counts(brain_db, monkeypatch, ca
         )
     lines = brain_db.homelab_get("outbox")["lines"]
     assert out["dropped"] == 11
-    assert lines[0] == "11 older homelab alerts dropped; see !net"
+    assert lines[0] == "11 older homelab alerts dropped; see /net"
     assert lines[-1] == "old 29" and len(lines) == service.OUTBOX_CAP
     assert "dropped 11" in caplog.text
 
 
 @pytest.mark.asyncio
 async def test_repeated_overflow_adds_up_the_dropped_count(brain_db, monkeypatch):
-    lines = ["11 older homelab alerts dropped; see !net"]
+    lines = ["11 older homelab alerts dropped; see /net"]
     lines += [f"old {i}" for i in range(20)]
     brain_db.homelab_put("outbox", {"lines": lines})
     script(monkeypatch, census_obs(device("00:00:5E:00:53:01")))
     out = await service.run_watch(brain_db, CENSUS_CFG, now=T0, notify=Sink(ok=False))
     assert out["dropped"] == 12  # the old note's 11 plus one line
     stored = brain_db.homelab_get("outbox")["lines"]
-    assert stored[0] == "12 older homelab alerts dropped; see !net"
+    assert stored[0] == "12 older homelab alerts dropped; see /net"
 
 
 @pytest.mark.asyncio

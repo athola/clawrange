@@ -299,8 +299,10 @@ stack without one. There is no `/docs`, `/redoc` or `/openapi.json`.
   unconfigured), `last_success`, `failures`; error text only with the
   bearer token; never URLs. `degraded` when a source fails or the last
   run is older than 15 min
-- Chat: `!home`, `!home <text>`, `!net`, `!home do <domain.service>
-  <entity_id>` and `!home confirm <code>` (whole message only). Settings:
+- Chat: `/home`, `/home <text>`, `/net`, `/home do <domain.service>
+  <entity_id>` and `/home confirm <code>` (whole message only; `!` forms
+  also parse, but OpenClaw swallows any message starting with `!` as its
+  shell shortcut, so Telegram users need the `/` forms). Settings:
   `HA_URL`, `HA_TOKEN` (workflows only, never OpenClaw),
   `HOMELAB_KUMA_URL`, `HOMELAB_CA_CERT`, `HOMELAB_CENSUS_URL`; unset means
   that source is off. `HOMELAB_HA_LOCAL` points at a gitignored YAML file

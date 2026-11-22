@@ -1464,7 +1464,7 @@ _TIER_COMMANDS = frozenset(
 # Assistant history turns containing these are our own synthetic replies or
 # hallucinated tool syntax; they are stripped before the next request.
 _CONFIRM_CODE_RE = re.compile(
-    r"(!home\s+confirm\s+)\S+"
+    r"([!/]home\s+confirm\s+)\S+"
 )  # one-time codes stay out of logs
 _POISON_MARKERS = (
     "temporarily on pause",

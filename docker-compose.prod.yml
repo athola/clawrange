@@ -25,6 +25,9 @@ services:
     # code (`make start-prod` passes --build). Data and config mounts only.
     volumes: !override
       - ./config/profiles:/config/profiles:ro
+      # Homelab CA and ha-local.yaml (see the base file); !override drops
+      # anything not repeated here.
+      - ./config/homelab:/config/homelab:ro
       - ./openclaw/soul.md:/opt/soul.md:ro
       - ./data/brain:/data
       - ${OPENCLAW_STATE_DIR:-./data/openclaw-state}:/openclaw-state

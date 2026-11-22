@@ -165,7 +165,7 @@ def _cap_outbox(lines: list[str]) -> tuple[list[str], int]:
     for line in lines[: len(lines) - len(keep)]:
         m = DROPPED_RE.match(line)
         dropped += int(m.group(1)) if m else 1
-    note = f"{dropped} older homelab alerts dropped; see !net"
+    note = f"{dropped} older homelab alerts dropped; see /net"
     return [note, *keep], dropped
 
 
@@ -380,7 +380,7 @@ async def request_action(
     # nothing attacker-chosen reaches the message.
     sent = await _send(
         notify,
-        f"Confirm `{service}` on `{entity_id}`: reply `!home confirm {code}` "
+        f"Confirm `{service}` on `{entity_id}`: reply `/home confirm {code}` "
         "within 2 minutes.",
     )
     if not sent:

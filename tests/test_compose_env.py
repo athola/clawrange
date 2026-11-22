@@ -71,3 +71,24 @@ def test_import_time_integer_tunables_never_get_an_empty_default():
     ):
         value = env.get(name, "")
         assert not value.endswith(":-}"), f"{name} has an empty default: {value}"
+
+
+class _ComposeLoader(yaml.SafeLoader):
+    """SafeLoader that reads compose's ``!override`` / ``!reset`` tags."""
+
+
+_ComposeLoader.add_constructor(
+    "!override", lambda loader, node: loader.construct_sequence(node)
+)
+_ComposeLoader.add_constructor("!reset", lambda loader, node: None)
+
+
+def test_prod_overlay_keeps_the_homelab_mount():
+    # The prod overlay replaces the workflows volume list (!override), so a
+    # mount added to the base file is silently dropped in prod unless it is
+    # repeated here: no Kuma CA (TLS fails) and no ha-local.yaml.
+    prod = yaml.load(
+        (ROOT / "docker-compose.prod.yml").read_text(), Loader=_ComposeLoader
+    )
+    mounts = prod["services"]["workflows"]["volumes"]
+    assert "./config/homelab:/config/homelab:ro" in mounts

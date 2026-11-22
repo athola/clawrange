@@ -75,33 +75,34 @@ async def _handle_tier_command() -> JSONResponse:
 def _handle_help() -> JSONResponse:
     """Return full command reference — all intercepted commands and brain operations."""
     text = """ClawRange Command Reference
+(From Telegram use the / forms: OpenClaw treats any message starting
+with ! as a shell command. Its own /help, /status and /learn take
+precedence, so type "help" for this list.)
 
 TASK MANAGEMENT
-  !task <description>      Create a new task (priority 3)
-  !tasks                   Show current task queue
-  !task list               Same as !tasks
-  !task tail               Show recently finished tasks (newest first)
-  !task cancel <id>        Cancel a pending/active task
-  !task priority <id> <1-5> Change priority (1=urgent, 5=low)
+  /task <description>      Create a new task (priority 3)
+  /tasks                   Show current task queue
+  /task list               Same as /tasks
+  /task tail               Show recently finished tasks (newest first)
+  /task cancel <id>        Cancel a pending/active task
+  /task priority <id> <1-5> Change priority (1=urgent, 5=low)
 
 HOMELAB (needs a profile with a homelab block)
-  !home                    Home Assistant and Uptime Kuma summary
-  !home <text>             Search entities by name or id (max 15)
-  !net                     Census, ports, router version, KEV, Kuma monitors
-  !home do <domain.service> <entity_id>
+  /home                    Home Assistant and Uptime Kuma summary
+  /home <text>             Search entities by name or id (max 15)
+  /net                     Census, ports, router version, KEV, Kuma monitors
+  /home do <domain.service> <entity_id>
                            Ask to run an allowlisted action; the code
                            arrives as a separate Telegram message
-  !home confirm <code>     Run it (code lasts 2 minutes, one use)
+  /home confirm <code>     Run it (code lasts 2 minutes, one use)
 
 PERSONA
-  !persona <feedback>      Queue a persona enhancement as a [DRAFT] proposal
-  !learn <feedback>        Same as !persona <feedback>
-  !persona reflect         Review recent activity and queue suggestions
+  /persona <feedback>      Queue a persona enhancement as a [DRAFT] proposal
+  /persona reflect         Review recent activity and queue suggestions
 
 SYSTEM STATUS
-  !tier                    Show LLM tier status and balance
-  !status                  Same as !tier
-  !help                    This command reference
+  /tier                    Show LLM tier status and balance ("status" works too)
+  help                     This command reference
 
 HTTP API (workflows port 5678; every route below needs
   Authorization: Bearer $PROXY_AUTH_TOKEN, which chat does not have)
@@ -773,7 +774,10 @@ def _handle_task_action(action: str, args: str, brain_db) -> str:
 # token and could only fail in ways the user can't act on.
 
 # !learn is an alias for !persona (docs/tradeoffs.md TR-013).
-_PERSONA_COMMANDS = frozenset({"!persona", "!learn"})
+# "/persona" is the form that works from Telegram: OpenClaw takes every
+# message starting with "!" as a host-shell command. "/learn" is an OpenClaw
+# built-in, so the alias stays "!learn" only.
+_PERSONA_COMMANDS = frozenset({"!persona", "/persona", "!learn"})
 
 
 def _extract_persona_command(msg: str) -> str | None:
@@ -802,7 +806,7 @@ async def _handle_persona_command(
     args = args.strip()
     if not args:
         return llm_proxy._synthetic_response(
-            "Usage: !persona <feedback> | !persona reflect"
+            "Usage: /persona <feedback> | /persona reflect"
         )
     try:
         profile_name = profile_provider().name
@@ -858,10 +862,10 @@ async def _dispatch_persona_command(
 # ─── !home / !net Commands ──────────────────────────────────────
 
 HOME_NOT_CONFIGURED = "Homelab watch is not configured."
-HOME_DO_USAGE = "Usage: !home do <domain.service> <entity_id>"
-HOME_CONFIRM_USAGE = "Usage: !home confirm <6-digit code>"
+HOME_DO_USAGE = "Usage: /home do <domain.service> <entity_id>"
+HOME_CONFIRM_USAGE = "Usage: /home confirm <6-digit code>"
 HOME_OWN_MESSAGE = (
-    "Send `!home do`/`!home confirm` as its own message; nothing was run."
+    "Send `/home do`/`/home confirm` as its own message; nothing was run."
 )
 
 _ID = r"[a-z0-9_]+\.[a-z0-9_]+"
@@ -871,9 +875,11 @@ _ID = r"[a-z0-9_]+\.[a-z0-9_]+"
 # ASCII-only: Unicode ignore-case would let "\u017f" pass for "s", and \d
 # accepts any script's digits.
 _HOME_FLAGS = re.IGNORECASE | re.ASCII
-_HOME_DO_RE = re.compile(rf"!home[ \t]+do[ \t]+({_ID})[ \t]+({_ID})", _HOME_FLAGS)
-_HOME_CONFIRM_RE = re.compile(r"!home[ \t]+confirm[ \t]+([0-9]{6})", _HOME_FLAGS)
-_HOME_READ_RE = re.compile(r"!(home|net)(?:[ \t]+(.*))?", _HOME_FLAGS)
+# "/" or "!": from Telegram only "/" arrives, because OpenClaw takes every
+# message starting with "!" as its host-shell shortcut (commands.bash).
+_HOME_DO_RE = re.compile(rf"[!/]home[ \t]+do[ \t]+({_ID})[ \t]+({_ID})", _HOME_FLAGS)
+_HOME_CONFIRM_RE = re.compile(r"[!/]home[ \t]+confirm[ \t]+([0-9]{6})", _HOME_FLAGS)
+_HOME_READ_RE = re.compile(r"[!/](home|net)(?:[ \t]+(.*))?", _HOME_FLAGS)
 _HOME_ACTION_WORDS = frozenset({"do", "confirm"})
 
 
