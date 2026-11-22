@@ -24,9 +24,10 @@
 # with no true positives and a guaranteed false one.
 #
 # It does check one positive failure signal: sync-heartbeat.sh (run in the
-# background at start) writes a marker when it could not load HEARTBEAT.md
-# into the heartbeat monitors. Without it every heartbeat is skipped as
-# empty, so that is reported as unhealthy with the recorded cause.
+# background at start) writes a marker when it could not find or create the
+# heartbeat automation job or load HEARTBEAT.md into its scratch. Without
+# that job no heartbeat reaches the proxy, so it is reported as unhealthy
+# with the recorded cause.
 
 set -e
 

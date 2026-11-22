@@ -157,8 +157,8 @@ enqueues a task whose description starts with
 
 The bridge script in `scripts/tome_bridge.py` runs on the
 operator's local machine where the tome Claude Code plugin lives. It
-needs `PROXY_AUTH_TOKEN` in its environment (the make targets load
-`.env`):
+needs `PROXY_AUTH_TOKEN` in its environment. The make targets read only
+that variable from `.env`, not the provider keys or the bot token:
 
 ```bash
 make tome-bridge          # one polling pass
@@ -182,7 +182,13 @@ the `WebSearch`, `WebFetch`, `Skill` and `Agent` tools exist and are
 pre-approved (`--tools`, `--allowedTools`, `--permission-mode
 dontAsk`), no MCP server config is loaded (`--strict-mcp-config`), and
 it runs in an empty temporary directory rather than the repo. It cannot
-read files or run commands.
+read files or run commands, and the bridge removes `PROXY_AUTH_TOKEN`
+from its environment, so it never holds a credential for the queue.
+
+A rejected token is not an outage. When workflows answers 401 or 403,
+the bridge logs `rejected the request ... set PROXY_AUTH_TOKEN for the
+bridge` rather than `workflows unreachable`, and keeps retrying until
+the token is fixed.
 
 A worker that dies after claiming leaves its task `active`. The
 heartbeat fails any task still active after `HEARTBEAT_ACTIVE_REAP_HOURS`
@@ -192,7 +198,23 @@ Setup options:
 - **One-off**: `make tome-bridge` after enqueuing a `research:tome`
   task from the assistant.
 - **Always-on**: run `make tome-bridge-watch` in a tmux/screen pane,
-  or wire it into a systemd user unit / launchd job.
+  or wire it into a systemd user unit / launchd job. A unit that runs
+  the script directly gets no `.env`, so give it a file holding only
+  the token (mode 600) rather than `EnvironmentFile=` on `.env`:
+
+  ```ini
+  # ~/.config/systemd/user/clawrange-tome-bridge.service, [Service]
+  WorkingDirectory=%h/clawrange
+  Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+  # Contains one line: PROXY_AUTH_TOKEN=<value from .env>
+  EnvironmentFile=%h/.config/clawrange/tome-bridge.env
+  ExecStart=/usr/bin/python3 scripts/tome_bridge.py --watch --interval 60
+  Restart=always
+  ```
+
+  Rotating `PROXY_AUTH_TOKEN` in `.env` means updating that file and
+  running `systemctl --user restart clawrange-tome-bridge`. Read the log
+  with `journalctl --user -u clawrange-tome-bridge`.
 - **Per-task timeout**: `TOME_BRIDGE_TIMEOUT=600 make tome-bridge`.
 
 The bridge has zero dependencies beyond Python stdlib and the

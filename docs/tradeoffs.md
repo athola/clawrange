@@ -6,6 +6,9 @@ Decisions, the alternatives weighed, and what was given up. Newest first.
 
 | ID | Phase | Status | Decision |
 |----|-------|--------|----------|
+| TR-014 | specify | accepted | Income loop reuses the task queue and tome bridge; every trade is a `[DRAFT]`, benchmarked against holding |
+| TR-013 | specify | accepted | Persona config and meta-learning: git profile, brain learning store, approval-gated `## Learned` overlay |
+| TR-012 | execute | accepted | OpenClaw 2026.11.6: heartbeat is an automation job that `sync-heartbeat.sh` ensures; render refuses retired keys |
 | TR-011 | specify | accepted | Marketing output is drafts for approval; nothing auto-posts |
 | TR-010 | specify | accepted | One server-side research orchestrator called as a tool, not lead/subagent agents |
 | TR-009 | specify | accepted | APScheduler 3.x inside the workflows process, in-memory jobstore rebuilt from the brain |
@@ -31,10 +34,139 @@ Decisions, the alternatives weighed, and what was given up. Newest first.
 -->
 
 TR-008 to TR-011 were recovered from the planning briefs and specs that
-lived in `docs/archive/` (removed; see `git log -- docs/archive`). Each was
+lived in `docs/archive/` (removed; see `git log -- docs/archive`). TR-013
+and TR-014 were recovered the same way from the design specs and plans in
+`docs/superpowers/` (removed; untracked since `5e33c1c`). Each was
 checked against the code when it was written here, and the
 **Changed since** lines record where the shipped design moved away from
 the plan.
+
+## TR-014: Income loop reuses the existing pipeline, approval-gated
+
+- **Phase**: specify
+- **Status**: accepted
+- **Decision (Y-statement)**: In the context of letting the operator task
+  ClawRange from Telegram with describing, researching and trying
+  income techniques (first instance: a $50 crypto testbed), facing the
+  risk of an assistant that chases or claims "reliable weekly returns" and
+  acts on money unsupervised, we decided to **build no new pipeline**:
+  description goes through the proxy chat with citation discipline,
+  research through `research:tome:` tasks and the tome bridge, and the
+  weekly reevaluation is an `income_review` generator that queues
+  `[DRAFT] income: weekly strategy review` for the operator, to achieve a
+  loop that cannot place a trade or change a strategy on its own,
+  accepting that every step waits on the operator.
+- **Constraints kept**: reviews benchmark against holding USDC and holding
+  BTC, and every proposal cites sources. Nothing depends on live exchange
+  keys. Out of scope: fixed-return strategies, leverage and derivatives,
+  and any trade without a human approval step.
+- **Options weighed**: a dedicated income service with its own scheduler
+  and store. Rejected: the task queue, `[DRAFT]` convention, brain notes
+  (`income:` prefix) and `/sched` already cover approval, memory and
+  cadence.
+- **Negative consequences**: the review is a draft for a human, so a week
+  the operator does not claim it is a week with no review. The heartbeat
+  leaves `[DRAFT] income:` tasks alone (`heartbeat._FOREIGN_TASK`); the
+  stale-queue nudge lists them as waiting on the operator.
+- **Changed since the spec**:
+  - The code landed on `variable-config`, not a separate `income-loop`
+    branch.
+  - The strategy doc is `config/profiles/marketing/income-strategy.md`,
+    not `docs/income-strategy.md`.
+  - The review checklist is the profile's `income_review` block, with a
+    generic default in `generators.py`.
+- **Deferred**: an `!income` command family (status, review, propose) and
+  a ccxt exchange adapter: balance reads first, a paper engine, then
+  approval-gated orders with trade-only keys. Both wait on a funded
+  account and about 4 weeks of review history.
+- **Evidence**: `income_review_generator` in `workflows/generators.py`
+  (registered in `GENERATORS`) and `workflows/tests/test_income_review.py`.
+
+## TR-013: Persona config and approval-gated meta-learning
+
+- **Phase**: specify
+- **Status**: accepted
+- **Decision (Y-statement)**: In the context of letting anyone who pulls
+  the repo shape the assistant's persona and identity per use case, while
+  the assistant also improves its own persona over time, facing the
+  conflict between git-tracked config and agent-evolved runtime state, we
+  decided on **three layers**: the profile's `assistant` and `identity`
+  blocks as the git-tracked baseline, the brain's `persona_learnings`
+  table as the live store with `config/profiles/<name>/learned.yaml` as
+  its exportable projection, and a render that regenerates the base and
+  accumulates approved learnings in a `## Learned` region. The aim is a
+  persona that grows but stays reproducible, accepting a proposal queue
+  the operator must work through.
+- **Rules kept**:
+  - No persona change without operator approval. Every proposal is a
+    `[DRAFT]` task, the same posture as outward-facing actions.
+  - Proposal sources all call `propose()`: `!persona` / `!learn`
+    feedback, `POST /persona/reflect`, the `persona_reflect` generator,
+    and outcome signals behind `PERSONA_SIGNAL_LEARNING=1`, off by
+    default for false-signal risk.
+  - Render is atomic (`mkstemp` in the target dir, fsync, `os.replace`).
+    An unwritable target still records the approval; the response's
+    `render` field gives each target's write result, and re-approving
+    retries the render.
+  - `export_overlay` and `seed_overlay` are inverse operations; a bad
+    overlay is skipped at boot, never fatal.
+  - No web UI, no new always-on service.
+- **Options weighed**: persona only in git (does not evolve), only in
+  runtime state (not reproducible), and letting the agent edit its own
+  `SOUL.md` (ungated). The design takes the brain from the second and the
+  growing `## Learned` region from the third, behind the approval gate.
+- **Negative consequences**: approved learnings exist only in the brain
+  until someone runs `make persona-export`, so a lost `brain.db` loses
+  unexported ones. Workflows needs write access to the OpenClaw state dir
+  to re-render on approval.
+- **Changed since the spec**:
+  - The runtime render mount is the whole state dir, not a narrow
+    per-file mount: `os.replace` swaps the inode, and a single-file bind
+    keeps pointing at the old one (`docker-compose.yml`).
+  - `openclaw/identity.md` is a render artifact only and is not mounted;
+    the agent reads `IDENTITY.md` from its workspace.
+  - Reflection prompts go through `llm_proxy._llm_call`, per the proxy
+    convention.
+- **Evidence**: `workflows/persona.py`, `persona_learning.py` and
+  `persona_api.py`, their tests, the `chief-of-staff` profile, and section
+  10 of `docs/multi-tenant-guide.md` (the operator guide).
+
+## TR-012: OpenClaw 2026.11.6 heartbeat as an ensured automation job
+
+- **Phase**: execute
+- **Status**: accepted
+- **Decision (Y-statement)**: In the context of upgrading OpenClaw from
+  2026.11.3 to 2026.11.6, facing the 2026.11.5 retirement of heartbeat
+  config (`agents.*.heartbeat` is now rejected and Gateway startup no
+  longer creates a heartbeat), we decided to **treat the heartbeat as an
+  ordinary `agentTurn` automation job**. `openclaw doctor --fix` migrates
+  an existing one. `sync-heartbeat.sh` finds it by its message prefix on
+  every start, creates it on a fresh state dir, caps its tools to the
+  `max-ops` allow list from `openclaw.json`, and loads `HEARTBEAT.md`
+  into its scratch. The aim is to keep the repo as the source for the
+  checklist and tool policy, accepting that cadence, active hours and
+  delivery are now stored on the job in the state DB rather than in git.
+- **Options weighed**: keeping the schedule in `openclaw.json` (no longer
+  possible). Re-creating the job from the repo on every start: that would
+  undo an operator's `automations edit` or `disable`, so an existing job is
+  kept, including a disabled one. Having `render-config.js` drop the
+  retired keys: that would hide a skipped doctor run, so it stops with an
+  error naming the doctor command instead.
+- **Negative consequences**:
+  - Automation jobs prefix the message with `[cron:<id> <name>]`, so
+    `llm_proxy` strips that tag before matching the heartbeat marker.
+  - The quiet reply is `NO_REPLY`: an empty reply could surface as a
+    missing-answer notice.
+  - 2026.11.5+ installs provider plugins it infers from env (Perplexity
+    from `OPENROUTER_API_KEY`) with npm, so the read-only container needs
+    `npm_config_cache=/tmp/.npm`.
+  - A world-writable state dir stops the gateway at start ("No safe
+    OpenClaw temp root").
+- **Evidence**: `tests/test_openclaw_scripts.py` (`TestSyncHeartbeat`,
+  `test_retired_heartbeat_keys_stop_the_render`) and `TestGetLastUserMessage`
+  in `workflows/tests/test_llm_proxy.py`. On the local install, doctor
+  migrated the job and a forced run was intercepted by the proxy, finishing
+  `ok (suppressed)`.
 
 ## TR-011: Marketing output is drafts for approval; nothing auto-posts
 

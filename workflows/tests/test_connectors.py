@@ -327,3 +327,16 @@ def test_login_scrape_html_export_is_an_error_not_junk_leads():
 
     with pytest.raises(ValueError, match="CSV"):
         login_scrape(_login_spec("/export"), client=_mock_client(handler))
+
+
+def test_crm_sink_skips_the_adapter_when_nothing_survived():
+    """GIVEN a connector run whose transform dropped every record
+    WHEN the crm sink runs
+    THEN it reports 0 and never calls the adapter (a REST CRM would get an
+    empty batch request)."""
+
+    class NoCalls:
+        def upsert(self, *args):
+            raise AssertionError("upsert called with no records")
+
+    assert SINKS["crm"]([], {"object": "leads"}, NoCalls()) == 0

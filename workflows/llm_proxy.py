@@ -309,6 +309,65 @@ def _is_rate_limited(resp: httpx.Response) -> bool:
     return False
 
 
+# Out of credit, as each provider says it: OpenRouter 402 "Insufficient
+# credits", OpenAI-style insufficient_quota, Z.AI code 1113 ("余额不足" =
+# insufficient balance, sent as HTTP 429). Retrying cannot fix these, so
+# naming them sends the operator to top up rather than wait.
+_NO_CREDIT_CODES = {"1113"}
+_NO_CREDIT_KEYWORDS = (
+    "insufficient credit",
+    "insufficient balance",
+    "insufficient_quota",
+    "insufficient quota",
+    "out of credit",
+    "余额不足",
+)
+
+
+def _classify_failure(resp: httpx.Response) -> str:
+    """Short operator-facing cause for a non-200 provider reply."""
+    code = msg = ""
+    try:
+        error = resp.json().get("error", {})
+        if isinstance(error, dict):
+            code = str(error.get("code", ""))
+            msg = str(error.get("message", ""))
+        else:
+            msg = str(error)
+    except Exception:
+        msg = resp.text[:200]
+    lowered = msg.lower()
+    if (
+        resp.status_code == 402
+        or code in _NO_CREDIT_CODES
+        or any(kw in lowered for kw in _NO_CREDIT_KEYWORDS)
+    ):
+        return "out of credit"
+    if _is_rate_limited(resp):
+        return "rate-limited"
+    if resp.status_code in (401, 403):
+        return "API key rejected"
+    return f"HTTP {resp.status_code}"
+
+
+# Why each tier last failed (kept until it succeeds), so a skip behind an
+# open breaker can still say what tripped it.
+_tier_failure_reason: dict[str, str] = {}
+# Per-tier outcome of the most recent background _llm_call that failed;
+# empty after one that answered. Read by describe_last_failure().
+_last_call_failures: dict[str, str] = {}
+
+
+def _note_failure(tier_name: str, reason: str) -> None:
+    _tier_failure_reason[tier_name] = reason
+    _last_call_failures[tier_name] = reason
+
+
+def describe_last_failure() -> str:
+    """'tier: cause; ...' for the last background call that got no answer."""
+    return "; ".join(f"{t}: {r}" for t, r in _last_call_failures.items())
+
+
 _RESET_HEADERS = ("x-ratelimit-reset-requests", "x-ratelimit-reset", "ratelimit-reset")
 
 # Patterns to extract timing from OpenRouter error messages
@@ -737,6 +796,10 @@ _TIMESTAMP_ENVELOPE_RE = re.compile(
     r"^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d{4}-\d{2}-\d{2} \d{2}:\d{2}"
     r"(?::\d{2})? [A-Za-z0-9_+/:-]+\]\s*"
 )
+# OpenClaw 2026.11.5+ automation jobs (the heartbeat among them) prefix the
+# job message with "[cron:<job-id> <job-name>] ". Without stripping it the
+# heartbeat marker never leads and heartbeats reach the model unintercepted.
+_AUTOMATION_TAG_RE = re.compile(r"^\[cron:[^\s\]]+(?: [^\]\n]*)?\]\s*")
 # First turn of a fresh session: "\n\nRuntime: agent=<id> | session=... | ...".
 # Any agent id matches.
 _RUNTIME_LINE_RE = re.compile(r"\n\s*runtime: agent=[^\n]*\s*$", re.IGNORECASE)
@@ -765,7 +828,8 @@ def _get_last_user_message(messages: list[dict]) -> str:
     for content in _user_texts(messages):
         content = _OPENCLAW_META_RE.sub("", content)
         content = _RUNTIME_LINE_RE.sub("", content.strip())
-        return _TIMESTAMP_ENVELOPE_RE.sub("", content).strip()
+        content = _TIMESTAMP_ENVELOPE_RE.sub("", content)
+        return _AUTOMATION_TAG_RE.sub("", content).strip()
     return ""
 
 
@@ -805,8 +869,12 @@ async def _llm_call(
     Z.AI's web_search MCP tool is paywalled to a separate resource
     package the GLM Coding Plan does not unlock, so it's bypassed.
     """
+    _last_call_failures.clear()
     if web_search:
-        return await _llm_call_search(prompt, max_tokens)
+        text = await _llm_call_search(prompt, max_tokens)
+        if text:
+            _last_call_failures.clear()
+        return text
 
     # The tier being tried, so the overall deadline can charge it.
     inflight: list[str] = []
@@ -819,6 +887,7 @@ async def _llm_call(
             # message (!paid / !claude). web_search=True does spend paid
             # :online credit, behind the floor in _llm_call_search.
             if tier.get("paid"):
+                _last_call_failures[tier_name] = "not tried (paid is opt-in)"
                 continue
             provider = tier["provider"]
             if provider not in PROVIDER_URLS:
@@ -840,6 +909,9 @@ async def _llm_call(
                         tier_name,
                         describe_balance(),
                     )
+                    _last_call_failures[tier_name] = (
+                        f"out of credit (balance {describe_balance()})"
+                    )
                     continue
 
             env_key = CONFIG["providers"][provider]["env_key"]
@@ -847,10 +919,15 @@ async def _llm_call(
                 logger.info(
                     "background LLM: skip %s: %s is not set", tier_name, env_key
                 )
+                _last_call_failures[tier_name] = f"{env_key} not set"
                 continue
             # Last gate, so a claimed half-open probe is always really used.
             if _circuit_open(tier_name):
                 logger.info("background LLM: skip %s: breaker open", tier_name)
+                cause = _tier_failure_reason.get(tier_name)
+                _last_call_failures[tier_name] = (
+                    f"{cause} (breaker open)" if cause else "breaker open"
+                )
                 continue
 
             # If the overall deadline fires first instead, the handler below
@@ -865,6 +942,7 @@ async def _llm_call(
             )
             inflight.clear()
             if text:
+                _last_call_failures.clear()
                 return text
         return None
 
@@ -881,6 +959,9 @@ async def _llm_call(
         )
         for tier_name in inflight:
             _record_failure(tier_name)
+            _note_failure(
+                tier_name, f"no reply within the {LLM_CALL_DEADLINE}s deadline"
+            )
         return None
 
 
@@ -917,13 +998,16 @@ async def _background_attempt(
     except TimeoutError:
         logger.warning("background LLM: %s: no reply within %.0fs", tier_name, timeout)
         _record_failure(tier_name)
+        _note_failure(tier_name, f"no reply within {timeout:.0f}s")
         return None
     except Exception as exc:
         logger.warning("background LLM: %s: %s: %s", tier_name, type(exc).__name__, exc)
         _record_failure(tier_name)
+        _note_failure(tier_name, f"connection failed ({type(exc).__name__})")
         return None
 
     if resp.status_code != 200:
+        _note_failure(tier_name, _classify_failure(resp))
         if _is_rate_limited(resp):
             _record_rate_limit(tier_name)
         else:
@@ -950,14 +1034,17 @@ async def _background_attempt(
             resp.text[:200],
         )
         _record_failure(tier_name)
+        _note_failure(tier_name, "malformed reply")
         return None
     if not text:
         logger.warning(
             "background LLM: %s: empty reply: %s", tier_name, resp.text[:200]
         )
         _record_failure(tier_name)
+        _note_failure(tier_name, "empty reply")
         return None
     _record_success(tier_name)
+    _tier_failure_reason.pop(tier_name, None)
     return text
 
 
@@ -999,12 +1086,16 @@ async def _llm_call_search(prompt: str, max_tokens: int) -> str | None:
     env_key = CONFIG["providers"][provider]["env_key"]
     if not os.getenv(env_key, ""):
         logger.info("background search: skip: %s is not set", env_key)
+        _last_call_failures[SEARCH_TIER] = f"{env_key} not set"
         return None
     if not await search_allowed():
         logger.warning(
             "background search: skip: OpenRouter balance %s (floor $%.2f)",
             describe_balance(),
             OPENROUTER_BALANCE_FLOOR,
+        )
+        _last_call_failures[SEARCH_TIER] = (
+            f"held by the balance floor (balance {describe_balance()})"
         )
         return None
     budget = deadline_at - time.monotonic()
@@ -1013,6 +1104,10 @@ async def _llm_call_search(prompt: str, max_tokens: int) -> str | None:
         return None
     if _circuit_open(SEARCH_TIER):
         logger.info("background search: skip: breaker open")
+        cause = _tier_failure_reason.get(SEARCH_TIER)
+        _last_call_failures[SEARCH_TIER] = (
+            f"{cause} (breaker open)" if cause else "breaker open"
+        )
         return None
     return await _background_attempt(
         SEARCH_TIER,
@@ -1445,7 +1540,7 @@ async def chat_completions(
     if marketing_cmd is not None:
         return await chat_commands._dispatch_marketing_command(marketing_cmd, is_stream)
 
-    # Intercept !persona / !learn (spec §6 alias) — explicit feedback and
+    # Intercept !persona / !learn (alias, TR-013) — explicit feedback and
     # on-demand reflection
     persona_args = chat_commands._extract_persona_command(last_user_msg)
     if persona_args is not None:

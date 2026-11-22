@@ -16,12 +16,17 @@ Tailscale and Caddy gateway.
   (ops agent), both rendered and gitignored (`make persona PROFILE=<name>`;
   ops comes from `soul-ops.template.md` plus the profile's `assistant.ops`
   block, with org and location in `.env`), `HEARTBEAT.md` (the ops
-  agent's heartbeat checklist; OpenClaw 2026.8+ reads it from a monitor scratch,
-  which `sync-heartbeat.sh` reloads on every container start),
+  agent's heartbeat checklist), `sync-heartbeat.sh` (on every container
+  start, ensures the heartbeat automation job exists, creating it on a fresh
+  state dir with the message the proxy intercepts, caps its tools to the
+  `max-ops` allow list and reloads `HEARTBEAT.md` into its scratch;
+  OpenClaw 2026.11.5+ runs heartbeats as ordinary `agentTurn` automations,
+  not config; upgrade an older state dir with `doctor --fix` first, see
+  `docs/DEPLOYMENT_GUIDE.md`),
   `config/openclaw.json` (rendered over the live config on start by
-  `render-config.js`: agents, Telegram binding, tool policy; pins the
-  heartbeat prompt the proxy intercepts and keeps dreaming, self-learning
-  and cross-conversation recall off)
+  `render-config.js`: agents, Telegram binding, tool policy; no heartbeat
+  keys, which 2026.11.5+ rejects; keeps dreaming, self-learning and
+  cross-conversation recall off)
 - `workflows/`: FastAPI service:
   - `app.py`: FastAPI entrypoint and route registration (no `/docs`,
     `/redoc` or `/openapi.json`)
@@ -62,7 +67,9 @@ Tailscale and Caddy gateway.
     from `llm_proxy` at call time. A task `active` longer than
     `HEARTBEAT_ACTIVE_REAP_HOURS` (default 6) is failed; a task that hits
     an LLM outage goes back to pending and is failed on its 6th outage
-    cycle (`LLM_RETRY_LIMIT`)
+    cycle (`LLM_RETRY_LIMIT`), its digest line naming each tier's cause
+    from `llm_proxy.describe_last_failure()`. The `Stale queue:` nudge
+    closes from the live queue, never the LLM
   - `digest.py`: hourly heartbeat digest buffer, message planner and the
     heartbeat stamps the watchdog reads. Heartbeat and digest log through
     the `clawrange.*` loggers (`clawrange.heartbeat`, `clawrange.digest`)
@@ -110,7 +117,7 @@ Tailscale and Caddy gateway.
   Pre-commit enforces ruff, ruff-format, and mypy on every commit and the
   full pytest suite at pre-push; `make lint` mirrors the commit gate.
   `make setup` (or `make hooks`) installs both git hooks.
-- Docker images are pinned (`ghcr.io/openclaw/openclaw:2026.11.3`, and
+- Docker images are pinned (`ghcr.io/openclaw/openclaw:2026.11.6`, and
   `python:3.12.16-slim-trixie` under `workflows/Dockerfile`). Bump them
   on purpose; never switch back to `:latest`.
 - `.env` is gitignored. `.env.example` is the template.
@@ -225,7 +232,9 @@ stack without one. There is no `/docs`, `/redoc` or `/openapi.json`.
   topic is untrusted queue text, so the session gets only `WebSearch`,
   `WebFetch`, `Skill` and `Agent` (`--tools`/`--allowedTools`,
   `--permission-mode dontAsk`, `--strict-mcp-config`) and runs in an
-  empty temp directory, never the repo.
+  empty temp directory, never the repo. It never sees `PROXY_AUTH_TOKEN`
+  (the bridge strips it) or the rest of `.env` (the make targets read
+  only the token; a systemd unit uses a token-only `EnvironmentFile`).
 - Make targets: `make tome-bridge` (one pass) and
   `make tome-bridge-watch` (poll forever).
 

@@ -11,23 +11,26 @@ gateway.
 
 | Service | Purpose | Port |
 |---------|---------|------|
-| [OpenClaw](https://github.com/openclaw/openclaw) | AI assistant gateway: routes Telegram and chat messages through the LLM proxy | 3000 |
+| [OpenClaw](https://github.com/openclaw/openclaw) `2026.11.6` | AI assistant gateway: routes Telegram and chat messages through the LLM proxy | 3000 |
 | Workflows (FastAPI) | Brain DB, task queue, LLM proxy, scheduler, Reddit/GitHub scanners | 5678 |
-| [DeerFlow](https://github.com/bytedance/deer-flow) | Deep research agent (optional, for heavy market analysis) | 2026 |
-| [Ollama](https://ollama.com/) | Local LLM inference (optional, for air-gapped tests) | 11434 |
+| [DeerFlow](https://github.com/bytedance/deer-flow) | Deep research agent (optional, `make start-full`) | 2026 |
+
+`make test-ollama` also probes a local [Ollama](https://ollama.com/) on
+port 11434 if you run one; the stack does not start it.
 
 ## Requirements
 
 - Docker 24+ and Docker Compose v2
-- 8 GB free RAM (workflows container is capped at 128 MB, OpenClaw at 2 GB)
+- 8 GB free RAM (the workflows container is capped at 128 MB, OpenClaw at
+  2 GB)
 - [OpenRouter API key](https://openrouter.ai/settings/keys) with $10+ balance
-- Optional: Z.AI key (GLM Tier 2 fallback), Telegram bot token, Reddit
+- Optional: Z.AI key (GLM fallback tier), Telegram bot token, Reddit
   script-app credentials, GitHub PAT: see `.env.example`
 
 ## Quick Start
 
 ```bash
-make setup          # generates .env from template and a random gateway token
+make setup          # creates .env from the template, a gateway token, git hooks
 # edit .env: add OPENROUTER_API_KEY and a PROXY_AUTH_TOKEN, e.g.
 #   echo "PROXY_AUTH_TOKEN=$(openssl rand -hex 32)" >> .env
 make start          # bring up OpenClaw and workflows
@@ -35,17 +38,16 @@ make health         # confirm both services answer /healthz
 make test           # run the validation suite
 ```
 
-`PROXY_AUTH_TOKEN` ships empty and `make start` refuses to start without
-it: the workflows API fails closed, so an empty token would answer 401 on
-every protected route. On a fresh clone `make start` also renders
-`openclaw/soul.md` from the active profile before the containers start.
+`make start` refuses to start with `PROXY_AUTH_TOKEN` empty: the
+workflows API fails closed, so every protected route would answer 401.
+On a fresh clone it also renders `openclaw/soul.md` from the active
+profile before the containers start.
 
 To see one real end-to-end run (scheduler, LLM proxy and Telegram), fire
-a seeded job now instead of waiting for its cron. A fresh clone runs the
-identity-free `starter` profile, which seeds no jobs; list what your
-profile seeds, then run one (the `marketing` example seeds
-`morning_digest`, `hot_pulse`, `daily-content-idea`, `homelab_deals` and
-`daily-research-pulse`):
+a seeded job instead of waiting for its cron. The default `starter`
+profile seeds no jobs; the `marketing` example seeds `morning_digest`,
+`hot_pulse`, `daily-content-idea`, `homelab_deals` and
+`daily-research-pulse`:
 
 ```bash
 set -a; . ./.env; set +a                                  # load PROXY_AUTH_TOKEN
@@ -55,22 +57,53 @@ curl -s -X POST localhost:5678/sched/<id>/run \
 curl -s localhost:5678/tier                               # tier and balance
 ```
 
-Every workflows route needs `Authorization: Bearer $PROXY_AUTH_TOKEN`
-except the health checks, `GET /tier` and `GET /sched[/{id}]`. A run
-answers `{"status": "ok" | "delivery_failed" | "error", "last_status": ...}`.
+Each rundown always sends, so an empty Telegram means delivery failed,
+not that nothing matched. The report's `Setup needed` block names any
+missing credential.
 
-Everything tenant-specific (timezone, tracked projects, outreach policy,
-deal targets and marketplaces) is profile YAML, never code: see
-[docs/multi-tenant-guide.md](docs/multi-tenant-guide.md).
+**Upgrading an existing install** from an older OpenClaw pin: run the
+doctor step in [Upgrading OpenClaw](docs/DEPLOYMENT_GUIDE.md#upgrading-openclaw)
+before the first start, or the container stops at start.
 
-Each rundown always sends, so an empty Telegram means delivery failed, not
-that nothing matched. The report's `Setup needed` block names any missing
-credential (Reddit script app, GitHub PAT, eBay keyset).
+## What's inside
 
-For Tailscale-secured deployment (cloud gateway and onsite node), see
-[docs/DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md); for a local testbed,
-[docs/TESTBED_GUIDE.md](docs/TESTBED_GUIDE.md). Design decisions and their
-trade-offs are logged in [docs/tradeoffs.md](docs/tradeoffs.md).
+- **Profiles.** Persona, identity, tracked projects, schedules,
+  connectors and CRM are profile YAML under `config/profiles/<name>/`,
+  selected by `CLAWRANGE_PROFILE`. Examples: `starter`, `marketing`,
+  `lead-crm`, `chief-of-staff`.
+- **Approval-gated persona learning.** `!persona <feedback>` queues a
+  `[DRAFT]` proposal; approved ones re-render the persona and export to
+  git with `make persona-export`.
+- **Tiered LLM proxy.** OpenAI-compatible `/v1/chat/completions` and
+  `/v1/embeddings`, racing the free tiers, with a balance floor and
+  circuit breakers.
+- **Research.** `POST /research` fans out across Reddit, GitHub, web,
+  academic and TRIZ channels with citation flags; `research:tome:` tasks
+  run through your local Claude Code via `scripts/tome_bridge.py`.
+- **Marketing scans.** 14 scheduled generators enqueue drafts into the
+  task queue. Nothing is auto-posted.
+- **Heartbeat.** An OpenClaw automation job every 10 minutes, answered in
+  Python: works one task, reaps stuck ones, sends an hourly digest.
+
+```
+[OpenClaw:3000] ──► [Workflows:5678] ──► brain.db (SQLite)
+                         │                    │
+                         ▼                    ▼
+                  OpenRouter / Z.AI      APScheduler
+                  (LLM tiers)            (generators, scanners)
+```
+
+## Documentation
+
+| Page | For |
+|------|-----|
+| [docs/multi-tenant-guide.md](docs/multi-tenant-guide.md) | Writing a profile: persona, connectors, CRM, schedules, meta-learning |
+| [docs/research-and-marketing.md](docs/research-and-marketing.md) | Running research, the tome bridge, and the marketing generators |
+| [docs/TESTBED_GUIDE.md](docs/TESTBED_GUIDE.md) | A local testbed |
+| [docs/DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md) | Tailscale and Caddy deployment, upgrades, troubleshooting |
+| [docs/tradeoffs.md](docs/tradeoffs.md) | Design decisions and what each gave up |
+| [CLAUDE.md](CLAUDE.md#api-endpoints) | Every HTTP route, and conventions for changing the code |
+| [CHANGELOG.md](CHANGELOG.md) | Changes per release, with upgrade notes first |
 
 ## Testing
 
@@ -81,16 +114,17 @@ make test            # full validation suite via scripts/tests/all.sh
 make test-openclaw   # OpenClaw layer only
 make test-workflows  # Workflows endpoints (health and canary webhook)
 make test-deerflow   # DeerFlow research layer
-make test-ollama     # local Ollama inference
+make test-research TOPIC="..."   # one /research fan-out
 ```
 
-**Offline validation** (no services required):
+**Offline** (no services required):
 
 ```bash
 make validate        # tests/: structure, compose, Makefile and config checks
 make test-unit       # workflows/tests/: the service's pytest suite
 make coverage        # the same suite, failing under 85% coverage
 make retrieval-eval  # offline brain-search quality against a golden set
+make persona-demo    # the persona learning loop, no keys or containers
 ```
 
 `make setup` installs the git hooks: ruff and mypy on every commit, the
@@ -125,157 +159,3 @@ full pytest suite (including the retrieval-eval baseline gate) on push.
 `env-check`
 
 Run `make help` for descriptions of each target.
-
-## Persona & identity (configurable and self-learning)
-
-The assistant's persona **and** identity are profile-driven, so anyone who
-pulls this repo can shape their own assistant declaratively: and the
-assistant can meta-learn enhancements to itself over time, gated by your
-approval.
-
-**Configure it (per use case).** A profile under
-`config/profiles/<name>/profile.yaml` carries an `assistant` block (role,
-capabilities, owner context) and an optional `identity` block (name,
-creature, vibe, emoji, avatar). Pick a profile with `CLAWRANGE_PROFILE` and
-render it:
-
-```bash
-cp -r config/profiles/chief-of-staff config/profiles/myassistant   # start from an example
-$EDITOR config/profiles/myassistant/profile.yaml                   # set name, role, identity
-make persona PROFILE=myassistant                                   # renders openclaw/soul.md and identity.md
-```
-
-Shipped examples: `starter` (identity-free baseline), `lead-crm`,
-`marketing` (a John-117 content-marketing persona), and **`chief-of-staff`
-(Max)**: the worked, end-to-end example of the whole system.
-
-**It learns (with your approval).** Three layers keep "others configure"
-and "the assistant evolves" reconciled: git-tracked config, a brain-backed
-`persona_learnings` store, and a non-destructive `## Learned` render overlay.
-The loop:
-
-1. **Propose**: say `!persona <feedback>` (e.g. *"lead with the
-   recommendation"*), call `POST /persona/propose`, or let the scheduled
-   `persona_reflect` job suggest one. Each proposal queues as a `[DRAFT]`
-   task: nothing changes yet.
-2. **Approve**: `POST /persona/proposals/{id}/approve` appends it to the
-   brain and atomically re-renders the assistant's read surfaces. (Approval
-   is API-gated by design: persona changes don't happen from a chat
-   command.)
-3. **Export**: `make persona-export PROFILE=<name>` writes approved
-   learnings to `config/profiles/<name>/learned.yaml`, so the evolved
-   persona is reproducible for anyone who pulls the repo.
-
-See the loop run end-to-end offline, without API keys or containers:
-
-```bash
-make persona-demo PROFILE=chief-of-staff
-```
-
-Full authoring guide: [`docs/multi-tenant-guide.md`](docs/multi-tenant-guide.md).
-
-## Architecture
-
-```
-Production (Tailscale-secured):
-  Internet → DigitalOcean droplet (Caddy and TLS) → Tailscale → Onsite node
-                                                              [OpenClaw, Workflows, and Ollama]
-
-Local stack (this repo):
-  Docker on localhost
-  [OpenClaw:3000] ──► [Workflows:5678] ──► brain.db (SQLite)
-                              │                │
-                              ▼                ▼
-                        OpenRouter       APScheduler
-                        (LLM tiers)      (cron jobs)
-                              │                │
-                              ▼                ▼
-                          [Z.AI GLM]     Reddit and GitHub scanners
-```
-
-The workflows service is a single FastAPI process. It owns:
-
-- `/healthz`, `/tier`, `/tier/notify`: health and tier status
-- `/v1/chat/completions`: OpenAI-compatible LLM proxy with tiered
-  routing, balance circuit breaker, and anti-hallucination guard
-- `/v1/embeddings`: OpenAI-compatible embeddings through OpenRouter, for
-  any client that holds the bearer token
-- `/task`, `/task/{id}`, `/task/{id}/claim`, `/task/{id}/result`:
-  task queue (`DELETE /task/{id}` cancels)
-- `/brain/*`: persistent knowledge store (pages, timeline, links, tags,
-  versions, chunks, graph and search; `DELETE` on a page, a link or a tag)
-- `/projects`, `/sched`, `/scan/{reddit,github,web}`: marketing
-  orchestrator (`/scan/web` uses the OpenRouter `:online` search tier; a
-  scan whose upstream fails returns 502, not an empty result)
-- `/research`, `/research/sessions`: multi-source research
-  orchestrator with citation flagging and persistent sessions
-- `/webhook/test`: connectivity canary
-
-The service serves no `/docs`, `/redoc` or `/openapi.json`. The routes
-live in `workflows/app.py` and the routers it mounts.
-
-### Research Orchestrator
-
-`POST /research` fans out in parallel across the channels a request
-names: Reddit (`discourse`), GitHub (`code`), OpenRouter `:online` web
-search (`discourse_web`), arXiv and Semantic Scholar (`academic`), and
-TRIZ analogical reasoning (`triz`). Without `channels` it runs
-`discourse`, `code` and `discourse_web`. It then merges and ranks the
-results with authority bonuses (stars, scores, citations), recency
-bonus, and a cross-channel triangulation bonus capped at +0.15. Each
-finding is tagged with a confidence flag (high / medium / low) so the
-assistant can mark single-source claims as "needs verification".
-
-Operators can probe per-channel readiness with `GET /healthz/research`
-or run the full smoke test with `make test-research TOPIC="..."`.
-
-Every call persists a session in the brain so earlier research is
-recoverable via `GET /research/sessions/{id}` without re-running
-the fanout. Heavier work (full tome `/tome:research` synthesis,
-academic deep-dives) is handled by `scripts/tome_bridge.py` which
-polls for `research:tome:` tasks and runs them through the
-operator's local Claude Code session. See
-[docs/research-and-marketing.md](docs/research-and-marketing.md)
-for the full operator guide.
-
-### Marketing Orchestrator
-
-Scheduled scans are driven by APScheduler. `workflows/generators.py`
-registers 14 generators in `GENERATORS`, from the 8am `morning_digest`
-outreach rundown to `comment_draft`, which drafts a reply for one URL and
-queues it for approval. The generator table in
-[docs/research-and-marketing.md](docs/research-and-marketing.md) gives
-the marketing ones with a suggested cron for each.
-
-The `marketing` profile seeds five tracked projects
-(`claude-night-market`, `skrills`, `simple-resume`, `clawrange` and
-`personal-brand`) on first boot. Schedules are stored in the
-brain DB and managed via `/sched`. Each generator enqueues tasks
-into the same queue agents read from `/task/{id}/claim`, so manual
-and scheduled work share one pipeline. Drafts are never auto-posted:
-the human-in-the-loop pattern is the entire point.
-
-## Multi-Tenant Template
-
-ClawRange is a pull-down-and-configure template. A declarative **tenant
-profile** (`config/profiles/<name>/profile.yaml`) owns everything
-tenant-specific: persona, seeded projects/schedules, connector wiring, and
-CRM config: while the connector registry and CRM adapters live in code and
-are shared. The active profile is chosen by `CLAWRANGE_PROFILE` (default `starter`,
-an identity-free baseline; `marketing` reproduces the original John-117
-setup).
-
-A second profile, `lead-crm`, is a worked business example: an assistant that
-hourly syncs leads from a web portal into a pluggable CRM (SQLite by default)
-and answers relational and time-series questions about them on a schedule or
-via Telegram. Stand up your own by copying the profile and editing YAML:
-
-```bash
-cp -r config/profiles/lead-crm config/profiles/acme
-$EDITOR config/profiles/acme/profile.yaml   # set profile: acme, fields, connectors
-make profile PROFILE=acme                     # render soul.md/identity.md, set .env
-make seed-demo                                # optional: load demo leads offline
-```
-
-Profile authoring, connector kinds and CRM backends are covered in
-[docs/multi-tenant-guide.md](docs/multi-tenant-guide.md).

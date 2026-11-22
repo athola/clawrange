@@ -21,9 +21,6 @@
       "sandbox": {
         "mode": "off"
       },
-      "heartbeat": {
-        "every": "0m"
-      },
       "modelPolicy": {
         "allow": [
           "clawrange-proxy/default"
@@ -70,18 +67,6 @@
         "sandbox": {
           "mode": "off",
           "workspaceAccess": "ro"
-        },
-        "heartbeat": {
-          "every": "10m",
-          "target": "telegram",
-          "to": "${TELEGRAM_CHAT_ID}",
-          "activeHours": {
-            "start": "08:00",
-            "end": "20:00"
-          },
-          "isolatedSession": true,
-          "lightContext": false,
-          "prompt": "ClawRange heartbeat: run the scheduled checks in the monitor scratch. Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK."
         },
         "tools": {
           "allow": [

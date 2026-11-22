@@ -1868,6 +1868,48 @@ class TestGetLastUserMessage:
         msgs = [{"role": "user", "content": "[Sun 2026-11-15 22:21 UTC] !help"}]
         assert _get_last_user_message(msgs) == "!help"
 
+    # How OpenClaw 2026.11.6 presents an automation job's message (logged
+    # verbatim from the live proxy after the 2026.11.3 -> 2026.11.6 upgrade).
+    CRON_TAGGED_HEARTBEAT = (
+        "[cron:ee854ad9-1791-4919-9dfb-897c7e3cb935 heartbeat-max-ops] "
+        "ClawRange heartbeat: run the scheduled checks in the monitor scratch. "
+        "If nothing needs attention, reply NO_REPLY."
+    )
+
+    def test_strips_automation_job_tag(self):
+        """GIVEN a heartbeat sent by an OpenClaw automation job
+        WHEN the proxy extracts the last user message
+        THEN the leading [cron:<id> <name>] tag is gone and the marker leads."""
+        import heartbeat
+        from llm_proxy import _get_last_user_message
+
+        msgs = [{"role": "user", "content": self.CRON_TAGGED_HEARTBEAT}]
+        extracted = _get_last_user_message(msgs)
+        assert extracted.startswith("ClawRange heartbeat:")
+        assert heartbeat._is_heartbeat(extracted)
+
+    def test_strips_automation_tag_after_timestamp_envelope(self):
+        """GIVEN a job tag behind a timestamp envelope
+        THEN both are stripped."""
+        from llm_proxy import _get_last_user_message
+
+        msgs = [
+            {
+                "role": "user",
+                "content": "[Sat 2026-11-21 22:30 UTC] [cron:abc-123 nightly] !help",
+            }
+        ]
+        assert _get_last_user_message(msgs) == "!help"
+
+    def test_ordinary_bracketed_text_is_kept(self):
+        """GIVEN a user message that merely starts with brackets
+        THEN it is not mistaken for a job tag."""
+        from llm_proxy import _get_last_user_message
+
+        for text in ("[note] call Dana", "[cron] what is cron?", "[cron:] hi"):
+            msgs = [{"role": "user", "content": text}]
+            assert _get_last_user_message(msgs) == text
+
     def test_heartbeat_prompt_survives_runtime_context(self):
         import heartbeat
         from llm_proxy import _get_last_user_message
@@ -2659,7 +2701,7 @@ class TestResearchRouter:
             headers=AUTH_HEADER,
         )
         assert r.status_code == 200
-        assert r.json()["choices"][0]["message"]["content"] == ""
+        assert r.json()["choices"][0]["message"]["content"] == "NO_REPLY"
 
         done = brain_db.get_task(t["id"])
         assert done["status"] == "completed"
@@ -2732,6 +2774,30 @@ class TestHeartbeatInterceptor:
             assert r.status_code == 200
             mock_caller.assert_not_called()
 
+    def test_automation_job_heartbeat_is_intercepted(self):
+        """GIVEN the heartbeat as OpenClaw 2026.11.6 automations send it,
+        tagged [cron:<id> <name>]
+        WHEN it reaches the proxy with nothing to report
+        THEN no LLM is called and the reply is the quiet NO_REPLY token."""
+        import time as _time
+
+        heartbeat._proactive_state["stale_tasks"] = _time.monotonic()
+        heartbeat._proactive_state["llm_thinking"] = _time.monotonic()
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": TestGetLastUserMessage.CRON_TAGGED_HEARTBEAT,
+                }
+            ]
+        }
+        mock_caller = AsyncMock(return_value=_mock_response(200))
+        with patch("llm_proxy._call_provider", mock_caller):
+            r = client.post("/v1/chat/completions", json=body, headers=AUTH_HEADER)
+        assert r.status_code == 200
+        mock_caller.assert_not_called()
+        assert r.json()["choices"][0]["message"]["content"] == "NO_REPLY"
+
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
     def test_heartbeat_processes_pending_task_hourly_digest(self, mock_notify):
         """Task completions buffer into the hourly digest: no per-completion
@@ -2771,7 +2837,7 @@ class TestHeartbeatInterceptor:
                 headers=AUTH_HEADER,
             )
             content = r.json()["choices"][0]["message"]["content"]
-            assert content == ""  # silent: completion buffered, not relayed
+            assert content == "NO_REPLY"  # silent: completion buffered, not relayed
             mock_caller.assert_called_once()
 
         # No per-completion Telegram notification
@@ -2948,7 +3014,8 @@ class TestHeartbeatInterceptor:
 
     def test_heartbeat_silent_when_no_issues(self):
         """With no pending tasks, no infra issues, and proactive checks
-        not yet due, return empty response (silent heartbeat)."""
+        not yet due, reply NO_REPLY: the token OpenClaw automations treat
+        as a quiet result (an empty reply can surface a missing-answer notice)."""
         # Mark all proactive checks as just-ran so they don't fire
         import time as _time
 
@@ -2961,7 +3028,7 @@ class TestHeartbeatInterceptor:
             headers=AUTH_HEADER,
         )
         content = r.json()["choices"][0]["message"]["content"]
-        assert content == ""
+        assert content == "NO_REPLY"
 
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
     def test_heartbeat_stale_task_detection(self, mock_notify):
@@ -2996,7 +3063,7 @@ class TestHeartbeatInterceptor:
         content = r.json()["choices"][0]["message"]["content"]
         # The stale task is processed and buffered into the digest; the
         # heartbeat response itself stays silent.
-        assert content == ""
+        assert content == "NO_REPLY"
         statuses = {t["id"]: t["status"] for t in brain_db.list_tasks()}
         assert statuses[old_task["id"]] == "completed"
 
@@ -3051,7 +3118,7 @@ class TestHeartbeatInterceptor:
                 headers=AUTH_HEADER,
             )
             content = r.json()["choices"][0]["message"]["content"]
-            assert content == ""  # created tasks buffer into the digest
+            assert content == "NO_REPLY"  # created tasks buffer into the digest
 
             # Once the digest hour elapses the suggestion is delivered
             digest._digest_state["last_flush"] = (
@@ -3093,7 +3160,7 @@ class TestHeartbeatInterceptor:
                 json=self._heartbeat_body(),
                 headers=AUTH_HEADER,
             )
-        assert r.json()["choices"][0]["message"]["content"] == ""
+        assert r.json()["choices"][0]["message"]["content"] == "NO_REPLY"
         return [t for t in brain_db.list_tasks() if t["description"] == suggestion]
 
     @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
@@ -3162,7 +3229,7 @@ class TestHeartbeatInterceptor:
             )
             # Should still return silent — LLM failure doesn't break heartbeat
             content = r.json()["choices"][0]["message"]["content"]
-            assert content == ""
+            assert content == "NO_REPLY"
 
     def test_llm_call_total_deadline_caps_tier_hangs(self):
         """_llm_call must enforce a total deadline across tiers.
@@ -4746,6 +4813,152 @@ class TestLlmCallExceptionHandling:
         with patch("llm_proxy._call_provider", side_effect=limited):
             asyncio.run(llm_proxy._llm_call("hi"))
         assert llm_proxy._circuit_open("openrouter-free", probe=False)
+
+
+# Z.AI's reply when the account has no credit left: HTTP 429, code 1113
+# ("insufficient balance or no resource package, please recharge"),
+# captured from the live proxy log.
+ZAI_NO_CREDIT = {
+    "error": {"code": "1113", "message": "余额不足或无可用资源包,请充值。"}
+}
+
+
+class TestFailureReasons:
+    """An outage must say why each tier failed, not just "unreachable"."""
+
+    def setup_method(self):
+        _reset_state()
+        llm_proxy._tier_failure_reason.clear()
+
+    @pytest.mark.parametrize(
+        ("status", "body", "want"),
+        [
+            (429, ZAI_NO_CREDIT, "out of credit"),
+            # The code alone decides when Z.AI rewords the message.
+            (
+                429,
+                {"error": {"code": "1113", "message": "Please recharge"}},
+                "out of credit",
+            ),
+            (402, {"error": {"message": "Insufficient credits"}}, "out of credit"),
+            (429, {"error": {"message": "insufficient_quota"}}, "out of credit"),
+            (429, {"error": "rate limited"}, "rate-limited"),
+            (401, {"error": {"message": "invalid api key"}}, "API key rejected"),
+            (503, {"error": "upstream"}, "HTTP 503"),
+        ],
+    )
+    def test_classifies_http_failures(self, status, body, want):
+        assert llm_proxy._classify_failure(_mock_response(status, body)) == want
+
+    @patch.dict("os.environ", FAKE_ENV)
+    def test_summary_names_each_tier_and_its_cause(self):
+        """GIVEN openrouter-free answers empty and Z.AI is out of credit
+        WHEN a background call fails on every tier
+        THEN the summary says so per tier, and that paid was not tried."""
+
+        async def fake(provider, models, body, api_key):
+            if provider == "zai":
+                return _mock_response(429, ZAI_NO_CREDIT)
+            return _mock_response(200, {"choices": [{"message": {"content": ""}}]})
+
+        with (
+            patch("llm_proxy._call_provider", side_effect=fake),
+            patch("llm_proxy._check_openrouter_balance", AsyncMock(return_value=17.0)),
+        ):
+            assert asyncio.run(llm_proxy._llm_call("hi")) is None
+        summary = llm_proxy.describe_last_failure()
+        assert "openrouter-free: empty reply" in summary
+        assert "zai-direct: out of credit" in summary
+        assert "openrouter-paid: not tried (paid is opt-in)" in summary
+
+    @patch.dict("os.environ", FAKE_ENV)
+    def test_open_breaker_keeps_the_cause_that_tripped_it(self):
+        """GIVEN Z.AI tripped its breaker by running out of credit
+        WHEN the next call skips it
+        THEN the summary still says out of credit, not just breaker open."""
+
+        async def fake(provider, models, body, api_key):
+            if provider == "zai":
+                return _mock_response(429, ZAI_NO_CREDIT)
+            return _mock_response(503, {"error": "upstream"})
+
+        with (
+            patch("llm_proxy._call_provider", side_effect=fake),
+            patch("llm_proxy._check_openrouter_balance", AsyncMock(return_value=17.0)),
+        ):
+            asyncio.run(llm_proxy._llm_call("hi"))
+            asyncio.run(llm_proxy._llm_call("hi"))
+        summary = llm_proxy.describe_last_failure()
+        assert "zai-direct: out of credit (breaker open)" in summary
+
+    @patch.dict("os.environ", FAKE_ENV)
+    def test_depleted_openrouter_is_named_out_of_credit(self):
+        """GIVEN the OpenRouter balance is at zero and Z.AI answers malformed
+        WHEN a background call fails
+        THEN OpenRouter reads as out of credit without being called, and
+        Z.AI's reply is named malformed."""
+        called = []
+
+        async def fake(provider, models, body, api_key):
+            called.append(provider)
+            return httpx.Response(200, content=b"not json")
+
+        with (
+            patch("llm_proxy._call_provider", side_effect=fake),
+            patch("llm_proxy._check_openrouter_balance", AsyncMock(return_value=0.0)),
+        ):
+            assert asyncio.run(llm_proxy._llm_call("hi")) is None
+        summary = llm_proxy.describe_last_failure()
+        assert "openrouter-free: out of credit (balance" in summary
+        assert "zai-direct: malformed reply" in summary
+        assert called == ["zai"]
+
+    @patch.dict("os.environ", FAKE_ENV)
+    def test_success_clears_the_summary(self):
+        async def ok(provider, models, body, api_key):
+            return _mock_response(200)
+
+        llm_proxy._last_call_failures["zai-direct"] = "out of credit"
+        with (
+            patch("llm_proxy._call_provider", side_effect=ok),
+            patch("llm_proxy._check_openrouter_balance", AsyncMock(return_value=17.0)),
+        ):
+            assert asyncio.run(llm_proxy._llm_call("hi"))
+        assert llm_proxy.describe_last_failure() == ""
+
+    @patch.dict("os.environ", FAKE_ENV)
+    @patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
+    @patch("telegram.notify", new_callable=AsyncMock, return_value=True)
+    def test_requeue_digest_line_says_why(self, _n):
+        """GIVEN every tier fails with known causes
+        WHEN the heartbeat re-queues a task
+        THEN its digest line names those causes instead of "LLM unreachable"."""
+        brain_db._conn.execute("DELETE FROM tasks")
+        brain_db._conn.commit()
+        for key in ("stale_tasks", "llm_thinking", "pending_reminder"):
+            heartbeat._proactive_state[key] = time.monotonic()
+        t = brain_db.create_task("Summarize the open deals")
+
+        async def fake(provider, models, body, api_key):
+            if provider == "zai":
+                return _mock_response(429, ZAI_NO_CREDIT)
+            return _mock_response(200, {"choices": [{"message": {"content": ""}}]})
+
+        with (
+            patch("llm_proxy._call_provider", side_effect=fake),
+            patch("llm_proxy._check_openrouter_balance", AsyncMock(return_value=17.0)),
+        ):
+            client.post(
+                "/v1/chat/completions",
+                json=TestHeartbeatInterceptor._heartbeat_body(None),
+                headers=AUTH_HEADER,
+            )
+        assert brain_db.get_task(t["id"])["status"] == "pending"
+        line = next(ln for ln in digest._digest_state["lines"] if t["id"] in ln)
+        assert "zai-direct: out of credit" in line
+        assert "openrouter-free: empty reply" in line
+        assert "unreachable" not in line.lower()
+        heartbeat._llm_retry_counts.clear()
 
 
 @patch.dict("os.environ", FAKE_ENV)

@@ -6,7 +6,9 @@ uses [Semantic Versioning](https://semver.org/). While the version is
 below 1.0, a minor bump may carry breaking changes; they are listed under
 **Upgrading** first.
 
-## [0.2.0] - 2026-11-16
+## [Unreleased]
+
+## [0.2.0] - 2026-11-21
 
 The first entry. It summarises the work since `v0.1.0` by theme rather
 than commit by commit; `git log v0.1.0..v0.2.0` has the detail.
@@ -18,14 +20,26 @@ than commit by commit; `git log v0.1.0..v0.2.0` has the detail.
 - **Every workflows route needs a bearer token** except the health
   checks, `GET /tier` and `GET /sched[/{id}]`. Set `PROXY_AUTH_TOKEN` in
   `.env` (`openssl rand -hex 32`); `make start` refuses to start with it
-  empty or left at the template placeholder.
+  empty or left at the template placeholder. Anything that runs
+  `scripts/tome_bridge.py` directly, such as a systemd unit, needs the
+  token too: give it a token-only `EnvironmentFile` (see "Heavy research
+  via tome" in `docs/research-and-marketing.md`).
+- **OpenClaw 2026.11.6 retires heartbeat config.** With a state dir from
+  an earlier image, stop OpenClaw, back it up and run
+  `openclaw doctor --fix --yes` before the first start (see "Upgrading
+  OpenClaw" in `docs/DEPLOYMENT_GUIDE.md`); otherwise `render-config.js`
+  exits non-zero and the container stops at start. The heartbeat's cadence
+  and active hours are edited with `openclaw automations edit`.
+- **Smoke-test scripts moved.** `scripts/test_*.sh` are now
+  `scripts/tests/*.sh` without the `test_` prefix. The make targets are
+  unchanged; update anything that calls the scripts by path.
 - **`/docs`, `/redoc` and `/openapi.json` are no longer served.**
 - **Tenant config moved into profiles.** Timezone, tracked projects,
   outreach policy and deal targets live in
   `config/profiles/<name>/profile.yaml`, selected by `CLAWRANGE_PROFILE`
   (default `starter`). Run `make profile PROFILE=<name>` after pulling.
-- **Dev tooling runs through uv.** Run `make setup` (or `make hooks`) to
-  install the pre-commit and pre-push hooks.
+- **Dev tooling runs through uv** (0.13.9 or newer). Run `make setup` (or
+  `make hooks`) to install the pre-commit and pre-push hooks.
 
 ### Added
 
@@ -43,7 +57,9 @@ than commit by commit; `git log v0.1.0..v0.2.0` has the detail.
   OpenRouter `:online` web search, arXiv/Semantic Scholar and TRIZ, with
   ranking, triangulation, confidence flags, persisted sessions and
   `GET /healthz/research`. Heavy topics route to a local Claude Code
-  session through `scripts/tome_bridge.py`.
+  session through `scripts/tome_bridge.py`, which gets no credentials:
+  the bridge strips `PROXY_AUTH_TOKEN` and the make targets pass it only
+  that token from `.env`.
 - **Marketing orchestrator**: scheduled scans, the 8am `morning_digest`
   outreach rundown, `hot_pulse`, content ideas and `[DRAFT]` comment
   drafts queued for human approval. 14 generators in all.
@@ -56,16 +72,21 @@ than commit by commit; `git log v0.1.0..v0.2.0` has the detail.
 - **LLM proxy**: OpenAI-compatible chat and `/v1/embeddings`, tiered
   routing across OpenRouter and Z.AI, an anti-hallucination guard and a
   balance circuit breaker.
-- **Ops**: heartbeat task processing with an hourly digest, a watchdog
-  that alerts Telegram when heartbeats stall, and a `/healthz` that names
-  the degraded part (`db`, `vector_search`, `scheduler`, `profile`).
+- **Ops**: a heartbeat that OpenClaw runs as an automation job
+  (`openclaw/sync-heartbeat.sh` ensures it and caps its tools) and the
+  proxy answers in Python: it works one task per cycle, sends an hourly
+  digest whose outage lines name each tier's cause (`out of credit`,
+  `rate-limited`, `empty reply`), and closes its `Stale queue:` nudge from
+  the live queue. Plus a watchdog that alerts Telegram when heartbeats
+  stall, and a `/healthz` that names the degraded part (`db`,
+  `vector_search`, `scheduler`, `profile`).
 - Secure gateway deployment via Tailscale and Caddy (`make start-prod`).
 
 ### Changed
 
 - `llm_proxy.py` split into `chat_commands.py`, `heartbeat.py` and
   `digest.py`.
-- Docker images are pinned (`ghcr.io/openclaw/openclaw:2026.11.3`,
+- Docker images are pinned (`ghcr.io/openclaw/openclaw:2026.11.6`,
   `python:3.12.16-slim-trixie`).
 - Ports bind `127.0.0.1` and the docker0 address only, never `0.0.0.0`.
 
@@ -83,5 +104,6 @@ than commit by commit; `git log v0.1.0..v0.2.0` has the detail.
 Initial testbed: OpenClaw with n8n, DeerFlow and Ollama under Docker
 Compose, plus CI, Makefile targets and the validation suite.
 
+[Unreleased]: https://github.com/athola/clawrange/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/athola/clawrange/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/athola/clawrange/releases/tag/v0.1.0

@@ -772,7 +772,7 @@ def _handle_task_action(action: str, args: str) -> str:
 # the /persona routes use. A loopback HTTP call would need the API bearer
 # token and could only fail in ways the user can't act on.
 
-# !learn is the spec §6 alias for !persona.
+# !learn is an alias for !persona (docs/tradeoffs.md TR-013).
 _PERSONA_COMMANDS = frozenset({"!persona", "!learn"})
 
 

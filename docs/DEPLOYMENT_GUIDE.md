@@ -242,7 +242,7 @@ Your personal devices can still reach everything as the tailnet owner.
 - [ ] `OPENROUTER_API_KEY` set in `.env`; balance is read live from the
   OpenRouter credits API (`/api/v1/credits`)
 - [ ] Docker images stay pinned (`docker-compose.yml` ships
-  `ghcr.io/openclaw/openclaw:2026.11.3`)
+  `ghcr.io/openclaw/openclaw:2026.11.6`)
 - [ ] Workflows runs single uvicorn worker (default: do not raise)
 - [ ] Brain DB at `data/brain/brain.db` is included in your backup plan
 
@@ -285,6 +285,43 @@ tailscale status                  # VPN status
 ufw status                        # Firewall status
 ```
 
+## Upgrading OpenClaw
+
+The image is pinned in `docker-compose.yml`. To move an existing install
+past a release that changes stored state, migrate the state before the new
+image first starts. 2026.11.5 is one: it turns the old `heartbeat` config
+into an automation job. Until `openclaw doctor --fix` has done that,
+`render-config.js` refuses to render and the container will not start.
+
+```bash
+git pull                                   # new pin, config and scripts
+docker compose -f docker-compose.yml -f docker-compose.prod.yml stop openclaw
+mkdir -p data/backups
+tar -czf "data/backups/openclaw-state-$(date +%Y%m%d-%H%M%S).tar.gz" \
+  -C data openclaw-state                   # or your OPENCLAW_STATE_DIR
+docker compose run --rm --no-deps -T --entrypoint sh openclaw -c \
+  'chown 1000:1000 /home/node/.openclaw /tmp &&
+   runuser -u node -- env npm_config_cache=/tmp/.npm \
+     node dist/index.js doctor --fix --yes' 2>&1 | tee doctor.log
+make start-prod
+```
+
+Read `doctor.log` even when doctor exits 0. A run can exit 0 and still
+report a failed plugin install or an unfinished state migration. If it
+does, run doctor again: the second run completes them. On the first start,
+`sync-heartbeat.sh` caps the migrated job's tools to the `max-ops` allow
+list and loads `HEARTBEAT.md` into its scratch. Then check:
+
+```bash
+docker exec msp-openclaw runuser -u node -- openclaw automations list --all
+docker compose logs workflows | grep "heartbeat intercepted"
+```
+
+To roll back, stop the container, restore the tarball over the state
+dir, and check out the previous commit. The old image also needs the old
+`openclaw.json` and `sync-heartbeat.sh`, so reverting only the pin is not
+enough.
+
 ## Troubleshooting
 
 | Symptom | Check |
@@ -298,9 +335,11 @@ ufw status                        # Firewall status
 | Workflows routes return 401 | `PROXY_AUTH_TOKEN` empty or not sent. Every route except the health checks, `GET /tier` and `GET /sched[/{id}]` needs `Authorization: Bearer $PROXY_AUTH_TOKEN` |
 | `/docs` or `/openapi.json` returns 404 | Expected: the interactive docs are turned off. Routes are listed in `CLAUDE.md` and `workflows/app.py` |
 | `/scan/*` or `/research` returns 502 | The upstream (Reddit, GitHub, the search tier) failed; `detail` carries the reason. Not an empty result |
-| OpenClaw container unhealthy, heartbeats never reach the proxy | `docker inspect --format '{{json .State.Health}}' msp-openclaw`: a `heartbeat sync failed: ...` line means `sync-heartbeat.sh` could not load `HEARTBEAT.md` into the heartbeat monitors and wrote `/run/sync-heartbeat.failed`. The script's output is in `docker logs msp-openclaw`; restart the container to retry |
+| OpenClaw container unhealthy, heartbeats never reach the proxy | `docker inspect --format '{{json .State.Health}}' msp-openclaw`: a `heartbeat sync failed: ...` line means `sync-heartbeat.sh` could not find or create the heartbeat automation job, or load `HEARTBEAT.md` into its scratch, and wrote `/run/sync-heartbeat.failed`. The script's output is in `docker logs msp-openclaw`; restart the container to retry |
+| OpenClaw exits at start with `render-config: ... still has retired keys` | The state dir predates 2026.11.5. Run the doctor step in [Upgrading OpenClaw](#upgrading-openclaw) |
 | A task stays `active` | A worker claimed it and died. The heartbeat fails it after `HEARTBEAT_ACTIVE_REAP_HOURS` (default 6) with a digest line; re-create it to retry |
-| Heartbeat tasks fail with the LLM down | During an outage a task goes back to pending each heartbeat and is failed on its 6th outage cycle (about an hour), so it cannot block the queue |
+| Heartbeat tasks fail with the LLM down | During an outage a task goes back to pending each heartbeat and is failed on its 6th outage cycle (about an hour), so it cannot block the queue. The digest line says why per tier, e.g. `No LLM answered (openrouter-free: empty reply; zai-direct: out of credit)`. `out of credit` will not clear by waiting: top up that provider. Z.AI sends it as HTTP 429 with code 1113 |
+| `research:tome:` tasks stay pending, a `Stale queue:` nudge lists them under the tome bridge | `journalctl --user -u clawrange-tome-bridge`. A `rejected the request` line means the bridge's `PROXY_AUTH_TOKEN` is missing or stale; see "Heavy research via tome" in `docs/research-and-marketing.md` |
 
 ## Cost Estimate
 

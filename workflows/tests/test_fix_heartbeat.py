@@ -305,6 +305,59 @@ class TestStaleNudgeDedup:
         assert len(_nudges(db)) == 1
 
 
+class TestStaleNudgeClosesWithLiveQueue:
+    """The scan only runs when no heartbeat-owned task is pending, so the
+    nudge can only ever be about other consumers. An LLM asked to "review
+    the queue" has no queue tools and answered "First, let me check..."."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, quiet, monkeypatch):
+        monkeypatch.setenv("HEARTBEAT_LLM_SUGGEST", "0")
+
+    def test_nudge_names_each_waiting_task_by_owner_without_the_llm(self, db):
+        """GIVEN a tome task and an operator draft waiting over 4 hours
+        WHEN the heartbeat creates and then works the stale nudge
+        THEN it closes from the live queue, naming who each task waits on,
+        and never calls the LLM."""
+        tome = db.create_task("research:tome: stuck behind the bridge")
+        draft = db.create_task("[DRAFT] income: weekly strategy review")
+        for t in (tome, draft):
+            _backdate(db, t["id"], "created_at", 5)
+        llm = AsyncMock(return_value="First, let me check the queue")
+        with patch.object(llm_proxy, "_llm_call", llm):
+            heartbeat._proactive_state.pop("stale_tasks", None)
+            _beat()  # creates the nudge
+            _beat()  # works it
+        (nudge,) = _nudges(db)
+        assert nudge["status"] == "completed"
+        result = nudge["result"].lower()
+        tome_part, _, you_part = result.partition("waiting on you")
+        assert "tome bridge" in tome_part and tome["id"] in tome_part
+        assert draft["id"] in you_part
+        assert "clawrange-tome-bridge" in result  # where to look
+        llm.assert_not_awaited()
+
+    def test_nudge_lists_heartbeat_owned_work_separately(self, db):
+        """GIVEN a stale task the heartbeat itself owns (it was skipped,
+        e.g. the claim raced, so the scan still ran)
+        WHEN the nudge is closed
+        THEN that task is listed under Heartbeat, not as waiting on you."""
+        own = db.create_task("Summarize the open deals")
+        _backdate(db, own["id"], "created_at", 50)
+        nudge = db.create_task(f"{heartbeat.STALE_NUDGE_PREFIX} 1 task(s) old")
+        result = asyncio.run(heartbeat._run_heartbeat_task(nudge, db, 50.0))
+        assert f"Heartbeat: #{own['id']} (2d)" in result
+        assert "Waiting on you" not in result
+        assert "Tome bridge" not in result
+
+    def test_nudge_reports_a_cleared_queue(self, db):
+        """GIVEN the stale tasks finished before the nudge was worked
+        THEN the nudge says so rather than repeating a stale count."""
+        nudge = db.create_task(f"{heartbeat.STALE_NUDGE_PREFIX} 1 task(s) old")
+        result = asyncio.run(heartbeat._run_heartbeat_task(nudge, db, 50.0))
+        assert "no task" in result.lower()
+
+
 # ─── #51: tier-recovery alerts are per tier ───────────────────────
 
 

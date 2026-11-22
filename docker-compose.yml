@@ -16,7 +16,7 @@ services:
   #   - ./data/openclaw-tmp/   (ephemeral logs, locks)
   # Host reads allowed via :ro mounts.
   openclaw:
-    image: ghcr.io/openclaw/openclaw:2026.11.3
+    image: ghcr.io/openclaw/openclaw:2026.11.6
     container_name: msp-openclaw
     # Reaps the backgrounded sync-heartbeat.sh once node is PID 1.
     init: true
@@ -52,8 +52,9 @@ services:
       # NOT mounted: it is a human-readable render artifact only; the agent
       # reads IDENTITY.md from its workspace under data/openclaw-state.
       - ./openclaw/soul.md:/home/node/.openclaw/soul.md:ro
-      # 2026.8+ no longer reads HEARTBEAT.md: sync-heartbeat.sh loads it into
-      # each heartbeat's monitor scratch once the gateway is up.
+      # OpenClaw never reads HEARTBEAT.md itself: sync-heartbeat.sh ensures
+      # the heartbeat automation job exists (2026.11.5+) and loads the file
+      # into its scratch once the gateway is up.
       - ./openclaw/HEARTBEAT.md:/opt/HEARTBEAT.md:ro
       - ./openclaw/sync-heartbeat.sh:/opt/sync-heartbeat.sh:ro
       - ./openclaw/config/openclaw.json:/opt/openclaw.json.template:ro
@@ -80,6 +81,10 @@ services:
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
       # The rootfs is read-only; 2026.8+ stages SQLite snapshots in the cache dir.
       - XDG_CACHE_HOME=/tmp/.cache
+      # 2026.11.5+ installs provider plugins it infers from env (Perplexity
+      # web_search from OPENROUTER_API_KEY) with npm, which needs a writable
+      # cache; the rootfs leaves it nowhere else to write.
+      - npm_config_cache=/tmp/.npm
     user: "0:0"
     security_opt:
       - no-new-privileges:true
@@ -143,7 +148,7 @@ services:
       - ./data/brain:/data
       # OpenClaw workspace state — writable so runtime persona re-render
       # (on learning approval) can update the agent's SOUL.md / IDENTITY.md.
-      # Mounted as a whole directory rather than spec §7's narrow per-file
+      # Mounted as a whole directory rather than a narrow per-file
       # mount because render_all writes atomically via os.replace, which
       # breaks single-file bind mounts (the bind pins the old inode).
       # The host side honours OPENCLAW_STATE_DIR from .env.

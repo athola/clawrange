@@ -160,9 +160,13 @@ def run_tome_research(claude_bin: str, topic: str, timeout: int) -> tuple[int, s
     try:
         # An empty scratch dir as cwd: started from the repo root the session
         # would sit next to .env and load the project's CLAUDE.md/settings.
+        # The token is the bridge's, for the task queue; the session runs on
+        # untrusted topic text and has no use for it.
+        env = {k: v for k, v in os.environ.items() if k != "PROXY_AUTH_TOKEN"}
         with tempfile.TemporaryDirectory(prefix="tome-bridge-") as workdir:
             result = subprocess.run(
                 cmd,
+                env=env,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -252,6 +256,18 @@ def complete_with_retry(base: str, task_id: str, result: str, status: str) -> bo
 def run_once(base: str, claude_bin: str, timeout: int, dry_run: bool) -> int:
     try:
         tasks = list_pending_tasks(base)
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (401, 403):
+            logger.error("tome bridge: workflows unreachable at %s: %s", base, exc)
+            return 1
+        # Not an outage: retrying never helps until the token is fixed.
+        logger.error(
+            "tome bridge: workflows at %s rejected the request (%s): set "
+            "PROXY_AUTH_TOKEN for the bridge to the value in .env",
+            base,
+            exc,
+        )
+        return 1
     except NETWORK_ERRORS as exc:
         logger.error("tome bridge: workflows unreachable at %s: %s", base, exc)
         return 1

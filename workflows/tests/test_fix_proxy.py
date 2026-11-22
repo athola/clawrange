@@ -573,6 +573,36 @@ class TestAuthHardening:
         assert proc.returncode == 0, proc.stderr
         assert marker.exists()
 
+    def test_make_tome_bridge_passes_only_the_token_from_env_file(self, tmp_path):
+        """GIVEN a .env holding the queue token beside provider secrets
+        WHEN make tome-bridge starts the bridge
+        THEN the bridge gets the token but none of the other secrets, which
+        its claude session (driven by untrusted queue text) would inherit."""
+        stub = tmp_path / "bin"
+        stub.mkdir()
+        seen = tmp_path / "env.txt"
+        uv = stub / "uv"
+        uv.write_text(f'#!/usr/bin/env bash\nenv > "{seen}"\n')
+        uv.chmod(0o755)
+        (tmp_path / ".env").write_text(
+            "PROXY_AUTH_TOKEN=from-dotenv\n"
+            "OPENROUTER_API_KEY=sk-or-secret\n"
+            "TELEGRAM_BOT_TOKEN=123:secret\n"
+        )
+        proc = subprocess.run(
+            ["make", "-s", "-f", str(REPO / "Makefile"), "tome-bridge"],
+            cwd=tmp_path,
+            env={"PATH": f"{stub}{os.pathsep}{os.environ['PATH']}"},
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        assert proc.returncode == 0, proc.stderr
+        env = seen.read_text().splitlines()
+        assert "PROXY_AUTH_TOKEN=from-dotenv" in env
+        assert not [ln for ln in env if ln.startswith(("OPENROUTER", "TELEGRAM"))]
+
 
 # ─── K8 follow-up: make start-prod runs the soul.md render guard ─────
 

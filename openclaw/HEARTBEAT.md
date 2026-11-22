@@ -5,6 +5,10 @@ in Python (`workflows/heartbeat.py`); the prompt never reaches a model.
 The LLM is used only to work a pending task and, on idle cycles, to
 suggest one grounded task.
 
+If you are a model reading this, the proxy did not intercept the
+heartbeat. Reply `NO_REPLY` and create no tasks: the checks below run
+in Python, and acting on them here duplicates their tasks.
+
 ## What Gets Checked
 
 1. **Tier health**: any circuit breakers tripped?
@@ -31,12 +35,16 @@ suggest one grounded task.
 - If the OpenRouter balance is below the floor, create a task:
   `Low balance alert: $X.XX remaining` (P1)
 - At most every 30 minutes: if tasks have waited over 4 hours, create one
-  `Stale queue: N task(s) pending over 4 hours; review the queue` (P2)
+  `Stale queue: N task(s) pending over 4 hours; review the queue` (P2).
+  The scan runs only when no heartbeat-owned task is pending, so these
+  wait on someone else; the nudge closes from the live queue (no LLM),
+  listing each task under the tome bridge, you, or the heartbeat
 - At most every 15 minutes, when nothing above fired: ask the LLM for one
   research task grounded in the tracked projects and deal targets (P3).
   A suggestion that names none of them is dropped. Set
   `HEARTBEAT_LLM_SUGGEST=0` to turn this off.
-- If nothing triggers: respond empty (silent, no Telegram notification)
+- If nothing triggers: reply `NO_REPLY`, which the automation treats as
+  silent (no Telegram message)
 
 ### Pending tasks exist: Process One
 - Claim the highest-priority pending task
@@ -46,9 +54,10 @@ suggest one grounded task.
   everything else to the LLM
 - Mark it completed with the result, or blocked when the result is a
   question for the operator, or failed when the work raised
-- If no LLM tier answers, put the task back to pending. On its 6th
-  outage cycle (about an hour) it is failed instead, so one task cannot
-  stall the queue
+- If no LLM tier answers, put the task back to pending. The digest line
+  names each tier's cause (`out of credit`, `rate-limited`, `empty
+  reply`, `API key rejected`). On its 6th outage cycle (about an hour)
+  it is failed instead, so one task cannot stall the queue
 
 ## Reporting: hourly digest, not per-event messages
 

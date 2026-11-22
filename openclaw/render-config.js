@@ -68,8 +68,27 @@ function main(templatePath, targetPath, env) {
       );
     }
   }
+  const merged = merge(current, rendered);
+  // OpenClaw 2026.11.5 retired heartbeat config for automation jobs and
+  // rejects a config that still has the keys. The merge keeps them from an
+  // older install, and only doctor can turn them into the job, so stop
+  // rather than delete them and hide a skipped migration.
+  const agents = merged.agents || {};
+  const stale = Object.entries(agents.entries || {})
+    .filter(([, a]) => isObject(a) && "heartbeat" in a)
+    .map(([id]) => `agents.entries.${id}.heartbeat`);
+  if (isObject(agents.defaults) && "heartbeat" in agents.defaults) {
+    stale.unshift("agents.defaults.heartbeat");
+  }
+  if (stale.length) {
+    throw new Error(
+      `${targetPath} still has retired keys (${stale.join(", ")}); ` +
+        "stop the container and run `openclaw doctor --fix --yes` to migrate " +
+        "them into an automation job (docs/DEPLOYMENT_GUIDE.md, Upgrading OpenClaw)"
+    );
+  }
   const tmp = `${targetPath}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(merge(current, rendered), null, 2) + "\n", {
+  fs.writeFileSync(tmp, JSON.stringify(merged, null, 2) + "\n", {
     mode: 0o600,
   });
   fs.renameSync(tmp, targetPath);

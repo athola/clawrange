@@ -240,6 +240,11 @@ schedules:
 The scheduler passes each generator its own row id as `schedule_id`, so
 kwargs never need to repeat it (a value given there is overridden).
 
+The five cron fields go straight to APScheduler, whose day-of-week `0`
+is **Monday**, not Sunday as in standard cron. Name the day instead of
+numbering it: `"0 16 * * sun"` runs Sundays at 16:00 in `SCHEDULER_TZ`.
+This applies to `seeds.schedules` and to `POST /sched` alike.
+
 Profiles are validated at load time: an unknown source/sink/adapter kind, a
 schedule whose `kind` is not a registered generator, or a schedule
 referencing an undefined connector all raise a `ProfileError` immediately.
@@ -443,6 +448,9 @@ unexported approvals still render. If the brain DB is missing or
 unreadable, they render `learned.yaml` alone and print a warning, leaving
 the DB as it found it. The command exits non-zero when any target file
 could not be written.
+
+To watch the whole loop (propose, approve, render, export) without API
+keys or containers, run `make persona-demo PROFILE=chief-of-staff`.
 
 > Outcome-signal proposals (the assistant noticing recurring corrections on
 > its own) are off by default. Set `PERSONA_SIGNAL_LEARNING=1` to enable them.

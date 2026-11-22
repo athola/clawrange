@@ -57,6 +57,8 @@ def _reset_proxy_globals(monkeypatch):
     import llm_proxy
 
     monkeypatch.setattr(llm_proxy, "_circuit_state", {})
+    monkeypatch.setattr(llm_proxy, "_tier_failure_reason", {})
+    monkeypatch.setattr(llm_proxy, "_last_call_failures", {})
     monkeypatch.setattr(llm_proxy, "_notification_last_sent", {})
     # String targets: conftest must not import app modules at module level
     # (the env above is set first), and a second local import is avoided.

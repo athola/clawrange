@@ -30,9 +30,16 @@ logger = logging.getLogger("clawrange.heartbeat")
 # ─── Heartbeat Interceptor ───────────────────────────────────────
 
 
-# Start of the heartbeat prompt pinned in openclaw/config/openclaw.json
-# (agents.entries.*.heartbeat.prompt); OpenClaw sends it verbatim.
+# Start of the heartbeat job's message. OpenClaw 2026.11.5+ runs the
+# heartbeat as an ordinary agentTurn automation job; openclaw/sync-heartbeat.sh
+# finds that job by this prefix (and creates it on a fresh install), and
+# OpenClaw sends the message verbatim.
 _HEARTBEAT_MARKER = "clawrange heartbeat:"
+
+# The reply for a cycle with nothing to report. OpenClaw automations suppress
+# delivery only when the whole final reply is exactly this token; an empty
+# reply can surface as a missing-answer notice on Telegram.
+QUIET_REPLY = "NO_REPLY"
 
 
 # How often each proactive check can fire (seconds).
@@ -53,11 +60,10 @@ _SOUL_MD_PATH = Path(
 # operator approves via /persona/*, and `[DRAFT] income:` is claimed by the
 # operator. `[DRAFT] Comment draft` tasks stay heartbeat-owned: they ask the
 # LLM worker to write the draft that the operator then reviews.
-_FOREIGN_TASK = re.compile(
-    r"^\s*(research:tome:|\[research:tome\]|research via tome:"
-    r"|\[DRAFT\]\s*persona\b|\[DRAFT\]\s*income:)",
-    re.IGNORECASE,
-)
+_TOME_TASK = r"research:tome:|\[research:tome\]|research via tome:"
+_OPERATOR_TASK = r"\[DRAFT\]\s*persona\b|\[DRAFT\]\s*income:"
+_FOREIGN_TASK = re.compile(rf"^\s*({_TOME_TASK}|{_OPERATOR_TASK})", re.IGNORECASE)
+_TOME_TASK_RE = re.compile(rf"^\s*({_TOME_TASK})", re.IGNORECASE)
 
 # Digest lines quote at most this much of a task description; the full
 # text stays on the task (GET /task/{id}).
@@ -727,7 +733,9 @@ async def _llm_work_task(description: str) -> str:
         if result:
             result = f"{SEARCH_HELD_NOTE}\n\n{result}"
     if not result:
-        raise LLMUnavailable("no LLM tier answered")
+        raise LLMUnavailable(
+            llm_proxy.describe_last_failure() or "no LLM tier answered"
+        )
     logger.info("LLM worked task: %r", result[:100])
     return result
 
@@ -764,8 +772,67 @@ def _balance_unknown_for(remaining: float | None) -> float:
 
 
 # Fixed start of the stale-queue nudge, so dedup matches what is written.
-# Not a status alert: it goes through the worker like any system task.
+# The scan runs only when no heartbeat-owned task is pending, so the nudge is
+# always about another consumer; it closes from the live queue, not the LLM.
 STALE_NUDGE_PREFIX = "Stale queue:"
+STALE_QUEUE_HOURS = 4
+
+
+def _stale_pending(all_tasks: list[dict]) -> list[dict]:
+    """Pending tasks older than STALE_QUEUE_HOURS, nudges excluded."""
+    cutoff = datetime.now(UTC) - timedelta(hours=STALE_QUEUE_HOURS)
+    out = []
+    for t in all_tasks:
+        created = _parse_task_time(t.get("created_at"))
+        if (
+            t["status"] == "pending"
+            and created is not None
+            and created < cutoff
+            and not t["description"].startswith(STALE_NUDGE_PREFIX)
+        ):
+            out.append(t)
+    return out
+
+
+def _stale_queue_result(all_tasks: list[dict]) -> str:
+    """Closing note for a stale nudge: what is waiting now, and on whom."""
+    stale = _stale_pending(all_tasks)
+    if not stale:
+        return (
+            f"Live queue: no task pending over {STALE_QUEUE_HOURS} hours now; "
+            "nothing to do."
+        )
+    now = datetime.now(UTC)
+
+    def line(t: dict) -> str:
+        created = _parse_task_time(t.get("created_at")) or now
+        age = (now - created).total_seconds() / 3600
+        age_txt = f"{age / 24:.0f}d" if age >= 48 else f"{age:.0f}h"
+        desc = t["description"][:DESCRIPTION_PREVIEW_CHARS]
+        return f"#{t['id']} ({age_txt}) {desc}"
+
+    tome = [t for t in stale if _TOME_TASK_RE.match(t["description"])]
+    yours = [
+        t for t in stale if t not in tome and _FOREIGN_TASK.match(t["description"])
+    ]
+    ours = [t for t in stale if t not in tome and t not in yours]
+    parts = [
+        f"Live queue: {len(stale)} task(s) pending over {STALE_QUEUE_HOURS} hours."
+    ]
+    if tome:
+        parts.append(
+            "Tome bridge: "
+            + "; ".join(line(t) for t in tome)
+            + ". Check `systemctl --user status clawrange-tome-bridge` and its "
+            "journal."
+        )
+    if yours:
+        parts.append("Waiting on you: " + "; ".join(line(t) for t in yours) + ".")
+    if ours:
+        parts.append(
+            "Heartbeat: " + "; ".join(line(t) for t in ours) + " (next cycles)."
+        )
+    return " ".join(parts)
 
 
 def _is_status_alert(description: str) -> bool:
@@ -863,6 +930,8 @@ async def _run_heartbeat_task(task: dict, brain_db, remaining: float | None) -> 
     description = task["description"]
     if _is_status_alert(description):
         return _status_alert_result(description, remaining)
+    if description.startswith(STALE_NUDGE_PREFIX):
+        return _stale_queue_result(brain_db.list_tasks())
     scan_result = await research_router._try_marketing_scan(description, brain_db)
     if scan_result is not None:
         return scan_result
@@ -880,6 +949,7 @@ def _settle_task(
     failure: str | None,
     llm_down: bool,
     attempts: int,
+    outage: str = "",
 ) -> None:
     """Close (or re-queue) the task this cycle worked and record its digest line."""
     try:
@@ -888,16 +958,19 @@ def _settle_task(
             # cycle. One digest line per task per outage, not per cycle.
             brain_db.release_task(task["id"])
             _llm_retry_counts[task["id"]] = attempts
+            cause = outage or "no LLM tier answered"
             logger.warning(
-                "heartbeat task #%s re-queued: LLM unreachable (attempt %d/%d)",
+                "heartbeat task #%s re-queued: %s (attempt %d/%d)",
                 task["id"],
+                cause,
                 attempts,
                 LLM_RETRY_LIMIT,
             )
             if attempts == 1:
                 digest._digest_record(
                     f"[{label}] #{task['id']}: {task['description']}\n"
-                    "LLM unreachable; re-queued, retrying each heartbeat."
+                    f"No LLM answered ({cause}); re-queued, retrying each "
+                    "heartbeat."
                 )
         elif failure is not None:
             logger.warning("heartbeat task #%s failed: %s", task["id"], failure)
@@ -971,18 +1044,11 @@ async def _proactive_scan(
     # Layer 2: Stale task awareness — every 30 min
     if _proactive_ready("stale_tasks"):
         _proactive_mark("stale_tasks")
-        stale_cutoff = datetime.now(UTC) - timedelta(hours=4)
-        stale = [
-            t
-            for t in all_tasks
-            if t["status"] == "pending"
-            and datetime.fromisoformat(t["created_at"]) < stale_cutoff
-            and not t["description"].startswith(STALE_NUDGE_PREFIX)
-        ]
+        stale = _stale_pending(all_tasks)
         if stale and not _has_recent_prefix(all_tasks, STALE_NUDGE_PREFIX):
             desc = (
                 f"{STALE_NUDGE_PREFIX} {len(stale)} task(s) pending over "
-                "4 hours; review the queue"
+                f"{STALE_QUEUE_HOURS} hours; review the queue"
             )
             t = brain_db.create_task(desc, priority=2)
             tasks_created.append(t)
@@ -1109,6 +1175,7 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
     if task:
         deadline = _heartbeat_work_deadline()
         llm_down = False
+        outage = ""
         try:
             result = await asyncio.wait_for(
                 _run_heartbeat_task(task, brain_db, remaining), timeout=deadline
@@ -1117,10 +1184,11 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
         except TimeoutError:
             result = ""
             failure = f"timed out after {deadline:g}s"
-        except LLMUnavailable:
+        except LLMUnavailable as exc:
             result = ""
             failure = None
             llm_down = True
+            outage = str(exc)
         except Exception as exc:
             logger.exception("heartbeat task #%s failed", task["id"])
             result = ""
@@ -1130,12 +1198,12 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
         if llm_down and attempts >= LLM_RETRY_LIMIT:
             llm_down = False
             failure = (
-                f"could not reach the LLM in {attempts} attempts; "
+                f"no LLM answered in {attempts} attempts ({outage}); "
                 f"{_sentence_start(tenant_profile.operator_name())} "
                 "should handle it manually"
             )
 
-        _settle_task(brain_db, task, label, result, failure, llm_down, attempts)
+        _settle_task(brain_db, task, label, result, failure, llm_down, attempts, outage)
         # No direct Telegram notification: the digest line above carries
         # the completion, at most once per hour.
 
@@ -1148,9 +1216,9 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
 
     # ── 3. Build response ───────────────────────────────────────
     # Created tasks buffer into the digest alongside completions. The
-    # response is non-empty only when the hourly digest is due, so the
-    # 10-minute heartbeat stays silent on Telegram except once per hour
-    # (OpenClaw relays non-empty heartbeat responses, not empty ones).
+    # response carries text only when the hourly digest is due; otherwise it
+    # is QUIET_REPLY, so the 10-minute heartbeat stays silent on Telegram
+    # except once per hour.
     for t in tasks_created:
         digest._digest_record(
             f"Created #{t['id']} [P{t['priority']}] "
@@ -1161,7 +1229,7 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
         await _flush_digest(all_tasks, tripped, remaining)
         if digest._digest_due()
         else ""
-    )
+    ) or QUIET_REPLY
     resp = llm_proxy._synthetic_response(text)
     # Reached only when the cycle ran to the end; the watchdog alerts when
     # heartbeats keep arriving without this stamp moving.

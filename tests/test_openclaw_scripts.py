@@ -58,6 +58,24 @@ class TestRenderConfig:
         assert "PROXY_AUTH_TOKEN" in proc.stderr
         assert target.exists()
 
+    @pytest.mark.parametrize(
+        "agents",
+        [
+            {"defaults": {"heartbeat": {"every": "0m"}}},
+            {"entries": {"max-ops": {"heartbeat": {"every": "10m"}}}},
+        ],
+    )
+    def test_retired_heartbeat_keys_stop_the_render(self, tmp_path, agents):
+        """GIVEN a live openclaw.json still holding pre-2026.11.5 heartbeat keys
+        (the deep merge would keep them, and 2026.11.6 rejects the config)
+        WHEN render-config runs
+        THEN it fails naming doctor --fix and leaves the file for doctor."""
+        before = json.dumps({"agents": agents})
+        proc, target = _render(tmp_path, before)
+        assert proc.returncode != 0
+        assert "doctor --fix" in proc.stderr
+        assert target.read_text() == before
+
     def test_unparseable_target_is_not_overwritten(self, tmp_path):
         broken = '{"meta": {"half-written": '
         proc, target = _render(tmp_path, broken)
@@ -87,26 +105,95 @@ def stubs(tmp_path):
     return bin_dir
 
 
-def _openclaw(bin_dir: Path, scratch_ok: bool) -> None:
-    jobs = json.dumps({"jobs": [{"id": "hb1", "payload": {"kind": "heartbeat"}}]})
-    scratch = (
-        "exit 0" if scratch_ok else 'echo "scratch: monitor hb1 is locked" >&2; exit 3'
-    )
-    _stub(
-        bin_dir,
-        "openclaw",
-        f"""case "$2" in
-  list) echo 'banner line'; echo '{jobs}' ;;
-  scratch) {scratch} ;;
-esac
-""",
-    )
+HEARTBEAT_JOB = {
+    "id": "hb1",
+    "enabled": True,
+    "payload": {
+        "kind": "agentTurn",
+        "message": "ClawRange heartbeat: run the scheduled checks. Reply NO_REPLY.",
+    },
+}
+# OpenClaw ships its own agentTurn jobs (memory dreaming); never touch them.
+OTHER_JOB = {
+    "id": "dream1",
+    "enabled": True,
+    "payload": {"kind": "agentTurn", "message": "__openclaw_memory_dream__"},
+}
 
 
-def _run(script: Path, bin_dir: Path, marker: Path, *args: str):
+def _openclaw(bin_dir: Path, jobs=None, scratch_ok=True, add_ok=True) -> Path:
+    """Stateful `openclaw automations` stub: list/add/scratch over a JSON file.
+
+    `add` records its argv in add.log and appends a job (id hb-new) carrying
+    its --message, so a later `list` returns it like the real gateway does.
+    `edit` appends its argv to edit.log and stores --tools as toolsAllow.
+    """
+    state = bin_dir.parent / "jobs.json"
+    state.write_text(json.dumps([HEARTBEAT_JOB] if jobs is None else jobs))
+    path = bin_dir / "openclaw"
+    path.write_text(
+        f"""#!/usr/bin/env python3
+import json, sys
+state = {str(state)!r}
+args = sys.argv[1:]
+assert args[0] == "automations", args
+jobs = json.load(open(state))
+if args[1] == "list":
+    assert "--all" in args and "--json" in args, args
+    print("banner line")
+    print(json.dumps({{"jobs": jobs, "total": len(jobs)}}))
+elif args[1] == "add":
+    open({str(bin_dir.parent / "add.log")!r}, "w").write(json.dumps(args[2:]))
+    if not {add_ok!r}:
+        sys.exit("invalid cron.add params: no route for telegram")
+    msg = args[args.index("--message") + 1]
+    jobs.append({{"id": "hb-new", "enabled": True,
+                 "payload": {{"kind": "agentTurn", "message": msg}}}})
+    json.dump(jobs, open(state, "w"))
+    print("created hb-new")
+elif args[1] == "edit":
+    open({str(bin_dir.parent / "edit.log")!r}, "a").write(json.dumps(args[2:]) + "\\n")
+    tools = args[args.index("--tools") + 1].split(",")
+    for j in jobs:
+        if j["id"] == args[2]:
+            j["payload"]["toolsAllow"] = tools
+    json.dump(jobs, open(state, "w"))
+elif args[1] == "scratch":
+    if not {scratch_ok!r}:
+        sys.exit(f"scratch: job {{args[2]}} is locked")
+    open({str(bin_dir.parent / "scratch.log")!r}, "a").write(args[2] + "\\n")
+"""
+    )
+    path.chmod(0o755)
+    return bin_dir.parent
+
+
+MAX_OPS_TOOLS = ["read", "web_fetch", "cron"]
+
+
+def _config(root: Path, tools=MAX_OPS_TOOLS) -> Path:
+    """A rendered openclaw.json whose max-ops allow list caps the heartbeat."""
+    path = root / "openclaw.json"
+    entries = {"max-ops": {"tools": {"allow": tools, "deny": ["exec"]}}}
+    path.write_text(json.dumps({"agents": {"entries": entries}}))
+    return path
+
+
+def _run(
+    script: Path,
+    bin_dir: Path,
+    marker: Path,
+    *args: str,
+    chat_id="4242",
+    config: Path | None = None,
+):
+    if config is None:
+        config = _config(bin_dir.parent)
     env = {
+        "OPENCLAW_CONFIG": str(config),
         "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
         "SYNC_HEARTBEAT_MARKER": str(marker),
+        "TELEGRAM_CHAT_ID": chat_id,
     }
     return subprocess.run(
         ["sh", str(script), *args],
@@ -118,19 +205,131 @@ def _run(script: Path, bin_dir: Path, marker: Path, *args: str):
     )
 
 
+def _scratched(root: Path) -> list[str]:
+    log = root / "scratch.log"
+    return log.read_text().split() if log.exists() else []
+
+
 @needs_node
 class TestSyncHeartbeat:
+    def test_loads_scratch_into_existing_heartbeat_job_only(self, tmp_path, stubs):
+        """GIVEN a migrated heartbeat job beside OpenClaw's own agentTurn jobs
+        WHEN sync-heartbeat runs
+        THEN only the heartbeat job gets HEARTBEAT.md and nothing is created."""
+        root = _openclaw(stubs, jobs=[OTHER_JOB, HEARTBEAT_JOB])
+        proc = _run(SYNC, stubs, tmp_path / "m", "/opt/HEARTBEAT.md")
+        assert proc.returncode == 0, proc.stderr
+        assert "loaded /opt/HEARTBEAT.md into hb1" in proc.stdout
+        assert _scratched(root) == ["hb1"]
+        assert not (root / "add.log").exists()
+
+    def test_disabled_heartbeat_job_is_not_recreated(self, tmp_path, stubs):
+        """GIVEN the operator disabled the heartbeat job
+        WHEN sync-heartbeat runs
+        THEN it is not recreated (list --all sees disabled jobs)."""
+        root = _openclaw(stubs, jobs=[{**HEARTBEAT_JOB, "enabled": False}])
+        proc = _run(SYNC, stubs, tmp_path / "m", "/opt/HEARTBEAT.md")
+        assert proc.returncode == 0, proc.stderr
+        assert not (root / "add.log").exists()
+
+    def test_creates_intercepted_heartbeat_job_on_fresh_install(self, tmp_path, stubs):
+        """GIVEN a fresh state dir with no heartbeat job (2026.11.5+ no longer
+        provisions one from config)
+        WHEN sync-heartbeat runs
+        THEN it creates a max-ops job whose message the proxy intercepts,
+        delivering to TELEGRAM_CHAT_ID, and loads HEARTBEAT.md into it."""
+        import heartbeat
+
+        root = _openclaw(stubs, jobs=[OTHER_JOB])
+        proc = _run(SYNC, stubs, tmp_path / "m", "/opt/HEARTBEAT.md")
+        assert proc.returncode == 0, proc.stderr
+        add = json.loads((root / "add.log").read_text())
+        opt = {add[i]: add[i + 1] for i in range(len(add) - 1) if add[i][:2] == "--"}
+        assert heartbeat._is_heartbeat(opt["--message"])
+        assert "NO_REPLY" in opt["--message"]
+        assert "HEARTBEAT_OK" not in opt["--message"]
+        assert opt["--agent"] == "max-ops"
+        assert opt["--to"] == "4242"
+        assert opt["--channel"] == "telegram"
+        # Same shape doctor --fix gives a migrated job: an explicit tool cap
+        # (else 2026.11.6 keeps legacy sender-policy resolution), the agent's
+        # 600s turn budget, and yielding to foreground chats.
+        assert opt["--tools"] == "read,web_fetch,cron"
+        assert opt["--timeout-seconds"] == "600"
+        assert opt["--active-hours-timezone"] == "user"
+        assert "--idle-only" in add
+        assert _scratched(root) == ["hb-new"]
+
+    def test_caps_existing_job_tools_from_config(self, tmp_path, stubs):
+        """GIVEN a doctor-migrated heartbeat job with no tool cap
+        WHEN sync-heartbeat runs
+        THEN it sets the cap to max-ops' allow list from openclaw.json."""
+        root = _openclaw(stubs, jobs=[OTHER_JOB, HEARTBEAT_JOB])
+        proc = _run(SYNC, stubs, tmp_path / "m", "/opt/HEARTBEAT.md")
+        assert proc.returncode == 0, proc.stderr
+        edits = [json.loads(x) for x in (root / "edit.log").read_text().splitlines()]
+        assert edits == [["hb1", "--tools", "read,web_fetch,cron"]]
+
+    def test_matching_tool_cap_is_left_alone(self, tmp_path, stubs):
+        """GIVEN a heartbeat job already capped to the config's allow list
+        WHEN sync-heartbeat runs
+        THEN it does not rewrite the job (no config revision churn)."""
+        capped = {
+            **HEARTBEAT_JOB,
+            "payload": {**HEARTBEAT_JOB["payload"], "toolsAllow": MAX_OPS_TOOLS},
+        }
+        root = _openclaw(stubs, jobs=[capped])
+        proc = _run(SYNC, stubs, tmp_path / "m", "/opt/HEARTBEAT.md")
+        assert proc.returncode == 0, proc.stderr
+        assert not (root / "edit.log").exists()
+        assert _scratched(root) == ["hb1"]
+
+    def test_unreadable_config_fails_loudly(self, tmp_path, stubs):
+        """GIVEN openclaw.json has no max-ops allow list
+        WHEN sync-heartbeat runs
+        THEN it writes the marker instead of running the job uncapped."""
+        root = _openclaw(stubs)
+        marker = tmp_path / "sync-heartbeat.failed"
+        missing = tmp_path / "nope.json"
+        proc = _run(SYNC, stubs, marker, "/opt/HEARTBEAT.md", config=missing)
+        assert proc.returncode != 0
+        assert "tool" in marker.read_text()
+        assert not (root / "edit.log").exists()
+
+    def test_fresh_install_without_chat_id_fails_loudly(self, tmp_path, stubs):
+        """GIVEN no heartbeat job and an empty TELEGRAM_CHAT_ID
+        WHEN sync-heartbeat runs
+        THEN it creates nothing and writes the failure marker."""
+        root = _openclaw(stubs, jobs=[])
+        marker = tmp_path / "sync-heartbeat.failed"
+        proc = _run(SYNC, stubs, marker, "/opt/HEARTBEAT.md", chat_id="")
+        assert proc.returncode != 0
+        assert not (root / "add.log").exists()
+        assert "TELEGRAM_CHAT_ID" in marker.read_text()
+
+    def test_failed_create_prints_cli_output_and_writes_marker(self, tmp_path, stubs):
+        """GIVEN no heartbeat job and a gateway that rejects the create
+        WHEN sync-heartbeat runs
+        THEN the CLI error reaches the log and the marker is written."""
+        _openclaw(stubs, jobs=[], add_ok=False)
+        marker = tmp_path / "sync-heartbeat.failed"
+        proc = _run(SYNC, stubs, marker, "/opt/HEARTBEAT.md")
+        assert proc.returncode != 0
+        assert "no route for telegram" in proc.stderr
+        # The healthcheck shows the marker, so it carries the reason too.
+        assert "no route for telegram" in marker.read_text()
+
     def test_scratch_failure_prints_cli_output_and_writes_marker(self, tmp_path, stubs):
         _openclaw(stubs, scratch_ok=False)
         marker = tmp_path / "sync-heartbeat.failed"
         proc = _run(SYNC, stubs, marker, "/opt/HEARTBEAT.md")
         assert proc.returncode != 0
-        assert "monitor hb1 is locked" in proc.stderr
+        assert "job hb1 is locked" in proc.stderr
         assert marker.exists()
         assert "hb1" in marker.read_text()
 
     def test_success_clears_stale_marker(self, tmp_path, stubs):
-        _openclaw(stubs, scratch_ok=True)
+        _openclaw(stubs)
         marker = tmp_path / "sync-heartbeat.failed"
         marker.write_text("old failure\n")
         proc = _run(SYNC, stubs, marker, "/opt/HEARTBEAT.md")
