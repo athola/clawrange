@@ -316,9 +316,13 @@ def health(
 # ─── Chat text ──────────────────────────────────────────────────────
 
 
-def render_net_full(obs: Observation, state: WatchState) -> str:
+def render_net_full(
+    obs: Observation,
+    state: WatchState,
+    kev_reviewed: frozenset[str] = frozenset(),
+) -> str:
     """`!net`: the census view plus Kuma monitors and per-source outages."""
-    lines = [render_net(obs, state)]
+    lines = [render_net(obs, state, kev_reviewed)]
     for source in SOURCES:
         if source in obs.configured and getattr(obs, source) is None:
             detail = safe_label(obs.errors.get(source, ""), 80) or "no detail"

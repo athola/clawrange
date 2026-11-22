@@ -3,6 +3,7 @@
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
+from homelab.findings import KEV_NOTE
 from homelab.models import (
     Census,
     Device,
@@ -318,3 +319,27 @@ def test_unknown_entities_are_counted_but_not_listed():
 def test_no_unknown_count_when_there_are_none():
     text = render_home(full_obs(), CFG)
     assert "unknown" not in text.split("\n")[0]
+
+
+# ─── reviewed KEV entries ───────────────────────────────────────────
+
+
+def test_all_reviewed_kev_entries_collapse_to_a_count():
+    text = render_net(
+        full_obs(), state(), kev_reviewed=frozenset({"CVE-2000-0001", "CVE-2000-0002"})
+    )
+    assert "MikroTik KEV: 2 entries (all reviewed)" in text
+    assert "CVE-2000-0001" not in text and "CVE-2000-0002" not in text
+    assert KEV_NOTE not in text
+
+
+def test_partly_reviewed_kev_lists_only_what_is_left_to_check():
+    text = render_net(full_obs(), state(), kev_reviewed=frozenset({"CVE-2000-0001"}))
+    assert "MikroTik KEV: 2 entries (1 reviewed, 1 to check)" in text
+    assert "CVE-2000-0002" in text and "CVE-2000-0001" not in text
+    assert KEV_NOTE in text
+
+
+def test_daily_report_uses_the_reviewed_list():
+    cfg = replace(CFG, kev_reviewed=frozenset({"CVE-2000-0001", "CVE-2000-0002"}))
+    assert "(all reviewed)" in render_report(full_obs(), state(), cfg)

@@ -152,7 +152,11 @@ def _ports(ports: list[int] | tuple[int, ...] | None) -> str:
     return ", ".join(str(p) for p in ports) if ports else "none"
 
 
-def render_net(obs: Observation, state: WatchState) -> str:
+def render_net(
+    obs: Observation,
+    state: WatchState,
+    kev_reviewed: frozenset[str] = frozenset(),
+) -> str:
     line = _status_line(obs, "census")
     if line:
         return line
@@ -189,15 +193,26 @@ def render_net(obs: Observation, state: WatchState) -> str:
     elif not cen.kev:
         lines.append("MikroTik KEV: no entries")
     else:
-        lines.append(f"MikroTik KEV: {len(cen.kev)} entries")
-        for entry in cen.kev[:KEV_CAP]:
+        todo = [e for e in cen.kev if e.cve_id not in kev_reviewed]
+        done = len(cen.kev) - len(todo)
+        if not done:
+            lines.append(f"MikroTik KEV: {len(cen.kev)} entries")
+        elif not todo:
+            lines.append(f"MikroTik KEV: {len(cen.kev)} entries (all reviewed)")
+        else:
+            lines.append(
+                f"MikroTik KEV: {len(cen.kev)} entries "
+                f"({done} reviewed, {len(todo)} to check)"
+            )
+        for entry in todo[:KEV_CAP]:
             lines.append(
                 f"{safe_label(entry.cve_id)} ({safe_label(entry.date_added)}): "
                 f"{safe_label(entry.name, 60)}"
             )
-        if len(cen.kev) > KEV_CAP:
-            lines.append(f"...and {len(cen.kev) - KEV_CAP} more")
-        lines.append(KEV_NOTE)
+        if len(todo) > KEV_CAP:
+            lines.append(f"...and {len(todo) - KEV_CAP} more")
+        if todo:
+            lines.append(KEV_NOTE)
     broken = sorted(
         f"{key.removeprefix('census.')} {safe_label(reason, 60)}"
         for key, reason in obs.errors.items()
@@ -220,7 +235,7 @@ def render_report(obs: Observation, state: WatchState, cfg: WatchConfig) -> str:
                 f"OUTAGE {SOURCE_LABELS[source]}: {detail} ({fails} failed checks)"
             )
     lines.append(render_home(obs, cfg))
-    lines.append(render_net(obs, state))
+    lines.append(render_net(obs, state, cfg.kev_reviewed))
     if obs.kuma:
         worst = sorted(
             (m for m in obs.kuma if m.uptime_24h is not None and m.uptime_24h < 1),

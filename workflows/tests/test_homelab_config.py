@@ -163,3 +163,19 @@ def test_local_error_never_echoes_file_contents(tmp_path):
         tmp_path, "actions: [{service: lock.unlock, entities: [lock.secret_door]}]\n"
     )
     assert "secret_door" not in _with_local(path).local_error
+
+
+def test_local_file_kev_reviewed_is_normalized(tmp_path):
+    path = _local(tmp_path, "kev_reviewed: [cve-2018-14847, CVE-2026-67277]\n")
+    cfg = _with_local(path)
+    assert cfg.watch.kev_reviewed == frozenset({"CVE-2018-14847", "CVE-2026-67277"})
+    assert cfg.local_error == ""
+
+
+@pytest.mark.parametrize(
+    "value", ["CVE-2018-14847", "[not-a-cve]", "[CVE-18-1]", "[7]"]
+)
+def test_bad_kev_reviewed_drops_the_file(tmp_path, value):
+    cfg = _with_local(_local(tmp_path, f"kev_reviewed: {value}\n"))
+    assert "kev_reviewed" in cfg.local_error
+    assert cfg.watch.kev_reviewed == frozenset()

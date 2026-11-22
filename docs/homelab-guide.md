@@ -209,7 +209,10 @@ checkout.
    recreate workflows once (`docker compose up -d --no-deps workflows`).
    After that the watch and the chat commands re-read the file on every
    use. The file may hold only `ignore_entities` and `actions`, which are
-   added to the profile's lists and checked by the same rules:
+   added to the profile's lists and checked by the same rules, and
+   `kev_reviewed`, a list of CVE ids you have checked against the running
+   RouterOS (they are counted, not listed, and never alert; re-check them
+   after a downgrade):
 
    ```yaml
    ignore_entities:
@@ -221,6 +224,8 @@ checkout.
        entities: ["light.*"]
      - service: light.turn_off
        entities: ["light.*"]
+   kev_reviewed:
+     - CVE-2018-14847                # fixed in 6.42.1
    ```
 
    If the file is missing or invalid, the whole file is ignored (none of its

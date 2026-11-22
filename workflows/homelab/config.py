@@ -43,11 +43,20 @@ def _str_list(value: Any) -> tuple[str, ...]:
     return tuple(x for x in value if isinstance(x, str) and x)
 
 
-LOCAL_KEYS = frozenset({"ignore_entities", "actions"})
+LOCAL_KEYS = frozenset({"ignore_entities", "actions", "kev_reviewed"})
+_CVE = re.compile(r"CVE-[0-9]{4}-[0-9]{4,}", re.IGNORECASE | re.ASCII)
 
 
-def _read_local(path: str) -> tuple[tuple[str, ...], tuple[ActionRule, ...], str]:
-    """Load the operator-private ``local_file``: (ignores, rules, error).
+@dataclass(frozen=True)
+class _Local:
+    ignores: tuple[str, ...] = ()
+    rules: tuple[ActionRule, ...] = ()
+    kev_reviewed: frozenset[str] = frozenset()
+    error: str = ""
+
+
+def _read_local(path: str) -> _Local:
+    """Load the operator-private ``local_file``.
 
     The file holds real entity ids, so it lives under the gitignored
     ``config/homelab/`` instead of the committed profile. It can only add to
@@ -58,31 +67,43 @@ def _read_local(path: str) -> tuple[tuple[str, ...], tuple[ActionRule, ...], str
     try:
         text = Path(path).read_text(encoding="utf-8")
     except OSError:
-        return (), (), "local_file cannot be read"
+        return _Local(error="local_file cannot be read")
     try:
         data = yaml.safe_load(text)
     except yaml.YAMLError as exc:
         mark = getattr(exc, "problem_mark", None)
         where = f" (line {mark.line + 1})" if mark is not None else ""
-        return (), (), f"local_file is not valid YAML{where}"
+        return _Local(error=f"local_file is not valid YAML{where}")
     if data is None:
         data = {}
     if not isinstance(data, dict):
-        return (), (), "local_file must be a mapping"
+        return _Local(error="local_file must be a mapping")
     unknown = set(map(str, data)) - LOCAL_KEYS
     if unknown:
-        return (), (), f"local_file has unknown keys (known: {sorted(LOCAL_KEYS)})"
+        return _Local(
+            error=f"local_file has unknown keys (known: {sorted(LOCAL_KEYS)})"
+        )
     ignore = data.get("ignore_entities")
     if ignore is not None and (
         not isinstance(ignore, list) or not all(isinstance(x, str) for x in ignore)
     ):
-        return (), (), "local_file ignore_entities must be a list of entity ids"
+        return _Local(error="local_file ignore_entities must be a list of entity ids")
     try:
         rules = parse_rules(data.get("actions"))
     except ValueError as exc:
         # parse_rules quotes the offending value; keep the reason, drop it.
-        return (), (), "local_file " + re.sub(r"'[^']*'", "'…'", str(exc))
-    return _str_list(ignore), rules, ""
+        return _Local(error="local_file " + re.sub(r"'[^']*'", "'…'", str(exc)))
+    reviewed = data.get("kev_reviewed")
+    if reviewed is not None and (
+        not isinstance(reviewed, list)
+        or not all(isinstance(x, str) and _CVE.fullmatch(x) for x in reviewed)
+    ):
+        return _Local(error="local_file kev_reviewed must be a list of CVE ids")
+    return _Local(
+        ignores=_str_list(ignore),
+        rules=rules,
+        kev_reviewed=frozenset(x.upper() for x in reviewed or ()),
+    )
 
 
 @dataclass(frozen=True)
@@ -121,19 +142,16 @@ class HomelabConfig:
         census = _map(block.get("census"))
         defaults = WatchConfig()
         ignore_entities = _str_list(ha.get("ignore_entities"))
-        local_ignore: tuple[str, ...] = ()
-        local_rules: tuple[ActionRule, ...] = ()
-        local_error = ""
         local_path = _text(ha.get("local_file"))
-        if local_path:
-            local_ignore, local_rules, local_error = _read_local(local_path)
+        local = _read_local(local_path) if local_path else _Local()
         watch = WatchConfig(
             battery_low=_int(ha.get("battery_low"), defaults.battery_low),
             unavailable_after_minutes=_int(
                 ha.get("unavailable_after_minutes"), defaults.unavailable_after_minutes
             ),
             flood_threshold=_int(ha.get("flood_threshold"), defaults.flood_threshold),
-            ignore_entities=ignore_entities + local_ignore,
+            ignore_entities=ignore_entities + local.ignores,
+            kev_reviewed=local.kev_reviewed,
             census_max_age_hours=_int(
                 census.get("max_age_hours"), defaults.census_max_age_hours
             ),
@@ -160,9 +178,9 @@ class HomelabConfig:
             kuma_ca_cert=ca_cert,
             census_url=_text(census.get("url")).rstrip("/"),
             watch=watch,
-            rules=rules + local_rules,
+            rules=rules + local.rules,
             incomplete=frozenset(incomplete),
-            local_error=local_error,
+            local_error=local.error,
         )
 
     @classmethod

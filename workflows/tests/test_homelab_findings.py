@@ -744,3 +744,11 @@ def test_source_down_alert_names_the_reason_class(error, phrase):
     assert phrase in alerts[0].text
     if phrase != "unreachable":
         assert "unreachable" not in alerts[0].text
+
+
+def test_reviewed_kev_entry_never_alerts_but_is_remembered():
+    state, _ = run(WatchState(), baseline_obs())
+    cfg = replace(CFG, kev_reviewed=frozenset({"CVE-2000-0002"}))
+    state, alerts = run(state, with_kev([kev(1), kev(2)]), cfg=cfg)
+    assert alerts == []
+    assert "CVE-2000-0002" in state.seen_kev

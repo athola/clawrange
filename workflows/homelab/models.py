@@ -100,6 +100,9 @@ class WatchConfig:
     ignore_entities: tuple[str, ...] = ()
     census_max_age_hours: int = 13
     source_down_after: int = 3
+    # KEV entries the operator has checked against the running RouterOS:
+    # listed by count only, never alerted.
+    kev_reviewed: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)

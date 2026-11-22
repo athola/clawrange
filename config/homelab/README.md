@@ -11,6 +11,8 @@ in it except this README is gitignored.
   profile. Put them in `ha-local.yaml` and set
   `HOMELAB_HA_LOCAL=/config/homelab/ha-local.yaml`. The file may hold only
   `ignore_entities` and `actions` (same format as the profile's
-  `homelab.home_assistant`), and both are added to the profile's lists.
+  `homelab.home_assistant`), both added to the profile's lists, and
+  `kev_reviewed`: CVE ids you have checked against the running RouterOS,
+  which the report and `/net` count without listing and which never alert.
   A file that is missing or invalid is ignored as a whole: none of its
   actions are allowed, and `/healthz/homelab` reports `ha_local_file`.

@@ -941,7 +941,7 @@ async def _handle_home_command(cmd: tuple[str, ...], *, brain_db, profile) -> st
         obs = await homelab_service.live_observation(cfg, now)
         if kind == "net":
             return homelab_service.render_net_full(
-                obs, homelab_service.load_state(brain_db)
+                obs, homelab_service.load_state(brain_db), cfg.watch.kev_reviewed
             )
         if cmd[1]:
             return homelab_report.render_entity_search(obs, cmd[1])

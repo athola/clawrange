@@ -254,7 +254,8 @@ def _census(st: WatchState, obs: Observation, cfg: WatchConfig, alerts: list[Ale
             (e for e in cen.kev if e.cve_id not in seen), key=lambda e: e.cve_id
         )
         if st.kev_learned:
-            for entry in fresh:
+            # Reviewed entries are remembered as seen but never alerted.
+            for entry in (e for e in fresh if e.cve_id not in cfg.kev_reviewed):
                 alerts.append(
                     Alert(
                         "census",
