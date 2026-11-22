@@ -808,6 +808,15 @@ _AUTOMATION_TAG_RE = re.compile(r"^\[cron:[^\s\]]+(?: [^\]\n]*)?\]\s*")
 _RUNTIME_LINE_RE = re.compile(r"\n\s*runtime: agent=[^\n]*\s*$", re.IGNORECASE)
 
 
+def _content_text(content: object) -> str:
+    """A message's text: the string itself, or its text parts joined."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(str(b.get("text", "")) for b in content if isinstance(b, dict))
+    return ""
+
+
 def _user_texts(messages: list[dict]):
     """Raw user message texts, newest first, minus OpenClaw runtime context."""
     for msg in reversed(messages):
@@ -1592,16 +1601,23 @@ async def chat_completions(
     # previous failures and generate apologies or continued deferrals.
     # Never drop an assistant turn that carries tool_calls: its tool results
     # would be left orphaned and providers reject that history with a 400.
+    # Markers are also checked in list-shaped content (text parts), so a
+    # replayed `[homelab]` turn cannot reach a model in either shape.
     messages = [
         msg
         for msg in messages
         if not (
             msg.get("role") == "assistant"
             and not msg.get("tool_calls")
-            and isinstance(msg.get("content"), str)
             and (
-                any(marker in msg["content"] for marker in _POISON_MARKERS)
-                or _is_non_answer(msg["content"])
+                any(
+                    marker in _content_text(msg.get("content"))
+                    for marker in _POISON_MARKERS
+                )
+                or (
+                    isinstance(msg.get("content"), str)
+                    and _is_non_answer(msg["content"])
+                )
             )
         )
     ]

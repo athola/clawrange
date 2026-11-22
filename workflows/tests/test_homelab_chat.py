@@ -425,6 +425,34 @@ def test_homelab_turns_are_dropped_from_forwarded_history(rig, monkeypatch):
     assert "Evil" not in json.dumps(sent)
 
 
+def test_homelab_turns_in_list_content_are_dropped_too(rig, monkeypatch):
+    """OpenClaw may replay an assistant turn as content parts, not a string."""
+    import json
+    from unittest.mock import AsyncMock
+
+    import httpx
+
+    body = {"choices": [{"message": {"role": "assistant", "content": "hi"}}]}
+    caller = AsyncMock(
+        return_value=httpx.Response(200, content=json.dumps(body).encode())
+    )
+    monkeypatch.setattr(llm_proxy, "_call_provider", caller)
+    monkeypatch.setattr(llm_proxy, "_background_notify", lambda *a, **k: None)
+    leaked = rig.raw("!home evil")
+    messages = [
+        {"role": "user", "content": "!home evil"},
+        {"role": "assistant", "content": [{"type": "text", "text": leaked}]},
+        {"role": "user", "content": "what did that say?"},
+    ]
+    resp = rig.client.post(
+        "/v1/chat/completions", json={"messages": messages}, headers=AUTH
+    )
+    assert resp.status_code == 200
+    sent = caller.call_args.args[2]["messages"]
+    assert not any(m["role"] == "assistant" for m in sent)
+    assert "Evil" not in json.dumps(sent)
+
+
 def test_confirm_code_is_masked_in_the_proxy_log(rig, capsys):
     rig.chat("!home confirm 424242")
     rig.chat("meta\n!home confirm 535353")

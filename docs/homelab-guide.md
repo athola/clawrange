@@ -152,15 +152,23 @@ checkout.
      source_down_after: 3
    ```
 
-4. **Rebuild the scanner and recreate the monitoring stack.** `scanjson` now
-   declares clawrange's `clawrange-homelab` as external, so that network must
-   exist first:
+4. **Swap in the prepared monitoring config, then rebuild.** The live
+   `compose.yaml` and `homepage/config/services.yaml` were left as they
+   were; the homelab versions sit beside them as `*.homelab-ready`. The
+   prepared compose declares clawrange's `clawrange-homelab` network as
+   external, so that network must exist first (it appears once clawrange
+   runs this branch's compose):
 
    ```sh
    docker network inspect clawrange-homelab >/dev/null && echo "network ok"
    cd <monitoring>/dashboard
+   cp compose.yaml.homelab-ready compose.yaml
+   cp homepage/config/services.yaml.homelab-ready homepage/config/services.yaml
    docker compose up -d --build scanner scanjson homepage
    ```
+
+   Rollback for this step: copy each `*.bak-2026-11-21` back and run
+   `docker compose up -d` again.
 
    If the network is missing, do step 5 first and come back. The scanner
    runs its legs as soon as it starts. Check them:
