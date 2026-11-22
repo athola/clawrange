@@ -49,11 +49,17 @@ def render_home(obs: Observation, cfg: WatchConfig) -> str:
     else:
         assert obs.ha is not None
         live = [e for e in obs.ha if not is_ignored(e.entity_id, cfg.ignore_entities)]
+        # "unknown" is routine in HA (a button never pressed, a sensor with
+        # no reading yet): counted, never listed by name.
         down = sorted(
-            (e for e in live if e.state in UNAVAILABLE_STATES),
+            (e for e in live if e.state == "unavailable"),
             key=lambda e: e.entity_id,
         )
-        lines.append(f"Home Assistant: {len(obs.ha)} entities, {len(down)} unavailable")
+        unknown = sum(
+            1 for e in live if e.state in UNAVAILABLE_STATES - {"unavailable"}
+        )
+        summary = f"Home Assistant: {len(obs.ha)} entities, {len(down)} unavailable"
+        lines.append(summary + (f", {unknown} unknown" if unknown else ""))
         if down:
             names = [safe_label(e.name) for e in down]
             lines.append("Unavailable: " + _more(names[:LIST_CAP], len(names)))

@@ -305,6 +305,16 @@ def test_report_carries_census_part_errors():
     assert "router HTTP 502" in render_report(obs, state(), CFG)
 
 
-def test_unknown_entities_are_counted_in_reports():
-    ha = (ent("sensor.a", "unknown", "A"), ent("sensor.b", "unavailable", "B"))
-    assert "2 unavailable" in render_home(full_obs(ha=ha), CFG)
+def test_unknown_entities_are_counted_but_not_listed():
+    # "unknown" is routine in HA (a button never pressed, a sensor with no
+    # reading yet), so it is a count only; names list just "unavailable".
+    ha = (ent("sensor.a", "unknown", "Alpha"), ent("sensor.b", "unavailable", "Beta"))
+    text = render_home(full_obs(ha=ha), CFG)
+    assert "2 entities, 1 unavailable, 1 unknown" in text
+    assert "Unavailable: Beta" in text
+    assert "Alpha" not in text
+
+
+def test_no_unknown_count_when_there_are_none():
+    text = render_home(full_obs(), CFG)
+    assert "unknown" not in text.split("\n")[0]
