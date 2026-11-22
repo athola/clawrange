@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 import app as app_module
 import llm_proxy
-from app import _current_profile, app
+from app import app
 from brain_db import BrainDB
 from chat_commands import _extract_task_command
 from persona_api import create_persona_router
@@ -356,7 +356,9 @@ class TestCurrentProfileGuard:
         soul = tmp_path / "soul.md"
         persona_app = FastAPI()
         persona_app.include_router(
-            create_persona_router(db, _current_profile, lambda p: {"soul": str(soul)})
+            create_persona_router(
+                db, app.state.profile_provider, lambda p: {"soul": str(soul)}
+            )
         )
         return TestClient(persona_app, raise_server_exceptions=False), soul
 

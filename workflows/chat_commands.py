@@ -28,6 +28,7 @@ import research_router
 import tenant_profile
 from brain_db import TaskStatus, project_list
 from errors import UpstreamError
+from tasks_api import TaskCreate
 
 logger = logging.getLogger("clawrange.chat_commands")
 
@@ -186,13 +187,6 @@ def _ops_name() -> str:
     return str(ops.get("name") or "").strip() or "The ops agent"
 
 
-def _live_scheduler():
-    """The running APScheduler (None outside the app lifespan)."""
-    from app import app
-
-    return getattr(app.state, "scheduler", None)
-
-
 # ─── Marketing Commands (/sched, /scan, /projects) ──────────────
 
 _MARKETING_PREFIXES = (
@@ -222,20 +216,24 @@ def _extract_marketing_command(msg: str) -> dict | None:
 
 
 async def _dispatch_marketing_command(
-    cmd: dict, is_stream: bool = False
+    cmd: dict, is_stream: bool = False, *, brain_db, scheduler=None
 ) -> JSONResponse | StreamingResponse:
-    """Route parsed marketing commands to handlers."""
+    """Route parsed marketing commands to handlers.
+
+    ``scheduler`` is the live APScheduler (None outside the app lifespan)."""
     verb = cmd["verb"]
     subcmd = cmd["subcmd"]
     args = cmd["args"]
 
     try:
         if verb == "sched":
-            text = await _handle_sched_command(subcmd, args)
+            text = await _handle_sched_command(
+                subcmd, args, brain_db=brain_db, scheduler=scheduler
+            )
         elif verb == "scan":
-            text = await _handle_scan_command(subcmd, args)
+            text = await _handle_scan_command(subcmd, args, brain_db=brain_db)
         elif verb == "projects":
-            text = await _handle_projects_command(subcmd, args)
+            text = await _handle_projects_command(subcmd, args, brain_db=brain_db)
         else:
             text = f"Unknown command: {verb}"
     except Exception as exc:
@@ -245,14 +243,14 @@ async def _dispatch_marketing_command(
     return _reply(text, is_stream)
 
 
-async def _handle_sched_command(subcmd: str, args: str) -> str:
+async def _handle_sched_command(
+    subcmd: str, args: str, *, brain_db, scheduler=None
+) -> str:
     """Handle /sched subcommands.
 
     Changes go through the scheduler helpers with the live APScheduler, as
     the HTTP routes do, so a pause/resume/add/rm takes effect immediately
     instead of at the next restart."""
-    from app import brain_db
-
     if subcmd == "list":
         scheds = brain_db.list_schedules()
         if not scheds:
@@ -323,9 +321,7 @@ async def _handle_sched_command(subcmd: str, args: str) -> str:
 
         sched_id = hashlib.md5(name.encode()).hexdigest()[:8]
 
-        await add_schedule(
-            _live_scheduler(), brain_db, sched_id, name, kind, cron_expr, kwargs
-        )
+        await add_schedule(scheduler, brain_db, sched_id, name, kind, cron_expr, kwargs)
         return (
             f"Schedule added: {name} ({sched_id})\n  cron: {cron_expr}\n  kind: {kind}"
         )
@@ -339,14 +335,13 @@ async def _handle_sched_command(subcmd: str, args: str) -> str:
         if not sched:
             return f"Schedule not found: {args}"
         label = f"{sched['name']} ({sched['id']})"
-        live = _live_scheduler()
         if subcmd == "pause":
-            await pause_schedule(live, brain_db, sched["id"])
+            await pause_schedule(scheduler, brain_db, sched["id"])
             return f"Paused: {label}"
         if subcmd == "resume":
-            await resume_schedule(live, brain_db, sched["id"])
+            await resume_schedule(scheduler, brain_db, sched["id"])
             return f"Resumed: {label}"
-        await remove_schedule(live, brain_db, sched["id"])
+        await remove_schedule(scheduler, brain_db, sched["id"])
         return f"Removed: {label}"
 
     if subcmd == "run":
@@ -360,7 +355,7 @@ async def _handle_sched_command(subcmd: str, args: str) -> str:
             await GENERATORS[target](brain_db=brain_db)
             return f"Ran generator {target} once (no schedule by that name)."
         try:
-            result = await run_schedule_now(_live_scheduler(), brain_db, target)
+            result = await run_schedule_now(scheduler, brain_db, target)
         except ValueError as e:
             return str(e)
         status = result.get("status", "unknown")
@@ -380,10 +375,8 @@ async def _handle_sched_command(subcmd: str, args: str) -> str:
     )
 
 
-async def _handle_scan_command(subcmd: str, args: str) -> str:
+async def _handle_scan_command(subcmd: str, args: str, *, brain_db) -> str:
     """Handle /scan subcommands."""
-    from app import brain_db
-
     if subcmd == "reddit":
         # /scan reddit <topic> [--subs ...] [--project <slug>] [--since 7d]
         topic, subreddits, project_slug, since = _parse_scan_args(args)
@@ -421,7 +414,7 @@ async def _handle_scan_command(subcmd: str, args: str) -> str:
 
     word, rest = _first_token(args)
     if subcmd == "github" and word == "traffic":
-        return await _github_traffic(rest.split()[0] if rest else "")
+        return await _github_traffic(rest.split()[0] if rest else "", brain_db)
 
     if subcmd == "github":
         # /scan github <topic> [--kind repos|issues] [--stars 5]
@@ -491,10 +484,8 @@ def _traffic_lines(owner: str, repo: str, traffic) -> str:
     )
 
 
-async def _github_traffic(slug: str) -> str:
+async def _github_traffic(slug: str, brain_db) -> str:
     """/scan github traffic [slug]: one project, or every tracked one."""
-    from app import brain_db
-
     if slug:
         project = brain_db.get_project(slug)
         if not project:
@@ -528,10 +519,8 @@ def _parse_scan_args(args: str) -> tuple[str, list[str], str | None, str]:
     )
 
 
-async def _handle_projects_command(subcmd: str, args: str) -> str:
+async def _handle_projects_command(subcmd: str, args: str, *, brain_db) -> str:
     """Handle /projects subcommands."""
-    from app import brain_db
-
     if subcmd in ("list", ""):
         projects = brain_db.list_projects()
         if not projects:
@@ -636,29 +625,30 @@ def _extract_task_command(msg: str) -> dict | None:
 
 
 async def _dispatch_task_command(
-    cmd: dict, is_stream: bool = False
+    cmd: dict, is_stream: bool = False, *, brain_db
 ) -> JSONResponse | StreamingResponse:
     """Route parsed task commands to handlers."""
     if cmd["type"] == "list":
-        text = _handle_tasks_list()
+        text = _handle_tasks_list(brain_db)
     elif cmd["type"] == "tail":
-        text = _handle_tasks_tail()
+        text = _handle_tasks_tail(brain_db)
     elif cmd["type"] == "create":
-        text = _handle_task_command(cmd["description"])
+        text = _handle_task_command(cmd["description"], brain_db)
     elif cmd["type"] == "action":
-        text = _handle_task_action(cmd["action"], cmd["args"])
+        text = _handle_task_action(cmd["action"], cmd["args"], brain_db)
     else:
         text = "Unknown task command. Try: !task <description> or !tasks"
     return _reply(text, is_stream)
 
 
-def _handle_task_command(description: str) -> str:
-    """Enqueue a task via the internal API and return confirmation."""
-    from app import TaskCreate as TC
-    from app import create_task
+def _handle_task_command(description: str, brain_db) -> str:
+    """Enqueue a task and return confirmation.
 
+    Validated with the POST /task model, so chat and the API accept the same
+    descriptions and both label the task as the user's."""
     try:
-        task = create_task(TC(description=description))
+        body = TaskCreate(description=description)
+        task = brain_db.create_task(body.description, body.priority, body.source)
     except Exception as exc:
         logger.exception("chat !task: could not queue task")
         return f"Failed to queue task: {exc}"
@@ -690,11 +680,9 @@ def _queue_section(title: str, tasks: list[dict]) -> list[str]:
     return lines
 
 
-def _handle_tasks_list() -> str:
+def _handle_tasks_list(brain_db) -> str:
     """Show the current task queue."""
-    from app import list_tasks
-
-    tasks = list_tasks()["tasks"]
+    tasks = brain_db.list_tasks()
     if not tasks:
         return "Task queue is empty. Send !task <description> to add one."
 
@@ -723,11 +711,9 @@ def _handle_tasks_list() -> str:
     return "\n".join(lines)
 
 
-def _handle_tasks_tail() -> str:
+def _handle_tasks_tail(brain_db) -> str:
     """Show the most recently closed tasks with results, newest first."""
-    from app import list_tasks
-
-    recent = _recently_closed(list_tasks()["tasks"], 5)
+    recent = _recently_closed(brain_db.list_tasks(), 5)
     if not recent:
         return "No finished tasks yet."
     lines = [f"Recent Tasks (last {len(recent)} finished)\n"]
@@ -743,10 +729,8 @@ def _handle_tasks_tail() -> str:
     return "\n".join(lines)
 
 
-def _handle_task_action(action: str, args: str) -> str:
+def _handle_task_action(action: str, args: str, brain_db) -> str:
     """Handle task management subcommands: cancel, priority."""
-    from app import brain_db
-
     parts = args.strip().split(None, 1)
     task_id = parts[0] if parts else ""
     task = brain_db.get_task(task_id)
@@ -789,14 +773,11 @@ def _extract_persona_command(msg: str) -> str | None:
     return stripped[len(first_word) :]
 
 
-def _persona_context():
-    """(brain_db, profile name) the /persona routes use (function-local: cycle)."""
-    import app as app_module
-
-    return app_module.brain_db, app_module._current_profile().name
-
-
-async def _handle_persona_command(args: str) -> JSONResponse:
+async def _handle_persona_command(
+    args: str, *, brain_db, profile_provider
+) -> JSONResponse:
+    """``profile_provider`` is the one the /persona routes use: it returns
+    the active profile or raises HTTPException when none is loadable."""
     # Function-local: persona_api does `from generators import ...`, and
     # generators imports llm_proxy, which imports this module, so a
     # module-level import fails when generators is imported first.
@@ -808,7 +789,7 @@ async def _handle_persona_command(args: str) -> JSONResponse:
             "Usage: !persona <feedback> | !persona reflect"
         )
     try:
-        brain_db, profile_name = _persona_context()
+        profile_name = profile_provider().name
     except HTTPException as exc:
         return llm_proxy._synthetic_response(f"Persona unavailable: {exc.detail}.")
     if args.lower() == "reflect":
@@ -849,8 +830,10 @@ async def _handle_persona_command(args: str) -> JSONResponse:
 
 
 async def _dispatch_persona_command(
-    args: str, is_stream: bool = False
+    args: str, is_stream: bool = False, *, brain_db, profile_provider
 ) -> JSONResponse | StreamingResponse:
     """Run a !persona / !learn command and wrap the reply as SSE once."""
-    resp = await _handle_persona_command(args)
+    resp = await _handle_persona_command(
+        args, brain_db=brain_db, profile_provider=profile_provider
+    )
     return llm_proxy._wrap_json_as_sse(resp) if is_stream else resp

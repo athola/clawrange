@@ -1521,10 +1521,17 @@ async def chat_completions(
             return _wrap_json_as_sse(resp)
         return resp
 
+    # Chat commands and the heartbeat work on the serving app's brain,
+    # profile and scheduler, never on a module global.
+    state = request.app.state
+    brain_db = state.brain_db
+
     # Intercept heartbeat messages — run checks in Python instead of LLM
     if heartbeat._is_heartbeat(last_user_msg):
         print("[PROXY] heartbeat intercepted — running checks in Python", flush=True)
-        return await heartbeat._handle_heartbeat(is_stream)
+        return await heartbeat._handle_heartbeat(
+            is_stream, brain_db=brain_db, profile=getattr(state, "profile", None)
+        )
 
     # Intercept !task commands — enqueue, list, cancel, reprioritize
     # Check both full message and last line (fallback when metadata stripping fails)
@@ -1533,18 +1540,30 @@ async def chat_completions(
         last_user_msg
     ) or chat_commands._extract_task_command(raw_last_line)
     if task_action is not None:
-        return await chat_commands._dispatch_task_command(task_action, is_stream)
+        return await chat_commands._dispatch_task_command(
+            task_action, is_stream, brain_db=brain_db
+        )
 
     # Intercept marketing commands (/sched, /scan, /projects, /marketing)
     marketing_cmd = chat_commands._extract_marketing_command(last_user_msg)
     if marketing_cmd is not None:
-        return await chat_commands._dispatch_marketing_command(marketing_cmd, is_stream)
+        return await chat_commands._dispatch_marketing_command(
+            marketing_cmd,
+            is_stream,
+            brain_db=brain_db,
+            scheduler=getattr(state, "scheduler", None),
+        )
 
     # Intercept !persona / !learn (alias, TR-013) — explicit feedback and
     # on-demand reflection
     persona_args = chat_commands._extract_persona_command(last_user_msg)
     if persona_args is not None:
-        return await chat_commands._dispatch_persona_command(persona_args, is_stream)
+        return await chat_commands._dispatch_persona_command(
+            persona_args,
+            is_stream,
+            brain_db=brain_db,
+            profile_provider=state.profile_provider,
+        )
 
     # Strip poisoned assistant messages from conversation history.
     # Uses both static markers (synthetic responses, tool hallucinations)

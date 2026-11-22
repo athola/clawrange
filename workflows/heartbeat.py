@@ -378,26 +378,22 @@ def _thinking_subjects(projects: list[dict], deals_block: dict | None) -> list[s
     return subjects
 
 
-def _deals_block() -> dict | None:
-    from app import app
-
-    profile = getattr(app.state, "profile", None)
+def _deals_block(profile) -> dict | None:
+    """The profile's homelab_deals block (None without a profile)."""
     return profile.raw.get("homelab_deals") if profile else None
 
 
-def _current_thinking_subjects() -> list[str]:
-    from app import brain_db
-
+def _current_thinking_subjects(brain_db, profile) -> list[str]:
     try:
-        return _thinking_subjects(brain_db.list_projects(), _deals_block())
+        return _thinking_subjects(brain_db.list_projects(), _deals_block(profile))
     except Exception:
         logger.exception("thinking: could not load subjects")
         return []
 
 
-def _thinking_context() -> str:
+def _thinking_context(profile) -> str:
     """Stack gaps from the deals profile, so hardware research has a why."""
-    gaps = (_deals_block() or {}).get("stack_gaps") or {}
+    gaps = (_deals_block(profile) or {}).get("stack_gaps") or {}
     if not gaps:
         return ""
     return "Stack gaps: " + "; ".join(f"{k}: {v}" for k, v in gaps.items())
@@ -421,13 +417,11 @@ def _is_grounded_suggestion(text: str, subjects: list[str]) -> bool:
     return any(_squash_words(s) in words for s in subjects)
 
 
-def _build_thinking_prompt(subjects: list[str], context: str = "") -> str:
+def _build_thinking_prompt(subjects: list[str], context: str = "", *, brain_db) -> str:
     """Ask for one research task about a listed subject."""
     soul = _load_soul()
     recent_descriptions = []
     try:
-        from app import brain_db
-
         cutoff = datetime.now(UTC) - timedelta(hours=24)
         for t in brain_db.list_tasks():
             created = _parse_task_time(t.get("created_at"))
@@ -529,10 +523,12 @@ def _has_recent_prefix(
     return False
 
 
-async def _llm_suggest_task(subjects: list[str], context: str = "") -> str | None:
+async def _llm_suggest_task(
+    subjects: list[str], context: str = "", *, brain_db
+) -> str | None:
     """Ask the LLM for one proactive task suggestion."""
     text = await llm_proxy._llm_call(
-        _build_thinking_prompt(subjects, context), max_tokens=100
+        _build_thinking_prompt(subjects, context, brain_db=brain_db), max_tokens=100
     )
     if text:
         text = text.strip('"')
@@ -542,10 +538,8 @@ async def _llm_suggest_task(subjects: list[str], context: str = "") -> str | Non
     return None
 
 
-async def _gather_system_state() -> str:
+async def _gather_system_state(brain_db) -> str:
     """Collect current system state for task context."""
-    from app import brain_db
-
     tier_lines = [
         f"  {t['name']}: {t['status']} — {t['description']}"
         for t in llm_proxy.tier_snapshot()
@@ -575,7 +569,9 @@ async def _gather_system_state() -> str:
     )
 
 
-async def _build_work_prompt(task_description: str, web_search: bool = False) -> str:
+async def _build_work_prompt(
+    task_description: str, web_search: bool = False, *, brain_db
+) -> str:
     """Build a prompt for the LLM to work on a specific task, with live system data.
 
     When `web_search=True`, the prompt routes through OpenRouter `:online`
@@ -588,14 +584,12 @@ async def _build_work_prompt(task_description: str, web_search: bool = False) ->
     soul = _load_soul()
     if web_search:
         soul = _strip_persona_backstory(soul)
-    state = await _gather_system_state()
+    state = await _gather_system_state(brain_db)
     context = f"{soul}\n\n---\n" if soul else ""
 
     # Pull brain pages for grounding (what actually exists)
     brain_context = ""
     try:
-        from app import brain_db
-
         pages = brain_db.list_pages(limit=10)
         if pages:
             page_list = ", ".join(f"{p['slug']} ({p['page_type']})" for p in pages)
@@ -712,7 +706,7 @@ SEARCH_HELD_NOTE = (
 )
 
 
-async def _llm_work_task(description: str) -> str:
+async def _llm_work_task(description: str, brain_db) -> str:
     """Ask the LLM to actually work on a task. Returns the result text.
 
     Raises LLMUnavailable when no tier answered, so the caller can re-queue
@@ -721,14 +715,16 @@ async def _llm_work_task(description: str) -> str:
     one non-search attempt, and the result says no live web data was used.
     """
     needs_web = _task_needs_web(description)
-    prompt = await _build_work_prompt(description, web_search=needs_web)
+    prompt = await _build_work_prompt(
+        description, web_search=needs_web, brain_db=brain_db
+    )
     if needs_web:
         logger.info("task needs web search: %r", description[:80])
     max_tok = 1500 if needs_web else 500
     result = await llm_proxy._llm_call(prompt, max_tokens=max_tok, web_search=needs_web)
     if not result and needs_web and not await llm_proxy.search_allowed():
         logger.info("search held by the balance floor; working without web data")
-        prompt = await _build_work_prompt(description)
+        prompt = await _build_work_prompt(description, brain_db=brain_db)
         result = await llm_proxy._llm_call(prompt, max_tokens=500)
         if result:
             result = f"{SEARCH_HELD_NOTE}\n\n{result}"
@@ -938,7 +934,7 @@ async def _run_heartbeat_task(task: dict, brain_db, remaining: float | None) -> 
     research_result = await research_router._try_research_task(description)
     if research_result is not None:
         return research_result
-    return await _llm_work_task(description)
+    return await _llm_work_task(description, brain_db)
 
 
 def _settle_task(
@@ -1005,9 +1001,10 @@ async def _proactive_scan(
     tripped: list[str],
     remaining: float | None,
     unknown_for: float,
+    profile=None,
 ) -> list[dict]:
     """The idle-cycle checks: alerts, stale nudge, LLM thinking. Returns the
-    tasks it created."""
+    tasks it created. ``profile`` grounds thinking in its deal targets."""
     tasks_created: list[dict] = []
 
     # Layer 1: Infrastructure — every cycle
@@ -1056,7 +1053,7 @@ async def _proactive_scan(
     # Layer 3: LLM self-directed thinking, grounded in real subjects.
     # HEARTBEAT_LLM_SUGGEST=0 turns it off.
     subjects = (
-        _current_thinking_subjects()
+        _current_thinking_subjects(brain_db, profile)
         if os.environ.get("HEARTBEAT_LLM_SUGGEST", "1") != "0"
         and not tasks_created
         and _proactive_ready("llm_thinking")
@@ -1064,7 +1061,9 @@ async def _proactive_scan(
     )
     if subjects:
         _proactive_mark("llm_thinking")
-        suggestion = await _llm_suggest_task(subjects, _thinking_context())
+        suggestion = await _llm_suggest_task(
+            subjects, _thinking_context(profile), brain_db=brain_db
+        )
         if suggestion and not _is_grounded_suggestion(suggestion, subjects):
             # Prompt rules alone never held this line; drop it in code.
             logger.info("dropped ungrounded task: %r", suggestion)
@@ -1115,7 +1114,9 @@ async def _flush_digest(
     return text
 
 
-async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse:
+async def _handle_heartbeat(
+    is_stream: bool, *, brain_db, profile=None
+) -> JSONResponse | StreamingResponse:
     """Run heartbeat checks in Python instead of relying on the LLM.
 
     Three layers of initiative:
@@ -1130,9 +1131,9 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
     returns a short closing summary as this response, which OpenClaw
     relays — so long results arrive whole instead of clipped to fit the
     single relayed message.
-    """
-    from app import brain_db
 
+    ``brain_db`` and ``profile`` come from the serving app's state.
+    """
     digest.record_heartbeat_seen()
 
     tasks_created: list[dict] = []
@@ -1211,7 +1212,7 @@ async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse
         # (all_tasks is fetched before the pending branch: the digest
         # footer also needs it to re-surface blocked questions.)
         tasks_created = await _proactive_scan(
-            brain_db, all_tasks, tripped, remaining, unknown_for
+            brain_db, all_tasks, tripped, remaining, unknown_for, profile
         )
 
     # ── 3. Build response ───────────────────────────────────────

@@ -19,7 +19,7 @@ import reddit_search
 import research
 import research_router
 import tenant_profile
-from app import app, brain_db
+from app import brain_db
 from errors import UpstreamError
 
 
@@ -235,7 +235,9 @@ class TestChatScanFailures:
             "search_subreddits",
             AsyncMock(side_effect=UpstreamError("403 everywhere")),
         )
-        text = await chat_commands._handle_scan_command("reddit", "mcp --subs x")
+        text = await chat_commands._handle_scan_command(
+            "reddit", "mcp --subs x", brain_db=brain_db
+        )
         assert text.startswith("Reddit search unavailable: 403 everywhere")
 
     @pytest.mark.asyncio
@@ -245,13 +247,17 @@ class TestChatScanFailures:
             "search_repos",
             AsyncMock(side_effect=UpstreamError("rate limited")),
         )
-        text = await chat_commands._handle_scan_command("github", "mcp")
+        text = await chat_commands._handle_scan_command(
+            "github", "mcp", brain_db=brain_db
+        )
         assert text.startswith("GitHub search unavailable: rate limited")
 
     @pytest.mark.asyncio
     async def test_web_search_failure_is_not_no_results(self, monkeypatch):
         monkeypatch.setattr(llm_proxy, "_llm_call", AsyncMock(return_value=None))
-        text = await chat_commands._handle_scan_command("web", "mcp servers")
+        text = await chat_commands._handle_scan_command(
+            "web", "mcp servers", brain_db=brain_db
+        )
         assert "unavailable" in text.lower()
 
 
@@ -265,7 +271,9 @@ class TestScanGithubTraffic:
         repos = AsyncMock(return_value=[])
         monkeypatch.setattr(github_search, "get_self_traffic", traffic)
         monkeypatch.setattr(github_search, "search_repos", repos)
-        text = await chat_commands._handle_scan_command("github", "traffic skrills")
+        text = await chat_commands._handle_scan_command(
+            "github", "traffic skrills", brain_db=brain_db
+        )
         traffic.assert_awaited_once_with("athola", "skrills")
         repos.assert_not_awaited()
         assert "Views: 10" in text
@@ -276,7 +284,9 @@ class TestScanGithubTraffic:
         repos = AsyncMock(return_value=[])
         monkeypatch.setattr(github_search, "get_self_traffic", traffic)
         monkeypatch.setattr(github_search, "search_repos", repos)
-        await chat_commands._handle_scan_command("github", "trafficking")
+        await chat_commands._handle_scan_command(
+            "github", "trafficking", brain_db=brain_db
+        )
         traffic.assert_not_awaited()
         repos.assert_awaited_once()
 
@@ -288,7 +298,9 @@ class TestScanGithubTraffic:
         monkeypatch.setattr(
             github_search, "get_self_traffic", AsyncMock(return_value=None)
         )
-        text = await chat_commands._handle_scan_command("github", "traffic skrills")
+        text = await chat_commands._handle_scan_command(
+            "github", "traffic skrills", brain_db=brain_db
+        )
         assert "unavailable" in text and "GITHUB_PAT" not in text
 
 
@@ -345,39 +357,41 @@ class TestWordBoundaries:
 async def live_scheduler():
     sched = AsyncIOScheduler(timezone="UTC")
     sched.start()
-    had = hasattr(app.state, "scheduler")
-    old = getattr(app.state, "scheduler", None)
-    app.state.scheduler = sched
     try:
         yield sched
     finally:
         sched.shutdown(wait=False)
-        if had:
-            app.state.scheduler = old
-        else:
-            del app.state.scheduler
 
 
 class TestSchedLiveScheduler:
     @pytest.mark.asyncio
     async def test_add_pause_resume_rm_by_name(self, live_scheduler):
         text = await chat_commands._handle_sched_command(
-            "add", 'myscan cron "0 9 * * *" -- morning_scan'
+            "add",
+            'myscan cron "0 9 * * *" -- morning_scan',
+            brain_db=brain_db,
+            scheduler=live_scheduler,
         )
         assert "Schedule added" in text
         sched = brain_db.get_schedule("myscan")
         job_id = f"marketing_{sched['id']}"
         assert live_scheduler.get_job(job_id) is not None
 
-        await chat_commands._handle_sched_command("pause", "myscan")
+        await chat_commands._handle_sched_command(
+            "pause", "myscan", brain_db=brain_db, scheduler=live_scheduler
+        )
         assert brain_db.get_schedule("myscan")["paused"]
         job = live_scheduler.get_job(job_id)
         assert job is None or job.next_run_time is None
 
-        await chat_commands._handle_sched_command("resume", "myscan")
+        await chat_commands._handle_sched_command(
+            "resume", "myscan", brain_db=brain_db, scheduler=live_scheduler
+        )
         assert live_scheduler.get_job(job_id).next_run_time is not None
 
-        text = await chat_commands._handle_sched_command("rm", "myscan")
+        text = await chat_commands._handle_sched_command(
+            "rm", "myscan", brain_db=brain_db, scheduler=live_scheduler
+        )
         assert "Removed" in text
         assert live_scheduler.get_job(job_id) is None
         assert brain_db.get_schedule("myscan") is None
@@ -385,7 +399,10 @@ class TestSchedLiveScheduler:
     @pytest.mark.asyncio
     async def test_add_validates_cron(self, live_scheduler):
         text = await chat_commands._handle_sched_command(
-            "add", 'bad cron "not a cron" -- morning_scan'
+            "add",
+            'bad cron "not a cron" -- morning_scan',
+            brain_db=brain_db,
+            scheduler=live_scheduler,
         )
         assert "invalid cron" in text.lower()
         assert brain_db.get_schedule("bad") is None
@@ -395,7 +412,9 @@ class TestSchedLiveScheduler:
         brain_db.upsert_schedule("a", "Alpha", "morning_scan", "0 9 * * *")
         brain_db.upsert_schedule("b", "Beta", "morning_scan", "0 9 * * *")
         brain_db.set_schedule_paused("b", True)
-        text = await chat_commands._handle_sched_command("list", "--paused")
+        text = await chat_commands._handle_sched_command(
+            "list", "--paused", brain_db=brain_db
+        )
         assert "Beta" in text and "Alpha" not in text
 
     @pytest.mark.asyncio
@@ -403,7 +422,9 @@ class TestSchedLiveScheduler:
         self, project, monkeypatch
     ):
         cmd = chat_commands._extract_marketing_command("/marketing")
-        text = await chat_commands._handle_sched_command(cmd["subcmd"], cmd["args"])
+        text = await chat_commands._handle_sched_command(
+            cmd["subcmd"], cmd["args"], brain_db=brain_db
+        )
         assert "not found" not in text.lower()
         assert len(brain_db.list_tasks(status="pending")) == 2
 
@@ -433,14 +454,22 @@ class TestRecentTasks:
     @pytest.mark.asyncio
     async def test_tail_newest_first_and_includes_blocked(self):
         self._seed()
-        text = _text(await chat_commands._dispatch_task_command({"type": "tail"}))
+        text = _text(
+            await chat_commands._dispatch_task_command(
+                {"type": "tail"}, brain_db=brain_db
+            )
+        )
         assert "asked" in text
         assert text.index("newest") < text.index("asked") < text.index("middle")
 
     @pytest.mark.asyncio
     async def test_list_recent_shows_last_three_by_completion(self):
         self._seed()
-        text = _text(await chat_commands._dispatch_task_command({"type": "list"}))
+        text = _text(
+            await chat_commands._dispatch_task_command(
+                {"type": "list"}, brain_db=brain_db
+            )
+        )
         recent = text.split("RECENT:")[1]
         assert "newest" in recent and "asked" in recent and "middle" in recent
         assert "old-urgent" not in recent
@@ -462,7 +491,7 @@ class TestHelpAndText:
         monkeypatch.setattr(tenant_profile, "active_profile", lambda: prof)
         text = _text(
             await chat_commands._dispatch_task_command(
-                {"type": "create", "description": "check backups"}
+                {"type": "create", "description": "check backups"}, brain_db=brain_db
             )
         )
         assert "Ops Bot will pick this up" in text
@@ -473,7 +502,7 @@ class TestHelpAndText:
         monkeypatch.setattr(tenant_profile, "active_profile", lambda: None)
         text = _text(
             await chat_commands._dispatch_task_command(
-                {"type": "create", "description": "check backups"}
+                {"type": "create", "description": "check backups"}, brain_db=brain_db
             )
         )
         assert "Max Ops" not in text
@@ -488,7 +517,7 @@ class TestHelpAndText:
         )
         with caplog.at_level(logging.ERROR):
             resp = await chat_commands._dispatch_marketing_command(
-                {"verb": "projects", "subcmd": "list", "args": ""}
+                {"verb": "projects", "subcmd": "list", "args": ""}, brain_db=brain_db
             )
         assert "boom" in _text(resp)
         assert any(r.exc_info for r in caplog.records)
@@ -514,11 +543,13 @@ class TestTaskHandlersEndToEnd:
     @pytest.mark.asyncio
     async def test_stream_wraps_once(self):
         resp = await chat_commands._dispatch_task_command(
-            {"type": "list"}, is_stream=True
+            {"type": "list"}, is_stream=True, brain_db=brain_db
         )
         assert isinstance(resp, StreamingResponse)
         resp = await chat_commands._dispatch_marketing_command(
-            {"verb": "projects", "subcmd": "list", "args": ""}, is_stream=True
+            {"verb": "projects", "subcmd": "list", "args": ""},
+            is_stream=True,
+            brain_db=brain_db,
         )
         assert isinstance(resp, StreamingResponse)
 
@@ -526,12 +557,12 @@ class TestTaskHandlersEndToEnd:
     async def test_cancel_and_priority(self):
         t = brain_db.create_task("x", priority=3)
         cmd = chat_commands._extract_task_command(f"!task priority {t['id']} 1")
-        text = _text(await chat_commands._dispatch_task_command(cmd))
+        text = _text(await chat_commands._dispatch_task_command(cmd, brain_db=brain_db))
         assert "priority set to 1" in text
         assert brain_db.get_task(t["id"])["priority"] == 1
 
         cmd = chat_commands._extract_task_command(f"!task cancel {t['id']}")
-        text = _text(await chat_commands._dispatch_task_command(cmd))
+        text = _text(await chat_commands._dispatch_task_command(cmd, brain_db=brain_db))
         assert "cancelled" in text
         assert brain_db.get_task(t["id"])["status"] == "cancelled"
 
@@ -540,6 +571,10 @@ class TestTaskHandlersEndToEnd:
         a = brain_db.create_task("being done")
         brain_db.claim_task(a["id"])
         brain_db.create_task("waiting")
-        text = _text(await chat_commands._dispatch_task_command({"type": "list"}))
+        text = _text(
+            await chat_commands._dispatch_task_command(
+                {"type": "list"}, brain_db=brain_db
+            )
+        )
         assert text.index("NOW PROCESSING:") < text.index("being done")
         assert text.index("QUEUED:") < text.index("waiting")

@@ -6,6 +6,7 @@ Decisions, the alternatives weighed, and what was given up. Newest first.
 
 | ID | Phase | Status | Decision |
 |----|-------|--------|----------|
+| TR-016 | execute | accepted | `create_app()` factory; chat commands and heartbeat take the brain, never `from app import` |
 | TR-015 | execute | accepted | Proxy token: env SecretRef, workspace-only file tools, one-time state migration, startup secrets audit |
 | TR-014 | specify | accepted | Income loop reuses the task queue and tome bridge; every trade is a `[DRAFT]`, benchmarked against holding |
 | TR-013 | specify | accepted | Persona config and meta-learning: git profile, brain learning store, approval-gated `## Learned` overlay |
@@ -41,6 +42,48 @@ and TR-014 were recovered the same way from the design specs and plans in
 checked against the code when it was written here, and the
 **Changed since** lines record where the shipped design moved away from
 the plan.
+
+## TR-016: App factory and injected state instead of `from app import`
+
+- **Phase**: execute
+- **Status**: accepted
+- **Decision (Y-statement)**: In the context of tests that had to set
+  `BRAIN_DB_PATH` before anything imported `app` (importing it opened the
+  brain and built the whole app), and of `heartbeat.py`, `chat_commands.py`
+  and `generators.py` reaching back with about 20 function-local
+  `from app import brain_db` / `app.state` lookups, we decided on a
+  **Flask-style `create_app(brain_db=None)` factory plus dependency
+  injection**:
+  - `create_app` configures logging, opens the brain (`open_brain()`) when
+    none is given, puts it on `app.state.brain_db` and mounts the routers.
+    Routes get it through a `Depends(_brain)`; the scheduler through
+    `Depends(_scheduler)`.
+  - `llm_proxy.chat_completions` reads the brain, profile, scheduler and
+    `profile_provider` off `request.app.state` and passes them down. The
+    chat command and heartbeat functions take them as required arguments.
+  - `!task` writes through `brain_db` with the `TaskCreate` model (now in
+    `tasks_api.py`) instead of calling the route function, so chat and
+    `POST /task` keep one validation rule and both record `source="user"`.
+  - `app.py` keeps `app = create_app()` and `brain_db` at module level, so
+    `uvicorn app:app` and the existing tests are unchanged.
+  `test_dependency_injection.py` fails if any non-test module imports
+  `app`; `test_app_factory.py` proves two apps never share a brain.
+- **Options weighed**:
+  - A: Move only the persona helpers out of `app.py`: two files, but the
+    import-time DB and the back-imports stay. Rejected.
+  - B: `runtime.py` holder that `create_app` sets and callers read: small,
+    but still a global, only renamed. Rejected for DI.
+  - C (chosen, first half): factory and DI, module-level `app` kept.
+  - Routes as `create_*_router(brain_db)` closures, like the brain and
+    persona routers, were considered; `Depends` was chosen so route
+    functions stay importable and the per-request root is the same
+    `request.app.state` the chat path uses.
+- **Negative consequences**:
+  - About 90 test call sites had to pass the brain explicitly.
+  - Importing `app` still opens a brain at `BRAIN_DB_PATH`, so `conftest.py`
+    keeps its env-before-import setup. Dropping that (`uvicorn --factory`,
+    a per-test app fixture) is the follow-up.
+- **Reversibility**: HIGH. Internal refactor, no API or schema change.
 
 ## TR-015: Keep the proxy token out of what agents can read
 

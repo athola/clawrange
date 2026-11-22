@@ -1390,6 +1390,7 @@ class TestWorkPromptPersonaRouting:
             _build_work_prompt(
                 "Research AI agent frameworks shipping this week",
                 web_search=True,
+                brain_db=brain_db,
             )
         )
         lower = prompt.lower()
@@ -1419,8 +1420,7 @@ class TestWorkPromptPersonaRouting:
         mock_soul.return_value = self._FAKE_SOUL
         prompt = asyncio.run(
             _build_work_prompt(
-                "Summarize the current task queue",
-                web_search=False,
+                "Summarize the current task queue", web_search=False, brain_db=brain_db
             )
         )
         # Persona character tokens should appear (soul.md is loaded in full)
@@ -2692,7 +2692,8 @@ class TestResearchRouter:
                     "knowledge capture"
                 ),
                 priority=1,
-            )
+            ),
+            brain_db=brain_db,
         )
 
         r = client.post(
@@ -2812,7 +2813,9 @@ class TestHeartbeatInterceptor:
         heartbeat._proactive_state["stale_tasks"] = _time.monotonic()
         heartbeat._proactive_state["llm_thinking"] = _time.monotonic()
 
-        create_task(TC(description="Test task for heartbeat", priority=2))
+        create_task(
+            TC(description="Test task for heartbeat", priority=2), brain_db=brain_db
+        )
 
         mock_resp = _mock_response(
             200,
@@ -2880,7 +2883,7 @@ class TestHeartbeatInterceptor:
         heartbeat._proactive_state["stale_tasks"] = _time.monotonic()
         heartbeat._proactive_state["llm_thinking"] = _time.monotonic()
 
-        create_task(TC(description="Long result task", priority=2))
+        create_task(TC(description="Long result task", priority=2), brain_db=brain_db)
 
         long_result = (
             "Filler sentence. " * 125
@@ -3580,7 +3583,7 @@ class TestLlmWorkTaskRouting:
             captured["prompt"] = prompt
             return "ok"
 
-        async def fake_prompt(desc, web_search=False):
+        async def fake_prompt(desc, web_search=False, brain_db=None):
             return f"PROMPT[{web_search}]: {desc}"
 
         with (
@@ -3588,7 +3591,7 @@ class TestLlmWorkTaskRouting:
             patch.object(heartbeat, "_build_work_prompt", side_effect=fake_prompt),
         ):
             result = asyncio.run(
-                heartbeat._llm_work_task("Scan reddit for MSP pain points")
+                heartbeat._llm_work_task("Scan reddit for MSP pain points", brain_db)
             )
 
         assert result == "ok"
@@ -3613,14 +3616,16 @@ class TestLlmWorkTaskRouting:
             captured["web_search"] = web_search
             return "summary"
 
-        async def fake_prompt(desc, web_search=False):
+        async def fake_prompt(desc, web_search=False, brain_db=None):
             return f"PROMPT[{web_search}]: {desc}"
 
         with (
             patch.object(llm_proxy, "_llm_call", side_effect=fake_call),
             patch.object(heartbeat, "_build_work_prompt", side_effect=fake_prompt),
         ):
-            result = asyncio.run(heartbeat._llm_work_task("Summarize standup notes"))
+            result = asyncio.run(
+                heartbeat._llm_work_task("Summarize standup notes", brain_db)
+            )
 
         assert result == "summary"
         assert captured["max_tokens"] == 500
@@ -3642,7 +3647,7 @@ class TestLlmWorkTaskRouting:
         async def fake_call(prompt, max_tokens, web_search=False):
             return ""
 
-        async def fake_prompt(desc, web_search=False):
+        async def fake_prompt(desc, web_search=False, brain_db=None):
             return "PROMPT"
 
         with (
@@ -3650,7 +3655,7 @@ class TestLlmWorkTaskRouting:
             patch.object(heartbeat, "_build_work_prompt", side_effect=fake_prompt),
         ):
             with pytest.raises(heartbeat.LLMUnavailable):
-                asyncio.run(heartbeat._llm_work_task("Send weekly invoice"))
+                asyncio.run(heartbeat._llm_work_task("Send weekly invoice", brain_db))
 
 
 class TestBuildWorkPromptFormatting:
@@ -3676,7 +3681,9 @@ class TestBuildWorkPromptFormatting:
             ),
         ):
             prompt = asyncio.run(
-                heartbeat._build_work_prompt("Find reddit threads", web_search=True)
+                heartbeat._build_work_prompt(
+                    "Find reddit threads", web_search=True, brain_db=brain_db
+                )
             )
 
         assert "OUTPUT FORMAT (for Telegram delivery):" in prompt
@@ -3703,7 +3710,9 @@ class TestBuildWorkPromptFormatting:
             ),
         ):
             prompt = asyncio.run(
-                heartbeat._build_work_prompt("Summarize standup", web_search=False)
+                heartbeat._build_work_prompt(
+                    "Summarize standup", web_search=False, brain_db=brain_db
+                )
             )
 
         assert "OUTPUT FORMAT (for Telegram delivery):" not in prompt
@@ -3728,7 +3737,9 @@ class TestBuildWorkPromptFormatting:
         ):
             for flag in (True, False):
                 prompt = asyncio.run(
-                    heartbeat._build_work_prompt("any task", web_search=flag)
+                    heartbeat._build_work_prompt(
+                        "any task", web_search=flag, brain_db=brain_db
+                    )
                 )
                 assert "Do NOT invent URLs" in prompt, f"missing for web={flag}"
 
@@ -4161,7 +4172,7 @@ class TestThinkingPromptDoesNotAskAlex:
         # neither rule, so the assertions would pass vacuously.
 
         monkeypatch.setattr(heartbeat, "_load_soul", lambda: "You are Max.")
-        return heartbeat._build_thinking_prompt(["skrills"])
+        return heartbeat._build_thinking_prompt(["skrills"], brain_db=brain_db)
 
     def test_prompt_does_not_ask_for_knowledge_building(self, monkeypatch):
         assert "suggest tasks that BUILD knowledge" not in self._prompt(monkeypatch)
@@ -4525,7 +4536,7 @@ class TestGroundedThinking:
 
         monkeypatch.setattr(heartbeat, "_load_soul", lambda: "You are Max.")
         prompt = heartbeat._build_thinking_prompt(
-            self.SUBJECTS, "Stack gaps: vram: nothing with 24 GB+"
+            self.SUBJECTS, "Stack gaps: vram: nothing with 24 GB+", brain_db=brain_db
         )
         for subject in self.SUBJECTS:
             assert subject in prompt
@@ -4562,7 +4573,7 @@ class TestGenericOperatorWording:
             patch.object(llm_proxy, "_llm_call", AsyncMock(return_value="")),
             patch.object(heartbeat, "_build_work_prompt", AsyncMock(return_value="P")),
         ):
-            asyncio.run(heartbeat._handle_heartbeat(False))
+            asyncio.run(heartbeat._handle_heartbeat(False, brain_db=brain_db))
         result = brain_db.get_task(task["id"])["result"]
         # The starter profile's placeholder owner.name is "Operator".
         assert "Operator should handle it manually" in result

@@ -44,7 +44,7 @@ def quiet(monkeypatch):
 
 
 def _beat() -> None:
-    asyncio.run(heartbeat._handle_heartbeat(False))
+    asyncio.run(heartbeat._handle_heartbeat(False, brain_db=brain_db))
 
 
 def _backdate(db, task_id: str, column: str, hours: float) -> None:
@@ -105,7 +105,7 @@ class TestLlmUnavailable:
             patch.object(heartbeat, "_build_work_prompt", AsyncMock(return_value="P")),
         ):
             with pytest.raises(heartbeat.LLMUnavailable) as info:
-                asyncio.run(heartbeat._llm_work_task("Send weekly invoice"))
+                asyncio.run(heartbeat._llm_work_task("Send weekly invoice", brain_db))
         assert isinstance(info.value, UpstreamError)
 
     @pytest.mark.usefixtures("quiet")
@@ -443,7 +443,7 @@ class TestUnknownBalanceAlert:
         assert "HTTP 503" in text
 
     def test_system_state_shows_lookup_error(self, db):
-        text = asyncio.run(heartbeat._gather_system_state())
+        text = asyncio.run(heartbeat._gather_system_state(brain_db))
         assert "unknown (lookup failed: HTTP 503)" in text
         assert "not configured" not in text
 
@@ -706,14 +706,16 @@ class TestModuleLoggers:
         assert "print(" not in source
 
     def test_heartbeat_suggestion_logs_under_heartbeat(self, monkeypatch, caplog):
-        monkeypatch.setattr(heartbeat, "_build_thinking_prompt", lambda s, c="": "p")
+        monkeypatch.setattr(
+            heartbeat, "_build_thinking_prompt", lambda s, c="", brain_db=None: "p"
+        )
         monkeypatch.setattr(
             llm_proxy, "_llm_call", AsyncMock(return_value="Draft a caching post")
         )
         with caplog.at_level(logging.INFO, logger="clawrange.heartbeat"):
-            assert asyncio.run(heartbeat._llm_suggest_task(["caching"])) == (
-                "Draft a caching post"
-            )
+            assert asyncio.run(
+                heartbeat._llm_suggest_task(["caching"], brain_db=brain_db)
+            ) == ("Draft a caching post")
         assert [r.name for r in caplog.records if "suggested" in r.getMessage()] == [
             "clawrange.heartbeat"
         ]

@@ -141,7 +141,11 @@ class TestSearchDeniedFallback:
             patch.object(heartbeat, "_build_work_prompt", build),
         ):
             try:
-                return asyncio.run(heartbeat._llm_work_task(WEB_TASK)), call, build
+                return (
+                    asyncio.run(heartbeat._llm_work_task(WEB_TASK, None)),
+                    call,
+                    build,
+                )
             except heartbeat.LLMUnavailable as exc:
                 return exc, call, build
 

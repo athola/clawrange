@@ -34,8 +34,13 @@ Tailscale and Caddy gateway.
   plaintext auth-profile copy; never run on start, see
   `docs/DEPLOYMENT_GUIDE.md`)
 - `workflows/`: FastAPI service:
-  - `app.py`: FastAPI entrypoint and route registration (no `/docs`,
-    `/redoc` or `/openapi.json`)
+  - `app.py`: FastAPI entrypoint. `create_app(brain_db=None)` builds an
+    app around its own brain (`app.state.brain_db`, routes read it via
+    `Depends`) and mounts the routers; `app = create_app()` is what
+    uvicorn serves (no `/docs`, `/redoc` or `/openapi.json`). Only `app.py`
+    imports `app`: chat commands and the heartbeat get the brain, profile
+    and scheduler from `llm_proxy` off `request.app.state`
+  - `tasks_api.py`: `TaskCreate`/`TaskResult`, shared by `/task` and `!task`
   - `auth.py`: app-wide bearer auth (`PROXY_AUTH_TOKEN`), fails closed on
     an empty token or the old `generate-a-token-here` placeholder; only
     `GET /healthz`, `GET /healthz/{research,crm,persona}`, `GET /tier` and

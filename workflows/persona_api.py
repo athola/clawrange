@@ -29,9 +29,9 @@ class Proposal(BaseModel):
     source: Literal["feedback", "reflect", "scheduled"] = "feedback"
 
 
-def _run_reflection(profile_name):
+def _run_reflection(brain_db, profile_name):
     """Override point; default runs the generator. Patched in tests."""
-    return asyncio.run(persona_reflect_generator(None, profile_name=profile_name))
+    return asyncio.run(persona_reflect_generator(brain_db, profile_name=profile_name))
 
 
 def reflect_now(brain_db, profile_name) -> int:
@@ -40,7 +40,7 @@ def reflect_now(brain_db, profile_name) -> int:
     Shared by POST /persona/reflect and the ``!persona reflect`` chat
     command so the two cannot drift. Blocking: call it from a worker thread.
     """
-    _run_reflection(profile_name)
+    _run_reflection(brain_db, profile_name)
     # Flagged outcome-signal source; a no-op unless PERSONA_SIGNAL_LEARNING.
     pl.scan_signals(brain_db, profile_name)
     return len(brain_db.list_learnings(profile=profile_name, status="pending"))

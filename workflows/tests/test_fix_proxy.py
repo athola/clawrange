@@ -170,7 +170,7 @@ class TestPersonaInProcess:
 
     def test_reflect_failure_is_reported(self, authed_app, monkeypatch):
 
-        def boom(profile_name):
+        def boom(_db, profile_name):
             raise RuntimeError("generator exploded")
 
         monkeypatch.setattr(persona_api, "_run_reflection", boom)

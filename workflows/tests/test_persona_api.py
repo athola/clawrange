@@ -130,7 +130,7 @@ def test_reflect_endpoint_creates_proposals(tmp_path, monkeypatch):
     monkeypatch.setattr(
         persona_api,
         "_run_reflection",
-        lambda profile_name: db.create_learning(
+        lambda _db, profile_name: db.create_learning(
             profile_name, "persona", "Reflection", "Observed: be terser.", "reflect"
         ),
     )
@@ -175,7 +175,7 @@ def test_reflect_runs_signal_scan_when_flag_set(monkeypatch, tmp_path):
     import persona_learning as pl
 
     calls = []
-    monkeypatch.setattr(persona_api, "_run_reflection", lambda name: None)
+    monkeypatch.setattr(persona_api, "_run_reflection", lambda _db, name: None)
     monkeypatch.setattr(pl, "scan_signals", lambda db, name: calls.append(name) or [])
     monkeypatch.setenv("PERSONA_SIGNAL_LEARNING", "1")
     c, _db = _client(tmp_path)

@@ -169,6 +169,13 @@ class TestJobErrorListener:
         sch._job_error_listener(db)(self._event("heartbeat_watchdog", ValueError()))
 
 
+def _bare_app() -> FastAPI:
+    """An app with only the state the lifespan reads (its brain)."""
+    api = FastAPI()
+    api.state.brain_db = app_module.brain_db
+    return api
+
+
 @pytest.mark.asyncio
 class TestStartupAlert:
     async def test_lifespan_alerts_on_scheduler_failure(self, monkeypatch):
@@ -181,7 +188,7 @@ class TestStartupAlert:
             "_STATE",
             {"status": "failed", "errors": ["start: boom"], "timezone": "UTC"},
         )
-        async with app_module.lifespan(FastAPI()):
+        async with app_module.lifespan(_bare_app()):
             pass
         notify.assert_awaited_once()
         assert "boom" in notify.await_args.args[0]
@@ -194,7 +201,7 @@ class TestStartupAlert:
         monkeypatch.setattr(
             sch, "_STATE", {"status": "running", "errors": [], "timezone": "UTC"}
         )
-        async with app_module.lifespan(FastAPI()):
+        async with app_module.lifespan(_bare_app()):
             pass
         notify.assert_not_awaited()
 
@@ -697,8 +704,7 @@ def test_scheduler_helper_replaces_hasattr_checks():
 
 
 def test_next_fire_times_without_scheduler(monkeypatch):
-    monkeypatch.setattr(app_module.app.state, "scheduler", None, raising=False)
-    assert app_module._next_fire_times() == {}
+    assert app_module._next_fire_times(None) == {}
 
 
 def test_no_agent_names_or_glm_in_app_source():

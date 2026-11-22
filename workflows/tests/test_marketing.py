@@ -2251,7 +2251,7 @@ class TestMarketingCommandDispatch:
     async def test_sched_list_empty(self):
         from chat_commands import _handle_sched_command
 
-        result = await _handle_sched_command("list", "")
+        result = await _handle_sched_command("list", "", brain_db=brain_db)
         assert "No schedules configured" in result
 
     @pytest.mark.asyncio
@@ -2261,7 +2261,7 @@ class TestMarketingCommandDispatch:
         brain_db.upsert_schedule(
             "test-sched", "Test Schedule", "morning_scan", "0 9 * * *"
         )
-        result = await _handle_sched_command("list", "")
+        result = await _handle_sched_command("list", "", brain_db=brain_db)
         assert "Test Schedule" in result
         assert "ACTIVE" in result
 
@@ -2270,7 +2270,7 @@ class TestMarketingCommandDispatch:
         from chat_commands import _handle_sched_command
 
         brain_db.upsert_schedule("show-test", "Showable", "custom_scan", "*/30 * * * *")
-        result = await _handle_sched_command("show", "show-test")
+        result = await _handle_sched_command("show", "show-test", brain_db=brain_db)
         assert "Showable" in result
         assert "custom_scan" in result
 
@@ -2278,14 +2278,14 @@ class TestMarketingCommandDispatch:
     async def test_sched_show_missing(self):
         from chat_commands import _handle_sched_command
 
-        result = await _handle_sched_command("show", "nonexistent")
+        result = await _handle_sched_command("show", "nonexistent", brain_db=brain_db)
         assert "not found" in result
 
     @pytest.mark.asyncio
     async def test_projects_list_empty(self):
         from chat_commands import _handle_projects_command
 
-        result = await _handle_projects_command("list", "")
+        result = await _handle_projects_command("list", "", brain_db=brain_db)
         assert "No projects tracked" in result
 
     @pytest.mark.asyncio
@@ -2293,11 +2293,13 @@ class TestMarketingCommandDispatch:
         from chat_commands import _handle_projects_command
 
         result = await _handle_projects_command(
-            "add", "test-proj athola/test-proj --topics yaml,pdf --subs Python"
+            "add",
+            "test-proj athola/test-proj --topics yaml,pdf --subs Python",
+            brain_db=brain_db,
         )
         assert "added" in result
 
-        result = await _handle_projects_command("show", "test-proj")
+        result = await _handle_projects_command("show", "test-proj", brain_db=brain_db)
         assert "athola/test-proj" in result
 
     @pytest.mark.asyncio
@@ -2305,28 +2307,28 @@ class TestMarketingCommandDispatch:
         from chat_commands import _handle_projects_command
 
         brain_db.upsert_project("rm-test", "athola", "rm-test")
-        result = await _handle_projects_command("rm", "rm-test")
+        result = await _handle_projects_command("rm", "rm-test", brain_db=brain_db)
         assert "Removed" in result
 
     @pytest.mark.asyncio
     async def test_sched_help(self):
         from chat_commands import _handle_sched_command
 
-        result = await _handle_sched_command("unknown", "")
+        result = await _handle_sched_command("unknown", "", brain_db=brain_db)
         assert "Usage" in result
 
     @pytest.mark.asyncio
     async def test_scan_help(self):
         from chat_commands import _handle_scan_command
 
-        result = await _handle_scan_command("unknown", "")
+        result = await _handle_scan_command("unknown", "", brain_db=brain_db)
         assert "Usage" in result
 
     @pytest.mark.asyncio
     async def test_projects_help(self):
         from chat_commands import _handle_projects_command
 
-        result = await _handle_projects_command("unknown", "")
+        result = await _handle_projects_command("unknown", "", brain_db=brain_db)
         assert "Usage" in result
 
 

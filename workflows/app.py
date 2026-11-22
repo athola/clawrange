@@ -5,10 +5,10 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field, field_validator
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
+from pydantic import BaseModel
 
 import auth
 import embeddings
@@ -38,31 +38,41 @@ from scheduler import (
     status_kind,
     validate_schedule,
 )
+from tasks_api import TaskCreate, TaskResult
 from telegram import notify
 from tenant_profile import load_profile
+
 
 # Wire INFO-level logging for the clawrange.* loggers so cron
 # heartbeats and digest delivery confirmations show up in
 # `docker logs msp-workflows` without needing a global basicConfig
 # (uvicorn already configures its own root handlers).
-logging.getLogger("clawrange").setLevel(logging.INFO)
-if not logging.getLogger("clawrange").handlers:
-    _clawrange_handler = logging.StreamHandler()
-    _clawrange_handler.setFormatter(
-        logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
-    )
-    logging.getLogger("clawrange").addHandler(_clawrange_handler)
+def _configure_logging() -> None:
+    """Idempotent: a second create_app() adds no second handler."""
+    root = logging.getLogger("clawrange")
+    root.setLevel(logging.INFO)
+    if not root.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
+        )
+        root.addHandler(handler)
+
 
 logger = logging.getLogger("clawrange.app")
 
 # ─── Database Initialization ─────────────────────────────────────
 
-_db_path = os.environ.get("BRAIN_DB_PATH", "/data/brain.db")
-brain_db = BrainDB(_db_path)
-brain_db.init_db()
-# Vectors live in one table per embedding model (see embeddings.py).
-_embed_cfg = embeddings.config()
-brain_db.use_vector_table(_embed_cfg.table, _embed_cfg.dim)
+
+def open_brain(path: str | None = None) -> BrainDB:
+    """Open and migrate the brain at ``path`` (default ``BRAIN_DB_PATH``)."""
+    db = BrainDB(path or os.environ.get("BRAIN_DB_PATH", "/data/brain.db"))
+    db.init_db()
+    # Vectors live in one table per embedding model (see embeddings.py).
+    cfg = embeddings.config()
+    db.use_vector_table(cfg.table, cfg.dim)
+    return db
+
 
 # ─── Tenant Profile and Lifespan ─────────────────────────────────
 
@@ -138,6 +148,7 @@ def init_profile(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     auth.warn_if_unset(llm_proxy.PROXY_AUTH_TOKEN)
+    brain_db = app.state.brain_db
     init_profile(app, brain_db)
     scheduler = init_scheduler(brain_db)
     app.state.scheduler = scheduler
@@ -153,26 +164,21 @@ async def lifespan(app: FastAPI):
         scheduler.shutdown(wait=False)
 
 
-app = FastAPI(
-    title="ClawRange Workflows",
-    lifespan=lifespan,
-    # Bearer auth on every route except the read-only allowlist in auth.py.
-    dependencies=[Depends(auth.require_token)],
-    # FastAPI serves its docs routes outside `dependencies`, so they would
-    # expose the route and schema map anonymously. Off.
-    docs_url=None,
-    redoc_url=None,
-    openapi_url=None,
-)
+def _brain(request: Request) -> BrainDB:
+    """The serving app's brain (route dependency)."""
+    return request.app.state.brain_db
 
 
-def _scheduler():
+def _scheduler(request: Request):
     """The running scheduler, or None (lifespan not run or start failed)."""
-    return getattr(app.state, "scheduler", None)
+    return getattr(request.app.state, "scheduler", None)
 
 
-app.include_router(llm_router)
-app.include_router(create_brain_router(brain_db), prefix="/brain")
+Brain = Annotated[BrainDB, Depends(_brain)]
+LiveScheduler = Annotated[Any, Depends(_scheduler)]
+
+# The routes below; create_app() mounts them on each app it builds.
+router = APIRouter()
 
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -213,7 +219,7 @@ def _persona_render_targets(profile):
     return targets
 
 
-def _current_profile():
+def _current_profile(app: FastAPI):
     try:
         return load_profile()
     except Exception as exc:
@@ -230,63 +236,30 @@ def _current_profile():
         raise HTTPException(status_code=500, detail=f"profile unavailable: {exc}")
 
 
-app.include_router(
-    create_persona_router(brain_db, _current_profile, _persona_render_targets)
-)
-
-
 # ─── Task Queue (Persistent via BrainDB) ──────────────────────────
 
 
-class TaskCreate(BaseModel):
-    description: str = Field(min_length=1, max_length=4000)
-    priority: int = 3  # 1=urgent, 3=normal, 5=low
-    # user (via !task / API) or system (heartbeat-generated). Internal
-    # producers (persona, schedule, scan) write via brain_db directly, so the
-    # public API can't impersonate them.
-    source: Literal["user", "system"] = "user"
-
-    @field_validator("description")
-    @classmethod
-    def _not_blank(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("description must not be blank")
-        return v
-
-
-class TaskResult(BaseModel):
-    result: str
-    status: TaskStatus = TaskStatus.COMPLETED
-
-    @field_validator("status")
-    @classmethod
-    def _closing_status(cls, v: TaskStatus) -> TaskStatus:
-        if v not in TaskStatus.RESULTS:
-            raise ValueError(f"status must be one of {sorted(TaskStatus.RESULTS)}")
-        return v
-
-
-@app.post("/task")
-def create_task(body: TaskCreate):
+@router.post("/task")
+def create_task(body: TaskCreate, brain_db: Brain):
     return brain_db.create_task(body.description, body.priority, body.source)
 
 
-@app.get("/task")
-def list_tasks(status: TaskStatus | None = None):
+@router.get("/task")
+def list_tasks(brain_db: Brain, status: TaskStatus | None = None):
     tasks = brain_db.list_tasks(status)
     return {"tasks": tasks, "total": len(tasks)}
 
 
-@app.get("/task/{task_id}")
-def get_task(task_id: str):
+@router.get("/task/{task_id}")
+def get_task(task_id: str, brain_db: Brain):
     task = brain_db.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     return task
 
 
-@app.post("/task/{task_id}/claim")
-def claim_task(task_id: str):
+@router.post("/task/{task_id}/claim")
+def claim_task(task_id: str, brain_db: Brain):
     """Mark a pending task as active: a worker calls this when it starts."""
     try:
         return brain_db.claim_task(task_id)
@@ -295,8 +268,8 @@ def claim_task(task_id: str):
         raise HTTPException(status_code=status_code, detail=str(e))
 
 
-@app.post("/task/{task_id}/result")
-def complete_task(task_id: str, body: TaskResult):
+@router.post("/task/{task_id}/result")
+def complete_task(task_id: str, body: TaskResult, brain_db: Brain):
     """Store a worker's result and close the task (completed, failed or
     blocked)."""
     if not brain_db.get_task(task_id):
@@ -307,8 +280,8 @@ def complete_task(task_id: str, body: TaskResult):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.delete("/task/{task_id}")
-def cancel_task(task_id: str):
+@router.delete("/task/{task_id}")
+def cancel_task(task_id: str, brain_db: Brain):
     try:
         return brain_db.cancel_task(task_id)
     except ValueError as e:
@@ -321,8 +294,8 @@ def cancel_task(task_id: str):
 # ─── Health ─────────────────────────────────────────────────────────
 
 
-@app.get("/healthz")
-def healthz(request: Request):
+@router.get("/healthz")
+def healthz(request: Request, brain_db: Brain, scheduler: LiveScheduler):
     """Always 200 while the process serves requests: the container
     entrypoint restarts the service after repeated non-200s, which would
     not fix a bad profile or a broken table. ``status`` says ``degraded``
@@ -345,13 +318,13 @@ def healthz(request: Request):
     if not vec["enabled"]:
         problems.append("vector_search")
     sched = scheduler_mod.scheduler_state()
-    running = _scheduler()
+    running = scheduler
     if sched["status"] in ("failed", "degraded") or (
         running is not None and not running.running
     ):
         problems.append("scheduler")
-    profile = getattr(app.state, "profile", None)
-    profile_error = getattr(app.state, "profile_error", None)
+    profile = getattr(request.app.state, "profile", None)
+    profile_error = getattr(request.app.state, "profile_error", None)
     if profile_error:
         problems.append("profile")
     if not auth.is_authenticated(request):
@@ -365,7 +338,7 @@ def healthz(request: Request):
             "db": db_state,
             "pages": counts["pages"],
             "embeddings": counts["vectors"] > 0,
-            "embedding_model": _embed_cfg.model,
+            "embedding_model": embeddings.config().model,
             "vectors": counts["vectors"],
             "vector_search": vec,
         },
@@ -380,7 +353,7 @@ def healthz(request: Request):
 # ─── Tier Status (direct endpoint, bypasses OpenClaw) ─────────────
 
 
-@app.get("/tier")
+@router.get("/tier")
 async def tier_status():
     tiers = llm_proxy.tier_snapshot()
     await llm_proxy._check_openrouter_balance()  # refresh the cache
@@ -393,7 +366,7 @@ async def tier_status():
     }
 
 
-@app.post("/tier/notify")
+@router.post("/tier/notify")
 async def tier_notify():
     """Send tier status to Telegram — hit this endpoint to get status in chat."""
     lines = ["*Tier Status*\n"]
@@ -413,7 +386,7 @@ async def tier_notify():
 # ─── Test Webhook (Connectivity Canary) ─────────────────────────────
 
 
-@app.post("/webhook/test")
+@router.post("/webhook/test")
 def test_webhook(body: dict[str, Any] = {}):
     keys = list(body.keys())
     summary = ", ".join(f"{k}={body[k]!r}" for k in keys) if keys else "(empty payload)"
@@ -439,22 +412,22 @@ class ProjectCreate(BaseModel):
     posture: str = ""
 
 
-@app.get("/projects")
-def list_projects():
+@router.get("/projects")
+def list_projects(brain_db: Brain):
     projects = brain_db.list_projects()
     return {"projects": projects, "total": len(projects)}
 
 
-@app.get("/projects/{slug}")
-def get_project(slug: str):
+@router.get("/projects/{slug}")
+def get_project(slug: str, brain_db: Brain):
     project = brain_db.get_project(slug)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     return project
 
 
-@app.post("/projects")
-def upsert_project(body: ProjectCreate):
+@router.post("/projects")
+def upsert_project(body: ProjectCreate, brain_db: Brain):
     return brain_db.upsert_project(
         body.slug,
         body.owner,
@@ -466,8 +439,8 @@ def upsert_project(body: ProjectCreate):
     )
 
 
-@app.delete("/projects/{slug}")
-def delete_project(slug: str):
+@router.delete("/projects/{slug}")
+def delete_project(slug: str, brain_db: Brain):
     if not brain_db.delete_project(slug):
         raise HTTPException(status_code=404, detail="Project not found")
     return {"deleted": True}
@@ -505,19 +478,19 @@ def _schedule_view(sched: dict[str, Any], full: bool) -> dict[str, Any]:
     return view
 
 
-def _next_fire_times() -> dict[str, str | None]:
+def _next_fire_times(scheduler) -> dict[str, str | None]:
     """Schedule id to the next fire time of its registered job."""
     return {
         j["id"].removeprefix("marketing_"): j["next_fire_time"]
-        for j in list_scheduled_jobs(_scheduler())
+        for j in list_scheduled_jobs(scheduler)
         if j["id"].startswith("marketing_")
     }
 
 
-@app.get("/sched")
-def list_schedules(request: Request):
+@router.get("/sched")
+def list_schedules(request: Request, brain_db: Brain, scheduler: LiveScheduler):
     scheds = brain_db.list_schedules()
-    fires = _next_fire_times()
+    fires = _next_fire_times(scheduler)
     for s in scheds:
         s["next_fire_time"] = fires.get(s["id"])
     full = auth.is_authenticated(request)
@@ -527,23 +500,27 @@ def list_schedules(request: Request):
     }
 
 
-@app.get("/sched/{schedule_id}")
-def get_schedule(schedule_id: str, request: Request):
+@router.get("/sched/{schedule_id}")
+def get_schedule(
+    schedule_id: str, request: Request, brain_db: Brain, scheduler: LiveScheduler
+):
     sched = brain_db.get_schedule(schedule_id)
     if not sched:
         raise HTTPException(status_code=404, detail="Schedule not found")
-    sched["next_fire_time"] = _next_fire_times().get(sched["id"])
+    sched["next_fire_time"] = _next_fire_times(scheduler).get(sched["id"])
     return _schedule_view(sched, auth.is_authenticated(request))
 
 
-@app.post("/sched")
-async def create_schedule(body: ScheduleCreate):
+@router.post("/sched")
+async def create_schedule(
+    body: ScheduleCreate, brain_db: Brain, scheduler: LiveScheduler
+):
     try:
         validate_schedule(body.kind, body.cron, body.kwargs)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     sched = await add_schedule(
-        _scheduler(),
+        scheduler,
         brain_db,
         body.id,
         body.name,
@@ -554,18 +531,20 @@ async def create_schedule(body: ScheduleCreate):
     return sched
 
 
-@app.patch("/sched/{schedule_id}")
-async def update_schedule(schedule_id: str, body: SchedulePatch):
+@router.patch("/sched/{schedule_id}")
+async def update_schedule(
+    schedule_id: str, body: SchedulePatch, brain_db: Brain, scheduler: LiveScheduler
+):
     if body.paused is not None:
         if body.paused:
             return await pause_schedule(
-                _scheduler(),
+                scheduler,
                 brain_db,
                 schedule_id,
             )
         else:
             return await resume_schedule(
-                _scheduler(),
+                scheduler,
                 brain_db,
                 schedule_id,
             )
@@ -586,7 +565,7 @@ async def update_schedule(schedule_id: str, body: SchedulePatch):
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return await add_schedule(
-            _scheduler(),
+            scheduler,
             brain_db,
             schedule_id,
             existing["name"],
@@ -598,10 +577,10 @@ async def update_schedule(schedule_id: str, body: SchedulePatch):
     return brain_db.get_schedule(schedule_id)
 
 
-@app.delete("/sched/{schedule_id}")
-async def delete_schedule(schedule_id: str):
+@router.delete("/sched/{schedule_id}")
+async def delete_schedule(schedule_id: str, brain_db: Brain, scheduler: LiveScheduler):
     if not await remove_schedule(
-        _scheduler(),
+        scheduler,
         brain_db,
         schedule_id,
     ):
@@ -609,11 +588,11 @@ async def delete_schedule(schedule_id: str):
     return {"deleted": True}
 
 
-@app.post("/sched/{schedule_id}/run")
-async def run_schedule(schedule_id: str):
+@router.post("/sched/{schedule_id}/run")
+async def run_schedule(schedule_id: str, brain_db: Brain, scheduler: LiveScheduler):
     try:
         return await run_schedule_now(
-            _scheduler(),
+            scheduler,
             brain_db,
             schedule_id,
         )
@@ -629,8 +608,8 @@ def _bad_gateway(source: str, exc: Exception | str) -> HTTPException:
     return HTTPException(status_code=502, detail=f"{source} search failed: {exc}")
 
 
-@app.post("/scan/reddit")
-async def scan_reddit(body: dict[str, Any]):
+@router.post("/scan/reddit")
+async def scan_reddit(body: dict[str, Any], brain_db: Brain):
     topic = body.get("topic", "")
     if not topic:
         raise HTTPException(status_code=400, detail="topic is required")
@@ -665,8 +644,8 @@ async def scan_reddit(body: dict[str, Any]):
     }
 
 
-@app.post("/scan/github")
-async def scan_github(body: dict[str, Any]):
+@router.post("/scan/github")
+async def scan_github(body: dict[str, Any], brain_db: Brain):
     kind = body.get("kind", "repos")
 
     if kind == "self_traffic":
@@ -714,7 +693,7 @@ async def scan_github(body: dict[str, Any]):
     }
 
 
-@app.post("/scan/web")
+@router.post("/scan/web")
 async def scan_web(body: dict[str, Any]):
     prompt = body.get("prompt", "")
     if not prompt:
@@ -738,8 +717,8 @@ class ResearchRequest(BaseModel):
     min_stars: int = 50
 
 
-@app.post("/research")
-async def run_research(body: ResearchRequest):
+@router.post("/research")
+async def run_research(body: ResearchRequest, brain_db: Brain):
     """Run a multi-source research session and return ranked findings.
 
     Channels default to discourse (Reddit), code (GitHub), and
@@ -788,7 +767,7 @@ async def run_research(body: ResearchRequest):
     return result
 
 
-@app.get("/healthz/research")
+@router.get("/healthz/research")
 def healthz_research():
     """Per-channel research orchestrator readiness report."""
     report = research.channel_health()
@@ -801,17 +780,62 @@ def healthz_research():
     }
 
 
-@app.get("/research/sessions")
-def list_research_sessions(limit: int = 25):
+@router.get("/research/sessions")
+def list_research_sessions(brain_db: Brain, limit: int = 25):
     """List recent research sessions, newest first."""
     sessions = brain_db.list_research_sessions(limit=limit)
     return {"sessions": sessions, "total": len(sessions)}
 
 
-@app.get("/research/sessions/{session_id}")
-def get_research_session(session_id: str):
+@router.get("/research/sessions/{session_id}")
+def get_research_session(session_id: str, brain_db: Brain):
     """Return a research session with all findings."""
     session = brain_db.get_research_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Research session not found")
     return session
+
+
+# ─── App Factory ──────────────────────────────────────────────────
+
+
+def create_app(brain_db: BrainDB | None = None) -> FastAPI:
+    """Build a workflows app around ``brain_db`` (default: ``open_brain()``).
+
+    Every app gets its own state: routes, chat commands and the heartbeat
+    read the brain, profile and scheduler off ``request.app.state``, so two
+    apps in one process never share a database. The profile and scheduler
+    are wired by the lifespan, on startup.
+    """
+    _configure_logging()
+    app = FastAPI(
+        title="ClawRange Workflows",
+        lifespan=lifespan,
+        # Bearer auth on every route except the read-only allowlist in auth.py.
+        dependencies=[Depends(auth.require_token)],
+        # FastAPI serves its docs routes outside `dependencies`, so they would
+        # expose the route and schema map anonymously. Off.
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+    db = brain_db if brain_db is not None else open_brain()
+    app.state.brain_db = db
+
+    def profile_provider():
+        return _current_profile(app)
+
+    app.state.profile_provider = profile_provider
+    app.include_router(llm_router)
+    app.include_router(create_brain_router(db), prefix="/brain")
+    app.include_router(
+        create_persona_router(db, profile_provider, _persona_render_targets)
+    )
+    app.include_router(router)
+    return app
+
+
+# The served app (`uvicorn app:app`) and its brain. Tests that need an app
+# of their own call create_app() instead.
+app = create_app()
+brain_db: BrainDB = app.state.brain_db

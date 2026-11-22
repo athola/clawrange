@@ -35,10 +35,6 @@ from crm import get_adapter
 if TYPE_CHECKING:
     from reddit_search import RedditPost
 
-# NOTE on deferred imports: ``app`` imports this module at module scope, so
-# the ``from app import brain_db`` fallback below must stay function-local
-# (cycle guard).
-
 logger = logging.getLogger("clawrange.generators")
 
 # In-memory throttle state for the hot_pulse generator. The cron fires
@@ -1470,10 +1466,6 @@ async def persona_reflect_generator(brain_db, profile_name=None, **kwargs) -> No
     suggestion = lines[0] if lines else ""
     if not suggestion or suggestion.lower().startswith("none"):
         return
-    if brain_db is None:
-        from app import brain_db as _bd
-
-        brain_db = _bd
     try:
         pl.propose(
             brain_db, profile_name, "persona", "Reflection", suggestion, "reflect"

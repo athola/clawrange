@@ -208,7 +208,7 @@ def quiet(monkeypatch):
 
 
 def _beat() -> None:
-    asyncio.run(heartbeat._handle_heartbeat(False))
+    asyncio.run(heartbeat._handle_heartbeat(False, brain_db=brain_db))
 
 
 @pytest.mark.usefixtures("quiet")
@@ -747,10 +747,8 @@ class TestTaskCommand:
         assert brain_db.get_task(t["id"])["status"] == "completed"
 
     def test_create_failure_is_reported(self, chat, monkeypatch):
-        import app as app_module
-
         monkeypatch.setattr(
-            app_module, "create_task", MagicMock(side_effect=RuntimeError("disk full"))
+            brain_db, "create_task", MagicMock(side_effect=RuntimeError("disk full"))
         )
         assert chat("!task write the report") == "Failed to queue task: disk full"
 
