@@ -11,7 +11,20 @@
 #
 # Usage:
 #   scp scripts/setup_gateway.sh root@<droplet-ip>:/root/
-#   ssh root@<droplet-ip> bash /root/setup_gateway.sh
+#   ssh root@<droplet-ip> NODE_TAILSCALE_IP=100.x.x.x bash /root/setup_gateway.sh [--reset-firewall]
+#
+# Options:
+#   --reset-firewall   Run `ufw --force reset` before applying rules. Off by
+#                      default so reruns keep any custom rules you added.
+#
+# Environment:
+#   NODE_TAILSCALE_IP  (required) node's Tailscale IP
+#   OPENCLAW_PORT      OpenClaw host port on the node (default 3000)
+#   WORKFLOWS_PORT     workflows host port on the node (default 5678)
+#   TS_AUTHKEY         Tailscale auth key for headless join. Passed to
+#                      tailscale via a 0600 temp file (--auth-key=file:...),
+#                      never on the command line. If unset and stdin is a
+#                      terminal you are prompted; otherwise interactive login.
 #
 # What this does:
 #   1. Updates system packages
@@ -27,8 +40,24 @@ set -euo pipefail
 # Find it on the node with: tailscale ip -4
 NODE_TAILSCALE_IP="${NODE_TAILSCALE_IP:-}"
 OPENCLAW_PORT="${OPENCLAW_PORT:-3000}"
-N8N_PORT="${N8N_PORT:-5678}"
-DEERFLOW_PORT="${DEERFLOW_PORT:-2026}"
+WORKFLOWS_PORT="${WORKFLOWS_PORT:-5678}"
+TS_AUTHKEY="${TS_AUTHKEY:-}"
+RESET_FIREWALL=false
+
+for arg in "$@"; do
+    case "$arg" in
+        --reset-firewall) RESET_FIREWALL=true ;;
+        -h|--help)
+            echo "Usage: NODE_TAILSCALE_IP=100.x.x.x bash $0 [--reset-firewall]"
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $arg" >&2
+            echo "Usage: NODE_TAILSCALE_IP=100.x.x.x bash $0 [--reset-firewall]" >&2
+            exit 2
+            ;;
+    esac
+done
 
 # ─── Colors ───────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -81,13 +110,21 @@ else
     echo "    tailscale up"
     echo ""
     echo "  Option B (auth key — headless, recommended for droplets):"
-    echo "    tailscale up --authkey=tskey-auth-XXXXX"
+    echo "    TS_AUTHKEY=tskey-auth-XXXXX NODE_TAILSCALE_IP=... bash $0"
     echo ""
     echo "  Get an auth key at: https://login.tailscale.com/admin/settings/keys"
     echo ""
-    read -r -p "Enter Tailscale auth key (or press Enter to use interactive login): " TS_KEY
-    if [ -n "$TS_KEY" ]; then
-        tailscale up --authkey="$TS_KEY"
+    if [ -z "$TS_AUTHKEY" ] && [ -t 0 ]; then
+        read -r -s -p "Enter Tailscale auth key (or press Enter to use interactive login): " TS_AUTHKEY
+        echo ""
+    fi
+    if [ -n "$TS_AUTHKEY" ]; then
+        # Hand the key over in a 0600 file so it never shows up in ps.
+        TS_KEY_FILE=$(umask 077 && mktemp)
+        trap 'rm -f "$TS_KEY_FILE"' EXIT
+        printf '%s' "$TS_AUTHKEY" > "$TS_KEY_FILE"
+        tailscale up --auth-key="file:${TS_KEY_FILE}"
+        rm -f "$TS_KEY_FILE"
     else
         tailscale up
     fi
@@ -120,7 +157,10 @@ fi
 
 # ─── 4. Configure UFW Firewall ──────────────────────────────────
 info "Configuring UFW firewall..."
-ufw --force reset >/dev/null 2>&1
+if [ "$RESET_FIREWALL" = true ]; then
+    warn "Resetting UFW (--reset-firewall): existing custom rules are removed."
+    ufw --force reset >/dev/null 2>&1
+fi
 ufw default deny incoming
 ufw default allow outgoing
 
@@ -151,7 +191,7 @@ fi
 cat > /etc/caddy/Caddyfile << 'CADDYEOF'
 # ClawRange Gateway — Reverse Proxy Configuration
 #
-# Replace YOUR_DOMAIN with your actual domain (e.g., ai.longviewhomecenter.com)
+# Replace YOUR_DOMAIN with your actual domain (e.g., ai.example.com)
 # Caddy automatically obtains and renews Let's Encrypt certificates.
 #
 # To use IP-only (no domain), replace the domain blocks with :443 and
@@ -173,7 +213,7 @@ YOUR_DOMAIN {
     }
 
     # Proxy to OpenClaw on the node via Tailscale tunnel
-    reverse_proxy NODE_TAILSCALE_IP_PLACEHOLDER:3000 {
+    reverse_proxy NODE_TAILSCALE_IP_PLACEHOLDER:OPENCLAW_PORT_PLACEHOLDER {
         # Health checking — stop sending traffic if node is down
         health_uri /healthz
         health_interval 30s
@@ -194,28 +234,13 @@ YOUR_DOMAIN {
     }
 }
 
-# ─── n8n Dashboard (optional — admin access only) ───────────────
-# Only expose if you need remote workflow editing.
-# Consider restricting to Tailscale IP only for admin access.
-#
-# n8n.YOUR_DOMAIN {
-#     # Restrict to your Tailscale network
-#     @not-tailscale not remote_ip 100.64.0.0/10
-#     respond @not-tailscale 403
-#
-#     reverse_proxy NODE_TAILSCALE_IP_PLACEHOLDER:5678 {
-#         health_uri /healthz
-#         health_interval 30s
-#     }
-# }
-
-# ─── n8n Webhooks (if needed from external services) ────────────
-# Only uncomment if external services need to POST to n8n webhooks.
+# ─── Workflows webhooks (if needed from external services) ──────
+# Only uncomment if external services need to POST to workflows webhooks.
 #
 # webhooks.YOUR_DOMAIN {
 #     # Only allow specific webhook paths
-#     @allowed-webhooks path /webhook/* /webhook-test/*
-#     reverse_proxy @allowed-webhooks NODE_TAILSCALE_IP_PLACEHOLDER:5678
+#     @allowed-webhooks path /webhook/*
+#     reverse_proxy @allowed-webhooks NODE_TAILSCALE_IP_PLACEHOLDER:WORKFLOWS_PORT_PLACEHOLDER
 #
 #     # Block everything else
 #     respond 404
@@ -223,7 +248,9 @@ YOUR_DOMAIN {
 CADDYEOF
 
 # Replace placeholder with actual node IP
-sed -i "s/NODE_TAILSCALE_IP_PLACEHOLDER/${NODE_TAILSCALE_IP}/g" /etc/caddy/Caddyfile
+sed -i -e "s/NODE_TAILSCALE_IP_PLACEHOLDER/${NODE_TAILSCALE_IP}/g" \
+    -e "s/OPENCLAW_PORT_PLACEHOLDER/${OPENCLAW_PORT}/g" \
+    -e "s/WORKFLOWS_PORT_PLACEHOLDER/${WORKFLOWS_PORT}/g" /etc/caddy/Caddyfile
 
 info "Caddyfile created at /etc/caddy/Caddyfile (node IP: ${NODE_TAILSCALE_IP})"
 warn "EDIT /etc/caddy/Caddyfile — replace YOUR_DOMAIN with your actual domain"

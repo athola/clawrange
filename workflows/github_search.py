@@ -1,14 +1,19 @@
 """GitHub search adapter — githubkit async wrapper for marketing research.
 
 Calls GitHub's Search API for repos and issues, and the Traffic API
-for self-repo analytics. Gracefully degrades when credentials are missing.
+for self-repo analytics. Search works keyless (at a lower rate limit), so
+a missing PAT is not an error; a failed search raises ``UpstreamError``
+so callers never mistake "could not look" for "nothing found".
 """
 
+import base64
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from pydantic import BaseModel
+
+from errors import UpstreamError
 
 logger = logging.getLogger("clawrange.github")
 
@@ -69,6 +74,16 @@ def _get_client():
     return GitHub()
 
 
+def _require_client():
+    """A client for search; keyless search works, so only a missing
+    githubkit means GitHub cannot be searched at all."""
+    client = _get_client()
+    if not client:
+        logger.warning("githubkit not installed; GitHub search unavailable")
+        raise UpstreamError("GitHub search unavailable: githubkit not installed")
+    return client
+
+
 # ─── Search Functions ────────────────────────────────────────────────
 
 
@@ -79,11 +94,8 @@ async def search_repos(
     sort: str = "stars",
     limit: int = 25,
 ) -> list[GitHubRepo]:
-    """Search GitHub repositories."""
-    client = _get_client()
-    if not client:
-        logger.warning("githubkit not installed — returning empty results")
-        return []
+    """Search GitHub repositories. Raises UpstreamError if the search failed."""
+    client = _require_client()
 
     parts = [query]
     if min_stars > 0:
@@ -93,7 +105,7 @@ async def search_repos(
     full_query = " ".join(parts)
 
     try:
-        resp = client.rest.search.search_repos(
+        resp = await client.rest.search.async_repos(
             q=full_query, sort=sort, order="desc", per_page=limit
         )
         return [
@@ -110,20 +122,18 @@ async def search_repos(
         ]
     except Exception as exc:
         logger.warning("GitHub repo search failed: %s", exc)
-        return []
+        raise UpstreamError(f"GitHub repo search failed: {exc}") from exc
 
 
 async def search_issues(
     query: str,
     limit: int = 25,
 ) -> list[GitHubIssue]:
-    """Search GitHub issues and PRs."""
-    client = _get_client()
-    if not client:
-        return []
+    """Search GitHub issues and PRs. Raises UpstreamError if the search failed."""
+    client = _require_client()
 
     try:
-        resp = client.rest.search.search_issues_and_pull_requests(
+        resp = await client.rest.search.async_issues_and_pull_requests(
             q=query, sort="updated", order="desc", per_page=limit
         )
         return [
@@ -140,7 +150,7 @@ async def search_issues(
         ]
     except Exception as exc:
         logger.warning("GitHub issue search failed: %s", exc)
-        return []
+        raise UpstreamError(f"GitHub issue search failed: {exc}") from exc
 
 
 async def get_self_traffic(owner: str, repo: str) -> GitHubTrafficSnapshot | None:
@@ -151,8 +161,8 @@ async def get_self_traffic(owner: str, repo: str) -> GitHubTrafficSnapshot | Non
         return None
 
     try:
-        views_resp = client.rest.repos.get_views(owner=owner, repo=repo)
-        clones_resp = client.rest.repos.get_clones(owner=owner, repo=repo)
+        views_resp = await client.rest.repos.async_get_views(owner=owner, repo=repo)
+        clones_resp = await client.rest.repos.async_get_clones(owner=owner, repo=repo)
 
         views_data = views_resp.parsed_data
         clones_data = clones_resp.parsed_data
@@ -164,7 +174,7 @@ async def get_self_traffic(owner: str, repo: str) -> GitHubTrafficSnapshot | Non
             views_uniques=views_data.uniques or 0,
             clones_count=clones_data.count or 0,
             clones_uniques=clones_data.uniques or 0,
-            fetched_at=datetime.now(timezone.utc).isoformat(),
+            fetched_at=datetime.now(UTC).isoformat(),
         )
     except Exception as exc:
         logger.warning("GitHub traffic fetch failed for %s/%s: %s", owner, repo, exc)
@@ -173,21 +183,24 @@ async def get_self_traffic(owner: str, repo: str) -> GitHubTrafficSnapshot | Non
 
 async def check_awesome_list(
     list_owner: str, list_repo: str, target_urls: list[str]
-) -> dict[str, bool]:
+) -> dict[str, bool] | None:
     """Check whether target URLs appear in an awesome-list README.
 
-    Returns dict mapping each target URL to whether it was found.
+    Returns a dict mapping each target URL to whether it was found, or None
+    when the README could not be read: "unknown" must never look like "not
+    listed", or callers would queue false submission tasks.
     """
     client = _get_client()
     if not client:
-        return {url: False for url in target_urls}
+        return None
 
     try:
-        resp = client.rest.repos.get_readme(owner=list_owner, repo=list_repo)
-        import base64
+        resp = await client.rest.repos.async_get_readme(
+            owner=list_owner, repo=list_repo
+        )
 
         content = base64.b64decode(resp.parsed_data.content).decode()
         return {url: url in content for url in target_urls}
     except Exception as exc:
         logger.warning("Failed to fetch %s/%s README: %s", list_owner, list_repo, exc)
-        return {url: False for url in target_urls}
+        return None

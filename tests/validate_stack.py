@@ -2,14 +2,18 @@
 AI MSP Testbed — Structural and Config Validation
 
 Validates project files, configs, and conventions without running services.
-For live HTTP endpoint tests, use: ./scripts/test_all.sh
+For live HTTP endpoint tests, use: ./scripts/tests/all.sh
 
 Run with: python3 tests/validate_stack.py
 """
 
 import json
 import os
+import re
 import sys
+from typing import Any
+
+import yaml
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -29,47 +33,60 @@ class TestResult:
         self.message = msg
 
 
+REQUIRED_FILES = (
+    "docker-compose.yml",
+    ".env.example",
+    ".gitignore",
+    "Makefile",
+    "openclaw/soul.template.md",
+    "openclaw/config/openclaw.json",
+    "deerflow/config.yaml",
+    "workflows/app.py",
+    "workflows/Dockerfile",
+    "workflows/requirements.txt",
+    "scripts/start.sh",
+    "scripts/stop.sh",
+    "scripts/reset.sh",
+    "scripts/tests/all.sh",
+    "scripts/tests/openclaw.sh",
+    "scripts/tests/workflows.sh",
+    "scripts/tests/deerflow.sh",
+    "scripts/tests/ollama.sh",
+)
+
+
 def check_required_files() -> TestResult:
     """Verify all required project files exist."""
     result = TestResult("Required Files")
-    required = [
-        "docker-compose.yml",
-        ".env.example",
-        ".gitignore",
-        "Makefile",
-        "openclaw/soul.template.md",
-        "openclaw/config/openclaw.json",
-        "deerflow/config.yaml",
-        "workflows/app.py",
-        "workflows/Dockerfile",
-        "workflows/requirements.txt",
-        "scripts/start.sh",
-        "scripts/stop.sh",
-        "scripts/reset.sh",
-        "scripts/test_all.sh",
-        "scripts/test_openclaw.sh",
-        "scripts/test_workflows.sh",
-        "scripts/test_deerflow.sh",
-        "scripts/test_ollama.sh",
+    missing = [
+        f for f in REQUIRED_FILES if not os.path.exists(os.path.join(PROJECT_ROOT, f))
     ]
-    missing = [f for f in required if not os.path.exists(os.path.join(PROJECT_ROOT, f))]
     if missing:
         result.fail_(f"Missing: {', '.join(missing)}")
     else:
-        result.pass_(f"All {len(required)} required files present")
+        result.pass_(f"All {len(REQUIRED_FILES)} required files present")
     return result
 
 
 def check_scripts_executable() -> TestResult:
-    """Verify shell scripts have execute permission."""
+    """Verify shell scripts have execute permission.
+
+    A .sh file without a shebang is a library meant to be sourced
+    (e.g. workflows_auth.sh), so it is exempt.
+    """
     result = TestResult("Script Permissions")
     scripts_dir = os.path.join(PROJECT_ROOT, "scripts")
     not_exec = []
-    for f in os.listdir(scripts_dir):
-        if f.endswith(".sh"):
-            path = os.path.join(scripts_dir, f)
+    for dirpath, _dirs, files in os.walk(scripts_dir):
+        for f in sorted(files):
+            if not f.endswith(".sh"):
+                continue
+            path = os.path.join(dirpath, f)
+            with open(path, "rb") as fh:
+                if fh.read(2) != b"#!":
+                    continue
             if not os.access(path, os.X_OK):
-                not_exec.append(f)
+                not_exec.append(os.path.relpath(path, scripts_dir))
     if not_exec:
         result.fail_(f"Not executable: {', '.join(not_exec)}")
     else:
@@ -91,7 +108,8 @@ def check_env_example() -> TestResult:
         "OPENROUTER_API_KEY",
         "OPENCLAW_GATEWAY_TOKEN",
         "WORKFLOWS_PORT",
-        "TIMEZONE",
+        "PROXY_AUTH_TOKEN",
+        "SCHEDULER_TZ",
     ]
     missing = [k for k in required_keys if k not in content]
     if missing:
@@ -119,7 +137,7 @@ def check_env_not_committed() -> TestResult:
     return result
 
 
-def check_n8n_workflows() -> TestResult:
+def check_workflow_service() -> TestResult:
     """Validate workflow service has required files and endpoints."""
     result = TestResult("Workflow Service")
     app_path = os.path.join(PROJECT_ROOT, "workflows", "app.py")
@@ -159,7 +177,7 @@ def check_openclaw_config() -> TestResult:
         result.fail_(str(e))
         return result
     errors = []
-    # v2026.3+ schema: gateway, agents.defaults.model required
+    # v2026.8+ schema: gateway, agents.defaults.model required
     if "gateway" not in data:
         errors.append("missing 'gateway' section")
     else:
@@ -207,7 +225,8 @@ def check_deerflow_data_sovereignty() -> TestResult:
     violations = [endpoint for endpoint in blocklist if endpoint in config_text]
     if violations:
         result.fail_(
-            f"Direct endpoints found: {', '.join(violations)} — must route through OpenRouter"
+            f"Direct endpoints found: {', '.join(violations)} "
+            f"— must route through OpenRouter"
         )
         return result
     # Check that base_url values specifically contain openrouter.ai
@@ -246,6 +265,61 @@ def check_soul_template() -> TestResult:
     return result
 
 
+_PROFILE_ENV_RE = re.compile(r"\$\{([A-Z0-9_]+)\}")
+
+
+def _profile_env_refs(value: Any) -> set[str]:
+    """Collect ``${VAR}`` names from a parsed profile (comments excluded)."""
+    if isinstance(value, str):
+        return set(_PROFILE_ENV_RE.findall(value))
+    if isinstance(value, dict):
+        return set().union(*(_profile_env_refs(v) for v in value.values()))
+    if isinstance(value, list):
+        return set().union(*(_profile_env_refs(v) for v in value))
+    return set()
+
+
+def check_profile_env_passthrough() -> TestResult:
+    """Every ``${VAR}`` a shipped profile uses reaches the workflows container.
+
+    Compose passes variables to workflows one by one (an ``env_file`` would
+    hand every secret in .env to the container), so a profile variable with
+    no environment line silently resolves to "" inside the container.
+    """
+    result = TestResult("Profile Env Passthrough")
+    try:
+        with open(os.path.join(PROJECT_ROOT, "docker-compose.yml")) as f:
+            compose = yaml.safe_load(f) or {}
+    except (FileNotFoundError, yaml.YAMLError) as e:
+        result.fail_(f"docker-compose.yml unreadable: {e}")
+        return result
+    service = (compose.get("services") or {}).get("workflows")
+    if not isinstance(service, dict):
+        result.fail_("docker-compose.yml has no workflows service")
+        return result
+    env = service.get("environment") or []
+    if isinstance(env, dict):
+        passed = set(env)
+    else:
+        passed = {str(item).split("=", 1)[0] for item in env}
+
+    missing: list[str] = []
+    profiles = os.path.join(PROJECT_ROOT, "config", "profiles")
+    names = sorted(os.listdir(profiles)) if os.path.isdir(profiles) else []
+    for name in names:
+        path = os.path.join(profiles, name, "profile.yaml")
+        if not os.path.isfile(path):
+            continue
+        with open(path) as f:
+            refs = _profile_env_refs(yaml.safe_load(f))
+        missing.extend(f"{var} ({name})" for var in sorted(refs - passed))
+    if missing:
+        result.fail_("Not in the workflows service environment: " + ", ".join(missing))
+    else:
+        result.pass_(f"All profile variables reach workflows ({len(names)} profiles)")
+    return result
+
+
 def main():
     print("=" * 50)
     print(" CLAWRANGE — CONFIG VALIDATION")
@@ -257,10 +331,11 @@ def main():
         check_scripts_executable,
         check_env_example,
         check_env_not_committed,
-        check_n8n_workflows,
+        check_workflow_service,
         check_openclaw_config,
         check_deerflow_data_sovereignty,
         check_soul_template,
+        check_profile_env_passthrough,
     ]
 
     results: list[TestResult] = []

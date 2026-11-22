@@ -1,8 +1,11 @@
-"""LLM proxy with three-tier fallback and Telegram notifications.
+"""OpenAI-compatible LLM proxy with tiered routing (models.json).
 
-Sits between OpenClaw and LLM providers. Tries each tier in order,
-notifies via Telegram on fallback transitions, and returns the first
-successful response in OpenAI-compatible format (streaming or non-streaming).
+Sits between OpenClaw and the LLM providers. Chat requests race every
+available free tier concurrently and return the first good reply
+(streaming or not); a paid tier is used only when the message asks for it
+(!paid / !claude) and the OpenRouter balance is above the floor.
+Background calls (_llm_call) try the free tiers in order. Tier events
+are logged, not sent to Telegram.
 """
 
 import asyncio
@@ -11,14 +14,20 @@ import logging
 import os
 import re
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from telegram import delete_message, edit_status, notify, send_status, send_typing
+import auth
+import chat_commands
+import embeddings
+import heartbeat
+import telegram
+import tenant_profile
 
 logger = logging.getLogger("clawrange.llm_proxy")
 
@@ -40,6 +49,39 @@ MODELS_CONFIG_PATH = Path(__file__).parent / "models.json"
 def _load_config() -> dict:
     with open(MODELS_CONFIG_PATH) as f:
         return json.load(f)
+
+
+def _validate_config(cfg: dict, hints: dict[str, str]) -> None:
+    """Fail at import, not at first request, on a broken models.json.
+
+    Checks: tier names are unique, every tier names a configured provider
+    with models, every provider has a base_url and env_key, the search
+    block names a real provider, and every routing hint targets a tier.
+    """
+    providers = cfg.get("providers") or {}
+    for name, p in providers.items():
+        for key in ("base_url", "env_key"):
+            if not p.get(key):
+                raise ValueError(f"models.json: provider {name!r} has no {key}")
+    names: set[str] = set()
+    for tier in cfg.get("tiers") or []:
+        name = tier.get("name")
+        if not name or name in names:
+            raise ValueError(f"models.json: duplicate or empty tier name {name!r}")
+        names.add(name)
+        if tier.get("provider") not in providers:
+            raise ValueError(
+                f"models.json: tier {name!r} uses unknown provider "
+                f"{tier.get('provider')!r}"
+            )
+        if not tier.get("models"):
+            raise ValueError(f"models.json: tier {name!r} lists no models")
+    search = cfg.get("search")
+    if search and (search.get("provider") not in providers or not search.get("models")):
+        raise ValueError("models.json: search block needs a known provider and models")
+    for keyword, target in hints.items():
+        if target not in names:
+            raise ValueError(f"tier hint !{keyword} targets unknown tier {target!r}")
 
 
 CONFIG = _load_config()
@@ -66,16 +108,30 @@ CIRCUIT_FAILURE_THRESHOLD = 3
 CIRCUIT_COOLDOWN_SECONDS = 60
 
 
-def _circuit_open(tier_name: str) -> bool:
-    """Check if a tier's circuit breaker is open (should be skipped)."""
+def _circuit_open(tier_name: str, probe: bool = True) -> bool:
+    """Check if a tier's circuit breaker is open (should be skipped).
+
+    After the cooldown the breaker is half-open: exactly one caller is let
+    through as a probe (``probe=True`` claims it). A failure during the probe
+    re-trips immediately (the failure count is still at threshold); a success
+    closes the breaker. ``probe=False`` is a read-only status check that
+    never claims the probe slot.
+    """
     state = _circuit_state.get(tier_name)
     if not state:
         return False
-    if state["failures"] >= CIRCUIT_FAILURE_THRESHOLD:
-        elapsed = time.monotonic() - state["last_failure"]
-        if elapsed < CIRCUIT_COOLDOWN_SECONDS:
-            return True
-        _circuit_state.pop(tier_name, None)
+    if state["failures"] < CIRCUIT_FAILURE_THRESHOLD:
+        return False
+    now = time.monotonic()
+    if now - state["last_failure"] < CIRCUIT_COOLDOWN_SECONDS:
+        return True
+    # Half-open: one probe at a time (a probe that never reports back is
+    # considered lost after another cooldown).
+    probe_at = state.get("probe_at")
+    if probe_at is not None and now - probe_at < CIRCUIT_COOLDOWN_SECONDS:
+        return True
+    if probe:
+        state["probe_at"] = now
     return False
 
 
@@ -83,6 +139,7 @@ def _record_failure(tier_name: str) -> None:
     state = _circuit_state.setdefault(tier_name, {"failures": 0, "last_failure": 0})
     state["failures"] += 1
     state["last_failure"] = time.monotonic()
+    state.pop("probe_at", None)
 
 
 def _record_success(tier_name: str) -> None:
@@ -99,41 +156,88 @@ def _record_rate_limit(tier_name: str) -> None:
 
 # ─── Balance Guard (protect $10 free-tier threshold) ─────────────
 
-OPENROUTER_CREDIT_BALANCE = float(os.getenv("OPENROUTER_CREDIT_BALANCE", "0"))
 OPENROUTER_BALANCE_FLOOR = float(os.getenv("OPENROUTER_BALANCE_FLOOR", "10.0"))
 
-_balance_cache: dict[str, float | None] = {"remaining": None, "checked_at": 0.0}
+_balance_cache: dict[str, float | None] = {"remaining": None, "checked_at": None}
 _BALANCE_CHECK_INTERVAL = 300  # re-check at most every 5 minutes
+_BALANCE_FAILURE_BACKOFF = 60  # after a failed lookup, wait this long to retry
+_BALANCE_CHECK_TIMEOUT = 10  # seconds for the /credits lookup
+# Outcome of the most recent lookup, for describe_balance(): monotonic time of
+# the last success, and the last failure reason (cleared on success).
+_balance_status: dict[str, Any] = {"ok_at": None, "error": None}
+
+
+def describe_balance() -> str:
+    """Human-readable OpenRouter balance for status lines and alerts.
+
+    Never renders an unknown balance as a number: a failing credits lookup
+    says so, and a cached value served after a failure carries its age.
+    """
+    if not os.getenv("OPENROUTER_API_KEY", ""):
+        return "not configured"
+    remaining = _balance_cache.get("remaining")
+    error = _balance_status.get("error")
+    if remaining is None:
+        if error:
+            return f"unknown (lookup failed: {error})"
+        return "unknown (not checked yet)"
+    amount = f"${remaining:.2f}"
+    if not error:
+        return amount
+    ok_at = _balance_status.get("ok_at")
+    age = (
+        "age unknown"
+        if ok_at is None
+        else f"{int((time.monotonic() - ok_at) // 60)} min old"
+    )
+    return f"{amount} ({age}; lookup failing: {error})"
 
 
 async def _check_openrouter_balance() -> float | None:
-    """Return estimated remaining OpenRouter balance, or None if unknown.
+    """Return remaining OpenRouter balance from the credits API, or None.
 
-    Calls the /auth/key endpoint at most once per _BALANCE_CHECK_INTERVAL.
+    GET /api/v1/credits reports {total_credits, total_usage}; the remaining
+    balance is the difference, read straight from the API so it stays true
+    after deposits and top-ups (no locally-configured constant to drift).
+    Cached for _BALANCE_CHECK_INTERVAL; on failure falls back to the last
+    known value.
     """
     now = time.monotonic()
-    if now - (_balance_cache.get("checked_at") or 0) < _BALANCE_CHECK_INTERVAL:
+    checked_at = _balance_cache.get("checked_at")
+    # None means "never checked": due now, even on a host whose monotonic
+    # clock is younger than the interval.
+    if checked_at is not None and now - checked_at < _BALANCE_CHECK_INTERVAL:
         return _balance_cache.get("remaining")
 
     api_key = os.getenv("OPENROUTER_API_KEY", "")
-    if not api_key or not OPENROUTER_CREDIT_BALANCE:
-        return None
+    if not api_key:
+        return _balance_cache.get("remaining")
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=_BALANCE_CHECK_TIMEOUT) as client:
             resp = await client.get(
-                "https://openrouter.ai/api/v1/auth/key",
+                "https://openrouter.ai/api/v1/credits",
                 headers={"Authorization": f"Bearer {api_key}"},
             )
             if resp.status_code == 200:
-                usage = resp.json().get("data", {}).get("usage", 0)
-                remaining = OPENROUTER_CREDIT_BALANCE - usage
+                data = resp.json().get("data", {})
+                remaining = float(data["total_credits"]) - float(data["total_usage"])
                 _balance_cache["remaining"] = remaining
                 _balance_cache["checked_at"] = now
+                _balance_status["ok_at"] = now
+                _balance_status["error"] = None
                 return remaining
-    except httpx.HTTPError:
-        pass
+            logger.warning("openrouter credits lookup: HTTP %s", resp.status_code)
+            _balance_status["error"] = f"HTTP {resp.status_code}"
+    except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+        logger.warning("openrouter credits lookup failed: %s", exc)
+        _balance_status["error"] = f"{type(exc).__name__}: {str(exc)[:80]}"
 
+    # Back off instead of re-hitting a failing API on every request: stamp
+    # the check so the next attempt comes _BALANCE_FAILURE_BACKOFF from now.
+    _balance_cache["checked_at"] = (
+        now - _BALANCE_CHECK_INTERVAL + _BALANCE_FAILURE_BACKOFF
+    )
     return _balance_cache.get("remaining")
 
 
@@ -146,38 +250,29 @@ _NOTIFICATION_DEBOUNCE_SECONDS = 120
 def _should_notify(tier_name: str) -> bool:
     """Return True if enough time has passed since last notification for this tier."""
     now = time.monotonic()
-    last = _notification_last_sent.get(tier_name, 0)
-    if now - last < _NOTIFICATION_DEBOUNCE_SECONDS:
+    last = _notification_last_sent.get(tier_name)
+    if last is not None and now - last < _NOTIFICATION_DEBOUNCE_SECONDS:
         return False
     _notification_last_sent[tier_name] = now
     return True
 
 
 def _background_notify(tier_name: str, message: str) -> None:
-    """Log tier events without sending to Telegram.
+    """Log a tier event (rate limit, error, switch). Never sends to Telegram.
 
     Telegram notifications go to the user's conversation chat and look like
-    garbled bot responses. Rate limit events are logged for debugging only.
-    Explicit admin alerts (balance guard) use notify() directly.
+    garbled bot responses, so these are log lines only, and every event is
+    logged (no debounce: a dropped line hides the failure being debugged).
+    Explicit admin alerts (balance guard) use telegram.notify() directly.
     """
-    if not _should_notify(tier_name):
-        return
     clean = message.replace("*", "").replace("`", "")
-    logger.info("[tier] %s", clean)
-
-
-async def _safe_notify(message: str) -> None:
-    """Fire-and-forget wrapper that logs failures instead of raising."""
-    try:
-        await notify(message)
-    except Exception:
-        logger.exception("Notification delivery failed")
+    logger.warning("[tier] %s: %s", tier_name, clean)
 
 
 # ─── Auto-Retry ──────────────────────────────────────────────────
 
 MAX_AUTO_RETRY_WAIT = 30  # seconds — max hold time before returning synthetic response
-PROVIDER_TIMEOUT = 45  # per-provider HTTP timeout (seconds) — was 90
+PROVIDER_TIMEOUT = 45  # per-provider attempt timeout on the chat path (seconds)
 REQUEST_DEADLINE = 60  # hard ceiling for the entire chat request (seconds)
 # Total ceiling for _llm_call across ALL tiers (seconds). The interactive chat
 # path races tiers concurrently under REQUEST_DEADLINE, but the heartbeat path
@@ -185,7 +280,13 @@ REQUEST_DEADLINE = 60  # hard ceiling for the entire chat request (seconds)
 # tries tiers sequentially. Without an aggregate cap a hung provider compounds
 # to PROVIDER_TIMEOUT * len(tiers), blocking the heartbeat past the upstream
 # OpenClaw client timeout and surfacing "LLM request timed out" to Telegram.
-LLM_CALL_DEADLINE = 45  # one full provider attempt; fast failover still fits
+LLM_CALL_DEADLINE = 45
+# One background attempt. Kept well below LLM_CALL_DEADLINE so a hung first
+# tier times out (and counts against its breaker) with time left to try the
+# next free tier.
+BACKGROUND_ATTEMPT_TIMEOUT = 20
+# Breaker key for the background web-search tier (CONFIG["search"]).
+SEARCH_TIER = "search"
 
 
 # ─── Rate Limit Detection ─────────────────────────────────────────
@@ -208,77 +309,66 @@ def _is_rate_limited(resp: httpx.Response) -> bool:
     return False
 
 
-def _get_reset_info(resp: httpx.Response) -> str:
-    """Extract rate limit reset time as a human-readable string.
+# Out of credit, as each provider says it: OpenRouter 402 "Insufficient
+# credits", OpenAI-style insufficient_quota, Z.AI code 1113 ("余额不足" =
+# insufficient balance, sent as HTTP 429). Retrying cannot fix these, so
+# naming them sends the operator to top up rather than wait.
+_NO_CREDIT_CODES = {"1113"}
+_NO_CREDIT_KEYWORDS = (
+    "insufficient credit",
+    "insufficient balance",
+    "insufficient_quota",
+    "insufficient quota",
+    "out of credit",
+    "余额不足",
+)
 
-    Checks retry-after (seconds), x-ratelimit-reset-* (epoch/ISO),
-    response body metadata, and error message text. Returns '' if nothing found.
-    """
-    # retry-after header — seconds until reset
-    retry_after = resp.headers.get("retry-after")
-    if retry_after:
-        try:
-            seconds = int(retry_after)
-            if seconds < 120:
-                return f"in {seconds}s"
-            return f"in ~{seconds // 60}min"
-        except ValueError:
-            pass
 
-    # Reset timestamp headers (epoch or ISO)
-    for header in (
-        "x-ratelimit-reset-requests",
-        "x-ratelimit-reset",
-        "ratelimit-reset",
-    ):
-        value = resp.headers.get(header)
-        if not value:
-            continue
-        # Try epoch seconds
-        try:
-            reset_dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
-            delta = reset_dt - datetime.now(timezone.utc)
-            if delta > timedelta(0):
-                mins = int(delta.total_seconds()) // 60
-                return f"at {reset_dt.strftime('%H:%M UTC')} (~{mins}min)"
-            return f"at {reset_dt.strftime('%H:%M UTC')}"
-        except (ValueError, OSError):
-            pass
-        # Try ISO timestamp
-        try:
-            reset_dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            return f"at {reset_dt.strftime('%H:%M UTC')}"
-        except (ValueError, AttributeError):
-            pass
-
-    # Check response body — metadata fields and error message text
+def _classify_failure(resp: httpx.Response) -> str:
+    """Short operator-facing cause for a non-200 provider reply."""
+    code = msg = ""
     try:
-        body = resp.json()
-        error = body.get("error", {})
+        error = resp.json().get("error", {})
         if isinstance(error, dict):
-            meta = error.get("metadata", {})
-            if isinstance(meta, dict):
-                # Explicit reset fields
-                raw = meta.get("ratelimit_reset") or meta.get("retry_after")
-                if raw:
-                    return f"at {raw}"
-                # OpenRouter puts provider error in metadata.raw
-                raw_msg = meta.get("raw", "")
-                if raw_msg:
-                    parsed = _parse_reset_from_message(raw_msg)
-                    if parsed:
-                        return parsed
-            # Fallback: extract timing from the top-level error message
-            msg = error.get("message", "")
-            if msg:
-                parsed = _parse_reset_from_message(msg)
-                if parsed:
-                    return parsed
+            code = str(error.get("code", ""))
+            msg = str(error.get("message", ""))
+        else:
+            msg = str(error)
     except Exception:
-        pass
+        msg = resp.text[:200]
+    lowered = msg.lower()
+    if (
+        resp.status_code == 402
+        or code in _NO_CREDIT_CODES
+        or any(kw in lowered for kw in _NO_CREDIT_KEYWORDS)
+    ):
+        return "out of credit"
+    if _is_rate_limited(resp):
+        return "rate-limited"
+    if resp.status_code in (401, 403):
+        return "API key rejected"
+    return f"HTTP {resp.status_code}"
 
-    return ""
 
+# Why each tier last failed (kept until it succeeds), so a skip behind an
+# open breaker can still say what tripped it.
+_tier_failure_reason: dict[str, str] = {}
+# Per-tier outcome of the most recent background _llm_call that failed;
+# empty after one that answered. Read by describe_last_failure().
+_last_call_failures: dict[str, str] = {}
+
+
+def _note_failure(tier_name: str, reason: str) -> None:
+    _tier_failure_reason[tier_name] = reason
+    _last_call_failures[tier_name] = reason
+
+
+def describe_last_failure() -> str:
+    """'tier: cause; ...' for the last background call that got no answer."""
+    return "; ".join(f"{t}: {r}" for t, r in _last_call_failures.items())
+
+
+_RESET_HEADERS = ("x-ratelimit-reset-requests", "x-ratelimit-reset", "ratelimit-reset")
 
 # Patterns to extract timing from OpenRouter error messages
 _RESET_SECONDS_RE = re.compile(r"(\d+)\s*(?:second|sec|s\b)", re.IGNORECASE)
@@ -286,133 +376,116 @@ _RESET_MINUTES_RE = re.compile(r"(\d+)\s*(?:minute|min|m\b)", re.IGNORECASE)
 _RESET_HOURS_RE = re.compile(r"(\d+)\s*(?:hour|hr|h\b)", re.IGNORECASE)
 
 
-def _parse_reset_from_message(msg: str) -> str:
-    """Extract reset timing from an error message string."""
-    hours = _RESET_HOURS_RE.search(msg)
-    if hours:
-        h = int(hours.group(1))
-        reset_dt = datetime.now(timezone.utc) + timedelta(hours=h)
-        return f"at ~{reset_dt.strftime('%H:%M UTC')} (~{h}h)"
-
-    minutes = _RESET_MINUTES_RE.search(msg)
-    if minutes:
-        m = int(minutes.group(1))
-        return f"in ~{m}min"
-
-    seconds = _RESET_SECONDS_RE.search(msg)
-    if seconds:
-        s = int(seconds.group(1))
-        return f"in {s}s"
-
-    # Daily limit — no specific time given
-    if "day" in msg.lower() or "daily" in msg.lower():
-        return "daily limit — resets in up to 24h"
-
-    # Upstream provider throttling — transient, no specific reset time
-    if "upstream" in msg.lower() or "retry shortly" in msg.lower():
-        return "upstream provider throttled — retry in a few minutes"
-
-    return ""
-
-
-def _parse_reset_seconds_from_message(msg: str) -> int | None:
-    """Extract reset time in seconds from error message text."""
-    hours = _RESET_HOURS_RE.search(msg)
-    if hours:
-        return int(hours.group(1)) * 3600
-
-    minutes = _RESET_MINUTES_RE.search(msg)
-    if minutes:
-        return int(minutes.group(1)) * 60
-
-    seconds = _RESET_SECONDS_RE.search(msg)
-    if seconds:
-        return int(seconds.group(1))
-
-    if "day" in msg.lower() or "daily" in msg.lower():
-        return 86400
-
-    if "upstream" in msg.lower() or "retry shortly" in msg.lower():
-        return 20  # transient upstream throttle — conservative estimate
-
-    return None
-
-
-def _get_reset_seconds(resp: httpx.Response) -> int | None:
-    """Extract rate limit reset time in seconds, or None if unknown."""
-    retry_after = resp.headers.get("retry-after")
-    if retry_after:
-        try:
-            return max(int(retry_after), 1)
-        except ValueError:
-            pass
-
-    for header in (
-        "x-ratelimit-reset-requests",
-        "x-ratelimit-reset",
-        "ratelimit-reset",
-    ):
+def _header_reset_at(resp: httpx.Response) -> datetime | None:
+    """First reset timestamp in the rate-limit headers (epoch or ISO), UTC."""
+    for header in _RESET_HEADERS:
         value = resp.headers.get(header)
         if not value:
             continue
         try:
-            reset_dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
-            delta = reset_dt - datetime.now(timezone.utc)
-            if delta > timedelta(0):
-                return max(int(delta.total_seconds()), 1)
+            return datetime.fromtimestamp(float(value), tz=UTC)
         except (ValueError, OSError):
             pass
+        try:
+            at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        return at if at.tzinfo else at.replace(tzinfo=UTC)
+    return None
 
+
+def _error_meta(resp: httpx.Response) -> tuple[dict, str]:
+    """(error.metadata, error.message) from an error body; empty when absent."""
     try:
         body = resp.json()
-        error = body.get("error", {})
-        if isinstance(error, dict):
-            meta = error.get("metadata", {})
-            if isinstance(meta, dict):
-                raw = meta.get("retry_after")
-                if raw:
-                    try:
-                        return max(int(raw), 1)
-                    except ValueError:
-                        pass
-                raw_msg = meta.get("raw", "")
-                if raw_msg:
-                    secs = _parse_reset_seconds_from_message(raw_msg)
-                    if secs is not None:
-                        return secs
-            msg = error.get("message", "")
-            if msg:
-                secs = _parse_reset_seconds_from_message(msg)
-                if secs is not None:
-                    return secs
     except Exception:
-        pass
+        return {}, ""
+    error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(error, dict):
+        return {}, ""
+    meta = error.get("metadata")
+    return (meta if isinstance(meta, dict) else {}), str(error.get("message") or "")
 
+
+def _message_reset(msg: str) -> tuple[int, str] | None:
+    """(seconds, human text) for the reset timing named in an error message."""
+    if m := _RESET_HOURS_RE.search(msg):
+        h = int(m.group(1))
+        at = datetime.now(UTC) + timedelta(hours=h)
+        return h * 3600, f"at ~{at.strftime('%H:%M UTC')} (~{h}h)"
+    if m := _RESET_MINUTES_RE.search(msg):
+        return int(m.group(1)) * 60, f"in ~{int(m.group(1))}min"
+    if m := _RESET_SECONDS_RE.search(msg):
+        return int(m.group(1)), f"in {int(m.group(1))}s"
+    lower = msg.lower()
+    if "day" in lower or "daily" in lower:
+        return 86400, "daily limit — resets in up to 24h"
+    if "upstream" in lower or "retry shortly" in lower:
+        # Transient upstream throttle: no stated time, conservative estimate.
+        return 20, "upstream provider throttled — retry in a few minutes"
+    return None
+
+
+def _get_reset_info(resp: httpx.Response) -> str:
+    """Rate limit reset time as a human-readable string, '' if unknown.
+
+    Checks retry-after (seconds), x-ratelimit-reset-* (epoch/ISO), body
+    metadata, then error message text.
+    """
+    retry_after = resp.headers.get("retry-after")
+    if retry_after and retry_after.isdigit():
+        seconds = int(retry_after)
+        return f"in {seconds}s" if seconds < 120 else f"in ~{seconds // 60}min"
+    at = _header_reset_at(resp)
+    if at is not None:
+        delta = at - datetime.now(UTC)
+        stamp = f"at {at.strftime('%H:%M UTC')}"
+        return (
+            f"{stamp} (~{int(delta.total_seconds()) // 60}min)"
+            if delta > timedelta(0)
+            else stamp
+        )
+    meta, message = _error_meta(resp)
+    raw = meta.get("ratelimit_reset") or meta.get("retry_after")
+    if raw:
+        return f"at {raw}"
+    # OpenRouter puts the provider error in metadata.raw.
+    for text in (meta.get("raw", ""), message):
+        if text and (found := _message_reset(text)):
+            return found[1]
+    return ""
+
+
+def _get_reset_seconds(resp: httpx.Response) -> int | None:
+    """Rate limit reset time in seconds, or None if unknown."""
+    retry_after = resp.headers.get("retry-after")
+    if retry_after and retry_after.isdigit():
+        return max(int(retry_after), 1)
+    at = _header_reset_at(resp)
+    if at is not None:
+        delta = at - datetime.now(UTC)
+        if delta > timedelta(0):
+            return max(int(delta.total_seconds()), 1)
+    meta, message = _error_meta(resp)
+    raw = meta.get("retry_after")
+    if raw and str(raw).isdigit():
+        return max(int(raw), 1)
+    for text in (meta.get("raw", ""), message):
+        if text and (found := _message_reset(text)):
+            return found[0]
     return None
 
 
 def _get_rate_limit_detail(resp: httpx.Response) -> str:
-    """Extract provider name and reason from a rate limit response."""
-    try:
-        body = resp.json()
-        error = body.get("error", {})
-        if isinstance(error, dict):
-            meta = error.get("metadata", {})
-            if isinstance(meta, dict):
-                provider = meta.get("provider_name", "")
-                raw = meta.get("raw", "")
-                if provider and raw:
-                    return f"({provider}: {raw[:120]})"
-                if provider:
-                    return f"(provider: {provider})"
-                if raw:
-                    return f"({raw[:120]})"
-    except Exception:
-        pass
-    return ""
+    """Provider name and reason from a rate limit response."""
+    meta, _ = _error_meta(resp)
+    provider, raw = meta.get("provider_name", ""), meta.get("raw", "")
+    if provider and raw:
+        return f"({provider}: {raw[:120]})"
+    if provider:
+        return f"(provider: {provider})"
+    return f"({raw[:120]})" if raw else ""
 
-
-# ─── Provider Calls ───────────────────────────────────────────────
 
 # ─── Response Sanitization ────────────────────────────────────────
 
@@ -441,7 +514,8 @@ _INNER_TAG = re.compile(
 )
 
 
-# XML-style hallucinated tool tags: <exec command="..."></exec>, <tool_call>...</tool_call>,
+# XML-style hallucinated tool tags: <exec command="..."></exec>,
+# <tool_call>...</tool_call>,
 # and colon-suffixed variants like <tool_call:paste>...</tool_call:paste> that free-tier
 # models invent when they get OpenAI tool schemas but the upstream doesn't support
 # function calling. Alternation keeps the two cases distinct so backref groups stay
@@ -470,7 +544,8 @@ _XML_UNCLOSED_TAG = re.compile(
     rf"<(?:{_TOOL_KEYWORDS})\b[\s\S]*$",
     re.IGNORECASE,
 )
-# Hallucinated metadata tags: <session_status>...</session_status>, <system>...</system>, etc.
+# Hallucinated metadata tags: <session_status>...</session_status>,
+# <system>...</system>, etc.
 _XML_META_TAG = re.compile(
     r"<(?:session_status|system_status|thinking|internal_monologue)\b[^>]*>"
     r"[\s\S]*?"
@@ -570,11 +645,9 @@ def _is_non_answer(text: str) -> bool:
     return hits >= 3
 
 
-PROVIDER_URLS = {
-    "openrouter": "https://openrouter.ai/api/v1/chat/completions",
-    "zai": "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
-    "zai-search": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-}
+# One source of truth: the provider URLs come from models.json (a missing
+# base_url is reported by _validate_config at import).
+PROVIDER_URLS = {name: p.get("base_url", "") for name, p in CONFIG["providers"].items()}
 
 
 async def _call_provider(
@@ -609,6 +682,8 @@ TIER_HINTS = {
     "claude": "openrouter-paid",
 }
 
+_validate_config(CONFIG, TIER_HINTS)
+
 
 def _detect_tier_hint(messages: list[dict]) -> str | None:
     """Check the last user message for an explicit ``!keyword`` routing command.
@@ -618,23 +693,19 @@ def _detect_tier_hint(messages: list[dict]) -> str | None:
     incidental mentions of provider names in conversation context never
     trigger routing.
     """
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            text = msg.get("content", "")
-            if isinstance(text, list):
-                text = " ".join(b.get("text", "") for b in text if isinstance(b, dict))
-            # Strip sender metadata blocks to avoid false matches
-            text = re.sub(
-                r"sender \(untrusted metadata\):.*?```.*?```",
-                "",
-                text,
-                flags=re.DOTALL,
-            )
-            text_lower = text.lower()
-            for keyword, tier in TIER_HINTS.items():
-                if f"!{keyword}" in text_lower:
-                    return tier
-            break
+    for text in _user_texts(messages):
+        # Strip sender metadata blocks to avoid false matches
+        text = re.sub(
+            r"sender \(untrusted metadata\):.*?```.*?```",
+            "",
+            text,
+            flags=re.DOTALL,
+        )
+        text_lower = text.lower()
+        for keyword, tier in TIER_HINTS.items():
+            if re.search(rf"(?<!\S)!{re.escape(keyword)}\b", text_lower):
+                return tier
+        break
     return None
 
 
@@ -667,7 +738,11 @@ def _wrap_json_as_sse(json_response: JSONResponse) -> StreamingResponse:
     data = json.loads(bytes(json_response.body))
     completion_id = data.get("id", "clawrange-fallback")
     model = data.get("model", "unknown")
-    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    first_choice = (data.get("choices") or [{}])[0]
+    message = first_choice.get("message") or {}
+    # Tool-call replies carry "content": null.
+    content = message.get("content") or ""
+    tool_calls = message.get("tool_calls") or []
     tier = data.get("_clawrange_tier", "")
 
     def _make_chunk(delta: dict, finish_reason: str | None = None) -> str:
@@ -685,11 +760,17 @@ def _wrap_json_as_sse(json_response: JSONResponse) -> StreamingResponse:
         # Role chunk (no content)
         yield _make_chunk({"role": "assistant"})
         # Token-by-token content — split on space boundaries, preserve spaces
-        for i, word in enumerate(content.split(" ")):
-            token = f" {word}" if i > 0 else word
-            yield _make_chunk({"content": token})
+        if content:
+            for i, word in enumerate(content.split(" ")):
+                token = f" {word}" if i > 0 else word
+                yield _make_chunk({"content": token})
+        if tool_calls:
+            # OpenAI streaming format: every tool call carries its index.
+            yield _make_chunk(
+                {"tool_calls": [{"index": i, **tc} for i, tc in enumerate(tool_calls)]}
+            )
         # Final chunk
-        yield _make_chunk({}, finish_reason="stop")
+        yield _make_chunk({}, finish_reason="tool_calls" if tool_calls else "stop")
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(
@@ -707,1027 +788,72 @@ _OPENCLAW_META_RE = re.compile(
 )
 
 
-def _get_last_user_message(messages: list[dict]) -> str:
-    """Extract the text of the last user message, stripping OpenClaw metadata."""
+# OpenClaw 2026.8+ appends a separate user message carrying runtime context
+# (temporal context, interrupted inputs) after the real one, and prefixes
+# the real text with a "[Sun 2026-11-15 22:21 UTC] " envelope.
+_RUNTIME_CONTEXT_PREFIX = "openclaw runtime context:"
+_TIMESTAMP_ENVELOPE_RE = re.compile(
+    r"^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d{4}-\d{2}-\d{2} \d{2}:\d{2}"
+    r"(?::\d{2})? [A-Za-z0-9_+/:-]+\]\s*"
+)
+# OpenClaw 2026.11.5+ automation jobs (the heartbeat among them) prefix the
+# job message with "[cron:<job-id> <job-name>] ". Without stripping it the
+# heartbeat marker never leads and heartbeats reach the model unintercepted.
+_AUTOMATION_TAG_RE = re.compile(r"^\[cron:[^\s\]]+(?: [^\]\n]*)?\]\s*")
+# First turn of a fresh session: "\n\nRuntime: agent=<id> | session=... | ...".
+# Any agent id matches.
+_RUNTIME_LINE_RE = re.compile(r"\n\s*runtime: agent=[^\n]*\s*$", re.IGNORECASE)
+
+
+def _user_texts(messages: list[dict]):
+    """Raw user message texts, newest first, minus OpenClaw runtime context."""
     for msg in reversed(messages):
-        if msg.get("role") == "user":
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                content = " ".join(
-                    b.get("text", "") for b in content if isinstance(b, dict)
-                )
-            if not isinstance(content, str):
-                return ""
-            # Strip OpenClaw conversation metadata prefix
-            content = _OPENCLAW_META_RE.sub("", content)
-            return content.strip()
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            content = " ".join(
+                b.get("text", "") for b in content if isinstance(b, dict)
+            )
+        if not isinstance(content, str):
+            yield ""
+            continue
+        if content.lstrip().lower().startswith(_RUNTIME_CONTEXT_PREFIX):
+            continue
+        yield content
+
+
+def _get_last_user_message(messages: list[dict]) -> str:
+    """Text of the last real user message, stripped of OpenClaw envelopes."""
+    for content in _user_texts(messages):
+        content = _OPENCLAW_META_RE.sub("", content)
+        content = _RUNTIME_LINE_RE.sub("", content.strip())
+        content = _TIMESTAMP_ENVELOPE_RE.sub("", content)
+        return _AUTOMATION_TAG_RE.sub("", content).strip()
     return ""
 
 
 # ─── /tier Command ───────────────────────────────────────────────
 
 
-async def _handle_tier_command() -> JSONResponse:
-    """Return current tier status, balance, and circuit breaker state."""
-    lines = ["Tier Status\n"]
+def tier_snapshot() -> list[dict[str, str]]:
+    """Read-only status of every tier: TRIPPED, ACTIVE (last used) or ready.
+
+    Never claims the half-open probe (probe=False): status displays are
+    polled, and claiming the probe there kept a tripped tier from ever
+    getting the real request that would close its breaker.
+    """
+    out = []
     for tier in CONFIG["tiers"]:
         name = tier["name"]
-        if _circuit_open(name):
+        if _circuit_open(name, probe=False):
             marker = "TRIPPED"
         elif name == _last_tier_used:
             marker = "ACTIVE"
         else:
             marker = "ready"
-        lines.append(f"  [{marker}] {name} — {tier['description']}")
-
-    remaining = await _check_openrouter_balance()
-    lines.append("")
-    if remaining is not None:
-        lines.append(
-            f"Balance: ${remaining:.2f} remaining (floor: ${OPENROUTER_BALANCE_FLOOR:.2f})"
-        )
-    else:
-        lines.append("Balance: not configured (set OPENROUTER_CREDIT_BALANCE)")
-
-    if _last_tier_used:
-        lines.append(f"Last used: {_last_tier_used}")
-    else:
-        lines.append("Last used: none yet")
-
-    lines.append("Paid auto-fallback: off (send !paid or !claude to enable)")
-    return _synthetic_response("\n".join(lines))
-
-
-# ─── !help Command ─────────────────────────────────────────────
-
-
-def _handle_help() -> JSONResponse:
-    """Return full command reference — all intercepted commands and brain operations."""
-    text = """ClawRange Command Reference
-
-TASK MANAGEMENT
-  !task <description>      Create a new task (priority 3)
-  !tasks                   Show current task queue
-  !task list               Same as !tasks
-  !task tail               Show recently completed tasks
-  !task cancel <id>        Cancel a pending/active task
-  !task priority <id> <1-5> Change priority (1=urgent, 5=low)
-
-BRAIN (Knowledge)
-  !remember <slug> <info>  Append info to a page's timeline
-  !recall <query>          Search the brain for matching pages
-  !page <slug>             Show a full page with timeline
-
-  Brain slugs use hierarchy: client/acme-corp, incident/wifi-site2, person/bob-smith
-  Page types: client, system, incident, decision, note, person, company, project
-
-SYSTEM STATUS
-  !tier                    Show LLM tier status and balance
-  !status                  Same as !tier
-  !help                    This command reference
-
-BRAIN API (via web_fetch)
-  POST /brain/pages              Create or update a page
-  GET  /brain/pages/{slug}       Get page with timeline + tags
-  DELETE /brain/pages/{slug}     Delete a page
-  GET  /brain/pages              List pages (filter: ?page_type=client)
-  GET  /brain/search?q=...       Hybrid search (modes: keyword, vector, hybrid)
-  POST /brain/pages/{slug}/timeline    Append timeline entry
-  GET  /brain/pages/{slug}/timeline    List timeline entries
-  POST /brain/pages/{slug}/links       Add link to another page
-  GET  /brain/pages/{slug}/links       List links
-  GET  /brain/pages/{slug}/graph       Traverse knowledge graph (?depth=2)
-  POST /brain/pages/{slug}/tags        Set tags
-  GET  /brain/pages/{slug}/versions    Version history
-  GET  /brain/pages/{slug}/chunks      Content chunks
-
-TASK API (via web_fetch)
-  POST /task                     Create task
-  GET  /task                     List tasks (?status=pending)
-  GET  /task/{id}                Get task by ID
-  POST /task/{id}/claim          Mark task active
-  POST /task/{id}/result         Complete task with result
-  DELETE /task/{id}              Cancel task
-
-HEALTH
-  GET  /healthz                  Service health + brain status
-  GET  /tier                     Tier status JSON
-
-MARKETING
-  /projects list                 List tracked GitHub projects
-  /projects show <slug>          Show project details
-  /projects add <slug> <owner>/<repo> [--topics ...] [--subs ...]
-  /projects rm <slug>
-
-  /sched list                    List scheduled jobs
-  /sched add <name> cron "<expr>" -- <generator>
-  /sched pause|resume|rm|run <id|name>
-
-  /scan reddit <topic> [--subs ...] [--project <slug>]
-  /scan github <topic> [--kind repos|issues] [--stars 5]
-  /scan github traffic [slug]    Pull repo traffic stats
-  /scan web <prompt>             LLM web search
-
-  /marketing                     Alias: /sched run morning_scan"""
-    return _synthetic_response(text)
-
-
-# ─── !task Command ──────────────────────────────────────────────
-
-
-_TASK_TRIGGERS = ("!task", "/task", "!tasks", "/tasks")
-_TASK_ACTIONS = ("cancel", "priority", "list", "tail")
-
-# ─── Marketing Commands (/sched, /scan, /projects) ──────────────
-
-_MARKETING_PREFIXES = (
-    "/sched",
-    "!sched",
-    "/scan",
-    "!scan",
-    "/projects",
-    "!projects",
-    "/marketing",
-    "!marketing",
-)
-
-
-def _strip_prefix(msg: str) -> str:
-    """Remove leading / or ! from a command message."""
-    msg = msg.strip()
-    if msg and msg[0] in "/!":
-        msg = msg[1:]
-    return msg
-
-
-def _extract_marketing_command(msg: str) -> dict | None:
-    """Parse marketing commands. Returns dict with verb, subcmd, args or None."""
-    stripped = msg.strip()
-    lower = stripped.lower()
-
-    for prefix in _MARKETING_PREFIXES:
-        if lower.startswith(prefix):
-            rest = stripped[len(prefix) :].strip()
-            verb = prefix.lstrip("/!")
-            if verb == "marketing":
-                return {"verb": "sched", "subcmd": "run", "args": "morning_scan"}
-            if not rest:
-                return {"verb": verb, "subcmd": "list", "args": ""}
-            # Parse subcommand
-            parts = rest.split(None, 1)
-            subcmd = parts[0].lower()
-            args = parts[1] if len(parts) > 1 else ""
-            return {"verb": verb, "subcmd": subcmd, "args": args}
-
-    return None
-
-
-async def _dispatch_marketing_command(
-    cmd: dict, is_stream: bool
-) -> JSONResponse | StreamingResponse:
-    """Route parsed marketing commands to handlers."""
-    verb = cmd["verb"]
-    subcmd = cmd["subcmd"]
-    args = cmd["args"]
-
-    try:
-        if verb == "sched":
-            text = await _handle_sched_command(subcmd, args)
-        elif verb == "scan":
-            text = await _handle_scan_command(subcmd, args)
-        elif verb == "projects":
-            text = await _handle_projects_command(subcmd, args)
-        else:
-            text = f"Unknown command: {verb}"
-    except Exception as exc:
-        text = f"Error: {exc}"
-
-    resp = _synthetic_response(text)
-    if is_stream:
-        return _wrap_json_as_sse(resp)
-    return resp
-
-
-async def _handle_sched_command(subcmd: str, args: str) -> str:
-    """Handle /sched subcommands."""
-    from app import brain_db
-
-    if subcmd == "list":
-        scheds = brain_db.list_schedules()
-        if not scheds:
-            return 'No schedules configured. Use /sched add <name> cron "<expr>" -- <generator>'
-        lines = ["Scheduled Jobs:\n"]
-        for s in scheds:
-            status = "PAUSED" if s.get("paused") else "ACTIVE"
-            last = s.get("last_status", "never")
-            lines.append(
-                f"  [{status}] {s['name']} ({s['id']})\n"
-                f"    cron: {s['cron']} | kind: {s['kind']}\n"
-                f"    last: {last or 'never'}"
-            )
-        lines.append("\n/sched show|pause|resume|rm|run <id|name>")
-        return "\n".join(lines)
-
-    if subcmd in ("show", "info"):
-        sched = brain_db.get_schedule(args.strip())
-        if not sched:
-            return f"Schedule not found: {args}"
-        return (
-            f"Schedule: {sched['name']} ({sched['id']})\n"
-            f"  Kind: {sched['kind']}\n"
-            f"  Cron: {sched['cron']}\n"
-            f"  Kwargs: {sched.get('kwargs', '{}')}\n"
-            f"  Paused: {bool(sched.get('paused'))}\n"
-            f"  Last run: {sched.get('last_run', 'never')}\n"
-            f"  Last status: {sched.get('last_status', 'never')}"
-        )
-
-    if subcmd == "add":
-        import shlex
-
-        try:
-            parts = shlex.split(args, posix=True)
-        except ValueError:
-            return 'Parse error. Usage: /sched add <name> cron "<expr>" -- <generator>'
-
-        if "--" in parts:
-            split_idx = parts.index("--")
-            before_dash = parts[:split_idx]
-            after_dash = parts[1 + split_idx :]
-        else:
-            before_dash = parts
-            after_dash = []
-
-        if len(before_dash) < 3:
-            return 'Usage: /sched add <name> cron "<expr>" -- <generator>'
-
-        name = before_dash[0]
-        cron_expr = " ".join(before_dash[2:])
-        kind = after_dash[0] if after_dash else "custom_scan"
-
-        from generators import GENERATORS
-
-        if kind not in GENERATORS:
-            return (
-                f"Unknown generator: {kind}. Available: {', '.join(GENERATORS.keys())}"
-            )
-
-        from scheduler import add_schedule
-        import hashlib
-
-        sched_id = hashlib.md5(name.encode()).hexdigest()[:8]
-
-        await add_schedule(
-            None,
-            brain_db,
-            sched_id,
-            name,
-            kind,
-            cron_expr,
-            {"topic": " ".join(after_dash[1:])} if after_dash[1:] else {},
-        )
-        return (
-            f"Schedule added: {name} ({sched_id})\n  cron: {cron_expr}\n  kind: {kind}"
-        )
-
-    if subcmd in ("pause",):
-        sched = brain_db.get_schedule(args.strip())
-        if not sched:
-            return f"Schedule not found: {args}"
-        brain_db.set_schedule_paused(sched["id"], True)
-        return f"Paused: {sched['name']} ({sched['id']})"
-
-    if subcmd in ("resume",):
-        sched = brain_db.get_schedule(args.strip())
-        if not sched:
-            return f"Schedule not found: {args}"
-        brain_db.set_schedule_paused(sched["id"], False)
-        return f"Resumed: {sched['name']} ({sched['id']})"
-
-    if subcmd in ("rm", "remove", "delete"):
-        from scheduler import remove_schedule
-
-        removed = await remove_schedule(None, brain_db, args.strip())
-        if not removed:
-            return f"Schedule not found: {args}"
-        return f"Removed: {args}"
-
-    if subcmd == "run":
-        from scheduler import run_schedule_now
-
-        try:
-            result = await run_schedule_now(None, brain_db, args.strip())
-            return f"Ran schedule: {result.get('schedule_id', args)} — {result.get('status', 'unknown')}"
-        except ValueError as e:
-            return str(e)
-
-    return (
-        "Usage:\n"
-        "  /sched list [--paused]\n"
-        "  /sched show <id|name>\n"
-        '  /sched add <name> cron "<expr>" -- <generator>\n'
-        "  /sched pause <id|name>\n"
-        "  /sched resume <id|name>\n"
-        "  /sched rm <id|name>\n"
-        "  /sched run <id|name>"
-    )
-
-
-async def _handle_scan_command(subcmd: str, args: str) -> str:
-    """Handle /scan subcommands."""
-    from app import brain_db
-
-    if subcmd == "reddit":
-        # /scan reddit <topic> [--subs ...] [--project <slug>] [--since 7d]
-        topic, subreddits, project_slug, since = _parse_scan_args(args)
-        if not topic:
-            return "Usage: /scan reddit <topic> [--subs sub1,sub2] [--project <slug>]"
-
-        if not subreddits and project_slug:
-            project = brain_db.get_project(project_slug)
-            if project:
-                import json
-
-                subreddits = json.loads(project.get("subreddits", "[]"))
-
-        if not subreddits:
-            subreddits = ["ClaudeAI", "LocalLLaMA", "SideProject"]
-
-        from reddit_search import search_subreddits
-
-        results = await search_subreddits(
-            topic, subreddits, since=since, limit_per_sub=10
-        )
-
-        if not results:
-            return f"No Reddit results for '{topic}' in {subreddits}"
-
-        lines = [f"Reddit scan: {topic} ({len(results)} results)\n"]
-        for i, r in enumerate(results[:10], 1):
-            lines.append(
-                f"{i}. {r.title}\n"
-                f"   r/{r.subreddit} | {r.score}pts | {r.comments} comments\n"
-                f"   {r.url}"
-            )
-            if r.snippet:
-                lines.append(f"   {r.snippet[:120]}")
-
-        if len(results) > 10:
-            lines.append(f"\n... and {len(results) - 10} more")
-
-        return "\n".join(lines)
-
-    if subcmd == "github":
-        # /scan github <topic> [--kind repos|issues] [--stars 5]
-        parts = args.split()
-        topic = parts[0] if parts else ""
-        kind = "repos"
-        min_stars = 0
-
-        for i, p in enumerate(parts):
-            if p == "--kind" and i + 1 < len(parts):
-                kind = parts[i + 1]
-            elif p == "--stars" and i + 1 < len(parts):
-                try:
-                    min_stars = int(parts[i + 1])
-                except ValueError:
-                    pass
-
-        if not topic:
-            return "Usage: /scan github <topic> [--kind repos|issues] [--stars 5]"
-
-        if kind == "issues":
-            from github_search import search_issues
-
-            results = await search_issues(topic)
-        else:
-            from github_search import search_repos
-
-            results = await search_repos(topic, min_stars=min_stars)
-
-        if not results:
-            return f"No GitHub results for '{topic}'"
-
-        lines = [f"GitHub scan ({kind}): {topic} ({len(results)} results)\n"]
-        for i, r in enumerate(results[:10], 1):
-            if hasattr(r, "full_name"):
-                lines.append(
-                    f"{i}. {r.full_name} ({r.stars}*)\n"
-                    f"   {r.description or 'No description'}\n"
-                    f"   {r.url}"
-                )
-            else:
-                lines.append(f"{i}. {r.title}\n   {r.url}")
-
-        return "\n".join(lines)
-
-    if subcmd == "web":
-        if not args:
-            return "Usage: /scan web <prompt>"
-        result = await _llm_call(args, max_tokens=1000, web_search=True)
-        return result or "No results from web search."
-
-    if subcmd == "github" and args.lower().startswith("traffic"):
-        parts = args.split()
-        slug = parts[1] if len(parts) > 1 else ""
-        if not slug:
-            projects = brain_db.list_projects()
-            if not projects:
-                return "No projects tracked. Use /projects add first."
-            lines = []
-            for p in projects:
-                from github_search import get_self_traffic
-
-                traffic = await get_self_traffic(p["owner"], p["repo"])
-                if traffic:
-                    lines.append(
-                        f"{p['owner']}/{p['repo']}\n"
-                        f"  Views: {traffic.views_count} ({traffic.views_uniques} unique)\n"
-                        f"  Clones: {traffic.clones_count} ({traffic.clones_uniques} unique)"
-                    )
-                else:
-                    lines.append(
-                        f"{p['owner']}/{p['repo']}: traffic unavailable (needs GITHUB_PAT)"
-                    )
-            return "\n\n".join(lines) if lines else "No traffic data available."
-
-        project = brain_db.get_project(slug)
-        if not project:
-            return f"Project not found: {slug}"
-        from github_search import get_self_traffic
-
-        traffic = await get_self_traffic(project["owner"], project["repo"])
-        if not traffic:
-            return "Traffic unavailable — needs GITHUB_PAT with repo scope"
-        return (
-            f"Traffic for {project['owner']}/{project['repo']} (14 days)\n"
-            f"  Views: {traffic.views_count} ({traffic.views_uniques} unique)\n"
-            f"  Clones: {traffic.clones_count} ({traffic.clones_uniques} unique)"
-        )
-
-    return (
-        "Usage:\n"
-        "  /scan reddit <topic> [--subs sub1,sub2] [--project <slug>]\n"
-        "  /scan github <topic> [--kind repos|issues] [--stars 5]\n"
-        "  /scan github traffic [project-slug]\n"
-        "  /scan web <prompt>"
-    )
-
-
-def _parse_scan_args(args: str) -> tuple[str, list[str], str | None, str]:
-    """Parse scan arguments, extracting topic, subreddits, project, since."""
-    parts = args.split()
-    topic_parts: list[str] = []
-    subreddits: list[str] = []
-    project_slug = None
-    since = "7d"
-    i = 0
-    while i < len(parts):
-        if parts[i] == "--subs" and i + 1 < len(parts):
-            subreddits = parts[i + 1].split(",")
-            i += 2
-        elif parts[i] == "--project" and i + 1 < len(parts):
-            project_slug = parts[i + 1]
-            i += 2
-        elif parts[i] == "--since" and i + 1 < len(parts):
-            since = parts[i + 1]
-            i += 2
-        else:
-            topic_parts.append(parts[i])
-            i += 1
-    return " ".join(topic_parts), subreddits, project_slug, since
-
-
-async def _handle_projects_command(subcmd: str, args: str) -> str:
-    """Handle /projects subcommands."""
-    from app import brain_db
-
-    if subcmd in ("list", ""):
-        projects = brain_db.list_projects()
-        if not projects:
-            return "No projects tracked. Use /projects add <slug> <owner>/<repo>"
-        lines = ["Tracked Projects:\n"]
-        for p in projects:
-            import json
-
-            subs = json.loads(p.get("subreddits", "[]"))
-            lines.append(
-                f"  {p['slug']} — {p['owner']}/{p['repo']}\n"
-                f"    subs: {', '.join(subs[:5]) or 'none'}\n"
-                f"    posture: {p.get('posture', 'none') or 'none'}"
-            )
-        return "\n".join(lines)
-
-    if subcmd == "show":
-        slug = args.strip()
-        project = brain_db.get_project(slug)
-        if not project:
-            return f"Project not found: {slug}"
-        import json
-
-        return (
-            f"Project: {project['slug']}\n"
-            f"  Repo: {project['owner']}/{project['repo']}\n"
-            f"  Topics: {json.loads(project.get('topics', '[]'))}\n"
-            f"  Subreddits: {json.loads(project.get('subreddits', '[]'))}\n"
-            f"  Search terms: {json.loads(project.get('search_terms', '[]'))}\n"
-            f"  Posture: {project.get('posture', 'none')}"
-        )
-
-    if subcmd == "add":
-        import shlex
-
-        try:
-            parts = shlex.split(args, posix=True)
-        except ValueError:
-            return "Parse error. Usage: /projects add <slug> <owner>/<repo> [--topics ...] [--subs ...]"
-
-        if len(parts) < 2:
-            return 'Usage: /projects add <slug> <owner>/<repo> [--topics ...] [--subs ...] [--posture "..."]'
-
-        slug = parts[0]
-        owner_repo = parts[1]
-        if "/" not in owner_repo:
-            return "Format: owner/repo"
-        owner, repo = owner_repo.split("/", 1)
-
-        topics: list[str] = []
-        subs: list[str] = []
-        posture = ""
-        i = 2
-        while i < len(parts):
-            if parts[i] == "--topics" and i + 1 < len(parts):
-                topics = parts[i + 1].split(",")
-                i += 2
-            elif parts[i] == "--subs" and i + 1 < len(parts):
-                subs = parts[i + 1].split(",")
-                i += 2
-            elif parts[i] == "--posture" and i + 1 < len(parts):
-                posture = parts[i + 1]
-                i += 2
-            else:
-                i += 1
-
-        brain_db.upsert_project(slug, owner, repo, topics, subs, posture=posture)
-        return f"Project added: {slug} ({owner}/{repo})"
-
-    if subcmd in ("rm", "remove"):
-        slug = args.strip()
-        if brain_db.delete_project(slug):
-            return f"Removed project: {slug}"
-        return f"Project not found: {slug}"
-
-    return (
-        "Usage:\n"
-        "  /projects list\n"
-        "  /projects show <slug>\n"
-        '  /projects add <slug> <owner>/<repo> [--topics ...] [--subs ...] [--posture "..."]\n'
-        "  /projects rm <slug>"
-    )
-
-
-def _extract_task_command(msg: str) -> dict | None:
-    """Parse task commands. Returns dict with 'type' and relevant fields, or None."""
-    stripped = msg.strip()
-    lower = stripped.lower()
-
-    # !tasks or /tasks → list
-    if lower in ("!tasks", "/tasks", "!task", "/task", "!task list", "/task list"):
-        return {"type": "list"}
-
-    # !task <action> <args>
-    for prefix in ("!task ", "/task "):
-        if lower.startswith(prefix):
-            rest = stripped[len(prefix) :].strip()
-            rest_lower = rest.lower()
-            # Check for sub-actions
-            for action in _TASK_ACTIONS:
-                if rest_lower.startswith(action):
-                    args = rest[len(action) :].strip()
-                    if action == "list":
-                        return {"type": "list"}
-                    if action == "tail":
-                        return {"type": "tail"}
-                    return {"type": "action", "action": action, "args": args}
-            # Default: create a new task
-            if rest:
-                return {"type": "create", "description": rest}
-            return {"type": "list"}
-
-    return None
-
-
-async def _dispatch_task_command(
-    cmd: dict, is_stream: bool
-) -> JSONResponse | StreamingResponse:
-    """Route parsed task commands to handlers."""
-    if cmd["type"] == "list":
-        return await _handle_tasks_list(is_stream)
-    elif cmd["type"] == "tail":
-        return await _handle_tasks_tail(is_stream)
-    elif cmd["type"] == "create":
-        return await _handle_task_command(cmd["description"], is_stream)
-    elif cmd["type"] == "action":
-        return await _handle_task_action(cmd["action"], cmd["args"], is_stream)
-    return _synthetic_response(
-        "Unknown task command. Try: !task <description> or !tasks"
-    )
-
-
-async def _handle_task_command(
-    description: str, is_stream: bool
-) -> JSONResponse | StreamingResponse:
-    """Enqueue a task via the internal API and return confirmation."""
-    from app import TaskCreate as TC
-    from app import create_task
-
-    try:
-        task = create_task(TC(description=description))
-        text = (
-            f"Task queued (#{task['id']})\n"
-            f"  {task['description']}\n"
-            f"  Priority: {task['priority']} | Status: {task['status']}\n"
-            f"Max Ops will pick this up on the next heartbeat cycle."
-        )
-    except Exception as exc:
-        text = f"Failed to queue task: {exc}"
-
-    resp = _synthetic_response(text)
-    if is_stream:
-        return _wrap_json_as_sse(resp)
-    return resp
-
-
-async def _handle_tasks_list(is_stream: bool) -> JSONResponse | StreamingResponse:
-    """Show the current task queue."""
-    from app import list_tasks
-
-    data = list_tasks()
-    tasks = data["tasks"]
-    if not tasks:
-        text = "Task queue is empty. Send !task <description> to add one."
-    else:
-        pending = [t for t in tasks if t["status"] == "pending"]
-        active = [t for t in tasks if t["status"] == "active"]
-        done = [t for t in tasks if t["status"] in ("completed", "failed")]
-
-        lines = [
-            f"Task Queue ({len(pending)} pending, {len(active)} active, {len(done)} done)\n"
-        ]
-
-        if active:
-            lines.append("NOW PROCESSING:")
-            for t in active:
-                src = "ALEX" if t.get("source") == "user" else "SYS"
-                lines.append(
-                    f"  [{src}] #{t['id']} [P{t['priority']}] {t['description'][:55]}"
-                )
-            lines.append("")
-
-        if pending:
-            lines.append("QUEUED:")
-            for t in pending:
-                src = "ALEX" if t.get("source") == "user" else "SYS"
-                lines.append(
-                    f"  [{src}] #{t['id']} [P{t['priority']}] {t['description'][:55]}"
-                )
-            lines.append("")
-
-        if done:
-            lines.append("RECENT:")
-            for t in done[-3:]:  # Show last 3
-                marker = "✅" if t["status"] == "completed" else "❌"
-                lines.append(f"  {marker} #{t['id']} {t['description'][:40]}")
-                if t["result"]:
-                    lines.append(f"     → {t['result'][:80]}")
-
-        lines.append(
-            "\nCommands: !task <desc> | !task cancel <id> | !task priority <id> <1-5>"
-        )
-        text = "\n".join(lines)
-
-    resp = _synthetic_response(text)
-    if is_stream:
-        return _wrap_json_as_sse(resp)
-    return resp
-
-
-async def _handle_tasks_tail(is_stream: bool) -> JSONResponse | StreamingResponse:
-    """Show recently completed/failed tasks with results."""
-    from app import list_tasks
-
-    data = list_tasks()
-    done = [t for t in data["tasks"] if t["status"] in ("completed", "failed")]
-    if not done:
-        text = "No completed tasks yet."
-    else:
-        lines = [f"Recent Tasks ({len(done)} completed)\n"]
-        for t in done[-5:]:  # Last 5
-            marker = "✅" if t["status"] == "completed" else "❌"
-            lines.append(f"{marker} #{t['id']} — {t['description'][:50]}")
-            if t["result"]:
-                lines.append(f"   {t['result'][:120]}")
-            if t["completed_at"]:
-                lines.append(f"   Completed: {t['completed_at'][:19]}")
-            lines.append("")
-        text = "\n".join(lines)
-
-    resp = _synthetic_response(text)
-    if is_stream:
-        return _wrap_json_as_sse(resp)
-    return resp
-
-
-async def _handle_task_action(
-    action: str, args: str, is_stream: bool
-) -> JSONResponse | StreamingResponse:
-    """Handle task management subcommands: cancel, priority."""
-    from app import brain_db
-
-    parts = args.strip().split(None, 1)
-    task_id = parts[0] if parts else ""
-    task = brain_db.get_task(task_id)
-
-    if not task:
-        text = f"Task #{task_id} not found."
-    elif action == "cancel":
-        if task["status"] in ("completed", "failed"):
-            text = f"Task #{task_id} already {task['status']}."
-        else:
-            brain_db.cancel_task(task_id)
-            text = f"Task #{task_id} cancelled."
-    elif action == "priority":
-        new_p = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
-        if new_p is None or not 1 <= new_p <= 5:
-            text = f"Usage: !task priority {task_id} <1-5>"
-        else:
-            brain_db.update_priority(task_id, new_p)
-            text = f"Task #{task_id} priority set to {new_p}."
-    else:
-        text = f"Unknown action: {action}. Try: cancel, priority"
-
-    resp = _synthetic_response(text)
-    if is_stream:
-        return _wrap_json_as_sse(resp)
-    return resp
-
-
-# ─── Heartbeat Interceptor ───────────────────────────────────────
-
-
-_HEARTBEAT_MARKER = "read heartbeat.md"
-
-# Track when proactive checks last fired (survives across heartbeat cycles,
-# resets on container restart which is fine — fresh start, fresh initiative).
-_proactive_state: dict[str, float] = {}
-
-# How often each proactive check can fire (seconds).
-_PROACTIVE_INTERVALS = {
-    "stale_tasks": 1800,  # 30 min — nudge about tasks stuck pending
-    "llm_thinking": 900,  # 15 min — balance responsiveness vs churn
-    "pending_reminder": 3600,  # 1 hr — remind Alex about P3+ tasks needing review
-}
-
-# Path to soul.md inside the container (mounted read-only).
-_SOUL_MD_PATH = Path(__file__).parent / "soul.md"
-
-
-def _load_soul() -> str:
-    """Read soul.md for persona context. Returns empty string if missing."""
-    try:
-        return _SOUL_MD_PATH.read_text().strip()
-    except FileNotFoundError:
-        return ""
-
-
-# Section headers that hold pure character-backstory narrative. When a
-# prompt routes to the OpenRouter `:online` search tier, Exa runs web
-# search on the prompt — these sections contain "John-117 / Master Chief
-# / Spartan-II / Cortana / MJOLNIR / Halo" tokens that pull Halopedia and
-# Master-Chief-Wikipedia citations to the top, polluting research output.
-# Operational sections (Marketing Mode, Research Mode, What You Can Do,
-# etc.) are kept so the model still understands its job.
-_BACKSTORY_HEADINGS = ("## Who You Are", "## Your Character")
-
-
-def _strip_persona_backstory(soul: str) -> str:
-    """Remove Halo character-backstory sections from soul.md text.
-
-    A section runs from its `## Heading` line to (but not including) the
-    next `## ` heading or end-of-file. Only the sections named in
-    `_BACKSTORY_HEADINGS` get stripped; the rest is returned intact.
-
-    Empty or whitespace-only input returns "" so callers can use the
-    result directly in prompt templates without an extra falsy check.
-    """
-    if not soul or not soul.strip():
-        return ""
-    lines = soul.splitlines()
-    out: list[str] = []
-    skipping = False
-    for line in lines:
-        if line.startswith("## "):
-            skipping = line.strip() in _BACKSTORY_HEADINGS
-            if skipping:
-                continue
-        if skipping:
-            continue
-        out.append(line)
-    return "\n".join(out).strip()
-
-
-_TASK_CATEGORIES = [
-    "client outreach or relationship building",
-    "financial review (spending, billing, ROI)",
-    "learning or skill development for Alex",
-    "infrastructure optimization or cost reduction",
-    "documentation or knowledge capture",
-    "personal wellness or family reminder",
-    "business development or lead generation",
-    "tooling improvement or workflow automation",
-    "security audit or compliance check",
-    "research into new technologies or services",
-]
-
-# Track which category was last used to rotate through them.
-_last_category_index = 0
-
-
-def _build_thinking_prompt() -> str:
-    """Build the LLM thinking prompt with recent task history and category rotation."""
-    global _last_category_index
-    soul = _load_soul()
-
-    # Gather recent tasks and brain state for grounding
-    recent_descriptions = []
-    brain_summary = "Brain is empty — no entities recorded yet."
-    try:
-        from app import brain_db
-
-        all_tasks = brain_db.list_tasks()
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-        for t in all_tasks:
-            try:
-                created = datetime.fromisoformat(t["created_at"])
-                if created > cutoff:
-                    recent_descriptions.append(t["description"])
-            except (ValueError, KeyError):
-                continue
-
-        pages = brain_db.list_pages(limit=20)
-        if pages:
-            by_type: dict[str, list[str]] = {}
-            for p in pages:
-                by_type.setdefault(p["page_type"], []).append(p["slug"])
-            parts = [f"{k}: {', '.join(v)}" for k, v in by_type.items()]
-            brain_summary = "Known entities in brain:\n  " + "\n  ".join(parts)
-    except Exception:
-        pass
-
-    recent_block = ""
-    if recent_descriptions:
-        recent_list = "\n".join(f"  - {d}" for d in recent_descriptions[-10:])
-        recent_block = (
-            f"\n\nTasks already created in the last 24 hours (DO NOT repeat or suggest anything similar):\n"
-            f"{recent_list}\n"
-        )
-
-    # Rotate through categories
-    category = _TASK_CATEGORIES[_last_category_index % len(_TASK_CATEGORIES)]
-    _last_category_index += 1
-
-    if soul:
-        return (
-            f"{soul}\n\n"
-            "---\n"
-            f"Focus area for this cycle: **{category}**\n"
-            f"\n{brain_summary}\n"
-            f"{recent_block}\n"
-            "RULES:\n"
-            "- Only reference clients, people, or systems that exist in the brain above.\n"
-            "- If the brain is empty, suggest tasks that BUILD knowledge: "
-            "record a client, document a system, capture a decision.\n"
-            "- Do NOT invent client names, people, or events.\n"
-            "- Do NOT suggest sending emails or making calls — suggest PREPARING drafts or RESEARCHING info.\n"
-            "- Tasks should be completable by an AI with access to web search and the brain API.\n\n"
-            "Suggest exactly ONE actionable task. "
-            "Respond with ONLY the task description (one sentence, no explanation, no quotes)."
-        )
-    return (
-        f"You are Max, an executive assistant. Focus area: {category}. "
-        "Suggest exactly ONE specific, actionable task that an AI can complete. "
-        "Respond with ONLY the task description (one sentence)."
-    )
-
-
-def _is_heartbeat(msg: str) -> bool:
-    """Detect heartbeat messages from max-ops agent."""
-    return msg.lower().strip().startswith(_HEARTBEAT_MARKER)
-
-
-def _proactive_ready(check_name: str) -> bool:
-    """Return True if enough time has passed since the last run of this check."""
-    interval = _PROACTIVE_INTERVALS.get(check_name, 3600)
-    last_run = _proactive_state.get(check_name, 0.0)
-    return (time.monotonic() - last_run) >= interval
-
-
-def _proactive_mark(check_name: str) -> None:
-    """Record that a proactive check just ran."""
-    _proactive_state[check_name] = time.monotonic()
-
-
-_STOP_WORDS = frozenset(
-    {
-        "a",
-        "an",
-        "and",
-        "are",
-        "as",
-        "at",
-        "be",
-        "by",
-        "for",
-        "from",
-        "has",
-        "he",
-        "in",
-        "is",
-        "it",
-        "its",
-        "of",
-        "on",
-        "or",
-        "that",
-        "the",
-        "to",
-        "was",
-        "were",
-        "will",
-        "with",
-        "this",
-        "but",
-        "they",
-        "have",
-        "had",
-        "not",
-        "all",
-        "can",
-        "her",
-        "if",
-        "our",
-        "out",
-        "so",
-        "up",
-        "what",
-        "when",
-        "which",
-        "who",
-        "do",
-        "does",
-        "any",
-        "should",
-        "ensure",
-        "check",
-        "review",
-        "before",
-        "after",
-        "current",
-    }
-)
-
-
-def _extract_keywords(text: str) -> set[str]:
-    """Extract meaningful lowercase words (3+ chars, no stop words)."""
-    words = re.findall(r"[a-z]+", text.lower())
-    return {w for w in words if len(w) >= 3 and w not in _STOP_WORDS}
-
-
-def _has_recent_task(queue: list[dict], keyword: str, hours: int = 24) -> bool:
-    """Check if a semantically similar task exists in the last N hours.
-
-    Uses keyword overlap: if >=2 meaningful words overlap between the new
-    suggestion and an existing task, it's considered a duplicate.  The
-    threshold scales with the smaller keyword set (at least 30% overlap)
-    so short descriptions aren't unfairly penalised.
-    """
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    new_keywords = _extract_keywords(keyword)
-    if not new_keywords:
-        return False
-    for t in queue:
-        try:
-            created = datetime.fromisoformat(t["created_at"])
-            if created <= cutoff:
-                continue
-        except (ValueError, KeyError):
-            continue
-        existing_keywords = _extract_keywords(t["description"])
-        overlap = new_keywords & existing_keywords
-        smaller = min(len(new_keywords), len(existing_keywords)) or 1
-        if len(overlap) >= max(2, int(smaller * 0.3)):
-            return True
-    return False
+        out.append({"name": name, "status": marker, "description": tier["description"]})
+    return out
 
 
 async def _llm_call(
@@ -1743,36 +869,81 @@ async def _llm_call(
     Z.AI's web_search MCP tool is paywalled to a separate resource
     package the GLM Coding Plan does not unlock, so it's bypassed.
     """
+    _last_call_failures.clear()
     if web_search:
-        return await _llm_call_search(prompt, max_tokens)
+        text = await _llm_call_search(prompt, max_tokens)
+        if text:
+            _last_call_failures.clear()
+        return text
+
+    # The tier being tried, so the overall deadline can charge it.
+    inflight: list[str] = []
 
     async def _try_tiers() -> str | None:
+        deadline_at = time.monotonic() + LLM_CALL_DEADLINE
         for tier in CONFIG["tiers"]:
-            if _circuit_open(tier["name"]):
+            tier_name = tier["name"]
+            # The paid chat tier is never tried here: it is opt-in per chat
+            # message (!paid / !claude). web_search=True does spend paid
+            # :online credit, behind the floor in _llm_call_search.
+            if tier.get("paid"):
+                _last_call_failures[tier_name] = "not tried (paid is opt-in)"
                 continue
             provider = tier["provider"]
-
-            provider_config = CONFIG["providers"][provider]
-            api_key = os.getenv(provider_config["env_key"], "")
-            if not api_key:
+            if provider not in PROVIDER_URLS:
+                logger.warning(
+                    "background LLM: skip %s: provider %r has no URL configured",
+                    tier_name,
+                    provider,
+                )
                 continue
 
-            body: dict = {
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": max_tokens,
-                "temperature": 0.7,
-            }
+            if provider == "openrouter":
+                remaining = await _check_openrouter_balance()
+                # Same rule as the racing path: a zero/negative balance
+                # 402s on every OpenRouter model — go straight to the next
+                # tier instead of burning a doomed provider attempt.
+                if remaining is not None and remaining <= 0:
+                    logger.info(
+                        "background LLM: skip %s: balance %s",
+                        tier_name,
+                        describe_balance(),
+                    )
+                    _last_call_failures[tier_name] = (
+                        f"out of credit (balance {describe_balance()})"
+                    )
+                    continue
 
-            try:
-                resp = await _call_provider(provider, tier["models"], body, api_key)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    msg = data.get("choices", [{}])[0].get("message", {})
-                    text = (msg.get("content") or "").strip()
-                    if text:
-                        return text
-            except Exception:
-                pass
+            env_key = CONFIG["providers"][provider]["env_key"]
+            if not os.getenv(env_key, ""):
+                logger.info(
+                    "background LLM: skip %s: %s is not set", tier_name, env_key
+                )
+                _last_call_failures[tier_name] = f"{env_key} not set"
+                continue
+            # Last gate, so a claimed half-open probe is always really used.
+            if _circuit_open(tier_name):
+                logger.info("background LLM: skip %s: breaker open", tier_name)
+                cause = _tier_failure_reason.get(tier_name)
+                _last_call_failures[tier_name] = (
+                    f"{cause} (breaker open)" if cause else "breaker open"
+                )
+                continue
+
+            # If the overall deadline fires first instead, the handler below
+            # charges the in-flight tier, so a hang always reaches the breaker.
+            budget = min(BACKGROUND_ATTEMPT_TIMEOUT, deadline_at - time.monotonic())
+            if budget <= 0:
+                logger.warning("background LLM: deadline reached before %s", tier_name)
+                return None
+            inflight[:] = [tier_name]
+            text = await _background_attempt(
+                tier_name, provider, tier["models"], prompt, max_tokens, budget
+            )
+            inflight.clear()
+            if text:
+                _last_call_failures.clear()
+                return text
         return None
 
     # Cap total time so a hung provider can't compound across tiers and block
@@ -1780,9 +951,118 @@ async def _llm_call(
     # callers (_llm_work_task / _llm_suggest_task) degrade gracefully.
     try:
         return await asyncio.wait_for(_try_tiers(), timeout=LLM_CALL_DEADLINE)
-    except asyncio.TimeoutError:
-        logger.warning("LLM call exceeded %ss deadline across tiers", LLM_CALL_DEADLINE)
+    except TimeoutError:
+        logger.warning(
+            "background LLM: exceeded %ss deadline across tiers (in flight: %s)",
+            LLM_CALL_DEADLINE,
+            inflight or "none",
+        )
+        for tier_name in inflight:
+            _record_failure(tier_name)
+            _note_failure(
+                tier_name, f"no reply within the {LLM_CALL_DEADLINE}s deadline"
+            )
         return None
+
+
+def _prompt_body(prompt: str, max_tokens: int) -> dict:
+    """Chat body for a single-prompt background call."""
+    return {
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": 0.7,
+    }
+
+
+async def _background_attempt(
+    tier_name: str,
+    provider: str,
+    models: list[str],
+    prompt: str,
+    max_tokens: int,
+    timeout: float,
+    citations: bool = False,
+) -> str | None:
+    """One background provider call: send, parse, log and update the breaker.
+
+    Returns the reply text, or None after logging why (tier, HTTP status and
+    the first 200 chars of the body). Every failure counts against the
+    tier's breaker; a timeout is a failure too.
+    """
+    api_key = os.getenv(CONFIG["providers"][provider]["env_key"], "")
+    body = _prompt_body(prompt, max_tokens)
+    try:
+        resp = await asyncio.wait_for(
+            _call_provider(provider, models, body, api_key), timeout=timeout
+        )
+    except TimeoutError:
+        logger.warning("background LLM: %s: no reply within %.0fs", tier_name, timeout)
+        _record_failure(tier_name)
+        _note_failure(tier_name, f"no reply within {timeout:.0f}s")
+        return None
+    except Exception as exc:
+        logger.warning("background LLM: %s: %s: %s", tier_name, type(exc).__name__, exc)
+        _record_failure(tier_name)
+        _note_failure(tier_name, f"connection failed ({type(exc).__name__})")
+        return None
+
+    if resp.status_code != 200:
+        _note_failure(tier_name, _classify_failure(resp))
+        if _is_rate_limited(resp):
+            _record_rate_limit(tier_name)
+        else:
+            _record_failure(tier_name)
+        logger.warning(
+            "background LLM: %s: HTTP %s: %s",
+            tier_name,
+            resp.status_code,
+            resp.text[:200],
+        )
+        return None
+    try:
+        msg = resp.json()["choices"][0]["message"]
+        text = (msg.get("content") or "").strip()
+        if citations:
+            refs = _extract_openrouter_citations(msg.get("annotations") or [])
+            if refs:
+                text = f"{text}\n\n{refs}" if text else refs
+    except (ValueError, LookupError, TypeError, AttributeError) as exc:
+        logger.warning(
+            "background LLM: %s: malformed reply (%s): %s",
+            tier_name,
+            type(exc).__name__,
+            resp.text[:200],
+        )
+        _record_failure(tier_name)
+        _note_failure(tier_name, "malformed reply")
+        return None
+    if not text:
+        logger.warning(
+            "background LLM: %s: empty reply: %s", tier_name, resp.text[:200]
+        )
+        _record_failure(tier_name)
+        _note_failure(tier_name, "empty reply")
+        return None
+    _record_success(tier_name)
+    _tier_failure_reason.pop(tier_name, None)
+    return text
+
+
+async def search_allowed() -> bool:
+    """False when the balance floor holds the paid search tier.
+
+    The search tier is denied while the OpenRouter balance is unknown or at
+    or below OPENROUTER_BALANCE_FLOOR. Callers use this to tell that denial
+    from an outage: a denied search is policy, not a provider failure. A
+    missing search config or key is not the floor, so it reports allowed.
+    """
+    search_cfg = CONFIG.get("search")
+    if not search_cfg or search_cfg["provider"] != "openrouter":
+        return True
+    if not os.getenv(CONFIG["providers"]["openrouter"]["env_key"], ""):
+        return True
+    remaining = await _check_openrouter_balance()
+    return remaining is not None and remaining > OPENROUTER_BALANCE_FLOOR
 
 
 async def _llm_call_search(prompt: str, max_tokens: int) -> str | None:
@@ -1792,88 +1072,70 @@ async def _llm_call_search(prompt: str, max_tokens: int) -> str | None:
     Exa-powered web search before generation and attach url_citation
     annotations to the response. We extract those citations and append them
     to the answer text so Telegram messages include real source links.
+
+    `:online` models are paid, so this obeys the same balance floor as
+    !paid (an unknown balance denies) and has its own breaker (SEARCH_TIER).
     """
     search_cfg = CONFIG.get("search")
     if not search_cfg:
         return None
 
+    # The balance lookup and the attempt share one LLM_CALL_DEADLINE.
+    deadline_at = time.monotonic() + LLM_CALL_DEADLINE
     provider = search_cfg["provider"]
-    models = search_cfg["models"]
-    provider_config = CONFIG["providers"][provider]
-    api_key = os.getenv(provider_config["env_key"], "")
-    if not api_key:
+    env_key = CONFIG["providers"][provider]["env_key"]
+    if not os.getenv(env_key, ""):
+        logger.info("background search: skip: %s is not set", env_key)
+        _last_call_failures[SEARCH_TIER] = f"{env_key} not set"
         return None
-
-    body = {
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_tokens,
-        "temperature": 0.7,
-    }
-    try:
-        resp = await _call_provider(provider, models, body, api_key)
-        if resp.status_code == 200:
-            data = resp.json()
-            msg = data.get("choices", [{}])[0].get("message", {})
-            text = (msg.get("content") or "").strip()
-            citations = _extract_openrouter_citations(msg.get("annotations") or [])
-            if citations:
-                text = f"{text}\n\n{citations}" if text else citations
-            if text:
-                return text
-        else:
-            print(
-                f"[PROXY] search tier {provider} returned {resp.status_code}: "
-                f"{resp.text[:200]}",
-                flush=True,
-            )
-    except Exception as exc:
-        print(f"[PROXY] search tier exception: {type(exc).__name__}: {exc}", flush=True)
-    return None
-
-
-def _extract_web_citations(tool_calls: list[dict]) -> str:
-    """Pull URLs and titles from GLM web_search tool call results.
-
-    Retained for backwards compatibility with any direct GLM web_search
-    integration. The active search path now uses _extract_openrouter_citations.
-    """
-    refs: list[str] = []
-    for tc in tool_calls:
-        if tc.get("type") == "web_search":
-            results = tc.get("web_search", {}).get("search_result", [])
-            for i, hit in enumerate(results, 1):
-                title = hit.get("title", "")
-                link = hit.get("link", "")
-                content = hit.get("content", "")[:120]
-                if link:
-                    refs.append(f"{i}. [{title}]({link})\n   {content}")
-    return "\n".join(refs)
+    if not await search_allowed():
+        logger.warning(
+            "background search: skip: OpenRouter balance %s (floor $%.2f)",
+            describe_balance(),
+            OPENROUTER_BALANCE_FLOOR,
+        )
+        _last_call_failures[SEARCH_TIER] = (
+            f"held by the balance floor (balance {describe_balance()})"
+        )
+        return None
+    budget = deadline_at - time.monotonic()
+    if budget <= 0:
+        logger.warning("background search: deadline reached before the attempt")
+        return None
+    if _circuit_open(SEARCH_TIER):
+        logger.info("background search: skip: breaker open")
+        cause = _tier_failure_reason.get(SEARCH_TIER)
+        _last_call_failures[SEARCH_TIER] = (
+            f"{cause} (breaker open)" if cause else "breaker open"
+        )
+        return None
+    return await _background_attempt(
+        SEARCH_TIER,
+        provider,
+        search_cfg["models"],
+        prompt,
+        max_tokens,
+        budget,
+        citations=True,
+    )
 
 
-# Citation URL/title patterns that indicate Halo character-backstory
-# pages — Exa returns these when the persona name leaks into search
-# (and as a defense even after _strip_persona_backstory runs). Matched
-# against url + title joined with a space, case-insensitive.
-_PERSONA_CITATION_PATTERN = re.compile(
-    r"halopedia|"
-    r"wiki(?:pedia|/john-117|/master_chief|/spartan-?ii?|/cortana|/mjolnir)|"
-    r"shapes\.ai.*master.chief|"
-    r"halo[\s\-_]?(?:5|infinite|wars|reach)|"
-    r"\bunsc\b|\bspartan-?ii?\b",
-    re.IGNORECASE,
-)
+def _blocked_citation_patterns() -> list[re.Pattern[str]]:
+    """Compiled `assistant.search_hygiene.blocked_citations` regexes."""
+    patterns = tenant_profile.search_hygiene().get("blocked_citations") or []
+    return [re.compile(p, re.IGNORECASE) for p in patterns]
 
 
 def _is_persona_citation(url: str, title: str) -> bool:
-    """Return True when a citation URL/title points at Halo character lore.
+    """Return True when a citation URL/title matches the persona's blocked
+    citation patterns (e.g. lore pages for a fictional persona).
 
-    Belt-and-suspenders for _strip_persona_backstory: even if a future
-    soul.md edit leaks "John-117 / Master Chief" tokens past the
-    stripper, Exa-returned Halopedia results never reach the user's
-    Telegram message.
+    Belt-and-suspenders for _strip_persona_backstory: even if a soul.md
+    edit leaks persona names past the stripper, matching search results
+    never reach the operator's message.
     """
     haystack = f"{url} {title}"
-    return bool(_PERSONA_CITATION_PATTERN.search(haystack))
+    return any(p.search(haystack) for p in _blocked_citation_patterns())
 
 
 def _extract_openrouter_citations(annotations: list[dict]) -> str:
@@ -1881,12 +1143,11 @@ def _extract_openrouter_citations(annotations: list[dict]) -> str:
 
     OpenRouter's `:online` plugin returns citations on the message via:
         message.annotations[].type == "url_citation"
-        message.annotations[].url_citation = {url, title, content, start_index, end_index}
+        message.annotations[].url_citation = {url, title, content, "
+        start_index, end_index}
 
-    Halo character-backstory citations (Halopedia, Master Chief Wikipedia,
-    etc.) are filtered out — see _is_persona_citation. Format mirrors
-    _extract_web_citations so Telegram output stays consistent regardless
-    of which search backend produced the citations.
+    Citations matching the persona's blocked patterns are filtered out —
+    see _is_persona_citation.
     """
     refs: list[str] = []
     idx = 0
@@ -1906,460 +1167,77 @@ def _extract_openrouter_citations(annotations: list[dict]) -> str:
     return "\n".join(refs)
 
 
-async def _llm_suggest_task() -> str | None:
-    """Ask the LLM for one proactive task suggestion."""
-    text = await _llm_call(_build_thinking_prompt(), max_tokens=100)
-    if text:
-        text = text.strip('"')
-        if 10 <= len(text) <= 200 and "\n" not in text:
-            print(f"[PROXY] LLM suggested task: {text!r}", flush=True)
-            return text
-    return None
-
-
-async def _gather_system_state() -> str:
-    """Collect current system state for task context."""
-    from app import brain_db
-
-    # Tier status
-    tier_lines = []
-    for tier in CONFIG["tiers"]:
-        name = tier["name"]
-        status = (
-            "TRIPPED"
-            if _circuit_open(name)
-            else ("ACTIVE" if name == _last_tier_used else "ready")
-        )
-        tier_lines.append(f"  {name}: {status} — {tier['description']}")
-
-    # Balance
-    remaining = await _check_openrouter_balance()
-    balance = f"${remaining:.2f}" if remaining is not None else "not configured"
-
-    # Task queue summary
-    all_tasks = brain_db.list_tasks()
-    pending = sum(1 for t in all_tasks if t["status"] == "pending")
-    active = sum(1 for t in all_tasks if t["status"] == "active")
-    done = sum(1 for t in all_tasks if t["status"] in ("completed", "failed"))
-
-    return (
-        "CURRENT SYSTEM STATE:\n"
-        "Tiers:\n" + "\n".join(tier_lines) + "\n"
-        f"Balance: {balance} (floor: ${OPENROUTER_BALANCE_FLOOR:.2f})\n"
-        f"Last tier used: {_last_tier_used or 'none'}\n"
-        f"Task queue: {pending} pending, {active} active, {done} done"
-    )
-
-
-async def _build_work_prompt(task_description: str, web_search: bool = False) -> str:
-    """Build a prompt for the LLM to work on a specific task, with live system data.
-
-    When `web_search=True`, the prompt routes through OpenRouter `:online`
-    which runs Exa server-side search over the full prompt body. The Halo
-    character backstory in soul.md ("Master Chief", "Spartan-II",
-    "Cortana", "MJOLNIR") pulls Halopedia/Wikipedia character pages to
-    the top of Exa results, polluting the research output. Strip those
-    sections for search-tier routes; non-search routes keep the full
-    persona so John-117 stays in character for direct chat replies.
-    """
-    soul = _load_soul()
-    if web_search:
-        soul = _strip_persona_backstory(soul)
-    state = await _gather_system_state()
-    context = f"{soul}\n\n---\n" if soul else ""
-
-    # Pull brain pages for grounding (what actually exists)
-    brain_context = ""
-    try:
-        from app import brain_db
-
-        pages = brain_db.list_pages(limit=10)
-        if pages:
-            page_list = ", ".join(f"{p['slug']} ({p['page_type']})" for p in pages)
-            brain_context = f"\nKnown entities in brain: {page_list}\n"
-        else:
-            brain_context = (
-                "\nBrain is empty — no clients, people, or incidents recorded yet.\n"
-            )
-    except Exception:
-        pass
-
-    format_rules = (
-        (
-            "OUTPUT FORMAT (for Telegram delivery):\n"
-            "- Include full URLs to posts/threads you find.\n"
-            "- For each result: link, why it's relevant, which project it maps to, "
-            "and a suggested comment Alex can post.\n"
-            "- Use numbered items, not bullet nesting.\n"
-            "- Be specific — real post titles, real subreddits, real URLs.\n"
-        )
-        if web_search
-        else ""
-    )
-
-    # Detect marketing tasks and inject anti-pattern rules
-    marketing_context = ""
-    desc_lower = task_description.lower()
-    marketing_keywords = {
-        "marketing",
-        "awesome-list",
-        "reddit",
-        "subreddit",
-        "comment",
-        "launch",
-        "post",
-        "draft",
-    }
-    if any(kw in desc_lower for kw in marketing_keywords):
-        marketing_context = ANTI_PATTERN_RULES + "\n"
-
-    return (
-        f"{context}"
-        f"{state}\n"
-        f"{brain_context}\n"
-        f"---\n"
-        f"You have been assigned this task:\n"
-        f'"{task_description}"\n\n'
-        f"{marketing_context}"
-        "RULES:\n"
-        "- Reference real data from the system state, brain, and web search results.\n"
-        "- Do NOT invent URLs, post titles, or usernames. Only cite what you found.\n"
-        "- If you have web search, use it to find live data before answering.\n"
-        "- If the task requires an action you can't perform (sending email, making calls), "
-        "describe what you prepared and what Alex needs to do to finish it.\n"
-        "- Be honest. 'I found nothing relevant today' is better than fabricating.\n\n"
-        f"{format_rules}"
-        "Provide the result. Include specific links or references when available."
-    )
-
-
-_WEB_SEARCH_KEYWORDS = {
-    "reddit",
-    "search",
-    "rundown",
-    "news",
-    "trending",
-    "posts",
-    "online",
-    "web",
-    "latest",
-    "recent",
-    "scan",
-    "find online",
-    "hacker news",
-    "hn",
-    "lobsters",
-    "twitter",
-    "x.com",
-}
-
-
-def _task_needs_web(description: str) -> bool:
-    """Return True if the task description suggests it needs live web data."""
-    desc_lower = description.lower()
-    return any(kw in desc_lower for kw in _WEB_SEARCH_KEYWORDS)
-
-
-async def _llm_work_task(description: str) -> str:
-    """Ask the LLM to actually work on a task. Returns the result text."""
-    needs_web = _task_needs_web(description)
-    prompt = await _build_work_prompt(description, web_search=needs_web)
-    if needs_web:
-        print(f"[PROXY] task needs web search: {description[:80]!r}", flush=True)
-    max_tok = 1500 if needs_web else 500
-    result = await _llm_call(prompt, max_tokens=max_tok, web_search=needs_web)
-    if result:
-        print(f"[PROXY] LLM worked task: {result[:100]!r}", flush=True)
-        return result
-    return f"Could not reach LLM to work this task. Alex should handle manually: {description}"
-
-
-# ─── Marketing Scan Interceptor ──────────────────────────────────
-
-_MARKETING_SCAN_PATTERNS = {
-    "reddit": re.compile(r"Scan reddit for (\S+)", re.IGNORECASE),
-    "github": re.compile(r"Scan github for (\S+)", re.IGNORECASE),
-    "traffic": re.compile(
-        r"(?:Weekly )?traffic snapshot for (\S+)/(\S+)", re.IGNORECASE
-    ),
-    "awesome": re.compile(r"Awesome-list watch: (\S+) not yet listed", re.IGNORECASE),
-}
-
-ANTI_PATTERN_RULES = """
-ANTI-PATTERNS (do not produce text that violates these):
-- Do NOT lead with "I built this with Claude" or similar AI-builder framing
-- Do NOT use superlatives like "fastest", "best", "revolutionary"
-- Do NOT fabricate post titles, subreddit names, usernames, or URLs
-- Do NOT recommend posting in subreddits where self-promotion is banned
-
-POSITIVE RULES:
-- Lead with the user problem solved
-- Include real upvote counts, comment counts, and timestamps when available
-- Cite source URLs for every claim
-- For comment suggestions, anchor in the user's question first; mention the project as a relevant tool second
-"""
-
-
-async def _try_marketing_scan(description: str, brain_db) -> str | None:
-    """Detect and execute structured marketing scan tasks.
-
-    Returns result text if the task matches a scan pattern, None otherwise.
-    """
-    for kind, pattern in _MARKETING_SCAN_PATTERNS.items():
-        match = pattern.search(description)
-        if not match:
-            continue
-
-        if kind == "reddit":
-            slug = match.group(1)
-            project = brain_db.get_project(slug)
-            if not project:
-                return None
-
-            import json
-            from reddit_search import search_subreddits
-
-            topics = json.loads(project.get("topics", "[]"))
-            subreddits = json.loads(project.get("subreddits", "[]"))
-            search_terms = json.loads(project.get("search_terms", "[]"))
-
-            query = (
-                " OR ".join(search_terms[:3]) if search_terms else " ".join(topics[:3])
-            )
-            results = await search_subreddits(
-                query, subreddits or ["ClaudeAI", "LocalLLaMA", "SideProject"]
-            )
-
-            if not results:
-                return f"Reddit scan for {slug}: no new relevant posts found."
-
-            lines = [f"Reddit scan for {slug} ({len(results)} results):\n"]
-            for i, r in enumerate(results[:8], 1):
-                lines.append(
-                    f"{i}. {r.title}\n"
-                    f"   r/{r.subreddit} | {r.score}pts | {r.comments} comments\n"
-                    f"   {r.url}"
-                )
-
-            # Mark results in scan cache
-            for r in results:
-                brain_db.mark_seen("reddit_post", r.id, slug)
-
-            return "\n".join(lines)
-
-        if kind == "github":
-            slug = match.group(1)
-            project = brain_db.get_project(slug)
-            if not project:
-                return None
-
-            import json
-            from github_search import search_repos, search_issues
-
-            search_terms = json.loads(project.get("search_terms", "[]"))
-            topics = json.loads(project.get("topics", "[]"))
-            query = (
-                " OR ".join(search_terms[:3]) if search_terms else " ".join(topics[:3])
-            )
-
-            repos = await search_repos(query, min_stars=5, limit=10)
-            issues = await search_issues(query, limit=10)
-
-            lines = [
-                f"GitHub scan for {slug} ({len(repos)} repos, {len(issues)} issues):\n"
-            ]
-
-            if repos:
-                lines.append("Adjacent repos:")
-                for i, r in enumerate(repos[:5], 1):
-                    lines.append(
-                        f"  {i}. {r.full_name} ({r.stars}*) — {r.description or ''}"
-                    )
-
-            if issues:
-                lines.append("\nRecent issues:")
-                for i, iss in enumerate(issues[:5], 1):
-                    lines.append(f"  {i}. {iss.title} — {iss.repository}#{iss.number}")
-
-            # Mark in cache
-            for r in repos:
-                brain_db.mark_seen("github_repo", str(r.id), slug)
-
-            return "\n".join(lines)
-
-        if kind == "traffic":
-            owner, repo = match.group(1), match.group(2)
-            from github_search import get_self_traffic
-
-            traffic = await get_self_traffic(owner, repo)
-            if not traffic:
-                return f"Traffic for {owner}/{repo}: unavailable (needs GITHUB_PAT with repo scope)"
-
-            return (
-                f"Traffic for {owner}/{repo} (14 days):\n"
-                f"  Views: {traffic.views_count} ({traffic.views_uniques} unique)\n"
-                f"  Clones: {traffic.clones_count} ({traffic.clones_uniques} unique)"
-            )
-
-        if kind == "awesome":
-            # These tasks are typically LLM-generated drafts, let them fall through
-            return None
-
-    return None
-
-
-async def _handle_heartbeat(is_stream: bool) -> JSONResponse | StreamingResponse:
-    """Run heartbeat checks in Python instead of relying on the LLM.
-
-    Three layers of initiative:
-    1. Infrastructure monitoring — tripped tiers, low balance (every cycle)
-    2. Task queue awareness — stale task nudges (every 30 min)
-    3. LLM-powered thinking — self-directed task suggestions (every 1 hr)
-    """
-    from app import brain_db
-
-    lines: list[str] = []
-    tasks_created: list[dict] = []
-
-    # ── 1. Tier status ──────────────────────────────────────────
-    tripped = [tier["name"] for tier in CONFIG["tiers"] if _circuit_open(tier["name"])]
-
-    remaining = await _check_openrouter_balance()
-
-    # ── 2. Check for pending tasks ──────────────────────────────
-    # Process one task per cycle — both system-generated and user-created.
-    pending = brain_db.list_tasks(status="pending")
-
-    if pending:
-        task = pending[0]
-        source = task.get("source", "system")
-        label = "ALEX" if source == "user" else "SYSTEM"
-        brain_db.claim_task(task["id"])
-
-        # Check if this is a structured marketing scan task
-        scan_result = await _try_marketing_scan(task["description"], brain_db)
-        if scan_result is not None:
-            result = scan_result
-        else:
-            result = await _llm_work_task(task["description"])
-
-        brain_db.complete_task(task["id"], result, "completed")
-        lines.append(f"[{label}] #{task['id']}: {task['description']}")
-        lines.append(f"Result: {result}")
-
-        # Direct Telegram notification
-        await notify(
-            f"[{label}] Task completed: #{task['id']}\n"
-            f"{task['description']}\n\n"
-            f"Result: {result}"
-        )
-    else:
-        # ── PROACTIVE SCAN ──────────────────────────────────────
-        all_tasks = brain_db.list_tasks()
-
-        # Layer 1: Infrastructure — every cycle
-        for name in tripped:
-            desc = f"Investigate tier recovery: {name}"
-            if not any(
-                t["description"] == desc and t["status"] == "pending" for t in all_tasks
-            ):
-                t = brain_db.create_task(desc, priority=2)
-                tasks_created.append(t)
-
-        if remaining is not None and remaining < 5.0:
-            desc = f"Low balance alert: ${remaining:.2f} remaining"
-            if not any(
-                "Low balance alert" in t["description"] and t["status"] == "pending"
-                for t in all_tasks
-            ):
-                t = brain_db.create_task(desc, priority=1)
-                tasks_created.append(t)
-
-        # Layer 2: Stale task awareness — every 30 min
-        if _proactive_ready("stale_tasks"):
-            _proactive_mark("stale_tasks")
-            stale_cutoff = datetime.now(timezone.utc) - timedelta(hours=4)
-            stale = [
-                t
-                for t in all_tasks
-                if t["status"] == "pending"
-                and datetime.fromisoformat(t["created_at"]) < stale_cutoff
-            ]
-            if stale and not _has_recent_task(all_tasks, "stale tasks pending"):
-                desc = f"{len(stale)} task(s) pending > 4 hours — review queue"
-                t = brain_db.create_task(desc, priority=2)
-                tasks_created.append(t)
-
-        # Layer 3: LLM self-directed thinking — every 1 hr
-        if not tasks_created and _proactive_ready("llm_thinking"):
-            _proactive_mark("llm_thinking")
-            suggestion = await _llm_suggest_task()
-            if suggestion and not _has_recent_task(all_tasks, suggestion):
-                t = brain_db.create_task(suggestion, priority=3)
-                tasks_created.append(t)
-
-    # ── 3. Build response ───────────────────────────────────────
-    # Only send a visible response when there's something worth reporting.
-    # Empty heartbeat_ok is silent — OpenClaw won't relay it to Telegram.
-    if not lines and not tasks_created:
-        resp = _synthetic_response("")
-    else:
-        if tasks_created:
-            lines.append(f"Created {len(tasks_created)} task(s):")
-            for t in tasks_created:
-                lines.append(f"  #{t['id']} [P{t['priority']}] {t['description'][:60]}")
-
-        if tripped:
-            lines.append(f"Tiers: {', '.join(tripped)} TRIPPED")
-        if remaining is not None:
-            lines.append(f"Balance: ${remaining:.2f}")
-
-        resp = _synthetic_response("\n".join(lines))
-
-    if is_stream:
-        return _wrap_json_as_sse(resp)
-    return resp
-
-
 # ─── Tier Helpers ─────────────────────────────────────────────────
 
 
 async def _notify_tier_change(tier_name: str) -> None:
-    """Notify via Telegram when the serving tier changes."""
+    """Log a tier switch and remember the tier that served this request."""
     global _last_tier_used
     if _last_tier_used is not None and _last_tier_used != tier_name:
         _background_notify(
             f"tier-change:{_last_tier_used}:{tier_name}",
-            f"*Tier switch*: `{_last_tier_used}` -> `{tier_name}`",
+            f"*Tier switch*: `{_last_tier_used}` to `{tier_name}`",
         )
     _last_tier_used = tier_name
+
+
+# ─── Fire-and-forget tasks ───────────────────────────────────────
+
+# asyncio keeps only weak references to tasks; an un-held fire-and-forget
+# task can be garbage collected mid-flight. Hold them until they finish.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
 
 
 # ─── Single-Tier Attempt ─────────────────────────────────────────
 
 
 async def _try_single_tier(
-    tier: dict, body: dict, status_msg_id: int | None = None
+    tier: dict,
+    body: dict,
+    status_msg_id: int | None = None,
+    failures: dict[str, str] | None = None,
 ) -> tuple[JSONResponse | None, tuple[str, int | None] | None]:
     """Attempt one provider tier. Returns (response, rate_limit_info).
 
     On success: (JSONResponse, None)
     On rate limit: (None, (tier_name, reset_seconds))
     On other failure: (None, None)
+
+    When ``failures`` is given, a failed attempt stores a short reason under
+    the tier name, so the caller can say what actually went wrong.
     """
     tier_name = tier["name"]
     provider = tier["provider"]
     models = tier["models"]
     provider_config = CONFIG["providers"][provider]
     api_key = os.getenv(provider_config["env_key"], "")
+    reasons = failures if failures is not None else {}
 
     if status_msg_id:
-        asyncio.create_task(send_typing())
-        asyncio.create_task(edit_status(status_msg_id, f"\u23f3 {tier['description']}"))
+        _spawn_background(telegram.send_typing())
+        _spawn_background(
+            telegram.edit_status(status_msg_id, f"\u23f3 {tier['description']}")
+        )
 
     try:
         non_stream_body = {**body, "stream": False}
-        resp = await _call_provider(provider, models, non_stream_body, api_key)
+        try:
+            resp = await asyncio.wait_for(
+                _call_provider(provider, models, non_stream_body, api_key),
+                timeout=PROVIDER_TIMEOUT,
+            )
+        except TimeoutError:
+            _record_failure(tier_name)
+            reasons[tier_name] = f"no reply within {PROVIDER_TIMEOUT}s"
+            _background_notify(tier_name, f"*Timeout* on `{tier_name}`")
+            return None, None
 
         if resp.status_code == 200:
             data = resp.json()
@@ -2399,24 +1277,29 @@ async def _try_single_tier(
                     f"[PROXY] garbled response from {tier_name} — skipping", flush=True
                 )
                 _record_failure(tier_name)
+                reasons[tier_name] = "garbled reply"
                 return None, None
 
             if not first_content.strip():
                 print(
-                    f"[PROXY] empty response from {tier_name} after sanitization — skipping",
+                    f"[PROXY] empty response from {tier_name} after "
+                    f"sanitization — skipping",
                     flush=True,
                 )
                 _record_failure(tier_name)
+                reasons[tier_name] = "empty reply"
                 return None, None
 
             if _is_non_answer(first_content):
                 print(
-                    f"[PROXY] non-answer from {tier_name}: {first_content[:80]!r} — skipping",
+                    f"[PROXY] non-answer from {tier_name}: {first_content[:80]!r} "
+                    f"— skipping",
                     flush=True,
                 )
                 # Don't _record_failure — the provider worked fine, the content
                 # was just bad. Tripping the circuit breaker would lock out a
                 # working provider and force expensive paid-tier fallback.
+                reasons[tier_name] = "non-answer reply"
                 return None, None
 
             _record_success(tier_name)
@@ -2431,13 +1314,15 @@ async def _try_single_tier(
             _record_rate_limit(tier_name)
             try:
                 print(
-                    f"[PROXY] 429 on {tier_name} — headers: {dict(resp.headers)} body: {resp.text[:500]}",
+                    f"[PROXY] 429 on {tier_name} — headers: {dict(resp.headers)} "
+                    f"body: {resp.text[:500]}",
                     flush=True,
                 )
             except Exception:
                 pass
             reset = _get_reset_info(resp)
             detail = _get_rate_limit_detail(resp)
+            reasons[tier_name] = "rate-limited" + (f", resets {reset}" if reset else "")
             _background_notify(
                 tier_name,
                 f"*Rate limited* on `{tier_name}`"
@@ -2447,49 +1332,93 @@ async def _try_single_tier(
             return None, (tier_name, _get_reset_seconds(resp))
 
         _record_failure(tier_name)
+        reasons[tier_name] = f"HTTP {resp.status_code}"
         _background_notify(
             tier_name,
-            f"*Error* on `{tier_name}` (HTTP {resp.status_code})",
+            f"*Error* on `{tier_name}` (HTTP {resp.status_code}): {resp.text[:200]}",
         )
         return None, None
 
     except httpx.HTTPError as exc:
         _record_failure(tier_name)
+        reasons[tier_name] = f"network error ({type(exc).__name__})"
         _background_notify(tier_name, f"*Network error* on `{tier_name}`: {exc}")
+        return None, None
+    except (ValueError, IndexError, KeyError, TypeError, AttributeError) as exc:
+        # A 200 with a non-JSON body, an empty/odd `choices`, or a non-dict
+        # payload is a broken provider: count it against the breaker.
+        logger.warning(
+            "tier %s returned a malformed response: %s: %s",
+            tier_name,
+            type(exc).__name__,
+            exc,
+        )
+        _record_failure(tier_name)
+        reasons[tier_name] = "malformed reply"
         return None, None
 
 
 # ─── Proxy Endpoint ───────────────────────────────────────────────
 
 
-@router.post("/v1/chat/completions")
-async def chat_completions(
+async def _json_object(request: Request) -> dict:
+    """Parse the request body as a JSON object or raise 400."""
+    try:
+        raw = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from None
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+    return raw
+
+
+@router.post("/v1/embeddings")
+async def create_embeddings(
     request: Request,
     authorization: str | None = Header(None),
 ):
-    # Auth check — if PROXY_AUTH_TOKEN is set, require it
-    if PROXY_AUTH_TOKEN:
-        if not authorization or authorization != f"Bearer {PROXY_AUTH_TOKEN}":
-            raise HTTPException(status_code=401, detail="Unauthorized")
+    """OpenAI-compatible embeddings via OpenRouter, for any bearer-token client.
 
-    raw_body = await request.json()
-    messages = raw_body.get("messages", [])
-    is_stream = raw_body.get("stream", False)
+    OpenClaw's own memory search is off (memory provider "none"), so it is
+    not a built-in caller. Always uses the configured model
+    (embeddings.config) so vectors stay comparable; a GLM Coding Plan Z.AI
+    key can't embed.
+    """
+    # Auth check — same PROXY_AUTH_TOKEN gate as chat completions
+    if not auth.bearer_ok(authorization, PROXY_AUTH_TOKEN):
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # Intercept status commands before they hit the LLM
-    last_user_msg = _get_last_user_message(messages)
-    msg_lower = last_user_msg.lower().strip()
-    print(f"[PROXY] extracted msg: {msg_lower[:200]!r} stream={is_stream}", flush=True)
-    # Intercept !help — return full command reference
-    help_commands = ("!help", "/help", "help", "help?", "!commands", "/commands")
-    last_line = msg_lower.rstrip().rsplit("\n", 1)[-1].strip()
-    if msg_lower in help_commands or last_line in help_commands:
-        resp = _handle_help()
-        if is_stream:
-            return _wrap_json_as_sse(resp)
-        return resp
+    raw_body = await _json_object(request)
+    inputs = raw_body.get("input")
+    if not inputs:
+        raise HTTPException(status_code=400, detail="input is required")
 
-    tier_commands = (
+    cfg = embeddings.config()
+    if not cfg.api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="embeddings provider not configured (set OPENROUTER_API_KEY)",
+        )
+    batch = inputs if isinstance(inputs, list) else [inputs]
+    try:
+        resp = await embeddings.request(batch, cfg)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"embeddings upstream error: {exc}")
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=f"embeddings upstream {resp.status_code}: {resp.text[:300]}",
+        )
+    return JSONResponse(content=resp.json())
+
+
+_HELP_COMMANDS = frozenset(
+    {"!help", "/help", "help", "help?", "!commands", "/commands"}
+)
+
+_TIER_COMMANDS = frozenset(
+    {
         "/tier",
         "!tier",
         "tier",
@@ -2517,49 +1446,138 @@ async def chat_completions(
         "what's your status?",
         "your status",
         "your status?",
-    )
-    if msg_lower in tier_commands or last_line in tier_commands:
-        resp = await _handle_tier_command()
+    }
+)
+
+# Assistant history turns containing these are our own synthetic replies or
+# hallucinated tool syntax; they are stripped before the next request.
+_POISON_MARKERS = (
+    "temporarily on pause",
+    "took too long to respond",
+    "<exec",
+    "[[exec",
+    "<tool_call",
+)
+
+# Appended as a TRAILING system message. LLMs weight instructions near the
+# end of context most heavily: at the start (where soul.md lives) it gets
+# lost, after the last user message the model sees it right before
+# generating.
+#
+# Always injected, even when tools are present. Free-tier upstream models
+# (the racing default) often get OpenAI tool schemas but don't actually
+# support function calling — they invent fake <tool_call:paste>...XML
+# that the proxy then strips, leaving the user with empty replies. The
+# tools wording tells the model to either use the OpenAI tool-call format
+# properly or answer in plain text — never improvise XML.
+_ANTI_HALLUCINATION_TOOLS = (
+    "[SYSTEM] If you need a tool, emit a real OpenAI tool_call object — "
+    "never XML tags, bracket syntax, or <tool_call:NAME> blocks. "
+    "Hallucinated tool syntax is stripped and the response is retried "
+    "on another tier. If no tool fits, answer in plain text from your "
+    "knowledge and conversation context."
+)
+_ANTI_HALLUCINATION_PLAIN = (
+    "[SYSTEM] Respond now in plain text. "
+    "No startup sequences. No initialization steps. "
+    "Never output XML tags, bracket syntax, or tool_call blocks — "
+    "those are not real tools and will be stripped. "
+    "Answer directly using your knowledge and conversation context."
+)
+
+
+@router.post("/v1/chat/completions")
+async def chat_completions(
+    request: Request,
+    authorization: str | None = Header(None),
+):
+    # Auth check — fails closed when PROXY_AUTH_TOKEN is unset
+    if not auth.bearer_ok(authorization, PROXY_AUTH_TOKEN):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    raw_body = await _json_object(request)
+    messages = raw_body.get("messages", [])
+    if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
+        raise HTTPException(
+            status_code=400, detail="messages must be a list of objects"
+        )
+    is_stream = raw_body.get("stream", False)
+
+    # Intercept status commands before they hit the LLM
+    last_user_msg = _get_last_user_message(messages)
+    msg_lower = last_user_msg.lower().strip()
+    print(f"[PROXY] extracted msg: {msg_lower[:200]!r} stream={is_stream}", flush=True)
+    # Intercept !help — return full command reference
+    last_line = msg_lower.rstrip().rsplit("\n", 1)[-1].strip()
+    if msg_lower in _HELP_COMMANDS or last_line in _HELP_COMMANDS:
+        resp = chat_commands._handle_help()
         if is_stream:
             return _wrap_json_as_sse(resp)
         return resp
 
+    if msg_lower in _TIER_COMMANDS or last_line in _TIER_COMMANDS:
+        resp = await chat_commands._handle_tier_command()
+        if is_stream:
+            return _wrap_json_as_sse(resp)
+        return resp
+
+    # Chat commands and the heartbeat work on the serving app's brain,
+    # profile and scheduler, never on a module global.
+    state = request.app.state
+    brain_db = state.brain_db
+
     # Intercept heartbeat messages — run checks in Python instead of LLM
-    if _is_heartbeat(last_user_msg):
+    if heartbeat._is_heartbeat(last_user_msg):
         print("[PROXY] heartbeat intercepted — running checks in Python", flush=True)
-        return await _handle_heartbeat(is_stream)
+        return await heartbeat._handle_heartbeat(
+            is_stream, brain_db=brain_db, profile=getattr(state, "profile", None)
+        )
 
     # Intercept !task commands — enqueue, list, cancel, reprioritize
     # Check both full message and last line (fallback when metadata stripping fails)
     raw_last_line = last_user_msg.rstrip().rsplit("\n", 1)[-1].strip()
-    task_action = _extract_task_command(last_user_msg) or _extract_task_command(
-        raw_last_line
-    )
+    task_action = chat_commands._extract_task_command(
+        last_user_msg
+    ) or chat_commands._extract_task_command(raw_last_line)
     if task_action is not None:
-        return await _dispatch_task_command(task_action, is_stream)
+        return await chat_commands._dispatch_task_command(
+            task_action, is_stream, brain_db=brain_db
+        )
 
     # Intercept marketing commands (/sched, /scan, /projects, /marketing)
-    marketing_cmd = _extract_marketing_command(last_user_msg)
+    marketing_cmd = chat_commands._extract_marketing_command(last_user_msg)
     if marketing_cmd is not None:
-        return await _dispatch_marketing_command(marketing_cmd, is_stream)
+        return await chat_commands._dispatch_marketing_command(
+            marketing_cmd,
+            is_stream,
+            brain_db=brain_db,
+            scheduler=getattr(state, "scheduler", None),
+        )
+
+    # Intercept !persona / !learn (alias, TR-013) — explicit feedback and
+    # on-demand reflection
+    persona_args = chat_commands._extract_persona_command(last_user_msg)
+    if persona_args is not None:
+        return await chat_commands._dispatch_persona_command(
+            persona_args,
+            is_stream,
+            brain_db=brain_db,
+            profile_provider=state.profile_provider,
+        )
 
     # Strip poisoned assistant messages from conversation history.
     # Uses both static markers (synthetic responses, tool hallucinations)
     # AND the deferral detector — any assistant message that would fail
     # _is_non_answer() gets stripped so the model doesn't see its own
     # previous failures and generate apologies or continued deferrals.
-    _POISON_MARKERS = (
-        "temporarily on pause",
-        "took too long to respond",
-        "<exec",
-        "[[exec",
-        "<tool_call",
-    )
+    # Never drop an assistant turn that carries tool_calls: its tool results
+    # would be left orphaned and providers reject that history with a 400.
     messages = [
         msg
         for msg in messages
         if not (
             msg.get("role") == "assistant"
+            and not msg.get("tool_calls")
             and isinstance(msg.get("content"), str)
             and (
                 any(marker in msg["content"] for marker in _POISON_MARKERS)
@@ -2572,35 +1590,13 @@ async def chat_completions(
     body = {k: v for k, v in raw_body.items() if k in ALLOWED_BODY_FIELDS}
     body["messages"] = messages
 
-    # Inject anti-hallucination reinforcement as a TRAILING system message.
-    # LLMs weight instructions near the end of context most heavily.
-    # Placing it at the start (where soul.md lives) gets lost — placing it
-    # after the last user message means the model sees it right before generating.
-    #
-    # Always inject, even when tools are present. Free-tier upstream models
-    # (the racing default) often get OpenAI tool schemas but don't actually
-    # support function calling — they invent fake <tool_call:paste>...XML
-    # that the proxy then strips, leaving the user with empty replies. The
-    # adapted wording below tells the model to either use the OpenAI
-    # tool-call format properly or answer in plain text — never improvise XML.
-    has_tools = bool(body.get("tools"))
-    if has_tools:
-        _ANTI_HALLUCINATION = (
-            "[SYSTEM] If you need a tool, emit a real OpenAI tool_call object — "
-            "never XML tags, bracket syntax, or <tool_call:NAME> blocks. "
-            "Hallucinated tool syntax is stripped and the response is retried "
-            "on another tier. If no tool fits, answer in plain text from your "
-            "knowledge and conversation context."
-        )
-    else:
-        _ANTI_HALLUCINATION = (
-            "[SYSTEM] Respond now in plain text. "
-            "No startup sequences. No initialization steps. "
-            "Never output XML tags, bracket syntax, or tool_call blocks — "
-            "those are not real tools and will be stripped. "
-            "Answer directly using your knowledge and conversation context."
-        )
-    messages.append({"role": "system", "content": _ANTI_HALLUCINATION})
+    # Inject anti-hallucination reinforcement as a TRAILING system message
+    # (see _ANTI_HALLUCINATION_* for why it goes last and why it is always
+    # injected, tools or not).
+    reminder = (
+        _ANTI_HALLUCINATION_TOOLS if body.get("tools") else _ANTI_HALLUCINATION_PLAIN
+    )
+    messages.append({"role": "system", "content": reminder})
 
     # Tier routing — explicit !keyword overrides, otherwise race all free tiers
     forced_tier = _detect_tier_hint(messages)
@@ -2610,8 +1606,8 @@ async def chat_completions(
         print("[PROXY] no tier hint — racing all free tiers", flush=True)
 
     # Show typing indicator and send a transient status message
-    asyncio.create_task(send_typing())
-    status_msg_id = await send_status("\u23f3")
+    _spawn_background(telegram.send_typing())
+    status_msg_id = await telegram.send_status("\u23f3")
 
     # Always use non-streaming internally for full sanitization + garbled
     # detection, then re-wrap as SSE if the client requested streaming.
@@ -2621,16 +1617,20 @@ async def chat_completions(
             _handle_non_streaming(body, forced_tier, status_msg_id=status_msg_id),
             timeout=REQUEST_DEADLINE,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning("Request exceeded %ds deadline", REQUEST_DEADLINE)
         result = _synthetic_response(
             "I took too long to respond — the LLM providers might be slow. "
             "Please try again in a moment."
         )
-
-    # Remove the status message — OpenClaw delivers the real response
-    if status_msg_id:
-        asyncio.create_task(delete_message(status_msg_id))
+    finally:
+        # Remove the status message — OpenClaw delivers the real response.
+        # In a finally so an error never strands the "⏳" message.
+        if status_msg_id:
+            try:
+                await asyncio.wait_for(telegram.delete_message(status_msg_id), 5)
+            except Exception as exc:
+                logger.warning("status message delete failed: %s", exc)
 
     if is_stream and isinstance(result, JSONResponse):
         return _wrap_json_as_sse(result)
@@ -2651,6 +1651,8 @@ async def _handle_non_streaming(
     """
     # Determine which tiers are available right now
     available: list[dict] = []
+    # Why a tier is not answering: skipped here or failed in the race.
+    failures: dict[str, str] = {}
     for tier in CONFIG["tiers"]:
         tier_name = tier["name"]
         if forced_tier and tier_name != forced_tier:
@@ -2658,33 +1660,55 @@ async def _handle_non_streaming(
         provider = tier["provider"]
         provider_config = CONFIG["providers"][provider]
         api_key = os.getenv(provider_config["env_key"], "")
-        if not api_key or _circuit_open(tier_name):
+        if not api_key:
             continue
         if provider not in PROVIDER_URLS:
             continue
-        if tier_name == "openrouter-paid" and not forced_tier:
-            continue
-        if tier_name == "openrouter-paid":
+        if provider == "openrouter":
             remaining = await _check_openrouter_balance()
-            if remaining is not None and remaining <= OPENROUTER_BALANCE_FLOOR:
-                await notify(
-                    f"*Balance guard* — ${remaining:.2f} remaining"
-                    f"\nSkipping `{tier_name}` to protect free-tier quota"
+            # A zero/negative balance blocks every OpenRouter model —
+            # free-tier included — with 402 payment-required errors. Skip
+            # the whole provider so zai-direct carries traffic instead of
+            # every request stalling through failed OpenRouter attempts.
+            if remaining is not None and remaining <= 0:
+                if _should_notify("balance-guard"):
+                    await telegram.notify(
+                        f"*Balance guard* — OpenRouter balance ${remaining:.2f}.\n"
+                        "Routing around OpenRouter until it's topped up."
+                    )
+                continue
+        # Paid tiers are opt-in per message (!paid / !claude), never raced.
+        if tier.get("paid") and not forced_tier:
+            continue
+        if tier.get("paid") and provider == "openrouter":
+            remaining = await _check_openrouter_balance()
+            # An unknown balance (lookup never succeeded or failing) denies
+            # paid: the floor exists to protect credit we cannot see.
+            if remaining is None or remaining <= OPENROUTER_BALANCE_FLOOR:
+                failures[tier_name] = (
+                    f"OpenRouter balance {describe_balance()} is not above "
+                    f"the ${OPENROUTER_BALANCE_FLOOR:.2f} paid floor"
                 )
                 continue
+        # Last gate: claiming the half-open probe slot must mean the tier
+        # really is going to be called.
+        if _circuit_open(tier_name):
+            failures[tier_name] = "breaker open after repeated failures"
+            continue
         available.append(tier)
 
     if not available:
-        print("[PROXY] no tiers available", flush=True)
+        print(f"[PROXY] no tiers available: {failures}", flush=True)
         return _synthetic_response(
-            "I'm temporarily on pause — no LLM tiers are available right now. "
-            "Try again later."
+            "I'm temporarily on pause — no LLM tiers are available right now"
+            + (f" ({_failure_summary(failures)})" if failures else "")
+            + ". Try again later."
         )
 
     # Race all available tiers concurrently — first success wins
     tasks = {
         asyncio.create_task(
-            _try_single_tier(tier, body, status_msg_id),
+            _try_single_tier(tier, body, status_msg_id, failures),
             name=f"tier:{tier['name']}",
         ): tier["name"]
         for tier in available
@@ -2729,14 +1753,17 @@ async def _handle_non_streaming(
                     f"All tiers rate-limited — auto-retrying in {wait}s",
                 )
                 if status_msg_id:
-                    asyncio.create_task(
-                        edit_status(
+                    _spawn_background(
+                        telegram.edit_status(
                             status_msg_id, f"\u23f3 Rate limited — retrying in {wait}s"
                         )
                     )
                 await asyncio.sleep(wait)
-                for name, _ in rate_limit_resets:
-                    _circuit_state.pop(name, None)
+                # Only tiers whose reset window has elapsed by now; a tier
+                # with a longer (or unknown) reset stays tripped.
+                for name, secs in rate_limit_resets:
+                    if secs is not None and secs <= wait:
+                        _circuit_state.pop(name, None)
                 return await _handle_non_streaming(
                     body,
                     forced_tier,
@@ -2744,8 +1771,24 @@ async def _handle_non_streaming(
                     status_msg_id=status_msg_id,
                 )
 
-    print("[PROXY] all tiers exhausted — returning synthetic response", flush=True)
-    return _synthetic_response(
-        "I'm temporarily on pause — the free API tiers are rate-limited right now. "
-        "Send !paid or !claude to use the paid tier, or try again later."
+    print(f"[PROXY] all tiers exhausted: {failures}", flush=True)
+    raced = {name: failures.get(name, "failed") for name in tasks.values()}
+    retry = (
+        "Try again later."
+        if forced_tier
+        else "Send !paid or !claude to use the paid tier, or try again later."
     )
+    if all(why.startswith("rate-limited") for why in raced.values()):
+        return _synthetic_response(
+            f"I'm temporarily on pause — the API tiers are rate-limited right now. "
+            f"{retry}"
+        )
+    return _synthetic_response(
+        f"I'm temporarily on pause — no tier answered ({_failure_summary(raced)}). "
+        f"{retry}"
+    )
+
+
+def _failure_summary(failures: dict[str, str]) -> str:
+    """``tier: reason; tier: reason`` for a user-facing failure line."""
+    return "; ".join(f"{name}: {why}" for name, why in failures.items())

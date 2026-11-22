@@ -11,6 +11,16 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
+
+class ConnectorNotConfigured(ValueError):
+    """A connector's required setting is empty (usually an unset ``${VAR}``).
+
+    Raised instead of returning ``[]`` so an unconfigured sync records an
+    error rather than "ok (0 written)". The message names the setting,
+    never its value.
+    """
+
+
 # A row at any stage of the pipeline. Sources emit raw rows (source-column
 # keys); transforms emit CRM-field rows; sinks consume those.
 Record = dict[str, Any]

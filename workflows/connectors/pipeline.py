@@ -17,7 +17,7 @@ def run_connector(spec: dict, crm, *, http_client=None) -> dict:
     from . import SINKS, SOURCES, TRANSFORMS
 
     src_spec = spec.get("source") or {}
-    source = SOURCES.get(src_spec.get("kind"))
+    source = SOURCES.get(src_spec.get("kind") or "")
     if source is None:
         raise ValueError(f"unknown source kind {src_spec.get('kind')!r}")
     rows = source(src_spec, client=http_client)
@@ -32,7 +32,7 @@ def run_connector(spec: dict, crm, *, http_client=None) -> dict:
     kept = len(rows)
 
     sink_spec = spec.get("sink") or {}
-    sink = SINKS.get(sink_spec.get("kind"))
+    sink = SINKS.get(sink_spec.get("kind") or "")
     if sink is None:
         raise ValueError(f"unknown sink kind {sink_spec.get('kind')!r}")
     written = sink(rows, sink_spec, crm)

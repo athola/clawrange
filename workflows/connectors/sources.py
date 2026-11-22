@@ -3,42 +3,33 @@
 ``http_csv`` GETs a CSV export with optional auth. ``login_scrape`` first
 POSTs a login form to establish an httpx session (cookie jar), then GETs an
 export path behind that session. Both accept an injectable ``client`` so
-tests use ``httpx.MockTransport`` instead of the network, and both degrade
-gracefully (return ``[]`` + a warning) when their URL is unconfigured —
-mirroring the marketing scanners: a missing credential disables a feature,
-it does not crash boot.
+tests use ``httpx.MockTransport`` instead of the network. An unconfigured
+URL (usually an unset ``${VAR}``) raises ``ConnectorNotConfigured`` at sync
+time, so the sync records an error instead of "ok (0 written)"; boot is
+unaffected.
 """
 
 from __future__ import annotations
 
-import base64
 import csv
 import io
 import logging
+from urllib.parse import urljoin
 
 import httpx
 
-from .base import Record
+from http_auth import auth_headers
+
+from .base import ConnectorNotConfigured, Record
 
 logger = logging.getLogger("clawrange.connectors.sources")
 
+FETCH_TIMEOUT_S = 30.0  # portal exports can be slow to generate
 
-def _auth_headers(auth: dict | None) -> dict:
-    """Build request headers for the static auth kinds (none/api_key/bearer/basic)."""
-    auth = auth or {}
-    kind = auth.get("kind", "none")
-    if kind == "bearer" and auth.get("token"):
-        return {"Authorization": f"Bearer {auth['token']}"}
-    if kind == "api_key":
-        ak = auth.get("api_key") or {}
-        if ak.get("value"):
-            return {ak.get("header", "X-API-Key"): ak["value"]}
-    if kind == "basic":
-        b = auth.get("basic") or {}
-        if b.get("username") is not None:
-            raw = f"{b.get('username', '')}:{b.get('password', '')}".encode()
-            return {"Authorization": f"Basic {base64.b64encode(raw).decode()}"}
-    return {}
+
+def _looks_like_html(resp: httpx.Response) -> bool:
+    ctype = resp.headers.get("content-type", "").lower()
+    return "html" in ctype or resp.text.lstrip()[:1] == "<"
 
 
 def _parse_csv(text: str) -> list[Record]:
@@ -49,22 +40,36 @@ def _ensure_client(client: httpx.Client | None) -> tuple[httpx.Client, bool]:
     """Return (client, owned); owned clients are closed by the caller."""
     if client is not None:
         return client, False
-    return httpx.Client(timeout=30.0), True
+    return httpx.Client(timeout=FETCH_TIMEOUT_S), True
+
+
+def _csv_or_raise(resp: httpx.Response, source: str) -> list[Record]:
+    if _looks_like_html(resp):
+        # A rejected login or expired token often serves a login page with
+        # a 200; parsing that as CSV would write junk leads.
+        raise ValueError(
+            f"{source}: export returned HTML, not CSV (auth likely failed)"
+        )
+    return _parse_csv(resp.text)
 
 
 def http_csv(spec: dict, *, client: httpx.Client | None = None) -> list[Record]:
     url = spec.get("url")
     if not url:
-        logger.warning("http_csv: no url configured (treating as unconfigured)")
-        return []
+        raise ConnectorNotConfigured("http_csv: no url configured")
     c, owned = _ensure_client(client)
     try:
-        resp = c.get(url, headers=_auth_headers(spec.get("auth")))
+        resp = c.get(url, headers=auth_headers(spec.get("auth")))
         resp.raise_for_status()
-        return _parse_csv(resp.text)
+        return _csv_or_raise(resp, "http_csv")
     finally:
         if owned:
             c.close()
+
+
+# 307/308 would make the client re-POST the form, password included, to the
+# redirect target; 301/302/303 switch to a body-less GET.
+_SAFE_LOGIN_REDIRECTS = {301, 302, 303}
 
 
 def login_scrape(spec: dict, *, client: httpx.Client | None = None) -> list[Record]:
@@ -72,21 +77,26 @@ def login_scrape(spec: dict, *, client: httpx.Client | None = None) -> list[Reco
     login_url = lf.get("login_url")
     export_path = lf.get("export_path")
     if not login_url or not export_path:
-        logger.warning(
-            "login_scrape: missing login_url/export_path (treating as unconfigured)"
-        )
-        return []
+        raise ConnectorNotConfigured("login_scrape: missing login_url/export_path")
     c, owned = _ensure_client(client)
     try:
         form = {
             lf.get("username_field", "username"): lf.get("username", ""),
             lf.get("password_field", "password"): lf.get("password", ""),
         }
-        login = c.post(login_url, data=form)
-        login.raise_for_status()
-        resp = c.get(export_path)
+        # Don't follow: the session cookie is set on this response, and a
+        # 307/308 would resend the password to wherever it points.
+        login = c.post(login_url, data=form, follow_redirects=False)
+        if login.status_code in (307, 308):
+            raise ValueError(
+                f"login_scrape: login answered a {login.status_code} redirect; "
+                "refusing to resend credentials"
+            )
+        if login.status_code not in _SAFE_LOGIN_REDIRECTS:
+            login.raise_for_status()
+        resp = c.get(urljoin(login_url, export_path), follow_redirects=True)
         resp.raise_for_status()
-        return _parse_csv(resp.text)
+        return _csv_or_raise(resp, "login_scrape")
     finally:
         if owned:
             c.close()

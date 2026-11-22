@@ -2,14 +2,21 @@
 
 import os
 import tempfile
+from datetime import UTC, datetime
 
 import pytest
 
+import brain_db
+import clock
 from brain_db import (
     BrainDB,
     LinkType,
     PageType,
+    _chunk_text,
+    rrf_fuse,
 )
+from connectors import transforms
+from crm import sqlite_adapter
 
 
 @pytest.fixture
@@ -28,7 +35,10 @@ def db():
 class TestSchemaInit:
     def test_creates_all_tables(self, db):
         """All required tables exist after init."""
-        tables = db._fetch_tables()
+        tables = {
+            r["name"]
+            for r in db._conn.execute("SELECT name FROM sqlite_master").fetchall()
+        }
         expected = {
             "pages",
             "timeline",
@@ -42,8 +52,23 @@ class TestSchemaInit:
         assert expected.issubset(tables)
 
     def test_init_idempotent(self, db):
-        """Calling init_db() twice does not error."""
-        db.init_db()  # should not raise
+        """A second init_db() keeps the schema and the data."""
+        db.upsert_page("a", "Alpha", "note", "body")
+        db.create_task("work")
+
+        def schema():
+            return sorted(
+                r["name"]
+                for r in db._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table','index')"
+                )
+            )
+
+        before = schema()
+        db.init_db()
+        assert schema() == before
+        assert db.get_page("a") is not None
+        assert len(db.list_tasks()) == 1
 
 
 # ─── Page CRUD ────────────────────────────────────────────────────
@@ -55,12 +80,12 @@ class TestPageCRUD:
             slug="client/acme-corp",
             title="Acme Corp",
             page_type=PageType.CLIENT,
-            compiled="Main contact: Bob Smith. 3 sites in Longview.",
+            compiled="Main contact: Pat Doe. 3 sites in Springfield.",
         )
         assert page["slug"] == "client/acme-corp"
         assert page["title"] == "Acme Corp"
         assert page["page_type"] == "client"
-        assert page["compiled"] == "Main contact: Bob Smith. 3 sites in Longview."
+        assert page["compiled"] == "Main contact: Pat Doe. 3 sites in Springfield."
         assert page["content_hash"]
         assert page["created_at"]
         assert page["updated_at"]
@@ -262,11 +287,16 @@ class TestChunkTextFunction:
 
 class TestEmbeddings:
     def test_has_embeddings(self, db):
-        """sqlite-vec should be available in test environment."""
+        """True once the active model's table holds vectors."""
+        assert db.use_vector_table("vec_test_1536", 1536) is True
+        assert db.has_embeddings() is False
+        db.upsert_page("note/v", "V", PageType.NOTE, "body")
+        db.store_embeddings([(db.get_chunks("note/v")[0]["id"], [0.1] * 1536)])
         assert db.has_embeddings() is True
 
     def test_store_and_search_vector(self, db):
         """Store embedding for a chunk, then find it via vector search."""
+        db.use_vector_table("vec_test_1536", 1536)
         db.upsert_page("note/vec", "Vector Test", PageType.NOTE, "searchable content")
         chunks = db.get_chunks("note/vec")
         assert len(chunks) >= 1
@@ -274,7 +304,7 @@ class TestEmbeddings:
 
         # Store a synthetic embedding (1536 dims)
         vector = [0.1] * 1536
-        assert db.store_embedding(chunk_id, vector) is True
+        assert db.store_embeddings([(chunk_id, vector)]) == 1
 
         # Search with the same vector — should find our page
         results = db.search_vector(vector, limit=5)
@@ -284,6 +314,7 @@ class TestEmbeddings:
 
     def test_vector_search_returns_best_per_page(self, db):
         """Dedup: only best matching chunk per page returned."""
+        db.use_vector_table("vec_test_1536", 1536)
         db.upsert_page(
             "note/multi",
             "Multi Chunk",
@@ -295,7 +326,7 @@ class TestEmbeddings:
         # Embed both chunks with slightly different vectors
         for i, chunk in enumerate(chunks):
             vec = [0.1 + i * 0.01] * 1536
-            db.store_embedding(chunk["id"], vec)
+            db.store_embeddings([(chunk["id"], vec)])
 
         results = db.search_vector([0.1] * 1536, limit=10)
         slugs = [r["slug"] for r in results]
@@ -314,6 +345,7 @@ class TestHybridSearch:
 
     def test_hybrid_with_vector_merges_results(self, db):
         """With both keyword and vector results, RRF fuses them."""
+        db.use_vector_table("vec_test_1536", 1536)
         # Page that matches keyword
         db.upsert_page(
             "inc/wifi", "WiFi Outage", PageType.INCIDENT, "WiFi down at site"
@@ -326,7 +358,7 @@ class TestHybridSearch:
         # Embed the network page
         chunks = db.get_chunks("inc/net")
         if chunks:
-            db.store_embedding(chunks[0]["id"], [0.5] * 1536)
+            db.store_embeddings([(chunks[0]["id"], [0.5] * 1536)])
 
         # Search with a vector that matches the network page
         results = db.search_hybrid("WiFi", query_vector=[0.5] * 1536)
@@ -647,3 +679,279 @@ class TestPersistentTaskQueue:
         fetched = db2.get_task(task_id)
         assert fetched is not None
         assert fetched["description"] == "persistent work"
+
+
+# ─── Persona Learnings ───────────────────────────────────────────
+
+
+def test_persona_learning_lifecycle(tmp_path):
+    from brain_db import BrainDB
+
+    db = BrainDB(str(tmp_path / "b.db"))
+    db.init_db()
+    row = db.create_learning(
+        "chief-of-staff",
+        "persona",
+        "Communication",
+        "Lead with the recommendation.",
+        "feedback",
+    )
+    assert row["status"] == "pending" and row["id"]
+    assert db.get_learning(row["id"])["content"].startswith("Lead with")
+    db.set_learning_status(row["id"], "approved")
+    approved = db.list_learnings(profile="chief-of-staff", status="approved")
+    assert len(approved) == 1 and approved[0]["decided_at"]
+
+
+class TestTaskStateIntegrity:
+    """Claims must be atomic and terminal states final: the queue is shared
+    by the heartbeat, the tome bridge and the HTTP API."""
+
+    def test_claim_is_atomic_against_stale_read(self, db, monkeypatch):
+        """Two consumers both read 'pending' before either writes. Only the
+        first UPDATE may win; the second must see the row already active."""
+        t = db.create_task("work")
+        db.claim_task(t["id"])  # consumer A wins
+        real_get = db.get_task
+        stale = dict(real_get(t["id"]), status="pending")
+        monkeypatch.setattr(db, "get_task", lambda tid: stale)  # B's stale read
+        with pytest.raises(ValueError):
+            db.claim_task(t["id"])
+
+    def test_complete_rejects_terminal_task(self, db):
+        t = db.create_task("work")
+        db.complete_task(t["id"], "done")
+        with pytest.raises(ValueError):
+            db.complete_task(t["id"], "overwrite")
+        assert db.get_task(t["id"])["result"] == "done"
+
+    def test_complete_rejects_cancelled_task(self, db):
+        t = db.create_task("nevermind")
+        db.cancel_task(t["id"])
+        with pytest.raises(ValueError):
+            db.complete_task(t["id"], "revived")
+        assert db.get_task(t["id"])["status"] == "cancelled"
+
+    def test_complete_unknown_task_raises(self, db):
+        with pytest.raises(ValueError):
+            db.complete_task("nope", "x")
+
+
+class TestConnectionLock:
+    """One sqlite connection is shared by FastAPI's threadpool and the event
+    loop; without a lock one thread's commit() can commit another's
+    half-finished write. Every BrainDB method serializes on one RLock."""
+
+    def test_methods_wait_for_the_lock(self, db):
+        import threading
+
+        done = threading.Event()
+        db._lock.acquire()
+        try:
+            th = threading.Thread(
+                target=lambda: (db.create_task("x"), done.set()), daemon=True
+            )
+            th.start()
+            assert not done.wait(0.3), "create_task ran without the lock"
+        finally:
+            db._lock.release()
+        assert done.wait(2), "create_task never completed after release"
+
+    def test_lock_is_reentrant(self, db):
+        """create_task calls get_task internally; an RLock must allow it."""
+        assert db.create_task("nested")["status"] == "pending"
+
+
+class TestKeywordSearchInput:
+    @pytest.mark.parametrize("q", ['"', "foo(", "a AND", "NEAR(", "*"])
+    def test_fts_syntax_in_user_query_does_not_raise(self, db, q):
+        db.upsert_page("a", "Alpha", "note", "alpha foo body")
+        assert isinstance(db.search_keyword(q), list)
+
+    def test_plain_words_still_match(self, db):
+        db.upsert_page("a", "Alpha", "note", "alpha foo body")
+        assert [r["slug"] for r in db.search_keyword("alpha foo")] == ["a"]
+
+    def test_limit_is_clamped(self, db):
+        for i in range(5):
+            db.upsert_page(f"p{i}", f"T{i}", "note", "common word")
+        assert len(db.search_keyword("common", limit=10_000)) == 5
+        assert len(db.search_keyword("common", limit=0)) == 1
+
+
+class TestProjectList:
+    """Project list columns are JSON TEXT; one malformed row used to raise in
+    the middle of a generator run (34 open-coded json.loads call sites)."""
+
+    def test_decodes_json_text(self):
+        from brain_db import project_list
+
+        assert project_list({"topics": '["a", "b"]'}, "topics") == ["a", "b"]
+
+    def test_missing_or_none(self):
+        from brain_db import project_list
+
+        assert project_list({}, "topics") == []
+        assert project_list(None, "topics") == []
+        assert project_list({"topics": None}, "topics") == []
+
+    def test_malformed_json_is_empty_not_a_crash(self):
+        from brain_db import project_list
+
+        assert project_list({"slug": "x", "topics": "[oops"}, "topics") == []
+        assert project_list({"topics": '{"a": 1}'}, "topics") == []
+
+    def test_already_a_list(self):
+        from brain_db import project_list
+
+        assert project_list({"topics": ["a"]}, "topics") == ["a"]
+
+
+class TestSubredditSearchBatch:
+    def test_batch_matches_individual_calls(self, db):
+        rows = [
+            ("ClaudeAI", "p", True),
+            ("python", "p", False),
+            ("ClaudeAI", "p", True),
+        ]
+        db.record_subreddit_searches(rows)
+        stats = {
+            r["subreddit"]: (r["impressions"], r["is_curated"])
+            for r in db._conn.execute("SELECT * FROM subreddit_stats").fetchall()
+        }
+        assert stats == {"claudeai": (2, 1), "python": (1, 0)}
+
+    def test_batch_commits_once(self, db, monkeypatch):
+        commits = []
+        real = db._conn
+
+        class Spy:
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            def commit(self):
+                commits.append(1)
+                real.commit()
+
+        monkeypatch.setattr(db, "_conn", Spy())
+        db.record_subreddit_searches([(f"s{i}", "p", False) for i in range(20)])
+        assert len(commits) == 1
+
+
+class TestRRFFuse:
+    """Fusion is a pure function so the retrieval eval and search_hybrid
+    rank with exactly the same code."""
+
+    def test_equal_weights_sum_reciprocal_ranks(self):
+        fused = dict(rrf_fuse([["a", "b"], ["b", "c"]], k=60))
+        assert fused["b"] == pytest.approx(1 / 61 + 1 / 60)
+        assert fused["a"] == pytest.approx(1 / 60)
+
+    def test_order_is_by_fused_score(self):
+        assert [s for s, _ in rrf_fuse([["a", "b"], ["b", "c"]])] == ["b", "a", "c"]
+
+    def test_ties_keep_first_seen_order(self):
+        assert [s for s, _ in rrf_fuse([["a"], ["c"]])] == ["a", "c"]
+
+    def test_weight_shifts_the_winner(self):
+        rankings = [["kw_top", "shared"], ["vec_top", "shared"]]
+        top_kw = rrf_fuse(rankings, k=1, weights=[3.0, 1.0])[0][0]
+        top_vec = rrf_fuse(rankings, k=1, weights=[1.0, 3.0])[0][0]
+        assert (top_kw, top_vec) == ("kw_top", "vec_top")
+
+    def test_weights_length_must_match(self):
+        with pytest.raises(ValueError):
+            rrf_fuse([["a"], ["b"]], weights=[1.0])
+
+
+class TestHybridTuning:
+    def test_keyword_weight_reorders_hybrid(self, db):
+        db.use_vector_table("vec_test_4", 4)
+        db.upsert_page("n/kw", "Alpha", PageType.NOTE, "zebra stripes")
+        db.upsert_page("n/vec", "Beta", PageType.NOTE, "unrelated words")
+        vec_chunk = db.get_chunks("n/vec")[0]["id"]
+        kw_chunk = db.get_chunks("n/kw")[0]["id"]
+        db.store_embeddings([(vec_chunk, [1, 0, 0, 0]), (kw_chunk, [0, 1, 0, 0])])
+        # n/kw is in both rankings (vector rank 1), so a small k lets the
+        # top rank dominate and the weights decide the winner.
+        q = [1.0, 0.0, 0.0, 0.0]
+        favour_kw = db.search_hybrid("zebra", q, k=1, kw_weight=3.0, vec_weight=1.0)
+        favour_vec = db.search_hybrid("zebra", q, k=1, kw_weight=1.0, vec_weight=3.0)
+        assert favour_kw[0]["slug"] == "n/kw"
+        assert favour_vec[0]["slug"] == "n/vec"
+
+    def test_chunk_size_is_configurable(self, db):
+        db.chunk_max_words = 20
+        db.chunk_overlap_words = 0
+        body = "\n\n".join(f"Paragraph {i} " + "word " * 15 for i in range(4))
+        db.upsert_page("n/long", "Long", PageType.NOTE, body)
+        assert len(db.get_chunks("n/long")) == len(
+            _chunk_text("Long\n\n" + body, 20, 0)
+        )
+        assert len(db.get_chunks("n/long")) > 1
+
+
+class TestKeywordMatchMode:
+    """FTS5 joins quoted tokens with AND, so a natural-language question
+    misses any page lacking one of its words. match="any" ORs the terms and
+    lets BM25 rank pages by how many (and how rare) terms they share."""
+
+    def test_all_mode_requires_every_word(self, db):
+        db.upsert_page("n/a", "Launch", PageType.NOTE, "post Show HN on a weekday")
+        assert db.search_keyword("Show HN timing") == []
+
+    def test_any_mode_matches_partial_overlap(self, db):
+        db.upsert_page("n/a", "Launch", PageType.NOTE, "post Show HN on a weekday")
+        hits = db.search_keyword("Show HN timing", match="any")
+        assert [h["slug"] for h in hits] == ["n/a"]
+
+    def test_any_mode_ranks_more_shared_terms_first(self, db):
+        db.upsert_page("n/one", "One", PageType.NOTE, "zebra")
+        db.upsert_page("n/two", "Two", PageType.NOTE, "zebra stripes savanna")
+        hits = db.search_keyword("zebra stripes savanna", match="any")
+        assert hits[0]["slug"] == "n/two"
+
+    def test_unknown_mode_rejected(self, db):
+        with pytest.raises(ValueError):
+            db.search_keyword("x", match="some")
+
+    def test_hybrid_passes_match_mode(self, db):
+        db.upsert_page("n/a", "Launch", PageType.NOTE, "post Show HN on a weekday")
+        hits = db.search_hybrid("Show HN timing", kw_match="any")
+        assert [h["slug"] for h in hits] == ["n/a"]
+
+    def test_hybrid_without_vector_falls_back_to_any_terms(self, db):
+        """With no query vector (embedding outage, no key) hybrid is keyword
+        only; AND-matching there found the right page for 21% of the eval's
+        questions, any-term matching for 79%."""
+        db.upsert_page("n/a", "Launch", PageType.NOTE, "post Show HN on a weekday")
+        hits = db.search_hybrid("Show HN timing")
+        assert [h["slug"] for h in hits] == ["n/a"]
+
+    def test_hybrid_with_vector_keeps_all_terms_by_default(self, db):
+        db.use_vector_table("vec_test_4", 4)
+        db.upsert_page("n/a", "Launch", PageType.NOTE, "post Show HN on a weekday")
+        db.store_embeddings([(db.get_chunks("n/a")[0]["id"], [0, 1, 0, 0])])
+        hits = db.search_hybrid("Show HN timing", [0.0, 1.0, 0.0, 0.0])
+        # keyword side (AND) is empty, so the vector side alone answers
+        assert [h["match_type"] for h in hits] == ["vector"]
+
+
+class TestUtcnowIso:
+    """#14: one timestamp helper replaces the three private `_now()` copies."""
+
+    def test_format_is_offset_aware_utc_iso(self):
+        stamp = clock.utcnow_iso()
+        parsed = datetime.fromisoformat(stamp)
+        assert parsed.utcoffset() == UTC.utcoffset(None)
+        assert stamp.endswith("+00:00")
+
+    def test_every_store_uses_the_shared_helper(self):
+        for module in (brain_db, transforms, sqlite_adapter):
+            assert module.utcnow_iso is clock.utcnow_iso
+            assert not hasattr(module, "_now")
+
+    def test_stored_task_timestamp_uses_the_format(self, db):
+        task = db.create_task("stamp check")
+        assert task["created_at"].endswith("+00:00")
+        datetime.fromisoformat(task["created_at"])

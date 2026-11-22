@@ -7,9 +7,6 @@ import pytest
 from crm.query import answer, route_nl
 from crm.sqlite_adapter import SQLiteCRM
 
-pytestmark = pytest.mark.asyncio
-
-
 TEMPLATES = [
     {
         "name": "new_leads_count",
@@ -21,7 +18,8 @@ TEMPLATES = [
         "name": "leads_by_status",
         "description": "Lead counts grouped by status.",
         "params": {},
-        "sql": "SELECT status, COUNT(*) AS n FROM leads GROUP BY status ORDER BY n DESC",
+        "sql": "SELECT status, COUNT(*) AS n FROM leads GROUP BY status "
+        "ORDER BY n DESC",
     },
 ]
 
@@ -48,6 +46,7 @@ def crm(tmp_path):
     return c
 
 
+@pytest.mark.asyncio
 async def test_route_nl_selects_template():
     out = await route_nl(
         "how many leads this week?",
@@ -58,6 +57,7 @@ async def test_route_nl_selects_template():
     assert out["params"] == {"window": "7d"}
 
 
+@pytest.mark.asyncio
 async def test_route_nl_parses_fenced_json():
     out = await route_nl(
         "status breakdown",
@@ -67,6 +67,7 @@ async def test_route_nl_parses_fenced_json():
     assert out["template"] == "leads_by_status"
 
 
+@pytest.mark.asyncio
 async def test_route_nl_unknown_template_is_none():
     out = await route_nl(
         "x", TEMPLATES, llm=_stub('{"template": "nonexistent", "params": {}}')
@@ -74,11 +75,13 @@ async def test_route_nl_unknown_template_is_none():
     assert out["template"] is None
 
 
+@pytest.mark.asyncio
 async def test_route_nl_malformed_is_none():
     out = await route_nl("x", TEMPLATES, llm=_stub("I have no idea, sorry."))
     assert out["template"] is None
 
 
+@pytest.mark.asyncio
 async def test_answer_returns_count(crm):
     res = await answer(
         "how many new leads this week?",
@@ -90,6 +93,7 @@ async def test_answer_returns_count(crm):
     assert res["rows"][0]["n"] == 2
 
 
+@pytest.mark.asyncio
 async def test_answer_grouped(crm):
     res = await answer(
         "break down leads by status",
@@ -100,7 +104,28 @@ async def test_answer_grouped(crm):
     assert "new: 1" in res["answer"] and "won: 1" in res["answer"]
 
 
+@pytest.mark.asyncio
 async def test_answer_fallback_on_unmappable(crm):
     res = await answer("what is the weather", crm, TEMPLATES, llm=_stub("nope"))
     assert res["template"] is None
     assert "couldn't map" in res["answer"].lower()
+
+
+def test_enum_value_missing_from_map_is_a_value_error():
+    from crm.query import coerce_params
+
+    t = {
+        "params": {
+            "g": {"type": "enum", "values": ["day", "week"], "map": {"day": "%d"}}
+        }
+    }
+    with pytest.raises(ValueError, match="map"):
+        coerce_params(t, {"g": "week"})
+
+
+def test_string_like_escapes_wildcards():
+    """'%' and '_' in user input are literal characters, not LIKE wildcards."""
+    from crm.query import coerce_params
+
+    t = {"params": {"q": {"type": "string"}}}
+    assert coerce_params(t, {"q": "50%_off"})["like"] == "%50\\%\\_off%"

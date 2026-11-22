@@ -8,6 +8,11 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
+# A row from any CRM object table. Spelled as an alias (not the builtin
+# ``list[dict]`` inline) because this class's own ``list`` method would
+# otherwise shadow the builtin inside later annotations.
+RecordList = list[dict]
+
 
 class CRMAdapter(ABC):
     """Backend-agnostic CRM contract."""
@@ -27,7 +32,7 @@ class CRMAdapter(ABC):
         """Return rows for ``object``, optionally filtered by equality."""
 
     @abstractmethod
-    def run_template(self, template: dict, params: dict) -> list[dict]:
+    def run_template(self, template: dict, params: dict) -> RecordList:
         """Execute a named, parameterized query template. Read-only."""
 
     @abstractmethod

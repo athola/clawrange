@@ -1,36 +1,84 @@
 repos:
   # Shell script linting
   - repo: https://github.com/shellcheck-py/shellcheck-py
-    rev: v0.10.0.1
+    rev: v0.11.0.1-1
     hooks:
       - id: shellcheck
         args: [--severity=warning]
 
   # General file hygiene + basic secret detection
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: v6.0.0
     hooks:
       - id: check-yaml
-        args: [--allow-multiple-documents]
+        args: [--unsafe, --allow-multiple-documents]
       - id: check-json
       - id: end-of-file-fixer
       - id: trailing-whitespace
       - id: check-merge-conflict
       - id: detect-private-key
 
+  # uv.lock must match pyproject.toml, and the image's requirements.txt must
+  # be the export of that lock (hash-pinned; the Dockerfile installs it).
+  - repo: https://github.com/astral-sh/uv-pre-commit
+    rev: 0.13.9
+    hooks:
+      - id: uv-lock
+      - id: uv-export
+        args: [--no-dev, --no-emit-project, --format, requirements-txt, -o, workflows/requirements.txt, -q]
+
   # Secret scanning — catches API keys, tokens, passwords
   - repo: https://github.com/gitleaks/gitleaks
-    rev: v8.24.3
+    rev: v8.30.1
     hooks:
       - id: gitleaks
 
-  # Python linting
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.11.4
+  # Python linting. Runs the ruff pinned in uv.lock via `uv run` so the hook,
+  # `make lint` and `make format` always agree (no mirror-rev drift).
+  # --force-exclude keeps pyproject's [tool.ruff] exclude in effect even when
+  # pre-commit passes filenames explicitly.
+  - repo: local
     hooks:
       - id: ruff
+        name: ruff (lint via uv)
+        entry: uv run ruff check --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
         args: [--fix]
       - id: ruff-format
+        name: ruff-format (via uv)
+        entry: uv run ruff format --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
+  # Python typechecking. Runs the mypy pinned in uv.lock via `uv run` so the
+  # hook and `make typecheck` use the exact same version (no mirror drift).
+  # Whole-program check — cross-file type narrowing — so pass_filenames is
+  # false: mypy must see the entire tree, not just staged files.
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy (typecheck via uv)
+        entry: uv run mypy
+        language: system
+        types: [python]
+        pass_filenames: false
+        args: [workflows, scripts, tests]
+      - id: pytest
+        name: pytest (full test suite via uv)
+        entry: uv run pytest
+        language: system
+        # always_run: the suite also tests profiles, compose and shell
+        # scripts, so a push touching only YAML or .sh must still run it.
+        always_run: true
+        pass_filenames: false
+        args: [-q, -rf, -n, auto]
+        stages: [pre-push]
+        # Full async+sync suite (~80s), gated at pre-push — not commit —
+        # to keep commits fast. Requires `pre-commit install
+        # --hook-type pre-push` to fire on push.
 
   # Docker compose validation
   - repo: https://github.com/IamTheFij/docker-pre-commit
@@ -53,4 +101,4 @@ repos:
         name: operator-private files must stay local (not committed)
         language: fail
         entry: "Operator-private file staged — keep it local-only, do not commit."
-        files: ^(openclaw/soul\.md$|config/profiles/local-)
+        files: ^(openclaw/soul(-ops)?\.md$|config/profiles/local-)

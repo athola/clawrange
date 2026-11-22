@@ -2,10 +2,13 @@
 generators, scheduler, and marketing command parsing."""
 
 import json
+from datetime import UTC
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app import brain_db
+import llm_proxy
+from errors import UpstreamError
 
 
 @pytest.fixture(autouse=True)
@@ -23,7 +26,7 @@ def _marketing_profile_default(monkeypatch):
 
 
 class TestProjects:
-    def test_create_project(self):
+    def test_create_project(self, brain_db):
         p = brain_db.upsert_project(
             "claude-night-market",
             "athola",
@@ -38,16 +41,16 @@ class TestProjects:
         assert json.loads(p["topics"]) == ["claude-code", "plugins"]
         assert json.loads(p["subreddits"]) == ["ClaudeAI", "LocalLLaMA"]
 
-    def test_get_project(self):
+    def test_get_project(self, brain_db):
         brain_db.upsert_project("skrills", "athola", "skrills")
         p = brain_db.get_project("skrills")
         assert p is not None
         assert p["owner"] == "athola"
 
-    def test_get_missing_project(self):
+    def test_get_missing_project(self, brain_db):
         assert brain_db.get_project("nonexistent") is None
 
-    def test_list_projects(self):
+    def test_list_projects(self, brain_db):
         brain_db.upsert_project("proj-a", "athola", "proj-a")
         brain_db.upsert_project("proj-b", "athola", "proj-b")
         projects = brain_db.list_projects()
@@ -55,7 +58,7 @@ class TestProjects:
         slugs = {p["slug"] for p in projects}
         assert slugs == {"proj-a", "proj-b"}
 
-    def test_upsert_project_updates_existing(self):
+    def test_upsert_project_updates_existing(self, brain_db):
         brain_db.upsert_project("resume", "athola", "simple-resume")
         brain_db.upsert_project(
             "resume",
@@ -66,12 +69,12 @@ class TestProjects:
         p = brain_db.get_project("resume")
         assert json.loads(p["topics"]) == ["yaml", "pdf"]
 
-    def test_delete_project(self):
+    def test_delete_project(self, brain_db):
         brain_db.upsert_project("to-delete", "athola", "to-delete")
         assert brain_db.delete_project("to-delete")
         assert brain_db.get_project("to-delete") is None
 
-    def test_delete_missing_project(self):
+    def test_delete_missing_project(self, brain_db):
         assert not brain_db.delete_project("nonexistent")
 
 
@@ -79,7 +82,7 @@ class TestProjects:
 
 
 class TestSchedules:
-    def test_create_schedule(self):
+    def test_create_schedule(self, brain_db):
         s = brain_db.upsert_schedule(
             "morning_scan",
             "Morning marketing scan",
@@ -91,7 +94,7 @@ class TestSchedules:
         assert s["kind"] == "morning_scan"
         assert s["cron"] == "0 9 * * *"
 
-    def test_get_schedule_by_id(self):
+    def test_get_schedule_by_id(self, brain_db):
         brain_db.upsert_schedule(
             "weekly", "Weekly traffic", "weekly_traffic", "0 8 * * 1"
         )
@@ -99,19 +102,19 @@ class TestSchedules:
         assert s is not None
         assert s["kind"] == "weekly_traffic"
 
-    def test_get_schedule_by_name(self):
+    def test_get_schedule_by_name(self, brain_db):
         brain_db.upsert_schedule("abc123", "My Schedule", "custom_scan", "*/30 * * * *")
         s = brain_db.get_schedule("My Schedule")
         assert s is not None
         assert s["id"] == "abc123"
 
-    def test_list_schedules(self):
+    def test_list_schedules(self, brain_db):
         brain_db.upsert_schedule("s1", "Schedule 1", "morning_scan", "0 9 * * *")
         brain_db.upsert_schedule("s2", "Schedule 2", "weekly_traffic", "0 8 * * 1")
         scheds = brain_db.list_schedules()
         assert len(scheds) == 2
 
-    def test_pause_resume_schedule(self):
+    def test_pause_resume_schedule(self, brain_db):
         brain_db.upsert_schedule("test-sched", "Test", "morning_scan", "0 9 * * *")
         brain_db.set_schedule_paused("test-sched", True)
         s = brain_db.get_schedule("test-sched")
@@ -121,7 +124,7 @@ class TestSchedules:
         s = brain_db.get_schedule("test-sched")
         assert s["paused"] == 0
 
-    def test_update_schedule_status(self):
+    def test_update_schedule_status(self, brain_db):
         brain_db.upsert_schedule(
             "status-test", "Status Test", "morning_scan", "0 9 * * *"
         )
@@ -130,12 +133,12 @@ class TestSchedules:
         assert s["last_run"] == "2026-05-03T09:00:00Z"
         assert s["last_status"] == "ok"
 
-    def test_delete_schedule(self):
+    def test_delete_schedule(self, brain_db):
         brain_db.upsert_schedule("to-rm", "Remove Me", "custom_scan", "0 * * * *")
         assert brain_db.delete_schedule("to-rm")
         assert brain_db.get_schedule("to-rm") is None
 
-    def test_upsert_schedule_updates(self):
+    def test_upsert_schedule_updates(self, brain_db):
         brain_db.upsert_schedule("upsert-test", "Original", "morning_scan", "0 9 * * *")
         brain_db.upsert_schedule(
             "upsert-test", "Updated Name", "custom_scan", "*/30 * * * *"
@@ -149,24 +152,13 @@ class TestSchedules:
 
 
 class TestScanCache:
-    def test_mark_and_check_seen(self):
+    def test_mark_and_check_seen(self, brain_db):
         brain_db.mark_seen("reddit_post", "abc123", "claude-night-market")
         assert brain_db.is_seen("reddit_post", "abc123", "claude-night-market")
         assert not brain_db.is_seen("reddit_post", "abc123", "different-project")
         assert not brain_db.is_seen("reddit_post", "xyz789", "claude-night-market")
 
-    def test_get_unseen(self):
-        brain_db.mark_seen("reddit_post", "seen1", "proj-a")
-        brain_db.mark_seen("reddit_post", "seen2", "proj-a")
-        unseen = brain_db.get_unseen(
-            "reddit_post", ["seen1", "seen2", "unseen1"], "proj-a"
-        )
-        assert unseen == ["unseen1"]
-
-    def test_get_unseen_empty(self):
-        assert brain_db.get_unseen("reddit_post", [], "proj-a") == []
-
-    def test_mark_seen_idempotent(self):
+    def test_mark_seen_idempotent(self, brain_db):
         brain_db.mark_seen("github_repo", "repo1", None)
         brain_db.mark_seen("github_repo", "repo1", None)
         assert brain_db.is_seen("github_repo", "repo1", None)
@@ -180,7 +172,7 @@ class TestSubredditStats:
     can see which subreddits actually pay off and so the system can
     auto-promote emerging subs that pass a sustained-yield bar."""
 
-    def test_record_search_increments_impressions(self):
+    def test_record_search_increments_impressions(self, brain_db):
         brain_db.record_subreddit_search("ClaudeAI", "claude-night-market", True)
         brain_db.record_subreddit_search("ClaudeAI", "claude-night-market", True)
         rows = brain_db.list_subreddit_stats(project_slug="claude-night-market")
@@ -190,7 +182,7 @@ class TestSubredditStats:
         assert rows[0]["hits"] == 0
         assert rows[0]["is_curated"] == 1
 
-    def test_record_hit_increments_hits_and_sets_first_hit(self):
+    def test_record_hit_increments_hits_and_sets_first_hit(self, brain_db):
         brain_db.record_subreddit_hit("Construction", "skrills")
         brain_db.record_subreddit_hit("Construction", "skrills")
         rows = brain_db.list_subreddit_stats(project_slug="skrills")
@@ -200,14 +192,14 @@ class TestSubredditStats:
         assert row["first_hit_at"] is not None
         assert row["last_hit_at"] is not None
 
-    def test_record_search_then_hit_aggregates(self):
+    def test_record_search_then_hit_aggregates(self, brain_db):
         brain_db.record_subreddit_search("ClaudeAI", "clawrange", True)
         brain_db.record_subreddit_hit("ClaudeAI", "clawrange")
         rows = brain_db.list_subreddit_stats(project_slug="clawrange")
         assert rows[0]["impressions"] == 1
         assert rows[0]["hits"] == 1
 
-    def test_curated_filter(self):
+    def test_curated_filter(self, brain_db):
         brain_db.record_subreddit_search("ClaudeAI", "p", True)
         brain_db.record_subreddit_search("emerging-sub", "p", False)
         all_ = brain_db.list_subreddit_stats(project_slug="p")
@@ -217,7 +209,7 @@ class TestSubredditStats:
         assert len(curated) == 1 and curated[0]["subreddit"] == "claudeai"
         assert len(emerging) == 1 and emerging[0]["subreddit"] == "emerging-sub"
 
-    def test_find_promotion_candidates_threshold(self):
+    def test_find_promotion_candidates_threshold(self, brain_db):
         """A non-curated sub with >= 5 hits and a first->last hit
         gap <= 14 days is promotable."""
         for _ in range(5):
@@ -228,7 +220,7 @@ class TestSubredditStats:
         assert len(candidates) == 1
         assert candidates[0]["subreddit"] == "ai_agents"
 
-    def test_find_promotion_skips_under_threshold(self):
+    def test_find_promotion_skips_under_threshold(self, brain_db):
         for _ in range(4):
             brain_db.record_subreddit_hit("LangChain", "clawrange")
         candidates = brain_db.find_promotion_candidates(
@@ -236,21 +228,21 @@ class TestSubredditStats:
         )
         assert candidates == []
 
-    def test_find_promotion_skips_curated(self):
+    def test_find_promotion_skips_curated(self, brain_db):
         for _ in range(5):
             brain_db.record_subreddit_search("ClaudeAI", "clawrange", True)
             brain_db.record_subreddit_hit("ClaudeAI", "clawrange")
         candidates = brain_db.find_promotion_candidates("clawrange")
         assert candidates == []
 
-    def test_mark_promoted_excludes_from_future_candidates(self):
+    def test_mark_promoted_excludes_from_future_candidates(self, brain_db):
         for _ in range(5):
             brain_db.record_subreddit_hit("AI_Agents", "clawrange")
         brain_db.mark_subreddit_promoted("AI_Agents", "clawrange")
         candidates = brain_db.find_promotion_candidates("clawrange")
         assert candidates == []
 
-    def test_add_project_subreddit_idempotent(self):
+    def test_add_project_subreddit_idempotent(self, brain_db):
         brain_db.upsert_project(
             "skrills", "athola", "skrills", subreddits=["Construction"]
         )
@@ -269,7 +261,7 @@ class TestSubredditStats:
 
 class TestGenerators:
     @pytest.mark.asyncio
-    async def test_morning_scan_generator(self):
+    async def test_morning_scan_generator(self, brain_db):
         brain_db.upsert_project(
             "test-proj",
             "athola",
@@ -289,7 +281,7 @@ class TestGenerators:
         assert any("Scan github" in d for d in descs)
 
     @pytest.mark.asyncio
-    async def test_morning_scan_filtered(self):
+    async def test_morning_scan_filtered(self, brain_db):
         brain_db.upsert_project("proj-1", "athola", "proj-1")
         brain_db.upsert_project("proj-2", "athola", "proj-2")
         from generators import morning_scan_generator
@@ -301,7 +293,7 @@ class TestGenerators:
         assert all("proj-1" in t["description"] for t in tasks)
 
     @pytest.mark.asyncio
-    async def test_weekly_traffic_generator(self):
+    async def test_weekly_traffic_generator(self, brain_db):
         brain_db.upsert_project("traffic-proj", "athola", "traffic-proj")
         from generators import weekly_traffic_generator
 
@@ -312,7 +304,7 @@ class TestGenerators:
         assert "traffic snapshot" in tasks[0]["description"].lower()
 
     @pytest.mark.asyncio
-    async def test_custom_scan_generator(self):
+    async def test_custom_scan_generator(self, brain_db):
         from generators import custom_scan_generator
 
         await custom_scan_generator(brain_db, topic="test search query")
@@ -331,7 +323,7 @@ class TestGenerators:
         assert "content_idea" in GENERATORS
 
     @pytest.mark.asyncio
-    async def test_content_idea_generator_uses_recent_research(self):
+    async def test_content_idea_generator_uses_recent_research(self, brain_db):
         """
         GIVEN a recent research session in the brain
         WHEN content_idea_generator runs
@@ -372,7 +364,47 @@ class TestGenerators:
         assert any("reddit.com/r/Construction" in t["description"] for t in idea_tasks)
 
     @pytest.mark.asyncio
-    async def test_content_idea_generator_skips_when_no_research(self):
+    async def test_content_idea_task_omits_empty_url_parens(self, brain_db):
+        """
+        GIVEN a recent research finding with no URL (e.g. a TRIZ analogy)
+        WHEN content_idea_generator runs
+        THEN the enqueued task description cites the finding without
+             rendering a dangling empty '()' citation.
+        """
+        from generators import content_idea_generator
+
+        brain_db.upsert_project(
+            "skrills",
+            "athola",
+            "skrills",
+            topics=["chrome-extension"],
+            posture="Lead with: trade skill capture",
+        )
+        session = brain_db.create_research_session(
+            "trade skills chrome extensions", ["triz"]
+        )
+        brain_db.add_research_finding(
+            session_id=session["id"],
+            source="triz",
+            channel="triz",
+            title="TRIZ analogies: capture field know-how",
+            url="",
+            relevance=0.9,
+            summary="cross-domain analogy",
+            metadata={},
+        )
+        brain_db.complete_research_session(session["id"])
+
+        await content_idea_generator(brain_db, project_slugs=["skrills"])
+
+        tasks = brain_db.list_tasks(status="pending")
+        idea_tasks = [t for t in tasks if "content idea" in t["description"].lower()]
+        assert len(idea_tasks) >= 1
+        assert all("()" not in t["description"] for t in idea_tasks)
+        assert any("TRIZ analogies" in t["description"] for t in idea_tasks)
+
+    @pytest.mark.asyncio
+    async def test_content_idea_generator_skips_when_no_research(self, brain_db):
         """No recent sessions -> no tasks emitted."""
         from generators import content_idea_generator
 
@@ -384,7 +416,7 @@ class TestGenerators:
         assert tasks == []
 
     @pytest.mark.asyncio
-    async def test_comment_draft_generator_emits_review_task(self):
+    async def test_comment_draft_generator_emits_review_task(self, brain_db):
         """
         GIVEN a Reddit URL and a project slug
         WHEN comment_draft_generator runs
@@ -423,7 +455,7 @@ class TestGenerators:
         assert "claude-night-market" in t["description"]
 
     @pytest.mark.asyncio
-    async def test_comment_draft_generator_requires_url(self):
+    async def test_comment_draft_generator_requires_url(self, brain_db):
         from generators import comment_draft_generator
 
         # Missing url -> no task created, no exception
@@ -432,7 +464,7 @@ class TestGenerators:
         assert brain_db.list_tasks(status="pending") == []
 
     @pytest.mark.asyncio
-    async def test_comment_draft_generator_handles_unknown_project(self):
+    async def test_comment_draft_generator_handles_unknown_project(self, brain_db):
         """Unknown project slug -> still emit a task; posture defaults."""
         from generators import comment_draft_generator
 
@@ -450,27 +482,29 @@ class TestGenerators:
 
         assert "comment_draft" in GENERATORS
 
-    def test_seed_default_schedules_creates_daily_content_idea(self):
+    def test_schedule_seed_creates_daily_content_idea(self, brain_db):
         """
-        GIVEN seed_default_schedules has been called
+        GIVEN the schedule seed has been called
         WHEN we list schedules
         THEN at minimum the daily-content-idea schedule exists with a
              cron string that fires at a morning hour.
         """
-        from generators import seed_default_schedules
+        from generators import _seed_schedules_from_profile
+        from tenant_profile import load_profile
 
-        seed_default_schedules(brain_db)
+        _seed_schedules_from_profile(brain_db, load_profile())
         scheds = {s["id"]: s for s in brain_db.list_schedules()}
         assert "daily-content-idea" in scheds
         sched = scheds["daily-content-idea"]
         assert sched["kind"] == "content_idea"
         assert sched["cron"].split()[1] in {"7", "8", "9", "10"}
 
-    def test_seed_default_schedules_idempotent(self):
+    def test_schedule_seed_idempotent(self, brain_db):
         """Calling twice does not duplicate, and preserves user edits."""
-        from generators import seed_default_schedules
+        from generators import _seed_schedules_from_profile
+        from tenant_profile import load_profile
 
-        seed_default_schedules(brain_db)
+        _seed_schedules_from_profile(brain_db, load_profile())
         first = brain_db.list_schedules()
         sched = brain_db.get_schedule("daily-content-idea")
         brain_db.upsert_schedule(
@@ -479,21 +513,22 @@ class TestGenerators:
             sched["kind"],
             "*/30 * * * *",
         )
-        seed_default_schedules(brain_db)
+        _seed_schedules_from_profile(brain_db, load_profile())
         second = brain_db.list_schedules()
         assert len(first) == len(second)
         edited = brain_db.get_schedule("daily-content-idea")
         assert edited["cron"] == "*/30 * * * *"
 
-    def test_personal_brand_project_seed_exists(self):
+    def test_personal_brand_project_seed_exists(self, brain_db):
         """
-        GIVEN seed_default_projects has been called
+        GIVEN seed_from_profile has been called
         WHEN we look up 'personal-brand'
         THEN it exists with athola owner and AI-systems posture.
         """
-        from generators import seed_default_projects
+        from generators import seed_from_profile
+        from tenant_profile import load_profile
 
-        seed_default_projects(brain_db)
+        seed_from_profile(brain_db, load_profile())
         pb = brain_db.get_project("personal-brand")
         assert pb is not None
         assert pb["owner"] == "athola"
@@ -502,16 +537,17 @@ class TestGenerators:
         joined = " ".join(topics).lower()
         assert "agent" in joined or "ai" in joined or "plugin" in joined
 
-    def test_clawrange_project_seed_exists(self):
+    def test_clawrange_project_seed_exists(self, brain_db):
         """
-        GIVEN seed_default_projects has been called
+        GIVEN seed_from_profile has been called
         WHEN we look up 'clawrange'
         THEN athola/clawrange exists with subreddits covering the
              AI-coding communities (vibecoding/claudecode/codex).
         """
-        from generators import seed_default_projects
+        from generators import seed_from_profile
+        from tenant_profile import load_profile
 
-        seed_default_projects(brain_db)
+        seed_from_profile(brain_db, load_profile())
         cr = brain_db.get_project("clawrange")
         assert cr is not None
         assert cr["owner"] == "athola"
@@ -536,6 +572,117 @@ class TestMorningDigestGenerator:
     of comment-worthy Reddit posts in the last 24h, scoped to
     tracked projects, deduplicated against scan_cache."""
 
+    @pytest.fixture(autouse=True)
+    def _no_other_channels(self, monkeypatch):
+        """Keep HN/GitHub/web and the LLM off the network; tests that
+        exercise those channels override these stubs."""
+        from unittest.mock import AsyncMock
+
+        monkeypatch.setattr(
+            "rundown.gather_other_channels", AsyncMock(return_value=([], []))
+        )
+        monkeypatch.setattr("rundown.synthesize", AsyncMock(return_value=None))
+        monkeypatch.setattr("reddit_search.search_all", AsyncMock(return_value=[]))
+
+    def _seed_one_project(self, *, brain_db):
+        brain_db.upsert_project(
+            "clawrange",
+            "athola",
+            "clawrange",
+            topics=["llm proxy"],
+            subreddits=["LocalLLaMA"],
+            search_terms=["openclaw"],
+        )
+
+    @pytest.mark.asyncio
+    async def test_morning_digest_always_sends_with_zero_evidence(
+        self, monkeypatch, brain_db
+    ):
+        """An empty morning still produces a report that says why."""
+        from unittest.mock import AsyncMock
+
+        from generators import morning_digest_generator
+
+        self._seed_one_project(brain_db=brain_db)
+        monkeypatch.setattr(
+            "reddit_search.search_subreddits", AsyncMock(return_value=[])
+        )
+        monkeypatch.setattr("reddit_search.search_all", AsyncMock(return_value=[]))
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        await morning_digest_generator(brain_db)
+
+        notify_mock.assert_awaited()
+        msg = "\n".join(c.args[0] for c in notify_mock.await_args_list)
+        assert "Daily outreach rundown" in msg
+        assert "No fresh evidence" in msg
+        status = brain_db.get_schedule("morning_digest")
+        if status is not None:
+            assert status["last_status"].startswith("delivered")
+
+    @pytest.mark.asyncio
+    async def test_morning_digest_records_failed_delivery(self, monkeypatch, brain_db):
+        from unittest.mock import AsyncMock
+
+        from generators import morning_digest_generator
+
+        self._seed_one_project(brain_db=brain_db)
+        brain_db.upsert_schedule(
+            "morning_digest", "Morning digest", "morning_digest", "0 8 * * *"
+        )
+        monkeypatch.setattr(
+            "reddit_search.search_subreddits", AsyncMock(return_value=[])
+        )
+        monkeypatch.setattr("reddit_search.search_all", AsyncMock(return_value=[]))
+        monkeypatch.setattr("telegram.notify", AsyncMock(return_value=False))
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+
+        await morning_digest_generator(brain_db)
+
+        status = brain_db.get_schedule("morning_digest")["last_status"]
+        assert status.startswith("FAILED")
+
+    @pytest.mark.asyncio
+    async def test_morning_digest_blends_other_channels_and_synthesis(
+        self, monkeypatch, brain_db
+    ):
+        from unittest.mock import AsyncMock
+
+        from generators import morning_digest_generator
+        from rundown import Evidence, SourceStatus
+
+        self._seed_one_project(brain_db=brain_db)
+        monkeypatch.setattr(
+            "reddit_search.search_subreddits", AsyncMock(return_value=[])
+        )
+        monkeypatch.setattr("reddit_search.search_all", AsyncMock(return_value=[]))
+        hn = Evidence(
+            source="hn",
+            group="Hacker News",
+            project="clawrange",
+            title="Ask HN: self-hosted LLM proxy?",
+            url="https://news.ycombinator.com/item?id=42",
+            facts="HN · 30 pts · 4 comments",
+        )
+        monkeypatch.setattr(
+            "rundown.gather_other_channels",
+            AsyncMock(
+                return_value=([hn], [SourceStatus("Hacker News", True, "1 items")])
+            ),
+        )
+        synth = AsyncMock(return_value="1. Answer the proxy question in [E1].")
+        monkeypatch.setattr("rundown.synthesize", synth)
+        notify_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("telegram.notify", notify_mock)
+
+        await morning_digest_generator(brain_db)
+
+        msg = "\n".join(c.args[0] for c in notify_mock.await_args_list)
+        assert "[E1](https://news.ycombinator.com/item?id=42)" in msg
+        assert "Hacker News" in msg
+        synth.assert_awaited_once()
+
     @pytest.mark.asyncio
     async def test_morning_digest_in_registry(self):
         from generators import GENERATORS
@@ -543,7 +690,7 @@ class TestMorningDigestGenerator:
         assert "morning_digest" in GENERATORS
 
     @pytest.mark.asyncio
-    async def test_morning_digest_skips_when_no_projects(self, monkeypatch):
+    async def test_morning_digest_skips_when_no_projects(self, monkeypatch, brain_db):
         from unittest.mock import AsyncMock
 
         from generators import morning_digest_generator
@@ -556,7 +703,9 @@ class TestMorningDigestGenerator:
         notify_mock.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_morning_digest_calls_search_with_24h_window(self, monkeypatch):
+    async def test_morning_digest_calls_search_with_24h_window(
+        self, monkeypatch, brain_db
+    ):
         from unittest.mock import AsyncMock
 
         from generators import morning_digest_generator
@@ -583,7 +732,7 @@ class TestMorningDigestGenerator:
             assert kwargs.get("since") == "24h"
 
     @pytest.mark.asyncio
-    async def test_morning_digest_groups_posts_by_project(self, monkeypatch):
+    async def test_morning_digest_groups_posts_by_project(self, monkeypatch, brain_db):
         from unittest.mock import AsyncMock
 
         from generators import morning_digest_generator
@@ -647,7 +796,7 @@ class TestMorningDigestGenerator:
         assert "skr1" in msg
 
     @pytest.mark.asyncio
-    async def test_morning_digest_dedupes_seen_posts(self, monkeypatch):
+    async def test_morning_digest_dedupes_seen_posts(self, monkeypatch, brain_db):
         from unittest.mock import AsyncMock
 
         from generators import morning_digest_generator
@@ -689,7 +838,9 @@ class TestMorningDigestGenerator:
                 assert "old1" not in call.args[0]
 
     @pytest.mark.asyncio
-    async def test_morning_digest_marks_seen_no_draft_tasks(self, monkeypatch):
+    async def test_morning_digest_marks_seen_no_draft_tasks(
+        self, monkeypatch, brain_db
+    ):
         """The digest marks delivered posts as seen (so tomorrow won't
         repeat them) but no longer queues [DRAFT] comment tasks. Alex
         reads the digest, clicks the direct links, and writes his own
@@ -736,7 +887,9 @@ class TestMorningDigestGenerator:
         assert len(post_tasks) == pre, "no new tasks should be queued"
 
     @pytest.mark.asyncio
-    async def test_morning_digest_renders_relevance_snippet(self, monkeypatch):
+    async def test_morning_digest_renders_relevance_snippet(
+        self, monkeypatch, brain_db
+    ):
         """Each pick must carry a short 'why relevant + comment angle'
         snippet directly in the Telegram message — no separate task,
         no example reply, just enough context to decide whether to
@@ -782,7 +935,9 @@ class TestMorningDigestGenerator:
         assert "5 comments" in msg or "5 comment" in msg or "5 pts" in msg
 
     @pytest.mark.asyncio
-    async def test_morning_digest_includes_user_extra_subreddits(self, monkeypatch):
+    async def test_morning_digest_includes_user_extra_subreddits(
+        self, monkeypatch, brain_db
+    ):
         """The scan set must include the AI-coding subreddits the user
         explicitly listed (vibecoding, opensourceai, claudecode, etc.)
         even when no project subscribes to them directly."""
@@ -819,7 +974,7 @@ class TestMorningDigestGenerator:
             )
 
     @pytest.mark.asyncio
-    async def test_morning_digest_popular_bonus_tier(self, monkeypatch):
+    async def test_morning_digest_popular_bonus_tier(self, monkeypatch, brain_db):
         """Subreddit-affinity bonus tier: a project subscribing to a
         sub gets up to popular_bonus_cap picks from that sub even
         when no literal keyword match, provided the score clears the
@@ -888,7 +1043,9 @@ class TestMorningDigestGenerator:
         assert "★" in digest, "bonus picks must be marked with ★"
 
     @pytest.mark.asyncio
-    async def test_morning_digest_records_search_impressions(self, monkeypatch):
+    async def test_morning_digest_records_search_impressions(
+        self, monkeypatch, brain_db
+    ):
         """Each (sub, project) pair gets at least one impression
         recorded per cycle, so the stats table has a denominator."""
         from unittest.mock import AsyncMock
@@ -919,7 +1076,9 @@ class TestMorningDigestGenerator:
         assert "vibecoding" in subs
 
     @pytest.mark.asyncio
-    async def test_morning_digest_records_hit_for_surfaced_post(self, monkeypatch):
+    async def test_morning_digest_records_hit_for_surfaced_post(
+        self, monkeypatch, brain_db
+    ):
         from unittest.mock import AsyncMock
 
         from generators import morning_digest_generator
@@ -957,7 +1116,7 @@ class TestMorningDigestGenerator:
         assert cn["hits"] >= 1
 
     @pytest.mark.asyncio
-    async def test_morning_digest_discovers_emerging_sub(self, monkeypatch):
+    async def test_morning_digest_discovers_emerging_sub(self, monkeypatch, brain_db):
         """search_all returns a post in a non-curated sub matching
         project terms — the digest must surface it under '🆕 Emerging
         subs' AND record a stats hit so the auto-promote path can
@@ -1007,7 +1166,9 @@ class TestMorningDigestGenerator:
         assert ai is not None and ai["hits"] >= 1
 
     @pytest.mark.asyncio
-    async def test_morning_digest_auto_promotes_emerging_sub(self, monkeypatch):
+    async def test_morning_digest_auto_promotes_emerging_sub(
+        self, monkeypatch, brain_db
+    ):
         """A non-curated sub with ≥5 hits in 14 days gets folded into
         the project's subreddits list and the digest report mentions
         it as newly promoted."""
@@ -1047,7 +1208,9 @@ class TestMorningDigestGenerator:
         assert any(s.lower() == "ai_agents" for s in subs)
 
     @pytest.mark.asyncio
-    async def test_morning_digest_includes_subreddit_report(self, monkeypatch):
+    async def test_morning_digest_includes_subreddit_report(
+        self, monkeypatch, brain_db
+    ):
         """Even when no picks land, the digest renders a one-paragraph
         coverage report listing tracked subs and confirming no new
         promotions this cycle. Operator wants visibility into the
@@ -1082,14 +1245,15 @@ class TestMorningDigestGenerator:
         assert "Subreddit coverage report" in msg
         assert "Tracking" in msg
 
-    def test_morning_digest_schedule_registered_after_seed(self):
-        """seed_default_projects must register a 0 8 * * * schedule
+    def test_morning_digest_schedule_registered_after_seed(self, brain_db):
+        """seed_from_profile must register a 0 8 * * * schedule
         for the morning_digest generator (idempotently)."""
-        from generators import seed_default_projects
+        from generators import seed_from_profile
+        from tenant_profile import load_profile
 
-        seed_default_projects(brain_db)
+        seed_from_profile(brain_db, load_profile())
         # Calling twice must not duplicate
-        seed_default_projects(brain_db)
+        seed_from_profile(brain_db, load_profile())
 
         sched = brain_db.get_schedule("morning_digest")
         assert sched is not None
@@ -1106,15 +1270,23 @@ class TestHotPulseGenerator:
     pulse history (independent of the 24h digest's dedup namespace)."""
 
     @pytest.fixture(autouse=True)
-    def _reset_throttle(self):
+    def _reset_throttle(self, monkeypatch):
         """Reset the module-level delivery-throttle timestamp before
         each test so cross-test pollution doesn't make the second
-        test's first fire throttle on the previous test's delivery."""
+        test's first fire throttle on the previous test's delivery.
+
+        Quiet hours depend on the wall clock (00:00-05:00 in the operator
+        tz, UTC when unset), so the gate is pinned open; the quiet-hours
+        tests pin it themselves, and the pure-helper tests call
+        tenant_profile.hour_in_window, which this patch does not touch."""
         import generators
 
         generators._LAST_HOT_PULSE_DELIVERY_AT = None
+        generators._HOT_PULSE_IN_QUIET_HOURS = False
+        monkeypatch.setattr(generators, "_is_quiet_hours", lambda *a, **kw: False)
         yield
         generators._LAST_HOT_PULSE_DELIVERY_AT = None
+        generators._HOT_PULSE_IN_QUIET_HOURS = False
 
     @pytest.mark.asyncio
     async def test_hot_pulse_in_registry(self):
@@ -1123,7 +1295,9 @@ class TestHotPulseGenerator:
         assert "hot_pulse" in GENERATORS
 
     @pytest.mark.asyncio
-    async def test_hot_pulse_calls_search_with_default_window(self, monkeypatch):
+    async def test_hot_pulse_calls_search_with_default_window(
+        self, monkeypatch, brain_db
+    ):
         """Default window is 15min lookback — the cron still fires
         every 5min but each fire scans a wider net to catch sparse
         Reddit activity without missing anything between fires."""
@@ -1151,7 +1325,7 @@ class TestHotPulseGenerator:
             assert call.kwargs.get("since") == "15m"
 
     @pytest.mark.asyncio
-    async def test_hot_pulse_window_is_overridable(self, monkeypatch):
+    async def test_hot_pulse_window_is_overridable(self, monkeypatch, brain_db):
         """An explicit `window` kwarg overrides the default."""
         from unittest.mock import AsyncMock
 
@@ -1176,7 +1350,7 @@ class TestHotPulseGenerator:
             assert call.kwargs.get("since") == "5m"
 
     @pytest.mark.asyncio
-    async def test_hot_pulse_renders_link_and_relevance(self, monkeypatch):
+    async def test_hot_pulse_renders_link_and_relevance(self, monkeypatch, brain_db):
         """The pulse message must include the post's direct URL and a
         short 'why relevant' snippet — no example comment text."""
         from unittest.mock import AsyncMock
@@ -1221,7 +1395,7 @@ class TestHotPulseGenerator:
         assert "write a" not in msg.lower()
 
     @pytest.mark.asyncio
-    async def test_hot_pulse_dedups_within_pulse_namespace(self, monkeypatch):
+    async def test_hot_pulse_dedups_within_pulse_namespace(self, monkeypatch, brain_db):
         """Re-running the pulse with the same post must NOT re-deliver
         it — dedup is via scan_cache kind='reddit_pulse'."""
         from unittest.mock import AsyncMock
@@ -1264,7 +1438,9 @@ class TestHotPulseGenerator:
         assert notify_mock.await_count == 1, "duplicate pulse must be suppressed"
 
     @pytest.mark.asyncio
-    async def test_hot_pulse_dedup_independent_of_morning_digest(self, monkeypatch):
+    async def test_hot_pulse_dedup_independent_of_morning_digest(
+        self, monkeypatch, brain_db
+    ):
         """A post the morning_digest already marked as seen
         (kind='reddit_post') must STILL surface in hot_pulse — Alex
         explicitly wants the digest to potentially repeat pulse picks
@@ -1307,7 +1483,9 @@ class TestHotPulseGenerator:
         notify_mock.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_hot_pulse_does_not_truncate_relevant_posts(self, monkeypatch):
+    async def test_hot_pulse_does_not_truncate_relevant_posts(
+        self, monkeypatch, brain_db
+    ):
         """All relevant posts in the 5-min window must appear — no
         truncation to a small fixed cap. Operator complained that
         a single match was the only thing surfaced when more were
@@ -1355,7 +1533,7 @@ class TestHotPulseGenerator:
             assert f"many{i}" in msg, f"post many{i} should appear, got:\n{msg}"
 
     @pytest.mark.asyncio
-    async def test_hot_pulse_does_not_queue_draft_tasks(self, monkeypatch):
+    async def test_hot_pulse_does_not_queue_draft_tasks(self, monkeypatch, brain_db):
         from unittest.mock import AsyncMock
 
         from generators import hot_pulse_generator
@@ -1391,7 +1569,7 @@ class TestHotPulseGenerator:
         assert len(post_tasks) == pre
 
     @pytest.mark.asyncio
-    async def test_hot_pulse_drops_semantic_only_matches(self, monkeypatch):
+    async def test_hot_pulse_drops_semantic_only_matches(self, monkeypatch, brain_db):
         """Posts Reddit's search returned for our query but that lack a
         literal topic/term phrase in title/snippet are NOT surfaced in
         the 15-min pulse. The operator wants high-precision picks; the
@@ -1430,12 +1608,15 @@ class TestHotPulseGenerator:
         notify_mock = AsyncMock(return_value=True)
         monkeypatch.setattr("telegram.notify", notify_mock)
 
+        brain_db.upsert_schedule("hot_pulse", "hp", "hot_pulse", "*/5 * * * *")
         await hot_pulse_generator(brain_db)
 
         notify_mock.assert_not_awaited()
+        status = brain_db.get_schedule("hot_pulse")["last_status"]
+        assert status.startswith("ok (0 picks"), status
 
     @pytest.mark.asyncio
-    async def test_hot_pulse_min_relevance_is_overridable(self, monkeypatch):
+    async def test_hot_pulse_min_relevance_is_overridable(self, monkeypatch, brain_db):
         """min_relevance defaults to 1.0 (one literal topic OR term
         match required). Operators can tighten via schedule kwargs:
         min_relevance=1.5 means only multi-word search_terms qualify
@@ -1491,7 +1672,7 @@ class TestHotPulseGenerator:
         )
 
     @pytest.mark.asyncio
-    async def test_hot_pulse_renders_category_buckets(self, monkeypatch):
+    async def test_hot_pulse_renders_category_buckets(self, monkeypatch, brain_db):
         """Picks group by which search query brought them, so the
         operator can see which category is currently active for a
         project. Category line appears above the picks for that bucket."""
@@ -1551,13 +1732,14 @@ class TestHotPulseGenerator:
         assert "cw1" in msg
         assert "ao1" in msg
 
-    def test_hot_pulse_schedule_registered_after_seed(self):
-        """seed_default_projects must register a */5 * * * * schedule
+    def test_hot_pulse_schedule_registered_after_seed(self, brain_db):
+        """seed_from_profile must register a */5 * * * * schedule
         for the hot_pulse generator (idempotently)."""
-        from generators import seed_default_projects
+        from generators import seed_from_profile
+        from tenant_profile import load_profile
 
-        seed_default_projects(brain_db)
-        seed_default_projects(brain_db)
+        seed_from_profile(brain_db, load_profile())
+        seed_from_profile(brain_db, load_profile())
 
         sched = brain_db.get_schedule("hot_pulse")
         assert sched is not None
@@ -1565,13 +1747,15 @@ class TestHotPulseGenerator:
         assert sched["cron"].strip() == "*/5 * * * *"
 
     @pytest.mark.asyncio
-    async def test_hot_pulse_throttles_within_delivery_interval(self, monkeypatch):
+    async def test_hot_pulse_throttles_within_delivery_interval(
+        self, monkeypatch, brain_db
+    ):
         """Cron fires every 5min for heartbeat, but Telegram delivery
         is throttled to once per `min_delivery_interval_minutes`
         (default 15). On throttled fires the function does NOT call
         Reddit or Telegram — just updates schedule status so the
         operator can see the cron is alive."""
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
         from unittest.mock import AsyncMock
 
         import generators
@@ -1586,7 +1770,7 @@ class TestHotPulseGenerator:
             search_terms=["agent orchestration"],
         )
         # Schedule row must exist for update_schedule_status to land —
-        # in production seed_default_projects creates this on startup.
+        # in production seed_from_profile creates this on startup.
         brain_db.upsert_schedule(
             "hot_pulse",
             "5-min Reddit hot-pulse",
@@ -1596,7 +1780,7 @@ class TestHotPulseGenerator:
         )
 
         # Pretend we delivered 5 minutes ago — within the 15min throttle.
-        recent = datetime.now(timezone.utc) - timedelta(minutes=5)
+        recent = datetime.now(UTC) - timedelta(minutes=5)
         monkeypatch.setattr(generators, "_LAST_HOT_PULSE_DELIVERY_AT", recent)
 
         search_mock = AsyncMock(return_value=[])
@@ -1610,13 +1794,19 @@ class TestHotPulseGenerator:
         notify_mock.assert_not_awaited()
         sched = brain_db.get_schedule("hot_pulse")
         assert sched is not None
-        assert "throttled" in (sched.get("last_status") or "")
+        import re
+
+        assert re.fullmatch(
+            r"throttled \(5\.\d+m of 15m\)", sched.get("last_status") or ""
+        ), sched.get("last_status")
 
     @pytest.mark.asyncio
-    async def test_hot_pulse_delivers_after_interval_elapses(self, monkeypatch):
+    async def test_hot_pulse_delivers_after_interval_elapses(
+        self, monkeypatch, brain_db
+    ):
         """After `min_delivery_interval_minutes` has passed since the
         last delivery, the next fire delivers normally."""
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
         from unittest.mock import AsyncMock
 
         import generators
@@ -1633,7 +1823,7 @@ class TestHotPulseGenerator:
         )
 
         # Last delivery 16 minutes ago — past the 15min throttle.
-        stale = datetime.now(timezone.utc) - timedelta(minutes=16)
+        stale = datetime.now(UTC) - timedelta(minutes=16)
         monkeypatch.setattr(generators, "_LAST_HOT_PULSE_DELIVERY_AT", stale)
 
         post = RedditPost(
@@ -1658,11 +1848,13 @@ class TestHotPulseGenerator:
         notify_mock.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_hot_pulse_min_delivery_interval_is_overridable(self, monkeypatch):
+    async def test_hot_pulse_min_delivery_interval_is_overridable(
+        self, monkeypatch, brain_db
+    ):
         """An operator can tune the delivery interval at runtime via
         the schedule's kwargs (e.g. min_delivery_interval_minutes=5
         to revert to the old behavior)."""
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
         from unittest.mock import AsyncMock
 
         import generators
@@ -1679,7 +1871,7 @@ class TestHotPulseGenerator:
         )
 
         # 6 minutes ago — past a 5min override but within the 15min default.
-        recent = datetime.now(timezone.utc) - timedelta(minutes=6)
+        recent = datetime.now(UTC) - timedelta(minutes=6)
         monkeypatch.setattr(generators, "_LAST_HOT_PULSE_DELIVERY_AT", recent)
 
         post = RedditPost(
@@ -1704,14 +1896,16 @@ class TestHotPulseGenerator:
         notify_mock.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_hot_pulse_marks_seen_for_all_candidate_projects(self, monkeypatch):
+    async def test_hot_pulse_marks_seen_for_all_candidate_projects(
+        self, monkeypatch, brain_db
+    ):
         """When two projects both could claim the same post (rel ties
         or one wins by a small margin), the delivered post must be
         marked seen for ALL projects that scanned it — not just the
         owner. Otherwise the loser project picks it up on the next
         fire that's still within the lookback window (cross-project
         dedup leak)."""
-        from datetime import datetime, timezone
+        from datetime import datetime
         from unittest.mock import AsyncMock
 
         import generators
@@ -1746,7 +1940,7 @@ class TestHotPulseGenerator:
             subreddit="ClaudeAI",
             score=2,
             comments=0,
-            created_utc=datetime.now(timezone.utc).isoformat(),
+            created_utc=datetime.now(UTC).isoformat(),
         )
 
         async def fake_search(*a, **kw):
@@ -1768,24 +1962,24 @@ class TestHotPulseGenerator:
         falls inside the configured local-time window in
         America/Chicago. 07:30 UTC = 01:30 CST (winter, UTC-6) or
         02:30 CDT (summer, UTC-5); both are inside [0, 5)."""
-        from datetime import datetime, timezone
+        from datetime import datetime
 
-        from generators import _is_quiet_hours
+        from tenant_profile import hour_in_window as _is_quiet_hours
 
-        winter_utc = datetime(2026, 1, 15, 7, 30, tzinfo=timezone.utc)
-        summer_utc = datetime(2026, 7, 15, 7, 30, tzinfo=timezone.utc)
+        winter_utc = datetime(2026, 1, 15, 7, 30, tzinfo=UTC)
+        summer_utc = datetime(2026, 7, 15, 7, 30, tzinfo=UTC)
         assert _is_quiet_hours(winter_utc, 0, 5, "America/Chicago") is True
         assert _is_quiet_hours(summer_utc, 0, 5, "America/Chicago") is True
 
     def test_is_quiet_hours_outside_window_chicago(self):
         """Returns False at noon UTC, which lands at 06:00 CST /
         07:00 CDT — outside the [0, 5) sleep window."""
-        from datetime import datetime, timezone
+        from datetime import datetime
 
-        from generators import _is_quiet_hours
+        from tenant_profile import hour_in_window as _is_quiet_hours
 
-        winter_noon_utc = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
-        summer_noon_utc = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
+        winter_noon_utc = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
+        summer_noon_utc = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
         assert _is_quiet_hours(winter_noon_utc, 0, 5, "America/Chicago") is False
         assert _is_quiet_hours(summer_noon_utc, 0, 5, "America/Chicago") is False
 
@@ -1793,15 +1987,15 @@ class TestHotPulseGenerator:
         """End hour is exclusive: 05:00 CST = 11:00 UTC (winter) is
         already OUT of quiet hours so the */5 fire at 5:00am wakes
         the operator's pulse up immediately."""
-        from datetime import datetime, timezone
+        from datetime import datetime
 
-        from generators import _is_quiet_hours
+        from tenant_profile import hour_in_window as _is_quiet_hours
 
-        five_am_cst_utc = datetime(2026, 1, 15, 11, 0, tzinfo=timezone.utc)
+        five_am_cst_utc = datetime(2026, 1, 15, 11, 0, tzinfo=UTC)
         assert _is_quiet_hours(five_am_cst_utc, 0, 5, "America/Chicago") is False
 
     @pytest.mark.asyncio
-    async def test_hot_pulse_skips_during_quiet_hours(self, monkeypatch):
+    async def test_hot_pulse_skips_during_quiet_hours(self, monkeypatch, brain_db):
         """During CST quiet hours (default 00:00-05:00 America/Chicago),
         hot_pulse must skip Reddit + Telegram entirely. On the first
         fire entering the window it writes a 'quiet hours' status to
@@ -1867,12 +2061,12 @@ class TestHotPulseGenerator:
         assert sched_after.get("last_run") == prior_run
 
     @pytest.mark.asyncio
-    async def test_hot_pulse_resumes_after_quiet_hours(self, monkeypatch):
+    async def test_hot_pulse_resumes_after_quiet_hours(self, monkeypatch, brain_db):
         """When the gate transitions from in-window back to out-of-window
         (5am CST boundary), the next fire must run the normal flow:
         reset the in-quiet-hours flag, call Reddit, and (if posts found)
         deliver to Telegram."""
-        from datetime import datetime, timezone
+        from datetime import datetime
         from unittest.mock import AsyncMock
 
         import generators
@@ -1903,7 +2097,7 @@ class TestHotPulseGenerator:
             url="https://reddit.com/r/ClaudeAI/post_after_sleep",
             score=42,
             comments=5,
-            created_utc=datetime.now(timezone.utc).isoformat(),
+            created_utc=datetime.now(UTC).isoformat(),
         )
 
         async def fake_search(*a, **kw):
@@ -1952,8 +2146,11 @@ class TestSchedulerModule:
     def test_parse_cron_duration_days(self):
         from scheduler import _parse_cron
 
-        result = _parse_cron("every 2d")
-        assert result == {"day": "*/2"}
+        result = _parse_cron("every 1d")
+        assert result == {"day": "*/1"}
+        # Day steps above 1 restart each month (uneven gaps): rejected.
+        with pytest.raises(ValueError, match="evenly"):
+            _parse_cron("every 2d")
 
     def test_parse_cron_invalid(self):
         from scheduler import _parse_cron
@@ -1968,7 +2165,7 @@ class TestSchedulerModule:
         assert result == {"minute": "*/5"}
 
     @pytest.mark.asyncio
-    async def test_init_scheduler_attaches_jobs_for_db_schedules(self):
+    async def test_init_scheduler_attaches_jobs_for_db_schedules(self, brain_db):
         """Regression: init_scheduler must actually attach APScheduler
         jobs for every active schedule in the DB. The previous
         SQLAlchemy jobstore tried to serialise brain_db (which holds a
@@ -2005,14 +2202,14 @@ class TestSchedulerModule:
 
 class TestMarketingCommandParsing:
     def test_extract_sched_list(self):
-        from llm_proxy import _extract_marketing_command
+        from chat_commands import _extract_marketing_command
 
         cmd = _extract_marketing_command("/sched list")
         assert cmd["verb"] == "sched"
         assert cmd["subcmd"] == "list"
 
     def test_extract_sched_add(self):
-        from llm_proxy import _extract_marketing_command
+        from chat_commands import _extract_marketing_command
 
         cmd = _extract_marketing_command(
             '/sched add myscan cron "0 9 * * *" -- morning_scan'
@@ -2021,7 +2218,7 @@ class TestMarketingCommandParsing:
         assert cmd["subcmd"] == "add"
 
     def test_extract_scan_reddit(self):
-        from llm_proxy import _extract_marketing_command
+        from chat_commands import _extract_marketing_command
 
         cmd = _extract_marketing_command(
             "/scan reddit claude code plugins --subs ClaudeAI,LocalLLaMA"
@@ -2030,7 +2227,7 @@ class TestMarketingCommandParsing:
         assert cmd["subcmd"] == "reddit"
 
     def test_extract_scan_github(self):
-        from llm_proxy import _extract_marketing_command
+        from chat_commands import _extract_marketing_command
 
         cmd = _extract_marketing_command(
             "/scan github claude code --kind repos --stars 5"
@@ -2039,14 +2236,14 @@ class TestMarketingCommandParsing:
         assert cmd["subcmd"] == "github"
 
     def test_extract_projects_list(self):
-        from llm_proxy import _extract_marketing_command
+        from chat_commands import _extract_marketing_command
 
         cmd = _extract_marketing_command("/projects list")
         assert cmd["verb"] == "projects"
         assert cmd["subcmd"] == "list"
 
     def test_extract_marketing_alias(self):
-        from llm_proxy import _extract_marketing_command
+        from chat_commands import _extract_marketing_command
 
         cmd = _extract_marketing_command("/marketing")
         assert cmd["verb"] == "sched"
@@ -2054,19 +2251,19 @@ class TestMarketingCommandParsing:
         assert cmd["args"] == "morning_scan"
 
     def test_extract_non_marketing(self):
-        from llm_proxy import _extract_marketing_command
+        from chat_commands import _extract_marketing_command
 
         assert _extract_marketing_command("!task do something") is None
         assert _extract_marketing_command("hello") is None
 
     def test_bang_prefix(self):
-        from llm_proxy import _extract_marketing_command
+        from chat_commands import _extract_marketing_command
 
         cmd = _extract_marketing_command("!scan web test query")
         assert cmd["verb"] == "scan"
 
     def test_scan_args_parsing(self):
-        from llm_proxy import _parse_scan_args
+        from chat_commands import _parse_scan_args
 
         topic, subs, proj, since = _parse_scan_args(
             "claude plugins --subs ClaudeAI,LocalLLaMA --project cnm --since 30d"
@@ -2082,85 +2279,87 @@ class TestMarketingCommandParsing:
 
 class TestMarketingCommandDispatch:
     @pytest.mark.asyncio
-    async def test_sched_list_empty(self):
-        from llm_proxy import _handle_sched_command
+    async def test_sched_list_empty(self, brain_db):
+        from chat_commands import _handle_sched_command
 
-        result = await _handle_sched_command("list", "")
+        result = await _handle_sched_command("list", "", brain_db=brain_db)
         assert "No schedules configured" in result
 
     @pytest.mark.asyncio
-    async def test_sched_list_with_items(self):
-        from llm_proxy import _handle_sched_command
+    async def test_sched_list_with_items(self, brain_db):
+        from chat_commands import _handle_sched_command
 
         brain_db.upsert_schedule(
             "test-sched", "Test Schedule", "morning_scan", "0 9 * * *"
         )
-        result = await _handle_sched_command("list", "")
+        result = await _handle_sched_command("list", "", brain_db=brain_db)
         assert "Test Schedule" in result
         assert "ACTIVE" in result
 
     @pytest.mark.asyncio
-    async def test_sched_show(self):
-        from llm_proxy import _handle_sched_command
+    async def test_sched_show(self, brain_db):
+        from chat_commands import _handle_sched_command
 
         brain_db.upsert_schedule("show-test", "Showable", "custom_scan", "*/30 * * * *")
-        result = await _handle_sched_command("show", "show-test")
+        result = await _handle_sched_command("show", "show-test", brain_db=brain_db)
         assert "Showable" in result
         assert "custom_scan" in result
 
     @pytest.mark.asyncio
-    async def test_sched_show_missing(self):
-        from llm_proxy import _handle_sched_command
+    async def test_sched_show_missing(self, brain_db):
+        from chat_commands import _handle_sched_command
 
-        result = await _handle_sched_command("show", "nonexistent")
+        result = await _handle_sched_command("show", "nonexistent", brain_db=brain_db)
         assert "not found" in result
 
     @pytest.mark.asyncio
-    async def test_projects_list_empty(self):
-        from llm_proxy import _handle_projects_command
+    async def test_projects_list_empty(self, brain_db):
+        from chat_commands import _handle_projects_command
 
-        result = await _handle_projects_command("list", "")
+        result = await _handle_projects_command("list", "", brain_db=brain_db)
         assert "No projects tracked" in result
 
     @pytest.mark.asyncio
-    async def test_projects_add_and_show(self):
-        from llm_proxy import _handle_projects_command
+    async def test_projects_add_and_show(self, brain_db):
+        from chat_commands import _handle_projects_command
 
         result = await _handle_projects_command(
-            "add", "test-proj athola/test-proj --topics yaml,pdf --subs Python"
+            "add",
+            "test-proj athola/test-proj --topics yaml,pdf --subs Python",
+            brain_db=brain_db,
         )
         assert "added" in result
 
-        result = await _handle_projects_command("show", "test-proj")
+        result = await _handle_projects_command("show", "test-proj", brain_db=brain_db)
         assert "athola/test-proj" in result
 
     @pytest.mark.asyncio
-    async def test_projects_rm(self):
-        from llm_proxy import _handle_projects_command
+    async def test_projects_rm(self, brain_db):
+        from chat_commands import _handle_projects_command
 
         brain_db.upsert_project("rm-test", "athola", "rm-test")
-        result = await _handle_projects_command("rm", "rm-test")
+        result = await _handle_projects_command("rm", "rm-test", brain_db=brain_db)
         assert "Removed" in result
 
     @pytest.mark.asyncio
-    async def test_sched_help(self):
-        from llm_proxy import _handle_sched_command
+    async def test_sched_help(self, brain_db):
+        from chat_commands import _handle_sched_command
 
-        result = await _handle_sched_command("unknown", "")
+        result = await _handle_sched_command("unknown", "", brain_db=brain_db)
         assert "Usage" in result
 
     @pytest.mark.asyncio
-    async def test_scan_help(self):
-        from llm_proxy import _handle_scan_command
+    async def test_scan_help(self, brain_db):
+        from chat_commands import _handle_scan_command
 
-        result = await _handle_scan_command("unknown", "")
+        result = await _handle_scan_command("unknown", "", brain_db=brain_db)
         assert "Usage" in result
 
     @pytest.mark.asyncio
-    async def test_projects_help(self):
-        from llm_proxy import _handle_projects_command
+    async def test_projects_help(self, brain_db):
+        from chat_commands import _handle_projects_command
 
-        result = await _handle_projects_command("unknown", "")
+        result = await _handle_projects_command("unknown", "", brain_db=brain_db)
         assert "Usage" in result
 
 
@@ -2239,9 +2438,11 @@ class TestMarketingAPIEndpoints:
         resp = client.post("/scan/github", json={})
         assert resp.status_code == 400
 
-    def test_scan_web(self, client):
+    def test_scan_web(self, client, monkeypatch):
+        monkeypatch.setattr(llm_proxy, "_llm_call", AsyncMock(return_value="found"))
         resp = client.post("/scan/web", json={"prompt": "test query"})
         assert resp.status_code == 200
+        assert resp.json()["result"] == "found"
 
     def test_scan_web_no_prompt(self, client):
         resp = client.post("/scan/web", json={})
@@ -2259,7 +2460,7 @@ class TestRedditAdapter:
         returning an empty list. This keeps the morning_digest useful
         on a fresh deploy before the operator wires script-app creds."""
         import json as _json
-        from datetime import datetime, timezone
+        from datetime import datetime
         from unittest.mock import AsyncMock, patch
 
         import httpx
@@ -2268,7 +2469,7 @@ class TestRedditAdapter:
 
         assert not await is_configured()
 
-        now_ts = datetime.now(timezone.utc).timestamp()
+        now_ts = datetime.now(UTC).timestamp()
         payload = {
             "data": {
                 "children": [
@@ -2305,9 +2506,7 @@ class TestRedditAdapter:
         assert results[0].score == 42
 
     @pytest.mark.asyncio
-    async def test_public_fallback_swallows_network_errors(self):
-        from unittest.mock import AsyncMock, patch
-
+    async def test_public_fallback_network_error_raises_upstream(self):
         from reddit_search import search_subreddits
 
         mock_client = AsyncMock()
@@ -2315,10 +2514,12 @@ class TestRedditAdapter:
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("reddit_search.httpx.AsyncClient", return_value=mock_client):
-            results = await search_subreddits("test", ["ClaudeAI"])
-
-        assert results == []
+        # A failed search must not look like "no posts" (#26).
+        with (
+            patch("reddit_search.httpx.AsyncClient", return_value=mock_client),
+            pytest.raises(UpstreamError),
+        ):
+            await search_subreddits("test", ["ClaudeAI"])
 
     def test_parse_since(self):
         from reddit_search import _parse_since
@@ -2335,12 +2536,13 @@ class TestRedditAdapter:
 
 class TestGitHubAdapter:
     @pytest.mark.asyncio
-    async def test_search_without_config(self):
+    async def test_search_unreachable_raises_upstream(self):
         from github_search import search_repos
 
-        # Without githubkit installed, returns empty
-        results = await search_repos("test")
-        assert isinstance(results, list)
+        # Unit tests have no network: the failed search raises (#26)
+        # instead of returning an empty list that reads as "no repos".
+        with pytest.raises(UpstreamError):
+            await search_repos("test")
 
     @pytest.mark.asyncio
     async def test_traffic_without_config(self):
@@ -2348,3 +2550,126 @@ class TestGitHubAdapter:
 
         result = await get_self_traffic("owner", "repo")
         assert result is None
+
+
+class TestCatchUpMissedDaily:
+    """GIVEN workflows was down across the 8am fire
+    WHEN the scheduler boots later that morning
+    THEN the missed morning_digest is queued once, not dropped."""
+
+    TZ = "America/Chicago"
+
+    def _sched(self, last_run=None, last_status=None):
+        return {
+            "id": "morning_digest",
+            "kind": "morning_digest",
+            "cron": "0 8 * * *",
+            "last_run": last_run,
+            "last_status": last_status,
+        }
+
+    def _now(self, hh, mm=0):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        return datetime(2026, 9, 26, hh, mm, tzinfo=ZoneInfo(self.TZ))
+
+    def test_missed_fire_after_restart(self):
+        from scheduler import _missed_fire
+
+        prev = _missed_fire(
+            self._sched("2026-09-25T13:05:00+00:00"), self._now(8, 40), self.TZ
+        )
+        assert prev is not None
+        assert (prev.hour, prev.minute) == (8, 0)
+
+    def test_no_catch_up_when_today_delivered(self):
+        from scheduler import _missed_fire
+
+        sched = self._sched("2026-09-26T13:03:00+00:00", "delivered 2/2 msgs (…)")
+        assert _missed_fire(sched, self._now(9), self.TZ) is None
+        # A manual run's generic "ok" after the fire also counts as handled.
+        sched = self._sched("2026-09-26T13:03:00+00:00", "ok")
+        assert _missed_fire(sched, self._now(9), self.TZ) is None
+
+    def test_catch_up_when_today_failed(self):
+        from scheduler import _missed_fire
+
+        sched = self._sched("2026-09-26T13:03:00+00:00", "FAILED telegram 0/2 msgs")
+        assert _missed_fire(sched, self._now(9), self.TZ) is not None
+
+    def test_no_catch_up_before_fire_time_or_too_late(self):
+        from scheduler import _missed_fire
+
+        sched = self._sched("2026-09-25T13:03:00+00:00", "delivered 1/1 msgs")
+        assert _missed_fire(sched, self._now(7, 30), self.TZ) is None
+        assert _missed_fire(sched, self._now(23), self.TZ) is None
+
+    def test_init_scheduler_queues_catch_up_job(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import scheduler as sched_mod
+
+        fake = MagicMock()
+        fake.get_job.return_value = None
+        monkeypatch.setattr(sched_mod, "AsyncIOScheduler", MagicMock(return_value=fake))
+        monkeypatch.setattr(sched_mod, "register_watchdog", MagicMock())
+        monkeypatch.setattr(sched_mod, "_missed_fire", lambda s, now, tz: object())
+        db = MagicMock()
+        db.list_schedules.return_value = [self._sched()]
+
+        sched_mod.init_scheduler(db)
+
+        ids = [c.kwargs.get("id") for c in fake.add_job.call_args_list]
+        assert "catchup_morning_digest" in ids
+
+
+class TestGitHubIssueSearch:
+    """search_issues must call githubkit's real search method; a wrong
+    name is swallowed as a warning and every search returns []."""
+
+    @pytest.mark.asyncio
+    async def test_calls_async_issues_search(self, monkeypatch):
+        from types import SimpleNamespace
+
+        import github_search
+
+        item = SimpleNamespace(
+            id=1,
+            number=7,
+            title="Need a plugin marketplace",
+            html_url="https://github.com/o/r/issues/7",
+            state="open",
+            repository_url="https://api.github.com/repos/o/r",
+            labels=[],
+        )
+        search = SimpleNamespace(
+            async_issues_and_pull_requests=AsyncMock(
+                return_value=SimpleNamespace(parsed_data=SimpleNamespace(items=[item]))
+            )
+        )
+        client = SimpleNamespace(rest=SimpleNamespace(search=search))
+        monkeypatch.setattr(github_search, "_get_client", lambda: client)
+
+        issues = await github_search.search_issues("plugin", limit=5)
+
+        assert [i.url for i in issues] == ["https://github.com/o/r/issues/7"]
+
+
+class TestRunNowKeepsGeneratorStatus:
+    @pytest.mark.asyncio
+    async def test_generator_written_status_survives_manual_run(
+        self, monkeypatch, brain_db
+    ):
+        import scheduler as sched_mod
+
+        brain_db.upsert_schedule("rs", "RS", "morning_digest", "0 8 * * *")
+
+        async def gen(brain_db, **kw):
+            brain_db.update_schedule_status(
+                "rs", "2026-09-26T15:00:00+00:00", "delivered 2/2 msgs"
+            )
+
+        monkeypatch.setitem(sched_mod.GENERATORS, "morning_digest", gen)
+        await sched_mod.run_schedule_now(None, brain_db, "rs")
+        assert brain_db.get_schedule("rs")["last_status"] == "delivered 2/2 msgs"

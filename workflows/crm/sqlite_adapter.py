@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from datetime import datetime, timezone
+import threading
 
-from .adapter import CRMAdapter
+from clock import utcnow_iso
+
+from .adapter import CRMAdapter, RecordList
 
 logger = logging.getLogger("clawrange.crm")
 
@@ -48,16 +50,21 @@ _LEAD_COLUMNS = (
     "created_at",
     "updated_at",
 )
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+# Columns with a UNIQUE index; ON CONFLICT(col) requires one. Keep in sync
+# with _SCHEMA. tenant_profile validates connector sinks against these.
+UNIQUE_LEAD_KEYS = frozenset({"email"})
+OBJECTS = frozenset({"leads"})  # objects upsert() writes
+_ACTIVITY_COLUMNS = ("id", "lead_id", "kind", "detail", "ts")
+MAX_TEMPLATE_ROWS = 1000
 
 
 class SQLiteCRM(CRMAdapter):
     def __init__(self, path: str):
         self.path = path
         self._conn: sqlite3.Connection | None = None
+        # Writes from the threadpool and the scheduler share one connection;
+        # serialize them so one thread's commit can't flush another's batch.
+        self._lock = threading.RLock()
 
     # ─── lifecycle ────────────────────────────────────────────────
 
@@ -89,19 +96,33 @@ class SQLiteCRM(CRMAdapter):
     # ─── writes ───────────────────────────────────────────────────
 
     def upsert(self, object: str, records: list[dict], upsert_key: str) -> int:
-        if object != "leads":
+        if object not in OBJECTS:
             raise ValueError(f"SQLiteCRM only supports object 'leads', got '{object}'")
-        if upsert_key not in _LEAD_COLUMNS:
-            raise ValueError(f"upsert_key '{upsert_key}' is not a lead column")
+        if upsert_key not in UNIQUE_LEAD_KEYS:
+            raise ValueError(
+                f"upsert_key '{upsert_key}' must be a unique lead column "
+                f"({', '.join(sorted(UNIQUE_LEAD_KEYS))})"
+            )
+        with self._lock:
+            conn = self._rw()
+            try:
+                written = self._upsert_rows(conn, records, upsert_key)
+            except Exception:
+                conn.rollback()  # never leave half a batch pending
+                raise
+            conn.commit()
+            return written
 
-        conn = self._rw()
-        now = _now()
+    def _upsert_rows(self, conn, records: list[dict], upsert_key: str) -> int:
+        now = utcnow_iso()
         written = 0
         for rec in records:
             row = {k: rec[k] for k in _LEAD_COLUMNS if k in rec}
             row.setdefault("created_at", now)
             row["updated_at"] = now
-            row.setdefault("status", "new")
+            # No status default here: the schema's DEFAULT 'new' covers
+            # inserts, and an explicit 'new' would reset a worked lead's
+            # status through ON CONFLICT ... SET status=excluded.status.
             if upsert_key not in row or row[upsert_key] in (None, ""):
                 logger.warning("crm.upsert: skipping record missing %s", upsert_key)
                 continue
@@ -116,18 +137,19 @@ class SQLiteCRM(CRMAdapter):
             )
             conn.execute(sql, row)
             written += 1
-        conn.commit()
         return written
 
     def add_activity(
         self, lead_id: int, kind: str, detail: str = "", ts: str | None = None
     ) -> None:
-        conn = self._rw()
-        conn.execute(
-            "INSERT INTO activities (lead_id, kind, detail, ts) VALUES (?, ?, ?, ?)",
-            (lead_id, kind, detail, ts or _now()),
-        )
-        conn.commit()
+        with self._lock:
+            conn = self._rw()
+            conn.execute(
+                "INSERT INTO activities (lead_id, kind, detail, ts) "
+                "VALUES (?, ?, ?, ?)",
+                (lead_id, kind, detail, ts or utcnow_iso()),
+            )
+            conn.commit()
 
     # ─── reads ────────────────────────────────────────────────────
 
@@ -141,7 +163,10 @@ class SQLiteCRM(CRMAdapter):
         params: list = []
         if filters:
             clauses = []
+            allowed = _LEAD_COLUMNS if object == "leads" else _ACTIVITY_COLUMNS
             for k, v in filters.items():
+                if k not in allowed:
+                    raise ValueError(f"unknown filter column '{k}' for {object}")
                 clauses.append(f"{k} = ?")
                 params.append(v)
             where = " WHERE " + " AND ".join(clauses)
@@ -150,12 +175,19 @@ class SQLiteCRM(CRMAdapter):
         params.append(limit)
         return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
-    def run_template(self, template: dict, params: dict) -> list[dict]:
+    def run_template(self, template: dict, params: dict) -> RecordList:
         sql = (template or {}).get("sql", "")
         _guard_readonly(sql)
         conn = self._ro()
+        # The authorizer is the real guard: on this connection SQLite refuses
+        # to compile anything but reads, whatever the statement text says.
+        conn.set_authorizer(_read_only_authorizer)
         try:
-            return [dict(r) for r in conn.execute(sql, params or {}).fetchall()]
+            cur = conn.execute(sql, params or {})
+        except sqlite3.DatabaseError as exc:
+            raise ValueError(f"template SQL rejected: {exc}") from exc
+        try:
+            return [dict(r) for r in cur.fetchmany(MAX_TEMPLATE_ROWS)]
         finally:
             conn.close()
 
@@ -169,8 +201,10 @@ class SQLiteCRM(CRMAdapter):
                 "path": self.path,
                 "leads": leads,
             }
-        except Exception as exc:  # pragma: no cover - defensive
-            return {"status": "error", "adapter": "sqlite", "error": str(exc)}
+        except Exception as exc:
+            # The message can name the DB path; keep it in the log.
+            logger.warning("crm health: sqlite unavailable: %s", exc)
+            return {"status": "error", "adapter": "sqlite", "error": type(exc).__name__}
 
 
 def _guard_readonly(sql: str) -> None:
@@ -189,18 +223,18 @@ def _guard_readonly(sql: str) -> None:
     # No stacked statements (a remaining ';' means a second statement).
     if ";" in s:
         raise ValueError("template SQL must be a single statement (no ';')")
-    forbidden = (
-        " insert ",
-        " update ",
-        " delete ",
-        " drop ",
-        " alter ",
-        " create ",
-        " replace ",
-        " attach ",
-        " pragma ",
-    )
-    padded = f" {lowered} "
-    for kw in forbidden:
-        if kw in padded:
-            raise ValueError(f"template SQL contains forbidden keyword '{kw.strip()}'")
+    # No keyword blacklist: substring matching both missed real mutations and
+    # rejected harmless string literals. _read_only_authorizer enforces
+    # read-only at compile time on the mode=ro connection.
+
+
+_READ_ACTIONS = {
+    sqlite3.SQLITE_SELECT,
+    sqlite3.SQLITE_READ,
+    sqlite3.SQLITE_FUNCTION,
+    sqlite3.SQLITE_RECURSIVE,
+}
+
+
+def _read_only_authorizer(action, *_args) -> int:
+    return sqlite3.SQLITE_OK if action in _READ_ACTIONS else sqlite3.SQLITE_DENY
