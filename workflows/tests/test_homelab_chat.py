@@ -410,6 +410,10 @@ def test_homelab_turns_are_dropped_from_forwarded_history(rig, monkeypatch):
     )
     monkeypatch.setattr(llm_proxy, "_call_provider", caller)
     monkeypatch.setattr(llm_proxy, "_background_notify", lambda *a, **k: None)
+    # A tier must exist for the forwarded request to reach _call_provider;
+    # never rely on keys in the developer's shell (CI has none).
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("ZAI_API_KEY", "test-key")
     leaked = rig.raw("!home evil")
     messages = [
         {"role": "user", "content": "!home evil"},
@@ -438,6 +442,10 @@ def test_homelab_turns_in_list_content_are_dropped_too(rig, monkeypatch):
     )
     monkeypatch.setattr(llm_proxy, "_call_provider", caller)
     monkeypatch.setattr(llm_proxy, "_background_notify", lambda *a, **k: None)
+    # A tier must exist for the forwarded request to reach _call_provider;
+    # never rely on keys in the developer's shell (CI has none).
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("ZAI_API_KEY", "test-key")
     leaked = rig.raw("!home evil")
     messages = [
         {"role": "user", "content": "!home evil"},
