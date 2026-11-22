@@ -44,7 +44,7 @@ Tailscale and Caddy gateway.
   - `tasks_api.py`: `TaskCreate`/`TaskResult`, shared by `/task` and `!task`
   - `auth.py`: app-wide bearer auth (`PROXY_AUTH_TOKEN`), fails closed on
     an empty token or the old `generate-a-token-here` placeholder; only
-    `GET /healthz`, `GET /healthz/{research,crm,persona}`, `GET /tier` and
+    `GET /healthz`, `GET /healthz/{research,crm,persona,homelab}`, `GET /tier` and
     `GET /sched[/{id}]` are public
   - `http_auth.py`: `auth_headers`, the one builder that turns a
     profile's `auth` block into outbound request headers (connector
@@ -69,7 +69,7 @@ Tailscale and Caddy gateway.
     in order), web-search routing to the OpenRouter `:online` tier,
     anti-hallucination guard, balance circuit breaker; dispatches chat
     commands and heartbeats to the modules below
-  - `chat_commands.py`: `/tier`, `!help`, `!task`, `!persona` (alias
+  - `chat_commands.py`: `/tier`, `!help`, `!task`, `!home`, `!net`, `!persona` (alias
     `!learn`), `/sched`, `/scan` and `/projects` chat commands handled
     inside the proxy
   - `heartbeat.py`: heartbeat interceptor (`_handle_heartbeat`, task
@@ -106,14 +106,26 @@ Tailscale and Caddy gateway.
   - `crm/`: pluggable `CRMAdapter` (SQLite default and REST seam) and
     read-only query templates / NL router (`crm/query.py`)
   - `crm_api.py`: `/crm/*` router (mounted only when profile defines `crm`)
+  - `homelab/`: pull-only homelab watch over Home Assistant REST, the
+    Uptime Kuma status page and the monitoring stack's router census
+    (`scanjson`, on the internal `clawrange-homelab` network only workflows
+    joins). Pure core (`models`, `parse`, `findings`, `report`, `actions`)
+    and shell (`config`, `sources`, `service`). State lives in the
+    `homelab_state` table, never brain pages; `!home`/`!net` replies carry
+    `[homelab]`, which the proxy strips from forwarded history. HA actions
+    are an empty-by-default allowlist with hard-denied domains and a
+    Telegram-only confirmation code. See `docs/homelab-guide.md`
+  - `homelab_api.py`: `/homelab/*` and `/healthz/homelab` (mounted only
+    when the profile defines `homelab`)
   - `tests/`: pytest suite (app, brain, llm_proxy, marketing, telegram,
     profile, persona, persona_api, persona_learning, connectors, crm,
     crm_api, lifespan)
 - `deerflow/`: DeerFlow research agent config (optional, OpenRouter)
 - `scripts/`: POSIX shell scripts for lifecycle and testing
 - `tests/`: Python validation suite (`validate_stack.py`)
-- `docs/`: testbed and deployment guides, the multi-tenant and
-  research/marketing operator guides, `tradeoffs.md` (decision journal).
+- `docs/`: testbed and deployment guides, the multi-tenant, homelab
+  (`homelab-guide.md`) and research/marketing operator guides,
+  `tradeoffs.md` (decision journal).
   Plans and specs are working files: record the lasting decisions in
   `tradeoffs.md` when the work ships, then delete them. `docs/archive/`
   is gitignored for local scratch
@@ -173,7 +185,7 @@ make py-lint          # uv run ruff check .
 ## API Endpoints
 
 Every route requires `Authorization: Bearer $PROXY_AUTH_TOKEN` except
-`GET /healthz`, `/healthz/{research,crm,persona}`, `GET /tier`, `GET /sched`
+`GET /healthz`, `/healthz/{research,crm,persona,homelab}`, `GET /tier`, `GET /sched`
 and `GET /sched/{id}` (polled by the homepage dashboard). Anonymous `/sched`
 reads omit `kwargs` and reduce `last_status` to `ok`/`failed`. An unset
 token fails closed (401), and `scripts/start.sh` refuses to start the
@@ -278,6 +290,20 @@ stack without one. There is no `/docs`, `/redoc` or `/openapi.json`.
   `make persona-export`. Offline loop demo via `make persona-demo`.
   `PERSONA_SIGNAL_LEARNING=1` enables the flagged outcome-signal source.
   See `docs/multi-tenant-guide.md` for profile authoring.
+
+**Homelab watch (mounted only when the profile defines `homelab`)**
+- `GET  /homelab/status`: live observation summary per source
+- `POST /homelab/watch`: run the watch now (same as the `homelab_watch`
+  schedule, every 5 min)
+- `GET  /healthz/homelab`: public; per source `configured`, `ok` (null when
+  unconfigured), `last_success`, `failures`; error text only with the
+  bearer token; never URLs. `degraded` when a source fails or the last
+  run is older than 15 min
+- Chat: `!home`, `!home <text>`, `!net`, `!home do <domain.service>
+  <entity_id>` and `!home confirm <code>` (whole message only). Settings:
+  `HA_URL`, `HA_TOKEN` (workflows only, never OpenClaw),
+  `HOMELAB_KUMA_URL`, `HOMELAB_CA_CERT`, `HOMELAB_CENSUS_URL`; unset means
+  that source is off. Activation runbook: `docs/homelab-guide.md`.
 
 **Canary**
 - `POST /webhook/test`: echo payload back
