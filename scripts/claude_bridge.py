@@ -231,7 +231,13 @@ def _render_turn(msg: dict, nonce: str, call_names: dict[str, str]) -> str:
 
 
 def render_prompt(body: dict, nonce: str) -> str:
-    """Render an OpenAI request into one system-prompt file."""
+    """Render an OpenAI request into one system-prompt file.
+
+    The turns go here, not into a user turn, on purpose: the CLI expands
+    ``@path`` mentions in user input even with ``--tools ""``, so a user
+    turn would let a message attach ~/.claude/.credentials.json. See
+    TR-017 in docs/tradeoffs.md for the boundary this relies on instead.
+    """
     messages = body.get("messages") or []
     system = [_text_of(m.get("content")) for m in messages if m.get("role") == "system"]
     call_names: dict[str, str] = {}

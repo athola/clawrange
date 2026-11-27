@@ -85,6 +85,17 @@ the plan.
   plain `ccd` (skips permission prompts: prompt injection could run
   commands on the host); Claude Code's own tools inside the session
   (would run outside OpenClaw's tool policy).
+- **Why the turns sit in the system prompt**: untrusted turns get system
+  authority there, which a security review flagged. The alternatives are
+  worse here: `--input-format stream-json` needs `-p`; a data file needs
+  the Read tool; and a real user turn (the prompt argument or typed
+  input) expands `@path` mentions client-side even with `--tools ""`
+  (checked: `@/etc/hostname` was attached and echoed), so a Telegram
+  message could pull `~/.claude/.credentials.json` into a reply. The
+  boundary is instead: no tools in the session, nonce-delimited turns
+  framed as data, `tool_calls` limited to the offered names and run by
+  OpenClaw under its own allowlist, and the sanitizer as defence in
+  depth.
 - **Negative consequences**: scrapes the terminal UI for the folder-trust
   prompt and the `/login` screen, which a CLI update can change (an
   unknown screen times out as 504); one CLI start-up (~2-3s) per
