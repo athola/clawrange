@@ -54,7 +54,7 @@ def chat(monkeypatch, app):
 @pytest.fixture()
 def keys(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
-    monkeypatch.setenv("ZAI_API_KEY", "zai-key")
+    monkeypatch.setenv("CLAUDE_BRIDGE_TOKEN", "zai-key")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "")
 
 
@@ -100,7 +100,7 @@ def _tool_call_reply() -> httpx.Response:
 class TestToolCallSingleTier:
     def test_null_content_tool_call_is_passed_through(self, keys):
         """Null content would fail the empty-reply check; tool calls skip it."""
-        tier = next(t for t in llm_proxy.CONFIG["tiers"] if t["name"] == "zai-direct")
+        tier = next(t for t in llm_proxy.CONFIG["tiers"] if t["name"] == "claude-sub")
         call = AsyncMock(return_value=_tool_call_reply())
         with patch.object(llm_proxy, "_call_provider", call):
             resp, rl = asyncio.run(
@@ -110,9 +110,9 @@ class TestToolCallSingleTier:
             )
         assert rl is None
         data = json.loads(bytes(resp.body))
-        assert data["_clawrange_tier"] == "zai-direct"
+        assert data["_clawrange_tier"] == "claude-sub"
         assert data["choices"][0]["message"]["tool_calls"] == [TOOL_CALL]
-        assert "zai-direct" not in llm_proxy._circuit_state
+        assert "claude-sub" not in llm_proxy._circuit_state
 
     def test_tool_call_reaches_a_streaming_client(self, keys, monkeypatch, app):
         monkeypatch.setattr(llm_proxy, "PROXY_AUTH_TOKEN", TOKEN)
@@ -274,20 +274,20 @@ class TestLowBalanceAlert:
 class TestTierRecovery:
     def test_tripped_tier_gets_a_priority_two_alert(self, monkeypatch, brain_db):
         monkeypatch.setattr(
-            llm_proxy, "_circuit_open", lambda name, probe=True: name == "zai-direct"
+            llm_proxy, "_circuit_open", lambda name, probe=True: name == "claude-sub"
         )
         _beat(brain_db=brain_db)
         alerts = [
             t
             for t in brain_db.list_tasks()
-            if t["description"] == "Investigate tier recovery: zai-direct"
+            if t["description"] == "Investigate tier recovery: claude-sub"
         ]
         assert len(alerts) == 1 and alerts[0]["priority"] == 2
 
     def test_alert_for_a_still_tripped_tier_says_so(self, monkeypatch, brain_db):
-        task = brain_db.create_task("Investigate tier recovery: zai-direct", 2)
+        task = brain_db.create_task("Investigate tier recovery: claude-sub", 2)
         monkeypatch.setattr(
-            llm_proxy, "_circuit_open", lambda name, probe=True: name == "zai-direct"
+            llm_proxy, "_circuit_open", lambda name, probe=True: name == "claude-sub"
         )
         _beat(brain_db=brain_db)
         done = brain_db.get_task(task["id"])
@@ -295,7 +295,7 @@ class TestTierRecovery:
         assert "TRIPPED (circuit open)" in done["result"]
 
     def test_alert_after_recovery_says_recovered(self, monkeypatch, brain_db):
-        task = brain_db.create_task("Investigate tier recovery: zai-direct", 2)
+        task = brain_db.create_task("Investigate tier recovery: claude-sub", 2)
         monkeypatch.setattr(llm_proxy, "_circuit_open", lambda name, probe=True: False)
         _beat(brain_db=brain_db)
         assert "recovered (circuit closed)" in brain_db.get_task(task["id"])["result"]
@@ -765,11 +765,11 @@ class TestTaskCommand:
 
 class TestTierCommand:
     def test_shows_last_used_tier(self, chat, monkeypatch):
-        monkeypatch.setattr(llm_proxy, "_last_tier_used", "zai-direct")
+        monkeypatch.setattr(llm_proxy, "_last_tier_used", "claude-sub")
         monkeypatch.setattr(
             llm_proxy, "_check_openrouter_balance", AsyncMock(return_value=None)
         )
-        assert "Last used: zai-direct" in chat("!tier")
+        assert "Last used: claude-sub" in chat("!tier")
 
 
 # ─── research_router: marketing scan branches ───────────────────────

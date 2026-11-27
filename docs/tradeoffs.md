@@ -6,6 +6,7 @@ Decisions, the alternatives weighed, and what was given up. Newest first.
 
 | ID | Phase | Status | Decision |
 |----|-------|--------|----------|
+| TR-017 | execute | accepted | Z.AI replaced by `claude-sub`: tmux-driven `claude` CLI on the subscription, tools stay with OpenClaw |
 | TR-016 | execute | accepted | `create_app()` factory; chat commands and heartbeat take the brain, never `from app import` |
 | TR-015 | execute | accepted | Proxy token: env SecretRef, workspace-only file tools, one-time state migration, startup secrets audit |
 | TR-014 | specify | accepted | Income loop reuses the task queue and tome bridge; every trade is a `[DRAFT]`, benchmarked against holding |
@@ -42,6 +43,55 @@ and TR-014 were recovered the same way from the design specs and plans in
 checked against the code when it was written here, and the
 **Changed since** lines record where the shipped design moved away from
 the plan.
+
+## TR-017: Claude subscription through a tmux bridge replaces Z.AI
+
+- **Phase**: execute
+- **Status**: accepted
+- **Decision (Y-statement)**: In the context of losing Z.AI GLM access
+  (the tier that carried most chat traffic) while the operator has a
+  Claude subscription, facing `claude -p` possibly billing API credit and
+  untrusted Telegram, scan and tool text in every prompt, we decided on
+  **a host bridge (`scripts/claude_bridge.py`) that speaks the OpenAI
+  chat API and answers each request in a throwaway interactive `claude`
+  session under tmux**, registered as the `claude-sub` provider so the
+  proxy's racing, breakers and fallbacks apply unchanged, to achieve a
+  like-for-like swap on the subscription, accepting that the tier spends
+  the same quota as the operator's own Claude Code work and joins the
+  chat race (a request the free tier wins may still cost a turn).
+  - The request is rendered into `--system-prompt-file`; the only typed
+    prompt is the constant `Continue.`, so the input box's `!`, `/` and
+    `@` handling never sees untrusted text (checked: `@/etc/hostname` and
+    `!touch` lines in the file stayed literal).
+  - `--tools ""`, `--safe-mode`, `--strict-mcp-config`,
+    `--permission-mode dontAsk`, `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1`
+    (the advisor is server-side and survives `--tools ""`), an empty
+    0700 workdir and a minimal env. The model did try an unavailable
+    `Bash` call in a spike; the CLI refused it.
+  - OpenClaw keeps executing its own allowlisted tools: `tools` become a
+    `<tool_calls>` JSON contract and the parsed block becomes OpenAI
+    `tool_calls`, validated against the offered names (502 otherwise).
+  - `--safe-mode` disables night-market's `sanitize_external_content`
+    hook, so its patterns run in the bridge: redacted from `role: tool`
+    turns; only structural markup (role tags, hidden-style text,
+    zero-width characters, spoofed turn delimiters) from other turns.
+  - Replies come from the session JSONL; `isApiErrorMessage` records map
+    to 429 (`rate_limit`), 503 (`authentication_failed`) or 502, so the
+    breaker sees outages as outages.
+- **Options weighed**: `claude -p` subprocess (simplest, but the
+  operator believes it bills API credit); one persistent session reset
+  with `/clear` between requests (saves ~2s start-up, but risks context
+  bleed between Telegram and heartbeat traffic and needs typed input);
+  plain `ccd` (skips permission prompts: prompt injection could run
+  commands on the host); Claude Code's own tools inside the session
+  (would run outside OpenClaw's tool policy).
+- **Negative consequences**: scrapes the terminal UI for the folder-trust
+  prompt and the `/login` screen, which a CLI update can change (an
+  unknown screen times out as 504); one CLI start-up (~2-3s) per
+  request; no streaming (the proxy calls tiers non-streaming anyway);
+  the bridge must be running on the host, outside compose. Running a
+  consumer subscription as a bot backend is the operator's call under
+  Anthropic's terms.
 
 ## TR-016: App factory and injected state instead of `from app import`
 

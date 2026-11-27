@@ -121,7 +121,10 @@ Tailscale and Caddy gateway.
 ## Key Conventions
 
 - All LLM calls route through the workflows `llm_proxy` (which fans out
-  to OpenRouter and Z.AI). Never call Anthropic/OpenAI/ByteDance directly.
+  to OpenRouter and the `claude-sub` bridge). Never call
+  Anthropic/OpenAI/ByteDance APIs directly: Claude is reached only
+  through `scripts/claude_bridge.py`, which drives the operator's
+  logged-in `claude` CLI in tmux (subscription, not API credit).
 - Shell scripts use **Bash** (`#!/usr/bin/env bash`) and must work on
   macOS and Ubuntu.
 - Python tooling is uv-managed: ruff, mypy, and pytest run via `uv run`
@@ -160,6 +163,7 @@ make retrieval-eval   # compare search configs offline (fixture golden set)
 make retrieval-harvest   # real brain searches -> data/retrieval/golden.json
 make retrieval-eval-brain # same matrix on the real brain (label queries first)
 make health           # quick curl health checks
+make claude-bridge    # host bridge for the claude-sub tier (keep it running)
 make logs             # tail docker logs
 
 # Python quality — uv-managed (ruff + mypy + pytest via pyproject.toml/uv.lock)
@@ -236,6 +240,25 @@ stack without one. There is no `/docs`, `/redoc` or `/openapi.json`.
   when `OPENROUTER_API_KEY` is set.
 - See `workflows/research.py` for synthesis logic and
   `docs/research-and-marketing.md` for the operator guide.
+
+**Claude subscription bridge (local-only, `claude-sub` tier)**
+- `scripts/claude_bridge.py` (`make claude-bridge`) answers
+  `POST /v1/chat/completions` on 127.0.0.1 and `DOCKER_HOST_IP`, port
+  8790, behind `CLAUDE_BRIDGE_TOKEN`; the workflows container reaches it
+  as `host.docker.internal`. Stdlib only.
+- Each request gets a throwaway tmux `claude` session: the request is
+  rendered into `--system-prompt-file` (nothing untrusted is typed),
+  `--tools ""`, `--safe-mode`, `--strict-mcp-config`,
+  `--permission-mode dontAsk`, the advisor tool off, an empty 0700
+  working directory and a minimal env. The reply comes from the session
+  transcript; error records map to 429/503/502, never reply text. A
+  full queue is 503 (a 429 trips the proxy breaker at once), and a
+  caller that hangs up (a lost race) gets its session killed.
+- OpenClaw's tools stay OpenClaw's: `tools` become a `<tool_calls>`
+  contract and the reply becomes OpenAI `tool_calls`. Night-market's
+  injection patterns are redacted from tool results (structural markup
+  only from other turns). `!sub` forces the tier; `!claude` is still
+  OpenRouter paid.
 
 **Tome bridge (local-only)**
 - `scripts/tome_bridge.py` polls the workflows task queue for

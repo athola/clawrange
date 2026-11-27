@@ -673,11 +673,8 @@ async def _call_provider(
 # ─── Tier Routing Hints ────────────────────────────────────────────
 
 TIER_HINTS = {
-    "z.ai": "zai-direct",
-    "zai": "zai-direct",
-    "zhipu": "zai-direct",
-    "glm": "zai-direct",
-    "bigmodel": "zai-direct",
+    "sub": "claude-sub",
+    "subscription": "claude-sub",
     "paid": "openrouter-paid",
     "claude": "openrouter-paid",
 }
@@ -689,7 +686,7 @@ def _detect_tier_hint(messages: list[dict]) -> str | None:
     """Check the last user message for an explicit ``!keyword`` routing command.
 
     Only matches keywords prefixed with ``!`` (e.g. ``!paid``, ``!claude``,
-    ``!zai``).  The sender metadata block is stripped first so that
+    ``!sub``).  The sender metadata block is stripped first so that
     incidental mentions of provider names in conversation context never
     trigger routing.
     """
@@ -866,8 +863,7 @@ async def _llm_call(
 
     When web_search=True, routes through CONFIG["search"] — a dedicated
     tier (OpenRouter `:online`) that performs server-side web search.
-    Z.AI's web_search MCP tool is paywalled to a separate resource
-    package the GLM Coding Plan does not unlock, so it's bypassed.
+    The claude-sub bridge runs with no tools, so it cannot search.
     """
     _last_call_failures.clear()
     if web_search:
@@ -1381,8 +1377,8 @@ async def create_embeddings(
 
     OpenClaw's own memory search is off (memory provider "none"), so it is
     not a built-in caller. Always uses the configured model
-    (embeddings.config) so vectors stay comparable; a GLM Coding Plan Z.AI
-    key can't embed.
+    (embeddings.config) so vectors stay comparable; the claude-sub bridge
+    serves chat only.
     """
     # Auth check — same PROXY_AUTH_TOKEN gate as chat completions
     if not auth.bearer_ok(authorization, PROXY_AUTH_TOKEN):
@@ -1668,7 +1664,7 @@ async def _handle_non_streaming(
             remaining = await _check_openrouter_balance()
             # A zero/negative balance blocks every OpenRouter model —
             # free-tier included — with 402 payment-required errors. Skip
-            # the whole provider so zai-direct carries traffic instead of
+            # the whole provider so claude-sub carries traffic instead of
             # every request stalling through failed OpenRouter attempts.
             if remaining is not None and remaining <= 0:
                 if _should_notify("balance-guard"):

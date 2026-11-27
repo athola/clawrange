@@ -8,6 +8,15 @@ below 1.0, a minor bump may carry breaking changes; they are listed under
 
 ## [Unreleased]
 
+### Upgrading
+
+- **The Z.AI GLM tier is gone.** `zai-direct` is replaced by
+  `claude-sub`, served by the host bridge `scripts/claude_bridge.py`
+  (`make claude-bridge`) through your logged-in `claude` CLI in tmux.
+  Set `CLAUDE_BRIDGE_TOKEN` in `.env` (and drop `ZAI_API_KEY`), run the
+  bridge, then restart the stack. The `!zai`/`!glm` hints no longer
+  route; use `!sub`.
+
 ## [0.2.0] - 2026-11-21
 
 The first entry. It summarises the work since `v0.1.0` by theme rather

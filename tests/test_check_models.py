@@ -12,7 +12,7 @@ import check_models
 TIERS = {
     "tiers": [
         {"name": "free", "provider": "openrouter", "models": ["a/live:free", "a/gone"]},
-        {"name": "direct", "provider": "zai", "models": ["glm-x"]},
+        {"name": "direct", "provider": "claude-sub", "models": ["sonnet"]},
     ],
     "search": {"provider": "openrouter", "models": ["a/live:online"]},
 }
@@ -50,7 +50,7 @@ def test_configured_ids_skips_non_openrouter_search_and_missing_base_url():
     with no base_url
     WHEN configured_ids runs
     THEN neither contributes an id."""
-    tiers = {"search": {"provider": "zai", "models": ["glm-search"]}}
+    tiers = {"search": {"provider": "claude-sub", "models": ["sonnet"]}}
     deerflow = {"models": [{"name": "n", "model": "m"}]}
     assert check_models.configured_ids(tiers, deerflow) == {}
 

@@ -66,7 +66,7 @@ assistant:
     - Write updates after completing tasks or learning new information
     - Deep online research via web_search and web_fetch tools
     - Multi-source research via the workflows /research endpoint:
-      fan out across Reddit, GitHub, and GLM web search, then dedupe
+      fan out across Reddit, GitHub, and OpenRouter web search, then dedupe
       and rank in one shot
     - Draft top-of-funnel content (Reddit comments, X threads, blog
       angles) for the operator's products and personal brand: drafts only,
@@ -205,7 +205,7 @@ assistant:
                                          body: {topic, channels?, subreddits?, limit?}
       GET  /research/sessions            List recent sessions (newest first)
       GET  /research/sessions/{id}       Get full session with findings
-      POST /scan/web                     One-shot GLM web search summary
+      POST /scan/web                     One-shot web search summary (:online)
                                          body: {prompt}
 
     BRAIN API (available via web_fetch from http://msp-workflows:5678)
@@ -444,7 +444,7 @@ homelab_deals:
   advisor:
     audience: >-
       a homelab owner who wants to replace part of their remote LLM
-      inference (OpenRouter free/paid tiers and Z.AI GLM, used for
+      inference (OpenRouter free/paid tiers and a Claude subscription, used for
       summarization, classification and short tool-using tasks) with
       open-weight models served locally behind an OpenAI-compatible proxy
     rules:

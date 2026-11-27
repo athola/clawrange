@@ -188,7 +188,7 @@ BODY = {"messages": [{"role": "user", "content": "hi"}]}
 @pytest.fixture()
 def keys(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
-    monkeypatch.setenv("ZAI_API_KEY", "zai-key")
+    monkeypatch.setenv("CLAUDE_BRIDGE_TOKEN", "zai-key")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "")
     monkeypatch.setattr(llm_proxy, "_balance_status", {"ok_at": None, "error": None})
 
@@ -329,7 +329,7 @@ class TestFailureReporting:
         with _balance(50.0), patch.object(llm_proxy, "_call_provider", call):
             assert asyncio.run(llm_proxy._llm_call("q")) is None
         log = caplog.text
-        assert "openrouter-free" in log and "zai-direct" in log
+        assert "openrouter-free" in log and "claude-sub" in log
         assert "503" in log and "upstream overloaded" in log
 
     def test_llm_call_logs_empty_reply(self, keys, caplog):
@@ -341,10 +341,10 @@ class TestFailureReporting:
 
     def test_llm_call_logs_skipped_tier(self, monkeypatch, caplog):
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-        monkeypatch.delenv("ZAI_API_KEY", raising=False)
+        monkeypatch.delenv("CLAUDE_BRIDGE_TOKEN", raising=False)
         caplog.set_level(logging.INFO, logger="clawrange.llm_proxy")
         assert asyncio.run(llm_proxy._llm_call("q")) is None
-        assert "zai-direct" in caplog.text and "ZAI_API_KEY" in caplog.text
+        assert "claude-sub" in caplog.text and "CLAUDE_BRIDGE_TOKEN" in caplog.text
 
     def test_exhausted_reply_names_the_real_failures(self, keys):
         call = AsyncMock(return_value=httpx.Response(500, text="boom"))
@@ -370,8 +370,8 @@ class TestFailureReporting:
 
     def test_background_notify_logs_every_event(self, caplog):
         caplog.set_level(logging.INFO, logger="clawrange.llm_proxy")
-        llm_proxy._background_notify("zai-direct", "*Error* on `zai-direct` (HTTP 500)")
-        llm_proxy._background_notify("zai-direct", "*Error* on `zai-direct` (HTTP 502)")
+        llm_proxy._background_notify("claude-sub", "*Error* on `claude-sub` (HTTP 500)")
+        llm_proxy._background_notify("claude-sub", "*Error* on `claude-sub` (HTTP 502)")
         assert "HTTP 500" in caplog.text and "HTTP 502" in caplog.text
 
 
@@ -474,7 +474,7 @@ class TestConfigValidation:
 
     def test_provider_without_url_rejected(self):
         cfg = _config()
-        del cfg["providers"]["zai"]["base_url"]
+        del cfg["providers"]["claude-sub"]["base_url"]
         with pytest.raises(ValueError, match="base_url"):
             llm_proxy._validate_config(cfg, {})
 

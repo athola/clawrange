@@ -288,7 +288,7 @@ class TestResearchHealthWebChannels:
 
     @pytest.mark.parametrize("channel", ["discourse_web", "triz"])
     def test_zai_key_alone_is_not_configured(self, monkeypatch, channel):
-        monkeypatch.setenv("ZAI_API_KEY", "z")
+        monkeypatch.setenv("CLAUDE_BRIDGE_TOKEN", "z")
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
         info = research.channel_health()[channel]
         assert info["configured"] is False
@@ -298,7 +298,7 @@ class TestResearchHealthWebChannels:
 
     @pytest.mark.parametrize("channel", ["discourse_web", "triz"])
     def test_openrouter_key_configures_web(self, monkeypatch, channel):
-        monkeypatch.delenv("ZAI_API_KEY", raising=False)
+        monkeypatch.delenv("CLAUDE_BRIDGE_TOKEN", raising=False)
         monkeypatch.setenv("OPENROUTER_API_KEY", "k")
         assert research.channel_health()[channel]["configured"] is True
 

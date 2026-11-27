@@ -1,8 +1,8 @@
 """Brain embeddings via OpenRouter's OpenAI-compatible /api/v1/embeddings.
 
-Per project convention every model call goes through OpenRouter or Z.AI.
-Z.AI is not an option here: a GLM Coding Plan key cannot call embedding
-models (error 1211), so embeddings use OpenRouter only.
+Per project convention every model call goes through the proxy's
+providers. The claude-sub bridge only serves chat, so embeddings use
+OpenRouter.
 
 Vectors from different models (or dimensions) are not comparable, so each
 model+dimension pair gets its own sqlite-vec table (``EmbedConfig.table``)

@@ -24,7 +24,8 @@ port 11434 if you run one; the stack does not start it.
 - 8 GB free RAM (the workflows container is capped at 128 MB, OpenClaw at
   2 GB)
 - [OpenRouter API key](https://openrouter.ai/settings/keys) with $10+ balance
-- Optional: Z.AI key (GLM fallback tier), Telegram bot token, Reddit
+- Optional: a logged-in `claude` CLI and tmux for the `claude-sub`
+  tier (`make claude-bridge`), Telegram bot token, Reddit
   script-app credentials, GitHub PAT: see `.env.example`
 
 ## Quick Start
@@ -89,7 +90,7 @@ before the first start, or the container stops at start.
 [OpenClaw:3000] ──► [Workflows:5678] ──► brain.db (SQLite)
                          │                    │
                          ▼                    ▼
-                  OpenRouter / Z.AI      APScheduler
+              OpenRouter / claude-sub    APScheduler
                   (LLM tiers)            (generators, scanners)
 ```
 
