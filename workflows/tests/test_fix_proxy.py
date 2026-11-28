@@ -188,7 +188,7 @@ BODY = {"messages": [{"role": "user", "content": "hi"}]}
 @pytest.fixture()
 def keys(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
-    monkeypatch.setenv("CLAUDE_BRIDGE_TOKEN", "zai-key")
+    monkeypatch.setenv("CLAUDE_BRIDGE_TOKEN", "bridge-token")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "")
     monkeypatch.setattr(llm_proxy, "_balance_status", {"ok_at": None, "error": None})
 
@@ -289,10 +289,10 @@ class TestBackgroundAttemptTimeout:
         async def first_hangs(provider, models, body, api_key):
             if provider == "openrouter":
                 await asyncio.sleep(5)
-            return _ok("from zai")
+            return _ok("from claude-sub")
 
         with _balance(50.0), patch.object(llm_proxy, "_call_provider", first_hangs):
-            assert asyncio.run(llm_proxy._llm_call("q")) == "from zai"
+            assert asyncio.run(llm_proxy._llm_call("q")) == "from claude-sub"
         assert llm_proxy._circuit_state["openrouter-free"]["failures"] == 1
 
     def test_overall_deadline_records_the_inflight_tier(self, keys, monkeypatch):

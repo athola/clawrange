@@ -54,7 +54,7 @@ def chat(monkeypatch, app):
 @pytest.fixture()
 def keys(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
-    monkeypatch.setenv("CLAUDE_BRIDGE_TOKEN", "zai-key")
+    monkeypatch.setenv("CLAUDE_BRIDGE_TOKEN", "bridge-token")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "")
 
 

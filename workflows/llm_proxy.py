@@ -310,38 +310,30 @@ def _is_rate_limited(resp: httpx.Response) -> bool:
 
 
 # Out of credit, as each provider says it: OpenRouter 402 "Insufficient
-# credits", OpenAI-style insufficient_quota, Z.AI code 1113 ("余额不足" =
-# insufficient balance, sent as HTTP 429). Retrying cannot fix these, so
+# credits", OpenAI-style insufficient_quota. Retrying cannot fix these, so
 # naming them sends the operator to top up rather than wait.
-_NO_CREDIT_CODES = {"1113"}
 _NO_CREDIT_KEYWORDS = (
     "insufficient credit",
     "insufficient balance",
     "insufficient_quota",
     "insufficient quota",
     "out of credit",
-    "余额不足",
 )
 
 
 def _classify_failure(resp: httpx.Response) -> str:
     """Short operator-facing cause for a non-200 provider reply."""
-    code = msg = ""
+    msg = ""
     try:
         error = resp.json().get("error", {})
         if isinstance(error, dict):
-            code = str(error.get("code", ""))
             msg = str(error.get("message", ""))
         else:
             msg = str(error)
     except Exception:
         msg = resp.text[:200]
     lowered = msg.lower()
-    if (
-        resp.status_code == 402
-        or code in _NO_CREDIT_CODES
-        or any(kw in lowered for kw in _NO_CREDIT_KEYWORDS)
-    ):
+    if resp.status_code == 402 or any(kw in lowered for kw in _NO_CREDIT_KEYWORDS):
         return "out of credit"
     if _is_rate_limited(resp):
         return "rate-limited"

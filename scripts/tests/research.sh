@@ -9,7 +9,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-# Load .env first (ports, PROXY_AUTH_TOKEN, ZAI/Reddit/GitHub creds) so the
+# Load .env first (ports, PROXY_AUTH_TOKEN, OpenRouter/Reddit/GitHub creds) so the
 # URL below honours WORKFLOWS_PORT from .env.
 if [ -f .env ]; then
     set -a
@@ -57,7 +57,7 @@ echo "Configured channels: ${HEALTHY_COUNT}/${CHANNEL_TOTAL}"
 if [ "${HEALTHY_COUNT}" = "0" ]; then
     echo "FAIL: no research channels configured"
     echo "Set at least one of: REDDIT_CLIENT_ID/SECRET/USERNAME/PASSWORD,"
-    echo "GITHUB_PAT, ZAI_API_KEY"
+    echo "GITHUB_PAT, OPENROUTER_API_KEY"
     exit 1
 fi
 

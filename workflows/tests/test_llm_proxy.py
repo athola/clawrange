@@ -288,7 +288,7 @@ class TestProxyTierFallback:
     def test_reasoning_content_used_when_content_empty(
         self, mock_call, _mock_bg, client
     ):
-        """GLM 5.1 reasoning models put output in reasoning_content — proxy merges
+        """Reasoning models put output in reasoning_content — proxy merges
         it."""
         reasoning_body = {
             "id": "test",
@@ -318,7 +318,7 @@ class TestProxyTierFallback:
     def test_reasoning_content_used_when_content_null(
         self, mock_call, _mock_bg, client
     ):
-        """Z.AI sometimes returns content: null — proxy merges reasoning_content."""
+        """Some providers return content: null — proxy merges reasoning_content."""
         reasoning_body = {
             "id": "test",
             "object": "chat.completion",
@@ -482,7 +482,7 @@ class TestProxyTierFallback:
         async def mock_call(provider, models, body, api_key):
             if provider == "openrouter":
                 return _mock_response(200, garbled_body)
-            return _mock_response(200)  # zai returns clean response
+            return _mock_response(200)  # claude-sub returns clean response
 
         with patch("llm_proxy._call_provider", side_effect=mock_call):
             r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
@@ -538,49 +538,49 @@ class TestProxyCircuitBreaker:
     def test_rate_limit_trips_circuit_immediately(self, _mock_bg, client):
         """A single 429 should trip the circuit — no need for 3 failures.
 
-        With concurrent racing, OpenRouter-free still serves when ZAI is tripped.
-        The test verifies ZAI is NOT retried on subsequent requests."""
-        call_count = {"zai": 0}
+        With concurrent racing, OpenRouter-free still serves when claude-sub is tripped.
+        The test verifies claude-sub is NOT retried on subsequent requests."""
+        call_count = {"sub": 0}
 
         async def mock_call(provider, models, body, api_key):
             if provider == "claude-sub":
-                call_count["zai"] += 1
+                call_count["sub"] += 1
                 return _mock_response(429, {"error": "rate limited"})
             return _mock_response(200)
 
         with patch("llm_proxy._call_provider", side_effect=mock_call):
-            # First request: zai 429 → circuit trips, but openrouter-free succeeds
+            # First request: claude-sub 429 trips its circuit; openrouter-free serves
             r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
             assert r.status_code == 200
-            assert call_count["zai"] == 1
+            assert call_count["sub"] == 1
 
-            # Second request: zai skipped (circuit open), openrouter-free serves
+            # Second request: claude-sub skipped (circuit open), openrouter-free serves
             r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
             assert r.status_code == 200
             assert "_clawrange_tier" in r.json()  # real response, not synthetic
-            assert call_count["zai"] == 1  # NOT called again
+            assert call_count["sub"] == 1  # NOT called again
 
     @patch("llm_proxy._background_notify")
     def test_transient_errors_still_need_threshold(self, _mock_bg, client):
         """Non-rate-limit errors should require CIRCUIT_FAILURE_THRESHOLD failures.
 
-        With concurrent racing, OpenRouter-free serves while ZAI accumulates
-        failures. The test verifies ZAI is still retried (circuit not yet open)."""
-        call_count = {"zai": 0}
+        With concurrent racing, OpenRouter-free serves while claude-sub accumulates
+        failures. It checks claude-sub is still retried (circuit not yet open)."""
+        call_count = {"sub": 0}
 
         async def mock_call(provider, models, body, api_key):
             if provider == "claude-sub":
-                call_count["zai"] += 1
+                call_count["sub"] += 1
                 return _mock_response(502, {"error": "bad gateway"})
             return _mock_response(200)
 
         with patch("llm_proxy._call_provider", side_effect=mock_call):
-            # First request: zai 502 but openrouter-free succeeds
+            # First request: claude-sub 502 but openrouter-free succeeds
             client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
 
-            # Second request: zai still tried (circuit not yet open, below threshold)
+            # Second request: claude-sub still tried (below the breaker threshold)
             client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
-            assert call_count["zai"] == 2  # Still being called
+            assert call_count["sub"] == 2  # Still being called
 
 
 # ─── Balance Guard ───────────────────────────────────────────────
@@ -918,7 +918,7 @@ class TestConcurrentDispatch:
             if provider == "openrouter":
                 await asyncio.sleep(5)  # slow
                 return _mock_response(200)
-            return _mock_response(200)  # zai is fast
+            return _mock_response(200)  # claude-sub is fast
 
         with patch("llm_proxy._call_provider", side_effect=mock_call):
             r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
@@ -1647,7 +1647,7 @@ class TestStreamingReturnsSSE:
         async def mock_call(provider, models, body, api_key):
             if provider == "openrouter":
                 return _mock_response(200, garbled_tool_body)
-            return _mock_response(200)  # zai returns clean
+            return _mock_response(200)  # claude-sub returns clean
 
         with patch("llm_proxy._call_provider", side_effect=mock_call):
             r = client.post(
@@ -3520,7 +3520,7 @@ class TestTaskNeedsWeb:
         """
         GIVEN a task description containing a known web-search keyword
         WHEN _task_needs_web is called
-        THEN it returns True so the work runner enables GLM web search.
+        THEN it returns True so the work runner enables web search.
         """
         from heartbeat import _task_needs_web
 
@@ -3575,7 +3575,7 @@ class TestLlmWorkTaskRouting:
     """_llm_work_task wires _task_needs_web into _llm_call with the right max_tokens."""
 
     @patch.dict("os.environ", FAKE_ENV)
-    def test_web_task_uses_1500_max_tokens_and_zai_search(self, brain_db):
+    def test_web_task_uses_1500_max_tokens_and_web_search(self, brain_db):
         """
         GIVEN a task description that triggers web search
         WHEN _llm_work_task runs
@@ -4838,11 +4838,13 @@ class TestLlmCallExceptionHandling:
         assert llm_proxy._circuit_open("openrouter-free", probe=False)
 
 
-# Z.AI's reply when the account has no credit left: HTTP 429, code 1113
-# ("insufficient balance or no resource package, please recharge"),
-# captured from the live proxy log.
-ZAI_NO_CREDIT = {
-    "error": {"code": "1113", "message": "余额不足或无可用资源包,请充值。"}
+# The claude bridge's reply when the subscription hits its usage limit
+# (scripts/claude_bridge.py maps the transcript's rate_limit record to 429).
+SUB_USAGE_LIMIT = {
+    "error": {
+        "message": "claude rate_limit: Claude usage limit reached",
+        "code": 429,
+    }
 }
 
 
@@ -4856,13 +4858,7 @@ class TestFailureReasons:
     @pytest.mark.parametrize(
         ("status", "body", "want"),
         [
-            (429, ZAI_NO_CREDIT, "out of credit"),
-            # The code alone decides when Z.AI rewords the message.
-            (
-                429,
-                {"error": {"code": "1113", "message": "Please recharge"}},
-                "out of credit",
-            ),
+            (429, SUB_USAGE_LIMIT, "rate-limited"),
             (402, {"error": {"message": "Insufficient credits"}}, "out of credit"),
             (429, {"error": {"message": "insufficient_quota"}}, "out of credit"),
             (429, {"error": "rate limited"}, "rate-limited"),
@@ -4875,13 +4871,13 @@ class TestFailureReasons:
 
     @patch.dict("os.environ", FAKE_ENV)
     def test_summary_names_each_tier_and_its_cause(self):
-        """GIVEN openrouter-free answers empty and Z.AI is out of credit
+        """GIVEN openrouter-free answers empty and claude-sub hit its usage limit
         WHEN a background call fails on every tier
         THEN the summary says so per tier, and that paid was not tried."""
 
         async def fake(provider, models, body, api_key):
             if provider == "claude-sub":
-                return _mock_response(429, ZAI_NO_CREDIT)
+                return _mock_response(429, SUB_USAGE_LIMIT)
             return _mock_response(200, {"choices": [{"message": {"content": ""}}]})
 
         with (
@@ -4891,18 +4887,18 @@ class TestFailureReasons:
             assert asyncio.run(llm_proxy._llm_call("hi")) is None
         summary = llm_proxy.describe_last_failure()
         assert "openrouter-free: empty reply" in summary
-        assert "claude-sub: out of credit" in summary
+        assert "claude-sub: rate-limited" in summary
         assert "openrouter-paid: not tried (paid is opt-in)" in summary
 
     @patch.dict("os.environ", FAKE_ENV)
     def test_open_breaker_keeps_the_cause_that_tripped_it(self):
-        """GIVEN Z.AI tripped its breaker by running out of credit
+        """GIVEN claude-sub tripped its breaker on a usage limit
         WHEN the next call skips it
-        THEN the summary still says out of credit, not just breaker open."""
+        THEN the summary still says rate-limited, not just breaker open."""
 
         async def fake(provider, models, body, api_key):
             if provider == "claude-sub":
-                return _mock_response(429, ZAI_NO_CREDIT)
+                return _mock_response(429, SUB_USAGE_LIMIT)
             return _mock_response(503, {"error": "upstream"})
 
         with (
@@ -4912,14 +4908,14 @@ class TestFailureReasons:
             asyncio.run(llm_proxy._llm_call("hi"))
             asyncio.run(llm_proxy._llm_call("hi"))
         summary = llm_proxy.describe_last_failure()
-        assert "claude-sub: out of credit (breaker open)" in summary
+        assert "claude-sub: rate-limited (breaker open)" in summary
 
     @patch.dict("os.environ", FAKE_ENV)
     def test_depleted_openrouter_is_named_out_of_credit(self):
-        """GIVEN the OpenRouter balance is at zero and Z.AI answers malformed
+        """GIVEN the OpenRouter balance is at zero and claude-sub answers malformed
         WHEN a background call fails
         THEN OpenRouter reads as out of credit without being called, and
-        Z.AI's reply is named malformed."""
+        claude-sub's reply is named malformed."""
         called = []
 
         async def fake(provider, models, body, api_key):
@@ -4962,7 +4958,7 @@ class TestFailureReasons:
 
         async def fake(provider, models, body, api_key):
             if provider == "claude-sub":
-                return _mock_response(429, ZAI_NO_CREDIT)
+                return _mock_response(429, SUB_USAGE_LIMIT)
             return _mock_response(200, {"choices": [{"message": {"content": ""}}]})
 
         with (
@@ -4976,7 +4972,7 @@ class TestFailureReasons:
             )
         assert brain_db.get_task(t["id"])["status"] == "pending"
         line = next(ln for ln in digest._digest_state["lines"] if t["id"] in ln)
-        assert "claude-sub: out of credit" in line
+        assert "claude-sub: rate-limited" in line
         assert "openrouter-free: empty reply" in line
         assert "unreachable" not in line.lower()
         heartbeat._llm_retry_counts.clear()
