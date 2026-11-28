@@ -492,13 +492,15 @@ class TmuxRunner:
                 pane = shown.stdout
                 # The folder-trust prompt shows once for the bridge's own
                 # empty working directory and is remembered after that. Keys
-                # sent while it is still drawing are dropped, so retry while
-                # it stays on screen, one key per call.
+                # sent while it is still drawing are dropped, and an Enter
+                # after a dropped Down picks the default "No, exit". So
+                # confirm only once the cursor is seen on "Yes", and retry
+                # the Down while it is not.
                 now = time.monotonic()
-                if "trust this folder" in pane and now - trust_sent_at > 1.5:
-                    self._tmux("send-keys", "-t", name, "Down")
-                    time.sleep(0.3)
+                if "❯ Yes, I trust this folder" in pane:
                     self._tmux("send-keys", "-t", name, "Enter")
+                elif "trust this folder" in pane and now - trust_sent_at > 1.5:
+                    self._tmux("send-keys", "-t", name, "Down")
                     trust_sent_at = now
                 if "/login" in pane:
                     raise BridgeError(

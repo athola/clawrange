@@ -400,6 +400,11 @@ class ScriptedRunner(cb.TmuxRunner):
         return cb.subprocess.CompletedProcess(args, 0 if alive else 1, out, "")
 
 
+_TRUST_HEAD = " Quick safety check: Is this a project you created or one you trust?\n"
+TRUST_ON_NO = _TRUST_HEAD + " ❯ No, exit\n   Yes, I trust this folder\n"
+TRUST_ON_YES = _TRUST_HEAD + "   No, exit\n ❯ Yes, I trust this folder\n"
+
+
 @pytest.fixture
 def fast_poll(monkeypatch):
     monkeypatch.setattr(cb, "_POLL_SECONDS", 0.001)
@@ -428,10 +433,19 @@ class TestAwaitReply:
         done = [USER, _assistant([{"type": "text", "text": "ok"}])]
         runner = ScriptedRunner(
             tmp_path,
-            [("Yes, I trust this folder", None), ("", None), ("", done)],
+            [(TRUST_ON_NO, None), (TRUST_ON_YES, None), ("", None), ("", done)],
         )
         assert runner._await_reply("sid", "s", lambda: False) == "ok"
         assert runner.keys == ["Down", "Enter"]
+
+    def test_dropped_down_never_confirms_no_exit(self, tmp_path, fast_poll):
+        """A Down sent while the dialog is still drawing is dropped; an
+        Enter then would pick the default "No, exit" and kill the session.
+        Enter goes only once the cursor is seen on "Yes"."""
+        runner = ScriptedRunner(tmp_path, [(TRUST_ON_NO, None)], timeout=0.05)
+        with pytest.raises(cb.BridgeError):
+            runner._await_reply("sid", "s", lambda: False)
+        assert runner.keys and "Enter" not in runner.keys
 
     def test_session_gone_is_502(self, tmp_path, fast_poll):
         runner = ScriptedRunner(tmp_path, [(None, None)])
