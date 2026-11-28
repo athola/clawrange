@@ -425,6 +425,8 @@ Nothing inside OpenClaw stores the value, so a rotation is env only:
 | OpenClaw exits at start with `render-config: ... still has retired keys` | The state dir predates 2026.11.5. Run the doctor step in [Upgrading OpenClaw](#upgrading-openclaw) |
 | A task stays `active` | A worker claimed it and died. The heartbeat fails it after `HEARTBEAT_ACTIVE_REAP_HOURS` (default 6) with a digest line; re-create it to retry |
 | Heartbeat tasks fail with the LLM down | During an outage a task goes back to pending each heartbeat and is failed on its 6th outage cycle (about an hour), so it cannot block the queue. The digest line says why per tier, e.g. `No LLM answered (openrouter-free: empty reply; claude-sub: rate-limited)`. `out of credit` will not clear by waiting: top up that provider. A `claude-sub` usage limit reads `rate-limited` and clears when the subscription window resets |
+| A digest or alert says `claude-sub: login expired` | The subscription login lapsed. Run `claude` on the host, then `/login`; the bridge needs no restart |
+| `claude-sub: connection failed (ConnectError)` | The bridge is not running or not reachable from the container. `systemctl --user status clawrange-claude-bridge`; check `DOCKER_HOST_IP` in `~/.config/clawrange/claude-bridge.env` matches docker0 |
 | `research:tome:` tasks stay pending, a `Stale queue:` nudge lists them under the tome bridge | `journalctl --user -u clawrange-tome-bridge`. A `rejected the request` line means the bridge's `PROXY_AUTH_TOKEN` is missing or stale; see "Heavy research via tome" in `docs/research-and-marketing.md` |
 
 ## Cost Estimate

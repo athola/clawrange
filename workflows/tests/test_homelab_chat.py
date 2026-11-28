@@ -445,7 +445,7 @@ def test_homelab_turns_in_list_content_are_dropped_too(rig, monkeypatch):
     # A tier must exist for the forwarded request to reach _call_provider;
     # never rely on keys in the developer's shell (CI has none).
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
-    monkeypatch.setenv("ZAI_API_KEY", "test-key")
+    monkeypatch.setenv("CLAUDE_BRIDGE_TOKEN", "test-key")
     leaked = rig.raw("!home evil")
     messages = [
         {"role": "user", "content": "!home evil"},

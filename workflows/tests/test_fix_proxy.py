@@ -286,7 +286,7 @@ class TestBackgroundAttemptTimeout:
         monkeypatch.setattr(llm_proxy, "LLM_CALL_DEADLINE", 2.0)
         monkeypatch.setattr(llm_proxy, "BACKGROUND_ATTEMPT_TIMEOUT", 0.2)
 
-        async def first_hangs(provider, models, body, api_key):
+        async def first_hangs(provider, models, body, api_key, deadline=None):
             if provider == "openrouter":
                 await asyncio.sleep(5)
             return _ok("from claude-sub")
@@ -401,7 +401,7 @@ class TestToolCallHistory:
         ]
         sent: list[list[dict]] = []
 
-        async def capture(provider, models, body, api_key):
+        async def capture(provider, models, body, api_key, deadline=None):
             sent.append(body["messages"])
             return _ok()
 
@@ -441,7 +441,7 @@ class TestPaidFlag:
         paid_models = next(t["models"] for t in cfg["tiers"] if t.get("paid"))
         seen: list[list[str]] = []
 
-        async def fail(provider, models, body, api_key):
+        async def fail(provider, models, body, api_key, deadline=None):
             seen.append(list(models))
             return httpx.Response(500, text="boom")
 

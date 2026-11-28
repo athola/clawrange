@@ -106,7 +106,21 @@ the plan.
   request; no streaming (the proxy calls tiers non-streaming anyway);
   the bridge must be running on the host, outside compose. Running a
   consumer subscription as a bot backend is the operator's call under
-  Anthropic's terms.
+  Anthropic's terms. The tier joins every chat race, and a session sends
+  its API request within ~2-3s, so a race the free tier wins usually
+  still spends a subscription turn. Nothing polls the bridge's health:
+  a stopped bridge shows only as `connection failed` until its breaker
+  opens. The sanitizer's windows are bounded (256 characters) to stay
+  linear, so a longer hostile tag or comment passes it unredacted.
+- **Changed since**: a review found the contract too coarse. The bridge
+  now sends a string `error.code`, so a busy queue or an unparseable
+  model reply skips the tier without tripping its breaker, and an
+  expired login is named as such. The proxy sends
+  `X-Deadline-Seconds` (20s background, 45s chat), so the bridge's own
+  504 arrives instead of a proxy-side timeout. Trailing system messages
+  stay after the turns; the sanitizer's unbounded patterns, quadratic on
+  hostile input, are bounded; SIGTERM and start-up sweep what a stopped
+  bridge left behind.
 ## TR-020: Homelab watch is pull-only and reads the scanner's census
 
 - **Phase**: specify

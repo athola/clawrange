@@ -263,9 +263,14 @@ stack without one. There is no `/docs`, `/redoc` or `/openapi.json`.
   `--tools ""`, `--safe-mode`, `--strict-mcp-config`,
   `--permission-mode dontAsk`, the advisor tool off, an empty 0700
   working directory and a minimal env. The reply comes from the session
-  transcript; error records map to 429/503/502, never reply text. A
-  full queue is 503 (a 429 trips the proxy breaker at once), and a
-  caller that hangs up (a lost race) gets its session killed.
+  transcript; error records map to 429/503/502/504, never reply text,
+  with a string `error.code` (`busy`, `bad_reply`, `login_expired`,
+  `timeout`, `rate_limit`). The proxy skips the tier without a breaker
+  hit on `busy` (a full queue, 503 not 429) and `bad_reply`. The proxy
+  sends `X-Deadline-Seconds` so the bridge answers or fails before the
+  caller gives up. A caller that hangs up (a lost race) gets its session
+  killed; a stop (SIGTERM) or the next start sweeps leftover prompt
+  files, transcripts and sessions.
 - OpenClaw's tools stay OpenClaw's: `tools` become a `<tool_calls>`
   contract and the reply becomes OpenAI `tool_calls`. Night-market's
   injection patterns are redacted from tool results (structural markup

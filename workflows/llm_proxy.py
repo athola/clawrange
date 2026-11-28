@@ -322,8 +322,35 @@ _NO_CREDIT_KEYWORDS = (
 )
 
 
+# The claude-sub bridge's error.code values (scripts/claude_bridge.py).
+# A busy queue or a model reply the bridge could not parse says nothing
+# about the tier's health, so those skip the tier without a breaker hit.
+_BRIDGE_SKIP = {"busy": "bridge busy", "bad_reply": "bad reply"}
+_BRIDGE_REASONS = {
+    **_BRIDGE_SKIP,
+    "login_expired": "login expired: run claude, then /login",
+    "timeout": "no reply in time",
+}
+
+
+def _error_code(resp: httpx.Response) -> str:
+    try:
+        error = resp.json().get("error", {})
+    except Exception:
+        return ""
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) else ""
+
+
+def _bridge_skip(resp: httpx.Response) -> str | None:
+    """Reason to skip this tier once without counting a failure, if any."""
+    return _BRIDGE_SKIP.get(_error_code(resp))
+
+
 def _classify_failure(resp: httpx.Response) -> str:
     """Short operator-facing cause for a non-200 provider reply."""
+    if reason := _BRIDGE_REASONS.get(_error_code(resp)):
+        return reason
     msg = ""
     try:
         error = resp.json().get("error", {})
@@ -644,23 +671,31 @@ PROVIDER_URLS = {name: p.get("base_url", "") for name, p in CONFIG["providers"].
 
 
 async def _call_provider(
-    provider: str, models: list[str], body: dict, api_key: str
+    provider: str,
+    models: list[str],
+    body: dict,
+    api_key: str,
+    deadline: float | None = None,
 ) -> httpx.Response:
-    """Call a provider with the given body. Returns the raw response."""
+    """Call a provider with the given body. Returns the raw response.
+
+    ``deadline`` is how long the caller will wait. The claude-sub bridge is
+    told it, so it answers or fails with its own reason before the caller
+    gives up, instead of being cut off mid-session.
+    """
     url = PROVIDER_URLS[provider]
     payload = {**body, "model": models[0]}
     if provider == "openrouter" and len(models) > 1:
         payload["models"] = models
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    if provider == "claude-sub" and deadline is not None:
+        headers["X-Deadline-Seconds"] = f"{deadline:g}"
 
     async with httpx.AsyncClient(timeout=PROVIDER_TIMEOUT) as client:
-        return await client.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
+        return await client.post(url, headers=headers, json=payload)
 
 
 # ─── Tier Routing Hints ────────────────────────────────────────────
@@ -993,7 +1028,8 @@ async def _background_attempt(
     body = _prompt_body(prompt, max_tokens)
     try:
         resp = await asyncio.wait_for(
-            _call_provider(provider, models, body, api_key), timeout=timeout
+            _call_provider(provider, models, body, api_key, deadline=timeout),
+            timeout=timeout,
         )
     except TimeoutError:
         logger.warning("background LLM: %s: no reply within %.0fs", tier_name, timeout)
@@ -1008,6 +1044,9 @@ async def _background_attempt(
 
     if resp.status_code != 200:
         _note_failure(tier_name, _classify_failure(resp))
+        if _bridge_skip(resp):
+            logger.warning("background LLM: %s: %s", tier_name, resp.text[:200])
+            return None
         if _is_rate_limited(resp):
             _record_rate_limit(tier_name)
         else:
@@ -1230,7 +1269,13 @@ async def _try_single_tier(
         non_stream_body = {**body, "stream": False}
         try:
             resp = await asyncio.wait_for(
-                _call_provider(provider, models, non_stream_body, api_key),
+                _call_provider(
+                    provider,
+                    models,
+                    non_stream_body,
+                    api_key,
+                    deadline=PROVIDER_TIMEOUT,
+                ),
                 timeout=PROVIDER_TIMEOUT,
             )
         except TimeoutError:
@@ -1330,6 +1375,12 @@ async def _try_single_tier(
                 + (f"\n{detail}" if detail else ""),
             )
             return None, (tier_name, _get_reset_seconds(resp))
+
+        if skip := _bridge_skip(resp):
+            # The tier works; this one reply did not. No breaker hit.
+            print(f"[PROXY] {tier_name}: {skip}: {resp.text[:200]}", flush=True)
+            reasons[tier_name] = skip
+            return None, None
 
         _record_failure(tier_name)
         reasons[tier_name] = f"HTTP {resp.status_code}"

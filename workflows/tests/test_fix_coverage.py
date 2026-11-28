@@ -143,7 +143,7 @@ class TestToolCallSingleTier:
 
 
 def _recording_provider(calls: list[tuple[str, list[str]]]):
-    async def provider(name, models, body, api_key):
+    async def provider(name, models, body, api_key, deadline=None):
         calls.append((name, list(models)))
         return _ok()
 

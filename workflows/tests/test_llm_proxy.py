@@ -74,21 +74,21 @@ def _reset_state():
 # ─── Provider mock helpers ────────────────────────────────────────
 
 
-async def _all_succeed(provider, models, body, api_key):
+async def _all_succeed(provider, models, body, api_key, deadline=None):
     return _mock_response(200)
 
 
-async def _openrouter_rate_limited(provider, models, body, api_key):
+async def _openrouter_rate_limited(provider, models, body, api_key, deadline=None):
     if provider == "openrouter":
         return _mock_response(429, {"error": "rate limited"})
     return _mock_response(200)
 
 
-async def _all_rate_limited(provider, models, body, api_key):
+async def _all_rate_limited(provider, models, body, api_key, deadline=None):
     return _mock_response(429, {"error": "rate limited"})
 
 
-async def _openrouter_502(provider, models, body, api_key):
+async def _openrouter_502(provider, models, body, api_key, deadline=None):
     if provider == "openrouter":
         return _mock_response(502, {"error": "bad gateway"})
     return _mock_response(200)
@@ -416,7 +416,7 @@ class TestProxyTierFallback:
             ],
         }
 
-        async def mock_call(provider, models, body, api_key):
+        async def mock_call(provider, models, body, api_key, deadline=None):
             if provider == "openrouter":
                 return _mock_response(200, hallucinated_body)
             return _mock_response(200, clean_body)
@@ -479,7 +479,7 @@ class TestProxyTierFallback:
             ],
         }
 
-        async def mock_call(provider, models, body, api_key):
+        async def mock_call(provider, models, body, api_key, deadline=None):
             if provider == "openrouter":
                 return _mock_response(200, garbled_body)
             return _mock_response(200)  # claude-sub returns clean response
@@ -542,7 +542,7 @@ class TestProxyCircuitBreaker:
         The test verifies claude-sub is NOT retried on subsequent requests."""
         call_count = {"sub": 0}
 
-        async def mock_call(provider, models, body, api_key):
+        async def mock_call(provider, models, body, api_key, deadline=None):
             if provider == "claude-sub":
                 call_count["sub"] += 1
                 return _mock_response(429, {"error": "rate limited"})
@@ -568,7 +568,7 @@ class TestProxyCircuitBreaker:
         failures. It checks claude-sub is still retried (circuit not yet open)."""
         call_count = {"sub": 0}
 
-        async def mock_call(provider, models, body, api_key):
+        async def mock_call(provider, models, body, api_key, deadline=None):
             if provider == "claude-sub":
                 call_count["sub"] += 1
                 return _mock_response(502, {"error": "bad gateway"})
@@ -848,7 +848,7 @@ class TestAutoRetry:
         """When ALL free tiers 429 with short reset, proxy waits and retries."""
         attempt = {"n": 0}
 
-        async def mock_call(provider, models, body, api_key):
+        async def mock_call(provider, models, body, api_key, deadline=None):
             attempt["n"] += 1
             if attempt["n"] <= 2:
                 # First pass: all tiers rate-limited with 5s reset
@@ -868,7 +868,7 @@ class TestAutoRetry:
     def test_no_retry_when_reset_too_long(self, _mock_bg, client):
         """When reset time exceeds MAX_AUTO_RETRY_WAIT, return synthetic immediately."""
 
-        async def mock_call(provider, models, body, api_key):
+        async def mock_call(provider, models, body, api_key, deadline=None):
             return _mock_response(
                 429,
                 {"error": {"message": "exceeded daily free limit"}},
@@ -886,7 +886,7 @@ class TestAutoRetry:
     def test_retry_fails_returns_synthetic(self, mock_sleep, _mock_bg, client):
         """If retry also fails, return synthetic response (no infinite loop)."""
 
-        async def mock_call(provider, models, body, api_key):
+        async def mock_call(provider, models, body, api_key, deadline=None):
             # Always 429 — both attempts fail
             return _mock_response(
                 429, {"error": "rate limited"}, headers={"retry-after": "5"}
@@ -917,7 +917,7 @@ class TestConcurrentDispatch:
         """When one tier is slow and another is fast, the fast one wins."""
         import asyncio
 
-        async def mock_call(provider, models, body, api_key):
+        async def mock_call(provider, models, body, api_key, deadline=None):
             if provider == "openrouter":
                 await asyncio.sleep(5)  # slow
                 return _mock_response(200)
@@ -935,7 +935,7 @@ class TestConcurrentDispatch:
 
         original_deadline = __import__("llm_proxy").REQUEST_DEADLINE
 
-        async def mock_call(provider, models, body, api_key):
+        async def mock_call(provider, models, body, api_key, deadline=None):
             await asyncio.sleep(10)  # both tiers slow
             return _mock_response(200)
 
@@ -956,7 +956,7 @@ class TestConcurrentDispatch:
     def test_one_tier_fails_other_succeeds(self, _mock_bg, client):
         """When one tier errors and another succeeds, the success wins."""
 
-        async def mock_call(provider, models, body, api_key):
+        async def mock_call(provider, models, body, api_key, deadline=None):
             if provider == "openrouter":
                 return _mock_response(502, {"error": "bad gateway"})
             return _mock_response(200)
@@ -1115,7 +1115,7 @@ class TestNonAnswerDetection:
         """If one tier returns a deferral, the other tier's response wins."""
         _reset_state()
 
-        async def mock_call(provider, models, body, api_key):
+        async def mock_call(provider, models, body, api_key, deadline=None):
             if provider == "openrouter":
                 return _mock_response(
                     200,
@@ -1647,7 +1647,7 @@ class TestStreamingReturnsSSE:
             ],
         }
 
-        async def mock_call(provider, models, body, api_key):
+        async def mock_call(provider, models, body, api_key, deadline=None):
             if provider == "openrouter":
                 return _mock_response(200, garbled_tool_body)
             return _mock_response(200)  # claude-sub returns clean
@@ -3263,7 +3263,7 @@ class TestHeartbeatInterceptor:
 
         import llm_proxy
 
-        async def _hang(provider, models, body, api_key):
+        async def _hang(provider, models, body, api_key, deadline=None):
             # Far slower than the (shrunk) deadline: a hung provider. One tier
             # alone takes 5s without the cap, so the 2s bound below leaves a
             # loaded machine (parallel tests) 1.7s of scheduling headroom.
@@ -4796,7 +4796,7 @@ class TestBackgroundLlmCallFreeTiersOnly:
         )
         seen: list[list[str]] = []
 
-        async def fail(provider, models, body, api_key):
+        async def fail(provider, models, body, api_key, deadline=None):
             seen.append(list(models))
             return _mock_response(500, {"error": "boom"})
 
@@ -4810,7 +4810,7 @@ class TestBackgroundLlmCallFreeTiersOnly:
         monkeypatch.delitem(llm_proxy.PROVIDER_URLS, "claude-sub")
         providers: list[str] = []
 
-        async def fail(provider, models, body, api_key):
+        async def fail(provider, models, body, api_key, deadline=None):
             providers.append(provider)
             return _mock_response(500, {"error": "boom"})
 
@@ -4822,7 +4822,7 @@ class TestBackgroundLlmCallFreeTiersOnly:
 class TestLlmCallExceptionHandling:
     @patch.dict("os.environ", FAKE_ENV)
     def test_exception_logged_and_recorded(self, caplog):
-        async def boom(provider, models, body, api_key):
+        async def boom(provider, models, body, api_key, deadline=None):
             raise RuntimeError("kaput")
 
         with patch("llm_proxy._call_provider", side_effect=boom):
@@ -4833,7 +4833,7 @@ class TestLlmCallExceptionHandling:
 
     @patch.dict("os.environ", FAKE_ENV)
     def test_429_in_background_call_trips_breaker(self):
-        async def limited(provider, models, body, api_key):
+        async def limited(provider, models, body, api_key, deadline=None):
             return _mock_response(429, {"error": "rate limited"})
 
         with patch("llm_proxy._call_provider", side_effect=limited):
@@ -4846,7 +4846,7 @@ class TestLlmCallExceptionHandling:
 SUB_USAGE_LIMIT = {
     "error": {
         "message": "claude rate_limit: Claude usage limit reached",
-        "code": 429,
+        "code": "rate_limit",
     }
 }
 
@@ -4878,7 +4878,7 @@ class TestFailureReasons:
         WHEN a background call fails on every tier
         THEN the summary says so per tier, and that paid was not tried."""
 
-        async def fake(provider, models, body, api_key):
+        async def fake(provider, models, body, api_key, deadline=None):
             if provider == "claude-sub":
                 return _mock_response(429, SUB_USAGE_LIMIT)
             return _mock_response(200, {"choices": [{"message": {"content": ""}}]})
@@ -4899,7 +4899,7 @@ class TestFailureReasons:
         WHEN the next call skips it
         THEN the summary still says rate-limited, not just breaker open."""
 
-        async def fake(provider, models, body, api_key):
+        async def fake(provider, models, body, api_key, deadline=None):
             if provider == "claude-sub":
                 return _mock_response(429, SUB_USAGE_LIMIT)
             return _mock_response(503, {"error": "upstream"})
@@ -4921,7 +4921,7 @@ class TestFailureReasons:
         claude-sub's reply is named malformed."""
         called = []
 
-        async def fake(provider, models, body, api_key):
+        async def fake(provider, models, body, api_key, deadline=None):
             called.append(provider)
             return httpx.Response(200, content=b"not json")
 
@@ -4937,7 +4937,7 @@ class TestFailureReasons:
 
     @patch.dict("os.environ", FAKE_ENV)
     def test_success_clears_the_summary(self):
-        async def ok(provider, models, body, api_key):
+        async def ok(provider, models, body, api_key, deadline=None):
             return _mock_response(200)
 
         llm_proxy._last_call_failures["claude-sub"] = "out of credit"
@@ -4959,7 +4959,7 @@ class TestFailureReasons:
             heartbeat._proactive_state[key] = time.monotonic()
         t = brain_db.create_task("Summarize the open deals")
 
-        async def fake(provider, models, body, api_key):
+        async def fake(provider, models, body, api_key, deadline=None):
             if provider == "claude-sub":
                 return _mock_response(429, SUB_USAGE_LIMIT)
             return _mock_response(200, {"choices": [{"message": {"content": ""}}]})
@@ -5068,7 +5068,7 @@ class TestSearchPathDeadline:
     def test_search_call_honours_deadline(self, monkeypatch):
         monkeypatch.setattr(llm_proxy, "LLM_CALL_DEADLINE", 0.05)
 
-        async def hang(provider, models, body, api_key):
+        async def hang(provider, models, body, api_key, deadline=None):
             await asyncio.sleep(10)
 
         async def run():
@@ -5093,7 +5093,7 @@ class TestAutoRetryPopsOnlyElapsedTiers:
         async def fake_sleep(_s):
             phase["retry"] = True
 
-        async def mock_call(provider, models, body, api_key):
+        async def mock_call(provider, models, body, api_key, deadline=None):
             if phase["retry"]:
                 retry_providers.append(provider)
                 return _mock_response(200)
@@ -5387,3 +5387,111 @@ class TestTierSnapshot:
         with patch("llm_proxy._check_openrouter_balance", return_value=None):
             assert client.get("/tier").status_code == 200
         assert "probe_at" not in llm_proxy._circuit_state[name]
+
+
+# ─── claude-sub bridge contract ──────────────────────────────────
+
+
+def _bridge_error(status, code, message="x"):
+    return _mock_response(status, {"error": {"message": message, "code": code}})
+
+
+class TestBridgeErrorCodes:
+    """The bridge's error.code separates a busy or confused bridge (skip the
+    tier this time, no breaker hit) from a broken one."""
+
+    def setup_method(self):
+        _reset_state()
+        llm_proxy._tier_failure_reason.clear()
+
+    @pytest.mark.parametrize(
+        ("status", "code", "want"),
+        [
+            (503, "busy", "bridge busy"),
+            (502, "bad_reply", "bad reply"),
+            (503, "login_expired", "login expired: run claude, then /login"),
+            (504, "timeout", "no reply in time"),
+        ],
+    )
+    def test_classified_by_code(self, status, code, want):
+        assert llm_proxy._classify_failure(_bridge_error(status, code)) == want
+
+    @pytest.mark.parametrize(("status", "code"), [(503, "busy"), (502, "bad_reply")])
+    @patch.dict("os.environ", FAKE_ENV)
+    def test_background_skip_is_not_a_breaker_failure(self, status, code):
+        tried: dict[str, int] = {}
+
+        async def fake(provider, models, body, api_key, deadline=None):
+            tried[provider] = tried.get(provider, 0) + 1
+            if provider == "claude-sub":
+                return _bridge_error(status, code)
+            return _mock_response(503, {"error": "upstream"})
+
+        with (
+            patch("llm_proxy._call_provider", side_effect=fake),
+            patch("llm_proxy._check_openrouter_balance", AsyncMock(return_value=17.0)),
+        ):
+            for _ in range(llm_proxy.CIRCUIT_FAILURE_THRESHOLD + 1):
+                asyncio.run(llm_proxy._llm_call("hi"))
+        assert llm_proxy._circuit_state.get("claude-sub", {}).get("failures", 0) == 0
+        assert tried["claude-sub"] > llm_proxy.CIRCUIT_FAILURE_THRESHOLD
+        assert not llm_proxy._circuit_open("claude-sub", probe=False)
+
+    @patch.dict("os.environ", FAKE_ENV)
+    @patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
+    @patch("llm_proxy._background_notify")
+    def test_chat_skip_is_not_a_breaker_failure(self, _bg, client):
+        tried: dict[str, int] = {}
+
+        async def fake(provider, models, body, api_key, deadline=None):
+            tried[provider] = tried.get(provider, 0) + 1
+            if provider == "claude-sub":
+                return _bridge_error(502, "bad_reply")
+            return _mock_response(200)
+
+        body = {"messages": [{"role": "user", "content": "!sub hi"}]}
+        with patch("llm_proxy._call_provider", side_effect=fake):
+            for _ in range(llm_proxy.CIRCUIT_FAILURE_THRESHOLD + 1):
+                client.post("/v1/chat/completions", json=body, headers=AUTH_HEADER)
+        assert llm_proxy._circuit_state.get("claude-sub", {}).get("failures", 0) == 0
+        assert tried["claude-sub"] > llm_proxy.CIRCUIT_FAILURE_THRESHOLD
+
+    @patch.dict("os.environ", FAKE_ENV)
+    def test_background_sends_its_attempt_budget(self):
+        seen = {}
+
+        async def fake(provider, models, body, api_key, deadline=None):
+            seen[provider] = deadline
+            return _mock_response(503, {"error": "upstream"})
+
+        with (
+            patch("llm_proxy._call_provider", side_effect=fake),
+            patch("llm_proxy._check_openrouter_balance", AsyncMock(return_value=17.0)),
+        ):
+            asyncio.run(llm_proxy._llm_call("hi"))
+        assert 0 < seen["claude-sub"] <= llm_proxy.BACKGROUND_ATTEMPT_TIMEOUT
+
+    def test_deadline_header_only_for_the_bridge(self, monkeypatch):
+        sent = {}
+
+        class FakeClient:
+            def __init__(self, timeout):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def post(self, url, headers, json):
+                sent[url] = headers
+                return _mock_response(200)
+
+        monkeypatch.setattr(llm_proxy.httpx, "AsyncClient", FakeClient)
+        for provider in ("claude-sub", "openrouter"):
+            asyncio.run(llm_proxy._call_provider(provider, ["m"], {}, "k", deadline=20))
+        bridge = llm_proxy.PROVIDER_URLS["claude-sub"]
+        other = llm_proxy.PROVIDER_URLS["openrouter"]
+        assert sent[bridge]["X-Deadline-Seconds"] == "20"
+        assert "X-Deadline-Seconds" not in sent[other]
