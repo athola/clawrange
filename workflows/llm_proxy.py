@@ -77,6 +77,8 @@ def _validate_config(cfg: dict, hints: dict[str, str]) -> None:
             )
         if not tier.get("models"):
             raise ValueError(f"models.json: tier {name!r} lists no models")
+        if tier.get("preferred") and tier.get("paid"):
+            raise ValueError(f"models.json: paid tier {name!r} cannot be preferred")
     search = cfg.get("search")
     if search and (search.get("provider") not in providers or not search.get("models")):
         raise ValueError("models.json: search block needs a known provider and models")
@@ -916,7 +918,7 @@ async def _llm_call(
 
     async def _try_tiers() -> str | None:
         deadline_at = time.monotonic() + LLM_CALL_DEADLINE
-        for tier in CONFIG["tiers"]:
+        for tier in _preferred_first(CONFIG["tiers"]):
             tier_name = tier["name"]
             # The paid chat tier is never tried here: it is opt-in per chat
             # message (!paid / !claude). web_search=True does spend paid
@@ -1680,7 +1682,10 @@ async def chat_completions(
     if forced_tier:
         print(f"[PROXY] tier hint detected: {forced_tier}", flush=True)
     else:
-        print("[PROXY] no tier hint — racing all free tiers", flush=True)
+        print(
+            "[PROXY] no tier hint — preferred tier first, then the free race",
+            flush=True,
+        )
 
     # Show typing indicator and send a transient status message
     _spawn_background(telegram.send_typing())
@@ -1714,17 +1719,25 @@ async def chat_completions(
     return result
 
 
+def _preferred_first(tiers: list[dict]) -> list[dict]:
+    """Preferred tiers (the subscription) first, the rest in config order."""
+    return sorted(tiers, key=lambda t: not t.get("preferred"))
+
+
 async def _handle_non_streaming(
     body: dict,
     forced_tier: str | None = None,
     _attempt: int = 0,
     status_msg_id: int | None = None,
 ):
-    """Handle non-streaming requests — race available tiers concurrently.
+    """Handle non-streaming requests: preferred tier first, then a race.
 
-    Instead of trying tiers sequentially (where each 45s timeout compounds),
-    all available free tiers are dispatched simultaneously. The first
-    successful response wins and the remaining requests are cancelled.
+    A preferred tier (the Claude subscription) that is available answers
+    alone, so its quota is spent only on replies it actually serves. If it
+    fails (usage limit, busy, error), the remaining free tiers race: they
+    are dispatched together and the first success wins, so their timeouts
+    do not compound. A usage limit trips the preferred tier's breaker at
+    once, so while it lasts requests go straight to the race.
     """
     # Determine which tiers are available right now
     available: list[dict] = []
@@ -1782,7 +1795,20 @@ async def _handle_non_streaming(
             + ". Try again later."
         )
 
-    # Race all available tiers concurrently — first success wins
+    rate_limit_resets: list[tuple[str, int | None]] = []
+    tried: list[str] = []
+    for tier in [t for t in available if t.get("preferred")]:
+        available.remove(tier)
+        tried.append(tier["name"])
+        response, rl_info = await _try_single_tier(tier, body, status_msg_id, failures)
+        if response is not None:
+            await _notify_tier_change(tier["name"])
+            return response
+        if rl_info is not None:
+            rate_limit_resets.append(rl_info)
+        print(f"[PROXY] preferred {tier['name']} did not answer, racing the rest")
+
+    # Race the remaining tiers concurrently — first success wins
     tasks = {
         asyncio.create_task(
             _try_single_tier(tier, body, status_msg_id, failures),
@@ -1790,9 +1816,8 @@ async def _handle_non_streaming(
         ): tier["name"]
         for tier in available
     }
-    print(f"[PROXY] racing {len(tasks)} tiers: {list(tasks.values())}", flush=True)
-
-    rate_limit_resets: list[tuple[str, int | None]] = []
+    if tasks:
+        print(f"[PROXY] racing {len(tasks)} tiers: {list(tasks.values())}", flush=True)
 
     try:
         pending = set(tasks.keys())
@@ -1849,7 +1874,7 @@ async def _handle_non_streaming(
                 )
 
     print(f"[PROXY] all tiers exhausted: {failures}", flush=True)
-    raced = {name: failures.get(name, "failed") for name in tasks.values()}
+    raced = {name: failures.get(name, "failed") for name in [*tried, *tasks.values()]}
     retry = (
         "Try again later."
         if forced_tier

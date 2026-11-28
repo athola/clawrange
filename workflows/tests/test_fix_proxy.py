@@ -286,14 +286,15 @@ class TestBackgroundAttemptTimeout:
         monkeypatch.setattr(llm_proxy, "LLM_CALL_DEADLINE", 2.0)
         monkeypatch.setattr(llm_proxy, "BACKGROUND_ATTEMPT_TIMEOUT", 0.2)
 
+        # claude-sub is preferred, so it is tried first.
         async def first_hangs(provider, models, body, api_key, deadline=None):
-            if provider == "openrouter":
+            if provider == "claude-sub":
                 await asyncio.sleep(5)
-            return _ok("from claude-sub")
+            return _ok("from openrouter")
 
         with _balance(50.0), patch.object(llm_proxy, "_call_provider", first_hangs):
-            assert asyncio.run(llm_proxy._llm_call("q")) == "from claude-sub"
-        assert llm_proxy._circuit_state["openrouter-free"]["failures"] == 1
+            assert asyncio.run(llm_proxy._llm_call("q")) == "from openrouter"
+        assert llm_proxy._circuit_state["claude-sub"]["failures"] == 1
 
     def test_overall_deadline_records_the_inflight_tier(self, keys, monkeypatch):
         monkeypatch.setattr(llm_proxy, "LLM_CALL_DEADLINE", 0.2)

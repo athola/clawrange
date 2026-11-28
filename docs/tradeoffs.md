@@ -61,8 +61,8 @@ the plan.
   session under tmux**, registered as the `claude-sub` provider so the
   proxy's racing, breakers and fallbacks apply unchanged, to achieve a
   like-for-like swap on the subscription, accepting that the tier spends
-  the same quota as the operator's own Claude Code work and joins the
-  chat race (a request the free tier wins may still cost a turn).
+  the same quota as the operator's own Claude Code work. It is the
+  preferred tier (see **Changed since**).
   - The request is rendered into `--system-prompt-file`; the only typed
     prompt is the constant `Continue.`, so the input box's `!`, `/` and
     `@` handling never sees untrusted text (checked: `@/etc/hostname` and
@@ -106,9 +106,11 @@ the plan.
   request; no streaming (the proxy calls tiers non-streaming anyway);
   the bridge must be running on the host, outside compose. Running a
   consumer subscription as a bot backend is the operator's call under
-  Anthropic's terms. The tier joins every chat race, and a session sends
-  its API request within ~2-3s, so a race the free tier wins usually
-  still spends a subscription turn. Nothing polls the bridge's health:
+  Anthropic's terms. As the preferred tier it carries most traffic,
+  heartbeats included, so it draws down the same usage window as the
+  operator's own Claude Code work; when that window runs out the free
+  tiers take over until it resets. A hung bridge delays a chat reply by
+  up to the 45s deadline before the free race starts. Nothing polls the bridge's health:
   a stopped bridge shows only as `connection failed` until its breaker
   opens. The sanitizer's windows are bounded (256 characters) to stay
   linear, so a longer hostile HTML comment or style attribute passes it
@@ -122,6 +124,13 @@ the plan.
   stay after the turns; the sanitizer's unbounded patterns, quadratic on
   hostile input, are bounded; SIGTERM and start-up sweep what a stopped
   bridge left behind.
+- **Changed since** (operator decision): the subscription wins whenever
+  it is not rate-limited. `claude-sub` is `"preferred": true` in
+  `models.json`: chat tries it alone first and races the free tiers only
+  if it fails, and background calls try it first. It used to join every
+  chat race, which spent a subscription turn on most races the free tier
+  won. A usage-limit 429 opens its breaker at once, so while the limit
+  lasts requests skip it with no wasted attempt.
 ## TR-020: Homelab watch is pull-only and reads the scanner's census
 
 - **Phase**: specify

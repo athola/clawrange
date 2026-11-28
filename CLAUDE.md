@@ -65,8 +65,9 @@ Tailscale and Caddy gateway.
     `baseline.json`. Real-brain mode keeps its golden set under
     `data/retrieval/` (gitignored)
   - `llm_proxy.py`: OpenAI-compatible chat and embeddings routes, tiered
-    routing (chat races the free tiers, background `_llm_call` tries them
-    in order), web-search routing to the OpenRouter `:online` tier,
+    routing (a `preferred` tier, the `claude-sub` subscription, answers
+    alone first unless rate-limited; chat then races the free tiers,
+    background `_llm_call` tries them in order), web-search routing to the OpenRouter `:online` tier,
     anti-hallucination guard, balance circuit breaker; dispatches chat
     commands and heartbeats to the modules below
   - `chat_commands.py`: `/tier`, `!help`, `!task`, `!home`, `!net`, `!persona` (alias

@@ -3426,8 +3426,8 @@ class TestNonWebSearchTierIteration:
 
         assert result == "hello"
         assert mock_call.call_count == 1
-        # First tier is openrouter-free
-        assert mock_call.call_args[0][0] == "openrouter"
+        # The preferred tier (the subscription) goes first
+        assert mock_call.call_args[0][0] == "claude-sub"
 
 
 class TestOpenRouterCitationExtraction:
@@ -5510,3 +5510,87 @@ class TestBridgeErrorCodes:
         other = llm_proxy.PROVIDER_URLS["openrouter"]
         assert sent[bridge]["X-Deadline-Seconds"] == "20"
         assert "X-Deadline-Seconds" not in sent[other]
+
+
+# ─── preferred tier (claude-sub first, free race as fallback) ────
+
+
+class TestPreferredTier:
+    """The subscription answers whenever it can; the free race only runs
+    when it is rate-limited, busy or failing."""
+
+    def setup_method(self):
+        _reset_state()
+
+    def _run(self, client, fake, n=1, text="hi"):
+        calls: list[str] = []
+
+        async def recording(provider, models, body, api_key, deadline=None):
+            calls.append(provider)
+            return await fake(provider)
+
+        body = {"messages": [{"role": "user", "content": text}]}
+        out = []
+        with patch("llm_proxy._call_provider", side_effect=recording):
+            for _ in range(n):
+                r = client.post("/v1/chat/completions", json=body, headers=AUTH_HEADER)
+                out.append(r.json())
+        return calls, out
+
+    def test_claude_sub_is_marked_preferred(self):
+        tier = next(t for t in llm_proxy.CONFIG["tiers"] if t["name"] == "claude-sub")
+        assert tier.get("preferred") is True
+
+    @patch.dict("os.environ", FAKE_ENV)
+    @patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
+    @patch("llm_proxy._background_notify")
+    def test_subscription_answers_alone_when_healthy(self, _bg, client):
+        async def fake(provider):
+            return _mock_response(200)
+
+        calls, out = self._run(client, fake)
+        assert calls == ["claude-sub"]
+        assert out[0]["_clawrange_tier"] == "claude-sub"
+
+    @patch.dict("os.environ", FAKE_ENV)
+    @patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
+    @patch("llm_proxy._background_notify")
+    def test_rate_limited_subscription_falls_back_then_is_skipped(self, _bg, client):
+        async def fake(provider):
+            if provider == "claude-sub":
+                return _mock_response(429, SUB_USAGE_LIMIT)
+            return _mock_response(200)
+
+        calls, out = self._run(client, fake, n=2)
+        # First message: subscription tried, rate-limited, free race answers.
+        # Second: the open breaker skips the subscription entirely.
+        assert calls == ["claude-sub", "openrouter", "openrouter"]
+        assert [o["_clawrange_tier"] for o in out] == ["openrouter-free"] * 2
+
+    @patch.dict("os.environ", FAKE_ENV)
+    @patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
+    @patch("llm_proxy._background_notify")
+    def test_busy_subscription_falls_back_without_tripping(self, _bg, client):
+        async def fake(provider):
+            if provider == "claude-sub":
+                return _bridge_error(503, "busy")
+            return _mock_response(200)
+
+        calls, out = self._run(client, fake, n=2)
+        assert calls == ["claude-sub", "openrouter"] * 2
+        assert out[1]["_clawrange_tier"] == "openrouter-free"
+
+    @patch.dict("os.environ", FAKE_ENV)
+    def test_background_tries_the_subscription_first(self):
+        calls: list[str] = []
+
+        async def fake(provider, models, body, api_key, deadline=None):
+            calls.append(provider)
+            return _mock_response(200)
+
+        with (
+            patch("llm_proxy._call_provider", side_effect=fake),
+            patch("llm_proxy._check_openrouter_balance", AsyncMock(return_value=17.0)),
+        ):
+            assert asyncio.run(llm_proxy._llm_call("hi"))
+        assert calls == ["claude-sub"]

@@ -521,6 +521,14 @@ def _post(port, body, token: str | None = "tok", path="/v1/chat/completions"):
     return r.status, json.loads(r.read() or b"{}")
 
 
+def _post_in_background(*args):
+    """A request whose server is shut down under it, by design."""
+    try:
+        _post(*args)
+    except (OSError, http.client.HTTPException, ValueError):
+        pass
+
+
 class TestHttp:
     def test_requires_bearer_token(self, serve):
         port = serve(FakeRunner())
@@ -563,7 +571,9 @@ class TestHttp:
         queue is transient and must count like any other failure."""
         runner = BlockingRunner()
         port = serve(runner, slot_wait=0.05)
-        first = threading.Thread(target=_post, args=(port, _body()), daemon=True)
+        first = threading.Thread(
+            target=_post_in_background, args=(port, _body()), daemon=True
+        )
         first.start()
         assert runner.started.wait(2)
         status, data = _post(port, _body())
@@ -692,7 +702,9 @@ class TestErrorCodes:
     def test_busy_carries_code(self, serve):
         runner = BlockingRunner()
         port = serve(runner, slot_wait=0.05)
-        threading.Thread(target=_post, args=(port, _body()), daemon=True).start()
+        threading.Thread(
+            target=_post_in_background, args=(port, _body()), daemon=True
+        ).start()
         assert runner.started.wait(2)
         status, data = _post(port, _body())
         assert (status, data["error"]["code"]) == (503, "busy")
@@ -756,7 +768,9 @@ class TestSharedSlots:
             threading.Thread(target=srv.serve_forever, daemon=True).start()
         try:
             a, b = (srv.server_address[1] for srv in servers)
-            threading.Thread(target=_post, args=(a, _body()), daemon=True).start()
+            threading.Thread(
+                target=_post_in_background, args=(a, _body()), daemon=True
+            ).start()
             assert runner.started.wait(2)
             assert _post(b, _body())[0] == 503
         finally:
