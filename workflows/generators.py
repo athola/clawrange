@@ -31,6 +31,10 @@ import tenant_profile
 from brain_db import project_list
 from connectors import run_connector
 from crm import get_adapter
+from homelab import report as homelab_report
+from homelab import service as homelab_service
+from homelab import sources as homelab_sources
+from homelab.config import HomelabConfig
 
 if TYPE_CHECKING:
     from reddit_search import RedditPost
@@ -1695,6 +1699,79 @@ async def homelab_deals_generator(
     logger.info("homelab_deals: %s", status)
 
 
+# ─── Homelab watch ───────────────────────────────────────────────────
+
+
+def _homelab_config(profile_name: str | None) -> HomelabConfig:
+    """The active profile's homelab settings (nothing configured when absent)."""
+    return HomelabConfig.from_profile(tenant_profile.load_profile(profile_name))
+
+
+def _homelab_outage_status(cfg: HomelabConfig, errors: dict, base: str) -> str:
+    """Schedule status naming failed sources.
+
+    When every configured source failed it starts with ``error`` so the
+    schedule reads as an error; otherwise the failed names ride in the text.
+    """
+    failed = sorted(src for src in cfg.configured if src in errors)
+    if not failed:
+        return base
+    names = ", ".join(failed)
+    if set(failed) == set(cfg.configured):
+        return f"error: all sources failed ({names}); {base}"
+    return f"{base}; sources failed: {names}"
+
+
+async def homelab_watch_generator(
+    brain_db,
+    profile_name: str | None = None,
+    schedule_id: str = "homelab_watch",
+    **kwargs,
+) -> None:
+    """Poll the homelab sources and message Telegram only on a new finding.
+
+    A silent no-op when no source is configured. Source outages and alert
+    delivery failures are recorded in the schedule status.
+    """
+    cfg = _homelab_config(profile_name)
+    if not cfg.configured:
+        logger.info("homelab_watch: no source configured, skipping")
+        return
+    out = await homelab_service.run_watch(brain_db, cfg, notify=telegram.notify)
+    errors = out.get("errors") or {}
+    status = f"ok ({out.get('alerts', 0)} alerts, {len(errors)} source errors)"
+    if out.get("delivered") is False:
+        status = f"FAILED telegram alert delivery ({status})"
+    status = _homelab_outage_status(cfg, errors, status)
+    _record_status(brain_db, schedule_id, status)
+    logger.info("homelab_watch: %s", status)
+
+
+async def homelab_report_generator(
+    brain_db,
+    profile_name: str | None = None,
+    schedule_id: str = "homelab_report",
+    **kwargs,
+) -> None:
+    """Daily homelab digest: a live observation rendered by deterministic code.
+
+    A silent no-op when no source is configured. Nothing here reaches an LLM.
+    """
+    cfg = _homelab_config(profile_name)
+    if not cfg.configured:
+        logger.info("homelab_report: no source configured, skipping")
+        return
+    obs = await homelab_sources.observe(cfg, datetime.now(UTC))
+    text = homelab_report.render_report(
+        obs, homelab_service.load_state(brain_db), cfg.watch
+    )
+    sent, total = await telegram.notify_long(text)
+    status = _delivery_status(sent, total, f"{len(obs.errors)} source errors")
+    status = _homelab_outage_status(cfg, dict(obs.errors), status)
+    _record_status(brain_db, schedule_id, status)
+    logger.info("homelab_report: %s", status)
+
+
 # ─── Registry ────────────────────────────────────────────────────────
 
 GENERATORS: dict[str, Callable[..., Any]] = {
@@ -1712,4 +1789,6 @@ GENERATORS: dict[str, Callable[..., Any]] = {
     "research_pulse": research_pulse_generator,
     "income_review": income_review_generator,
     "homelab_deals": homelab_deals_generator,
+    "homelab_watch": homelab_watch_generator,
+    "homelab_report": homelab_report_generator,
 }

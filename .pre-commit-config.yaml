@@ -101,4 +101,4 @@ repos:
         name: operator-private files must stay local (not committed)
         language: fail
         entry: "Operator-private file staged — keep it local-only, do not commit."
-        files: ^(openclaw/soul(-ops)?\.md$|config/profiles/local-|config/homelab/|\.env\.(?!example$))
+        files: ^(openclaw/soul(-ops)?\.md$|config/profiles/local-|config/homelab/(?!README\.md$)|\.env\.(?!example$))

@@ -28,6 +28,7 @@ import embeddings
 import heartbeat
 import telegram
 import tenant_profile
+from homelab import HOMELAB_REPLY_MARKER
 
 logger = logging.getLogger("clawrange.llm_proxy")
 
@@ -771,8 +772,10 @@ def _wrap_json_as_sse(json_response: JSONResponse) -> StreamingResponse:
 
 # Regex to strip OpenClaw's metadata prefix from user messages.
 # Format: "<label> (untrusted metadata):\n```json\n{...}\n```\n<actual message>"
+# OpenClaw can stack several blocks (Conversation info, Sender, ...), so all
+# leading ones are removed.
 _OPENCLAW_META_RE = re.compile(
-    r"^[^\n]*\(untrusted metadata\)\s*:\s*```json\s*\{.*?\}\s*```\s*",
+    r"^(?:[^\n]*\(untrusted metadata\)\s*:\s*```json\s*\{.*?\}\s*```\s*)+",
     re.DOTALL | re.IGNORECASE,
 )
 
@@ -792,6 +795,15 @@ _AUTOMATION_TAG_RE = re.compile(r"^\[cron:[^\s\]]+(?: [^\]\n]*)?\]\s*")
 # First turn of a fresh session: "\n\nRuntime: agent=<id> | session=... | ...".
 # Any agent id matches.
 _RUNTIME_LINE_RE = re.compile(r"\n\s*runtime: agent=[^\n]*\s*$", re.IGNORECASE)
+
+
+def _content_text(content: object) -> str:
+    """A message's text: the string itself, or its text parts joined."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(str(b.get("text", "")) for b in content if isinstance(b, dict))
+    return ""
 
 
 def _user_texts(messages: list[dict]):
@@ -1439,12 +1451,16 @@ _TIER_COMMANDS = frozenset(
 
 # Assistant history turns containing these are our own synthetic replies or
 # hallucinated tool syntax; they are stripped before the next request.
+_CONFIRM_CODE_RE = re.compile(
+    r"([!/]home\s+confirm\s+)\S+"
+)  # one-time codes stay out of logs
 _POISON_MARKERS = (
     "temporarily on pause",
     "took too long to respond",
     "<exec",
     "[[exec",
     "<tool_call",
+    HOMELAB_REPLY_MARKER,  # !home / !net replies carry attacker-chosen names
 )
 
 # Appended as a TRAILING system message. LLMs weight instructions near the
@@ -1494,7 +1510,8 @@ async def chat_completions(
     # Intercept status commands before they hit the LLM
     last_user_msg = _get_last_user_message(messages)
     msg_lower = last_user_msg.lower().strip()
-    print(f"[PROXY] extracted msg: {msg_lower[:200]!r} stream={is_stream}", flush=True)
+    shown = _CONFIRM_CODE_RE.sub(r"\1******", msg_lower[:200])
+    print(f"[PROXY] extracted msg: {shown!r} stream={is_stream}", flush=True)
     # Intercept !help — return full command reference
     last_line = msg_lower.rstrip().rsplit("\n", 1)[-1].strip()
     if msg_lower in _HELP_COMMANDS or last_line in _HELP_COMMANDS:
@@ -1553,6 +1570,18 @@ async def chat_completions(
             profile_provider=state.profile_provider,
         )
 
+    # Intercept !home / !net: answered from live homelab state by
+    # deterministic code. Hostnames and entity names are attacker-chosen,
+    # so these never reach an LLM.
+    home_cmd = chat_commands._extract_home_command(last_user_msg)
+    if home_cmd is not None:
+        return await chat_commands._dispatch_home_command(
+            home_cmd,
+            is_stream,
+            brain_db=brain_db,
+            profile=getattr(state, "profile", None),
+        )
+
     # Strip poisoned assistant messages from conversation history.
     # Uses both static markers (synthetic responses, tool hallucinations)
     # AND the deferral detector — any assistant message that would fail
@@ -1560,16 +1589,23 @@ async def chat_completions(
     # previous failures and generate apologies or continued deferrals.
     # Never drop an assistant turn that carries tool_calls: its tool results
     # would be left orphaned and providers reject that history with a 400.
+    # Markers are also checked in list-shaped content (text parts), so a
+    # replayed `[homelab]` turn cannot reach a model in either shape.
     messages = [
         msg
         for msg in messages
         if not (
             msg.get("role") == "assistant"
             and not msg.get("tool_calls")
-            and isinstance(msg.get("content"), str)
             and (
-                any(marker in msg["content"] for marker in _POISON_MARKERS)
-                or _is_non_answer(msg["content"])
+                any(
+                    marker in _content_text(msg.get("content"))
+                    for marker in _POISON_MARKERS
+                )
+                or (
+                    isinstance(msg.get("content"), str)
+                    and _is_non_answer(msg["content"])
+                )
             )
         )
     ]

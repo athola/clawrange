@@ -127,6 +127,10 @@ class Profile:
     def crm(self) -> dict | None:
         return self.raw.get("crm")
 
+    @property
+    def homelab(self) -> dict | None:
+        return self.raw.get("homelab")
+
     def connector(self, connector_id: str) -> dict | None:
         for c in self.connectors:
             if c.get("id") == connector_id:
@@ -234,6 +238,7 @@ def validate(
     if subs is not None and not _is_str_list(subs):
         raise ProfileError("reddit.default_subreddits must be a list of names")
     _validate_homelab_deals(profile.raw.get("homelab_deals"))
+    _validate_homelab(profile.raw.get("homelab"))
     _validate_outreach(profile.raw.get("outreach"))
     _validate_income_review(profile.raw.get("income_review"))
 
@@ -487,6 +492,91 @@ def _validate_deal_policy(block: dict) -> None:
             "homelab_deals.sources.ebay.categories must map a target category "
             "to a numeric eBay category id"
         )
+
+
+HOMELAB_TOP_KEYS = {"home_assistant", "kuma", "census", "source_down_after"}
+HOMELAB_HA_KEYS = {
+    "url",
+    "token",
+    "battery_low",
+    "unavailable_after_minutes",
+    "flood_threshold",
+    "ignore_entities",
+    "actions",
+    "local_file",
+}
+HOMELAB_KUMA_KEYS = {"url", "slug", "ca_cert"}
+HOMELAB_CENSUS_KEYS = {"url", "max_age_hours"}
+
+
+def _homelab_section(block: dict, key: str, allowed: set[str]) -> dict:
+    section = block.get(key)
+    if section is None:
+        return {}
+    if not isinstance(section, dict):
+        raise ProfileError(f"homelab.{key} must be a mapping")
+    unknown = set(section) - allowed
+    if unknown:
+        raise ProfileError(
+            f"homelab.{key} has unknown keys {sorted(map(str, unknown))} "
+            f"(known: {sorted(allowed)})"
+        )
+    return section
+
+
+def _homelab_positive(where: str, section: dict, keys: tuple[str, ...]) -> None:
+    for key in keys:
+        value = section.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ProfileError(
+                f"homelab.{where}{key} must be a positive integer, got {value!r}"
+            )
+
+
+def _validate_homelab(block: Any) -> None:
+    """Shape of the ``homelab`` block; unknown keys fail at every level.
+
+    ``${VAR}`` values resolve to "" before validation, and an empty url or
+    token means "source not configured", so only the shape is checked.
+    """
+    if block is None:
+        return
+    if not isinstance(block, dict):
+        raise ProfileError("homelab must be a mapping")
+    unknown = set(block) - HOMELAB_TOP_KEYS
+    if unknown:
+        raise ProfileError(
+            f"homelab has unknown keys {sorted(map(str, unknown))} "
+            f"(known: {sorted(HOMELAB_TOP_KEYS)})"
+        )
+    _homelab_positive("", block, ("source_down_after",))
+    ha = _homelab_section(block, "home_assistant", HOMELAB_HA_KEYS)
+    kuma = _homelab_section(block, "kuma", HOMELAB_KUMA_KEYS)
+    census = _homelab_section(block, "census", HOMELAB_CENSUS_KEYS)
+    _homelab_positive(
+        "home_assistant.",
+        ha,
+        ("battery_low", "unavailable_after_minutes", "flood_threshold"),
+    )
+    _homelab_positive("census.", census, ("max_age_hours",))
+    for where, section in (("home_assistant", ha), ("kuma", kuma), ("census", census)):
+        for key, value in section.items():
+            if key in ("ignore_entities", "actions") or isinstance(value, int):
+                continue
+            if not isinstance(value, str):
+                raise ProfileError(f"homelab.{where}.{key} must be text")
+    if ha.get("ignore_entities") is not None and not _is_str_list(
+        ha["ignore_entities"]
+    ):
+        raise ProfileError("homelab.home_assistant.ignore_entities must be a list")
+    from homelab.actions import parse_rules
+
+    try:
+        parse_rules(ha.get("actions"))
+    except ValueError as exc:
+        raise ProfileError(f"homelab.home_assistant.actions: {exc}") from exc
 
 
 def _validate_homelab_deals(block: dict | None) -> None:

@@ -18,8 +18,6 @@ openclaw/soul-ops.md
 # Operator-private profiles. The shipped examples (starter, lead-crm, marketing)
 # are committed; copy one to a new name for your own identity and it stays local.
 config/profiles/local-*/
-# Operator-private homelab settings, mounted read-only into workflows.
-config/homelab/
 
 # OpenClaw sandboxed state (bind-mounted, not Docker volumes)
 data/
@@ -69,3 +67,7 @@ docs/research/
 # Local scratch for finished plans and specs. Lasting decisions go in
 # docs/tradeoffs.md; the old archive is in git history (git log -- docs/archive).
 docs/archive/
+
+# Homelab: private CA certificate for Uptime Kuma TLS (keep the README)
+config/homelab/*
+!config/homelab/README.md

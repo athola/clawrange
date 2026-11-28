@@ -156,6 +156,21 @@
       "kwargs": {}
     },
     {
+      "id": "homelab_watch",
+      "name": "Homelab watch (Home Assistant, Uptime Kuma, network census)",
+      "kind": "homelab_watch",
+      "cron": "*/5 * * * *",
+      "kwargs": {}
+    },
+    {
+      "id": "homelab_report",
+      "name": "Daily homelab report",
+      "kind": "homelab_report",
+      "cron": "30 7 * * *",
+      "catch_up": true,
+      "kwargs": {}
+    },
+    {
       "id": "daily-research-pulse",
       "name": "Daily research freshness pulse via tome bridge",
       "kind": "research_pulse",

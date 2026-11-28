@@ -6,7 +6,11 @@ Decisions, the alternatives weighed, and what was given up. Newest first.
 
 | ID | Phase | Status | Decision |
 |----|-------|--------|----------|
-| TR-017 | execute | accepted | Z.AI replaced by `claude-sub`: tmux-driven `claude` CLI on the subscription, tools stay with OpenClaw |
+| TR-021 | execute | accepted | Z.AI replaced by `claude-sub`: tmux-driven `claude` CLI on the subscription, tools stay with OpenClaw |
+| TR-020 | specify | accepted | Homelab watch is pull-only: polls HA, Kuma and the scanner census; never logs in to the router |
+| TR-019 | specify | accepted | Homelab data stays out of brain pages and LLM prompts (own table, internal census network, `[homelab]` history strip) |
+| TR-018 | specify | accepted | HA actions: empty allowlist, hard-denied domains, out-of-band single-use code, lockout |
+| TR-017 | specify | accepted | Homelab alerts: baseline first, debounce, flood collapse; batteries and updates are report-only |
 | TR-016 | execute | accepted | `create_app()` factory; chat commands and heartbeat take the brain, never `from app import` |
 | TR-015 | execute | accepted | Proxy token: env SecretRef, workspace-only file tools, one-time state migration, startup secrets audit |
 | TR-014 | specify | accepted | Income loop reuses the task queue and tome bridge; every trade is a `[DRAFT]`, benchmarked against holding |
@@ -44,7 +48,7 @@ checked against the code when it was written here, and the
 **Changed since** lines record where the shipped design moved away from
 the plan.
 
-## TR-017: Claude subscription through a tmux bridge replaces Z.AI
+## TR-021: Claude subscription through a tmux bridge replaces Z.AI
 
 - **Phase**: execute
 - **Status**: accepted
@@ -103,6 +107,127 @@ the plan.
   the bridge must be running on the host, outside compose. Running a
   consumer subscription as a bot backend is the operator's call under
   Anthropic's terms.
+## TR-020: Homelab watch is pull-only and reads the scanner's census
+
+- **Phase**: specify
+- **Status**: accepted
+- **Decision (Y-statement)**: In the context of watching Home Assistant,
+  Uptime Kuma and the router from clawrange on the secure side, facing a
+  zone firewall and tailnet policy that let the IoT zone initiate nothing
+  toward the secure zone, we decided that clawrange **polls** (HA REST
+  `/api/states`, Kuma's public status-page JSON, the monitoring stack's
+  `scanjson` census) and **never logs in to the router**, to achieve
+  alerts without opening any IoT-to-secure path and without a second
+  router collector, accepting up to 5 minutes of alert latency and the
+  census's 6-hour cadence for device and port findings.
+- **Options weighed**:
+  - HA webhooks, `rest_command` or an MQTT bridge to clawrange. Rejected:
+    each needs IoT-to-secure traffic the firewall forbids by design.
+  - An outbound HA WebSocket subscription (laptop-initiated, so allowed).
+    Deferred: push-like latency, but a long-lived connection inside the
+    single uvicorn worker for a household that tolerates minutes.
+  - RouterOS REST over `www-ssl` with a read-only group. Rejected: a fourth
+    management port changes the documented 22/53/8291 baseline, needs a
+    certificate, and one report says a read-only group can still list
+    users (forum.mikrotik.com/t/rest-api-policy/169084, single source).
+- **Negative consequences**: a state change that flips and recovers inside
+  one poll is never seen (the DNP3 "integrity poll" analogy: snapshots
+  miss transients; HA's logbook would close that gap). The census network
+  `clawrange-homelab` is external to the monitoring stack, so clawrange
+  must be up before that stack starts.
+- **Evidence**: `workflows/homelab/sources.py`, `scanner/scan-loop.sh` in
+  the monitoring repo (router `/system resource print` and every MikroTik
+  KEV entry are new scanner legs), `docs/homelab-guide.md`.
+
+## TR-019: Homelab data stays out of brain pages and LLM prompts
+
+- **Phase**: specify
+- **Status**: accepted
+- **Decision (Y-statement)**: In the context of an assistant whose brain
+  pages are embedded through OpenRouter and whose chat history is replayed
+  to free LLM tiers, facing DHCP hostnames and HA entity names that are
+  both private topology and attacker-chosen strings, we decided that
+  homelab state lives in its own `homelab_state` table, the census is
+  served on an internal network only the workflows container joins, and
+  every `!home`/`!net` reply starts with `[homelab]`, a `_POISON_MARKERS`
+  entry the proxy strips from forwarded history, to achieve deterministic
+  answers that no model ever reads, accepting that the assistant cannot
+  answer free-form questions about the network ("what's the TV's IP?")
+  except through the commands.
+- **Options weighed**: an inventory brain page so recall could answer
+  questions. Rejected: the embeddings backfill would ship the topology to
+  OpenRouter. Putting `scanjson` on `msp-network`. Rejected after review:
+  OpenClaw sits there and its agents can `web_fetch`.
+- **Negative consequences**: the marker filter only covers string content;
+  if OpenClaw ever reformats stored assistant turns, the strip misses them.
+- **Evidence**: `homelab_get`/`homelab_put` in `workflows/brain_db.py`,
+  the `homelab-census` network in `docker-compose.yml`,
+  `HOMELAB_REPLY_MARKER` and its proxy test.
+
+## TR-018: HA actions: empty allowlist, hard-deny, out-of-band code
+
+- **Phase**: specify
+- **Status**: accepted
+- **Decision (Y-statement)**: In the context of running HA services from
+  Telegram, facing demonstrated indirect prompt injection into smart-home
+  agents (a poisoned calendar title drove Google Home, arXiv 2508.12175)
+  and an HA token that cannot be scoped per entity, we decided on a
+  deterministic gateway the LLM never reaches: `!home do <service>
+  <entity_id>` must be the whole message, the profile allowlist ships
+  empty, `lock`, `cover`, `alarm_control_panel`, `valve`, `siren`,
+  `camera` and HA's own system domains are denied in code, a 6-digit code
+  bound to the exact `(service, entity_id)` goes to Telegram directly
+  (never in the proxy reply), lives 120 s and works once, and 3 bad codes
+  in 10 minutes lock confirmations for 10 minutes, to achieve actions that
+  injected text cannot trigger, accepting two messages per action and no
+  garage or lock control from chat at all.
+- **Options weighed**: HA's `mcp_server` or the Assist API with exposed
+  entities. Rejected for actuation: the MCP "Home Assistant" toolset can
+  do anything and needs an admin; exposure scoping is coarse and has no
+  confirmation step. Name-matched targets. Rejected: CaMeL-style
+  separation (arXiv 2503.18813, 2506.08837) says plan from trusted input
+  only, so targets are exact entity ids.
+- **Borrowed rules**: PSD2 dynamic linking (approval bound to the literal
+  action), rail interlocking (deny on any failure), the nuclear weak-link
+  idea (repeated failure disables actuation instead of allowing guesses).
+- **Negative consequences**: codes and lockout state are in memory, so a
+  restart clears them. A non-admin `clawrange` HA user is recommended;
+  HA's read-only group may not be selectable in its UI.
+- **Evidence**: `workflows/homelab/actions.py`, `service.request_action`
+  and `confirm_action`, `workflows/tests/test_homelab_actions.py`.
+
+## TR-017: Homelab alerts: baseline first, debounce, flood collapse
+
+- **Phase**: specify
+- **Status**: accepted
+- **Decision (Y-statement)**: In the context of a Telegram channel the
+  operator reads on a phone, facing the top alert-fatigue complaints
+  (per-device duplicates, `unavailable` floods after HA updates) and
+  dozens of randomized phone MACs in the router's ARP table, we decided
+  that the first good observation of each source learns a baseline and
+  alerts nothing, a failed source is an outage (never "everything
+  vanished"), randomized MACs are counted not alerted, HA entities alert
+  only after 30 minutes `unavailable` (`unknown` is report-only), more
+  than 10 at once collapse into one line, and batteries, pending updates
+  and KEV history go to the daily report, to achieve near-zero routine
+  alerts, accepting that a real outage of fewer than 30 minutes never
+  pages.
+- **Borrowed rules**: ISA-18.2 / IEC 62682 / EEMUA 191 (flood above 10
+  alarms in 10 minutes; routine events are not alarms; zero chattering;
+  every alarm has a response), via the ABB/IChemE KPI deck. HA's own
+  battery tutorial batches low batteries daily.
+- **KEV wording**: CISA's feed has no affected-version field, so a new
+  MikroTik entry alerts with the running RouterOS version and "check
+  MikroTik's advisory", never "vulnerable".
+- **Deviation kept**: a stale census alerts on the very first pass;
+  freshness is not a baseline.
+- **Negative consequences**: a dead poller is silent. `/healthz/homelab`
+  goes `degraded` after 15 minutes without a run and the admin Homepage
+  shows it, but nothing outside the laptop watches the watcher until an
+  always-on secure-zone host exists.
+- **Evidence**: `workflows/homelab/findings.py` and
+  `workflows/tests/test_homelab_findings.py`; research notes for this
+  decision were gathered with tome (papers, code, discourse, TRIZ).
 
 ## TR-016: App factory and injected state instead of `from app import`
 

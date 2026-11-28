@@ -148,6 +148,9 @@ services:
       - ./workflows:/app:ro
       # Tenant profiles — load_profile() resolves CLAWRANGE_PROFILE here.
       - ./config/profiles:/config/profiles:ro
+      # Homelab: the private CA certificate for Uptime Kuma's TLS (public
+      # certificate only, never a key). Gitignored except its README.
+      - ./config/homelab:/config/homelab:ro
       # Soul: gives the assistant its persona context for self-directed tasks
       - ./openclaw/soul.md:/opt/soul.md:ro
       # Brain — persistent knowledge storage
@@ -220,6 +223,18 @@ services:
       - HEARTBEAT_WATCH_REALERT_SECS=${HEARTBEAT_WATCH_REALERT_SECS:-7200}
       # Non-empty enables the flagged outcome-signal persona proposals.
       - PERSONA_SIGNAL_LEARNING=${PERSONA_SIGNAL_LEARNING:-}
+      # Homelab watch (profile `homelab` block). Unset -> that source is off
+      # and the stack behaves as before. Workflows only: HA_TOKEN must never
+      # reach the openclaw service.
+      - HA_URL=${HA_URL:-}
+      - HA_TOKEN=${HA_TOKEN:-}
+      - HOMELAB_KUMA_URL=${HOMELAB_KUMA_URL:-}
+      - HOMELAB_CENSUS_URL=${HOMELAB_CENSUS_URL:-}
+      # Path inside the container, under the read-only mount below.
+      - HOMELAB_CA_CERT=${HOMELAB_CA_CERT:-}
+      # Operator-private ignore list and action rules (real entity ids), also
+      # under the read-only mount below.
+      - HOMELAB_HA_LOCAL=${HOMELAB_HA_LOCAL:-}
       # Lead-CRM profile connector credentials (unset -> connector disabled).
       # Passed one by one, never via env_file: that would hand every secret
       # in .env to the container. tests/validate_stack.py checks that each
@@ -256,8 +271,20 @@ services:
           memory: 128M
     networks:
       - msp-network
+      # Reaches the homelab census (scanjson) over this network only.
+      - homelab-census
 
 networks:
   msp-network:
     name: msp-network
     driver: bridge
+  # Dedicated to the homelab census: the monitoring stack's scanjson joins it
+  # as an external network. It is not msp-network because OpenClaw lives on
+  # that one and its agents have web_fetch with no private-host block, so
+  # anything reachable there (http://scanjson/devices.json) would hand the
+  # LLM the whole home topology. Only workflows attaches here. Internal: the
+  # census needs no egress.
+  homelab-census:
+    name: clawrange-homelab
+    driver: bridge
+    internal: true
