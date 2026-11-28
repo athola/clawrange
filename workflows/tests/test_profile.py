@@ -387,7 +387,7 @@ def test_marketing_flags_its_daily_reports_for_catch_up():
 
     p = load_profile("marketing", profiles_dir=_real_profiles_dir())
     ids = {s["id"] for s in p.schedules if s.get("catch_up") is True}
-    assert ids == {"morning_digest", "homelab_deals"}
+    assert ids == {"morning_digest", "homelab_deals", "homelab_report"}
     assert scheduler.CATCH_UP_WINDOW  # window itself stays code-level
 
 
@@ -425,3 +425,85 @@ class TestResolveSubreddits:
         assert profile_mod.resolve_subreddits(db, [], "empty") == ["dflt"]
         assert profile_mod.resolve_subreddits(db, None, "missing") == ["dflt"]
         assert profile_mod.resolve_subreddits(db, None, None) == ["dflt"]
+
+
+# ─── homelab block ───────────────────────────────────────────────────
+
+
+def _homelab_profile(tmp_path, block: str):
+    _write_profile(
+        tmp_path,
+        "h",
+        "profile: h\nhomelab:\n" + textwrap.indent(textwrap.dedent(block), "  "),
+    )
+    return lambda: load_profile(
+        "h", profiles_dir=tmp_path, known_generator_kinds=KNOWN_KINDS
+    )
+
+
+def test_homelab_absent_is_none(tmp_path):
+    _write_profile(tmp_path, "h", "profile: h\n")
+    p = load_profile("h", profiles_dir=tmp_path, known_generator_kinds=KNOWN_KINDS)
+    assert p.homelab is None
+
+
+def test_homelab_valid_block_loads_with_unset_env(tmp_path):
+    load = _homelab_profile(
+        tmp_path,
+        """
+        home_assistant:
+          url: ${HOMELAB_TEST_UNSET_URL}
+          token: ${HOMELAB_TEST_UNSET_TOKEN}
+          battery_low: 20
+          ignore_entities: [sensor.noisy_*]
+          local_file: ${HOMELAB_TEST_UNSET_LOCAL}
+          actions:
+            - {service: light.turn_on, entities: [light.lamp, "light.*"]}
+        kuma: {url: "${HOMELAB_TEST_UNSET_KUMA}", slug: home, ca_cert: ""}
+        census: {url: "${HOMELAB_TEST_UNSET_CENSUS}", max_age_hours: 13}
+        source_down_after: 3
+        """,
+    )
+    assert load().homelab["home_assistant"]["url"] == ""
+
+
+@pytest.mark.parametrize(
+    "block, match",
+    [
+        ("bogus: 1", "bogus"),
+        ("home_assistant: {nope: 1}", "nope"),
+        ("kuma: {nope: 1}", "nope"),
+        ("census: {nope: 1}", "nope"),
+        ("home_assistant: [1]", "mapping"),
+        ("source_down_after: 0", "positive"),
+        ("source_down_after: true", "positive"),
+        ("home_assistant: {battery_low: -1}", "positive"),
+        ("home_assistant: {flood_threshold: 1.5}", "positive"),
+        ("home_assistant: {unavailable_after_minutes: 0}", "positive"),
+        ("census: {max_age_hours: 0}", "positive"),
+        ("home_assistant: {ignore_entities: x}", "ignore_entities"),
+        ("home_assistant: {ignore_entities: [1]}", "ignore_entities"),
+        ("kuma: {slug: [a]}", "text"),
+        ("home_assistant: {local_file: [a]}", "text"),
+    ],
+)
+def test_homelab_bad_shape_raises(tmp_path, block, match):
+    with pytest.raises(ProfileError, match=match):
+        _homelab_profile(tmp_path, block)()
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "{service: lock.unlock, entities: [lock.door]}",
+        "{service: light.turn_on, entities: [lock.door]}",
+        "{service: script.turn_on, entities: ['script.*']}",
+        "{service: light.turn_on, entities: []}",
+        "{service: light.turn_on, entities: [light.a], extra: 1}",
+        "{service: homeassistant.restart, entities: [light.a]}",
+    ],
+)
+def test_homelab_hard_denied_or_bad_actions_rejected_at_validation(tmp_path, action):
+    load = _homelab_profile(tmp_path, f"home_assistant:\n  actions:\n    - {action}\n")
+    with pytest.raises(ProfileError, match="actions"):
+        load()

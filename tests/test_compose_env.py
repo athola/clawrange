@@ -31,6 +31,33 @@ def test_heartbeat_tunables_reach_the_workflows_container():
     assert not missing, f"not passed to workflows in docker-compose.yml: {missing}"
 
 
+def _compose() -> dict:
+    return yaml.safe_load((ROOT / "docker-compose.yml").read_text())
+
+
+def test_homelab_settings_reach_workflows_but_never_openclaw():
+    compose = _compose()
+    names = {"HA_URL", "HA_TOKEN", "HOMELAB_KUMA_URL", "HOMELAB_CENSUS_URL"}
+    names |= {"HOMELAB_CA_CERT", "HOMELAB_HA_LOCAL"}
+    assert names <= set(_compose_env())
+    openclaw_env = compose["services"]["openclaw"]["environment"]
+    joined = "\n".join(openclaw_env)
+    assert not any(name in joined for name in names)
+    mounts = compose["services"]["workflows"]["volumes"]
+    assert "./config/homelab:/config/homelab:ro" in mounts
+    assert not any("homelab" in v for v in compose["services"]["openclaw"]["volumes"])
+
+
+def test_census_network_is_internal_and_workflows_only():
+    compose = _compose()
+    net = compose["networks"]["homelab-census"]
+    assert net["name"] == "clawrange-homelab"
+    assert net["internal"] is True
+    assert "homelab-census" in compose["services"]["workflows"]["networks"]
+    assert "msp-network" in compose["services"]["workflows"]["networks"]
+    assert compose["services"]["openclaw"]["networks"] == ["msp-network"]
+
+
 def test_import_time_integer_tunables_never_get_an_empty_default():
     """digest.py and watchdog.py parse these at import; '' would crash boot."""
     env = _compose_env()
@@ -44,3 +71,24 @@ def test_import_time_integer_tunables_never_get_an_empty_default():
     ):
         value = env.get(name, "")
         assert not value.endswith(":-}"), f"{name} has an empty default: {value}"
+
+
+class _ComposeLoader(yaml.SafeLoader):
+    """SafeLoader that reads compose's ``!override`` / ``!reset`` tags."""
+
+
+_ComposeLoader.add_constructor(
+    "!override", lambda loader, node: loader.construct_sequence(node)
+)
+_ComposeLoader.add_constructor("!reset", lambda loader, node: None)
+
+
+def test_prod_overlay_keeps_the_homelab_mount():
+    # The prod overlay replaces the workflows volume list (!override), so a
+    # mount added to the base file is silently dropped in prod unless it is
+    # repeated here: no Kuma CA (TLS fails) and no ha-local.yaml.
+    prod = yaml.load(
+        (ROOT / "docker-compose.prod.yml").read_text(), Loader=_ComposeLoader
+    )
+    mounts = prod["services"]["workflows"]["volumes"]
+    assert "./config/homelab:/config/homelab:ro" in mounts

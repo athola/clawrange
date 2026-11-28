@@ -734,16 +734,19 @@ class TestHelpCommand:
         assert "SYSTEM STATUS" in content
         assert "BRAIN API" in content
         assert "HEALTH" in content
-        assert "!task" in content
+        # The forms that reach the proxy from Telegram (OpenClaw takes any
+        # message starting with "!" as a shell command).
+        assert "/task" in content
         # No proxy handler exists for these, so help must not list them.
         assert "!recall" not in content
         assert "!remember" not in content
-        assert "!tier" in content
+        assert "/tier" in content
         assert "/brain/search" in content
         assert "PERSONA" in content
-        assert "!persona <feedback>" in content
-        assert "!persona reflect" in content
-        assert "!learn" in content
+        assert "/persona <feedback>" in content
+        assert "/persona reflect" in content
+        # /learn is an OpenClaw built-in, so help never offers it.
+        assert "/learn <" not in content
 
     def test_help_with_metadata_prefix(self, client):
         msg = "some metadata block\n!help"
