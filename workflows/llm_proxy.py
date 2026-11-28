@@ -1383,7 +1383,9 @@ async def _try_single_tier(
             return None, None
 
         _record_failure(tier_name)
-        reasons[tier_name] = f"HTTP {resp.status_code}"
+        reasons[tier_name] = _BRIDGE_REASONS.get(
+            _error_code(resp), f"HTTP {resp.status_code}"
+        )
         _background_notify(
             tier_name,
             f"*Error* on `{tier_name}` (HTTP {resp.status_code}): {resp.text[:200]}",

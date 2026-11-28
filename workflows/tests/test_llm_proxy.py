@@ -5457,6 +5457,21 @@ class TestBridgeErrorCodes:
         assert tried["claude-sub"] > llm_proxy.CIRCUIT_FAILURE_THRESHOLD
 
     @patch.dict("os.environ", FAKE_ENV)
+    @patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
+    @patch("llm_proxy._background_notify")
+    def test_chat_reason_names_the_bridge_code(self, _bg, client):
+        """The 'no tier answered' reply names an expired login, not HTTP 503."""
+
+        async def fake(provider, models, body, api_key, deadline=None):
+            return _bridge_error(503, "login_expired")
+
+        body = {"messages": [{"role": "user", "content": "!sub hi"}]}
+        with patch("llm_proxy._call_provider", side_effect=fake):
+            r = client.post("/v1/chat/completions", json=body, headers=AUTH_HEADER)
+        assert "login expired" in r.text
+        assert llm_proxy._circuit_state["claude-sub"]["failures"] == 1
+
+    @patch.dict("os.environ", FAKE_ENV)
     def test_background_sends_its_attempt_budget(self):
         seen = {}
 

@@ -103,16 +103,18 @@ class BridgeError(Exception):
 # Every quantifier is bounded and each pattern has a single variable-width
 # window: an unbounded `[^>]*` (or two windows around a keyword) backtracks
 # quadratically, and one hostile 100 KB web page then pinned every bridge
-# thread. The cost is that a tag, comment or style attribute longer than
+# thread. The cost is that a comment or style attribute longer than
 # _WINDOW characters passes through unredacted; the turn nonce and the lack
 # of tools, not this list, are the boundary (TR-021).
 _WINDOW = 256
 _STRUCTURAL = [
     re.compile(p)
     for p in (
-        rf"(?i)</?\s*(?:system|assistant|human|important)\b[^>]{{0,{_WINDOW}}}>",
+        # Role and turn tags are neutralised by the opener alone, so no
+        # padding inside the tag can carry it past a window.
+        r"(?i)</?\s*(?:system|assistant|human|important)\b",
         r"(?i)system-reminder",
-        rf"(?i)</?\s*turn[^>]{{0,{_WINDOW}}}>",
+        r"(?i)</?\s*turn\b",
         r"(?i)</?\s*tool_calls\s*>",
     )
 ]
@@ -386,6 +388,8 @@ def parse_reply(text: str, tool_names: set[str]) -> tuple[dict, str]:
 # ─── Transcript ──────────────────────────────────────────────────
 
 _ERROR_STATUS = {"rate_limit": 429, "authentication_failed": 503}
+# Transcript error kinds the proxy knows by another name.
+_ERROR_CODE = {"authentication_failed": "login_expired"}
 # Stops that end the answer. "tool_use" does not: the model sometimes
 # reaches for a tool it does not have, the CLI refuses, and it carries on.
 _FINAL_STOPS = {"end_turn", "max_tokens", "stop_sequence"}
@@ -417,7 +421,9 @@ def read_transcript(lines: Iterable[str]) -> str | None:
             kind = str(rec.get("error") or "api_error")
             detail = _text_of(msg.get("content"))[:200]
             raise BridgeError(
-                _ERROR_STATUS.get(kind, 502), f"claude {kind}: {detail}", kind
+                _ERROR_STATUS.get(kind, 502),
+                f"claude {kind}: {detail}",
+                _ERROR_CODE.get(kind, kind),
             )
         for block in msg.get("content") or []:
             if isinstance(block, dict) and block.get("type") == "text":

@@ -111,7 +111,8 @@ the plan.
   still spends a subscription turn. Nothing polls the bridge's health:
   a stopped bridge shows only as `connection failed` until its breaker
   opens. The sanitizer's windows are bounded (256 characters) to stay
-  linear, so a longer hostile tag or comment passes it unredacted.
+  linear, so a longer hostile HTML comment or style attribute passes it
+  unredacted (role and turn tags are caught by their opener alone).
 - **Changed since**: a review found the contract too coarse. The bridge
   now sends a string `error.code`, so a busy queue or an unparseable
   model reply skips the tier without tripping its breaker, and an
