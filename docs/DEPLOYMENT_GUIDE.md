@@ -67,6 +67,29 @@ cp .env.example .env
 is set, and renders `openclaw/soul.md` from the active profile if it is
 missing.
 
+The `claude-sub` tier needs `scripts/claude_bridge.py` running on the
+host, logged in with `claude` and `/login` once. `make claude-bridge`
+serves it in the foreground. To keep it up across reboots, run it as a
+systemd user unit (needs `loginctl enable-linger $USER` to start
+without a login). Give the unit only the two values it reads, never
+the whole `.env`:
+
+```ini
+# ~/.config/clawrange/claude-bridge.env (mode 600), copied from .env:
+#   CLAUDE_BRIDGE_TOKEN=...
+#   DOCKER_HOST_IP=...
+# ~/.config/systemd/user/clawrange-claude-bridge.service, [Service]
+WorkingDirectory=%h/clawrange
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/.config/clawrange/claude-bridge.env
+ExecStart=/usr/bin/python3 scripts/claude_bridge.py
+Restart=always
+```
+
+Then `systemctl --user enable --now clawrange-claude-bridge`. Rotating
+`CLAUDE_BRIDGE_TOKEN` in `.env` means updating that file and restarting
+the unit; logs are in `journalctl --user -u clawrange-claude-bridge`.
+
 ### 1.3 Start services in production mode
 
 ```bash

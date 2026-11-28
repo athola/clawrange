@@ -163,7 +163,7 @@ make retrieval-eval   # compare search configs offline (fixture golden set)
 make retrieval-harvest   # real brain searches -> data/retrieval/golden.json
 make retrieval-eval-brain # same matrix on the real brain (label queries first)
 make health           # quick curl health checks
-make claude-bridge    # host bridge for the claude-sub tier (keep it running)
+make claude-bridge    # host bridge for the claude-sub tier (or the systemd unit, docs/DEPLOYMENT_GUIDE.md)
 make logs             # tail docker logs
 
 # Python quality — uv-managed (ruff + mypy + pytest via pyproject.toml/uv.lock)
