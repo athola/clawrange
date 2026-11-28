@@ -40,7 +40,8 @@ Env:
   CLAUDE_BRIDGE_TOKEN        bearer token callers must send (required)
   CLAUDE_BRIDGE_PORT         listen port (default 8790)
   DOCKER_HOST_IP             also listen here (docker0), beside 127.0.0.1
-  CLAUDE_BRIDGE_TIMEOUT      seconds to wait for a reply (default 40)
+  CLAUDE_BRIDGE_TIMEOUT      max seconds to wait for a reply (default 40);
+                             a caller's X-Deadline-Seconds can shorten it
   CLAUDE_BRIDGE_CONCURRENCY  sessions at once (default 2)
   CLAUDE_BIN                 defaults to 'claude' on $PATH
   CLAUDE_BRIDGE_STATE        state dir (default ~/.local/state/clawrange-claude-bridge)
@@ -59,6 +60,7 @@ import re
 import secrets
 import select
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -84,29 +86,49 @@ _POLL_SECONDS = 0.25
 class BridgeError(Exception):
     """A request failure with the HTTP status the caller should see."""
 
-    def __init__(self, status: int, message: str):
+    def __init__(self, status: int, message: str, code: str | None = None):
         super().__init__(message)
         self.status = status
         self.message = message
+        # Machine-readable kind for the proxy: "busy" and "bad_reply" are
+        # skipped without a breaker hit, "login_expired" names the fix.
+        self.code = code
 
 
 # ─── Sanitize (patterns from night-market sanitize_external_content) ──
 
 # Markup that only exists to impersonate the harness or hide text. It goes
 # from every turn: no honest chat message needs a <system> tag.
+#
+# Every quantifier is bounded and each pattern has a single variable-width
+# window: an unbounded `[^>]*` (or two windows around a keyword) backtracks
+# quadratically, and one hostile 100 KB web page then pinned every bridge
+# thread. The cost is that a tag, comment or style attribute longer than
+# _WINDOW characters passes through unredacted; the turn nonce and the lack
+# of tools, not this list, are the boundary (TR-021).
+_WINDOW = 256
 _STRUCTURAL = [
     re.compile(p)
     for p in (
-        r"(?i)</?\s*(?:system|assistant|human|important)\b[^>]*>",
+        rf"(?i)</?\s*(?:system|assistant|human|important)\b[^>]{{0,{_WINDOW}}}>",
         r"(?i)system-reminder",
-        r"(?i)</?\s*turn[-\w]*[^>]*>",
+        rf"(?i)</?\s*turn[^>]{{0,{_WINDOW}}}>",
         r"(?i)</?\s*tool_calls\s*>",
-        r"(?i)<!--[^>]*(?:ignore|override|forget|you are)[^>]*-->",
-        r'(?i)style\s*=\s*["\'][^"\']*display:\s*none[^"\']*["\']',
-        r'(?i)style\s*=\s*["\'][^"\']*visibility:\s*hidden[^"\']*["\']',
-        r'(?i)style\s*=\s*["\'][^"\']*font-size:\s*0\b[^"\']*["\']',
-        r'(?i)style\s*=\s*["\'][^"\']*opacity:\s*0\b[^"\']*["\']',
     )
+]
+# Matched first, then redacted only when the matched text is hostile, so
+# the keyword test runs on at most _WINDOW characters.
+_CONDITIONAL = [
+    (
+        re.compile(rf"<!--([^>]{{0,{_WINDOW}}})-->"),
+        re.compile(r"(?i)ignore|override|forget|you are"),
+    ),
+    (
+        re.compile(rf"""(?i)style\s*=\s*["']([^"']{{0,{_WINDOW}}})["']"""),
+        re.compile(
+            r"(?i)display:\s*none|visibility:\s*hidden|font-size:\s*0\b|opacity:\s*0\b"
+        ),
+    ),
 ]
 # Instruction phrases. Only tool output (web pages, files, search results)
 # is held to these: a user writing "ignore previous drafts" is conversation.
@@ -131,7 +153,22 @@ _ZERO_WIDTH = re.compile("[​‌‍⁠﻿]")
 def sanitize_untrusted(text: str, strict: bool) -> tuple[str, int]:
     """Return ``(clean_text, hits)``. ``strict`` adds the phrase patterns."""
     text, hits = _ZERO_WIDTH.subn("", text)
-    for pattern in _STRUCTURAL + (_PHRASES if strict else []):
+    for pattern in _STRUCTURAL:
+        text, n = pattern.subn(REDACTED, text)
+        hits += n
+    for pattern, hostile in _CONDITIONAL:
+        found = 0
+
+        def _redact(m: re.Match[str], hostile: re.Pattern[str] = hostile) -> str:
+            nonlocal found
+            if hostile.search(m.group(1)):
+                found += 1
+                return REDACTED
+            return m.group(0)
+
+        text = pattern.sub(_redact, text)
+        hits += found
+    for pattern in _PHRASES if strict else []:
         text, n = pattern.subn(REDACTED, text)
         hits += n
     return text, hits
@@ -239,7 +276,22 @@ def render_prompt(body: dict, nonce: str) -> str:
     TR-021 in docs/tradeoffs.md for the boundary this relies on instead.
     """
     messages = body.get("messages") or []
-    system = [_text_of(m.get("content")) for m in messages if m.get("role") == "system"]
+    # System messages after the last turn stay after the turns: the proxy
+    # appends its anti-hallucination reminder last on purpose, since models
+    # weight instructions near the end. Earlier ones lead the prompt.
+    last_turn = max(
+        (i for i, m in enumerate(messages) if m.get("role") != "system"), default=-1
+    )
+    system = [
+        _text_of(m.get("content"))
+        for m in messages[: last_turn + 1]
+        if m.get("role") == "system"
+    ]
+    trailing = [
+        _text_of(m.get("content"))
+        for m in messages[last_turn + 1 :]
+        if m.get("role") == "system"
+    ]
     call_names: dict[str, str] = {}
     turns = [
         _render_turn(m, nonce, call_names)
@@ -260,6 +312,7 @@ def render_prompt(body: dict, nonce: str) -> str:
         "\n".join(rules),
         _tool_contract(body),
         "\n\n".join(turns),
+        "\n\n".join(t for t in trailing if t),
         "Write the assistant's next turn now: the message text only, with no "
         "role label and no turn tags.",
     ]
@@ -277,34 +330,48 @@ def parse_reply(text: str, tool_names: set[str]) -> tuple[dict, str]:
     match = _BLOCK.search(text)
     if not match:
         if "<tool_calls" in text:
-            raise BridgeError(502, "claude: unterminated <tool_calls> block")
+            raise BridgeError(
+                502, "claude: unterminated <tool_calls> block", "bad_reply"
+            )
         content = text.strip()
         if not content:
-            raise BridgeError(502, "claude: empty reply")
+            raise BridgeError(502, "claude: empty reply", "bad_reply")
         return {"role": "assistant", "content": content}, "stop"
     if not tool_names:
-        raise BridgeError(502, "claude: called a function none were offered")
+        raise BridgeError(
+            502, "claude: called a function none were offered", "bad_reply"
+        )
     try:
         calls = json.loads(_FENCE.sub("", match.group(1)))
     except ValueError as exc:
-        raise BridgeError(502, f"claude: malformed <tool_calls> JSON ({exc})") from exc
+        raise BridgeError(
+            502, f"claude: malformed <tool_calls> JSON ({exc})", "bad_reply"
+        ) from exc
     if isinstance(calls, dict):
         calls = [calls]
     if not isinstance(calls, list) or not calls:
-        raise BridgeError(502, "claude: <tool_calls> is not a list of calls")
+        raise BridgeError(
+            502, "claude: <tool_calls> is not a list of calls", "bad_reply"
+        )
     out = []
     for call in calls:
         name = call.get("name") if isinstance(call, dict) else None
         if name not in tool_names:
-            raise BridgeError(502, f"claude: called unknown function {name!r}")
+            raise BridgeError(
+                502, f"claude: called unknown function {name!r}", "bad_reply"
+            )
         args = call.get("arguments", {})
         if isinstance(args, str):
             try:
                 args = json.loads(args or "{}")
             except ValueError as exc:
-                raise BridgeError(502, f"claude: bad arguments for {name}") from exc
+                raise BridgeError(
+                    502, f"claude: bad arguments for {name}", "bad_reply"
+                ) from exc
         if not isinstance(args, dict):
-            raise BridgeError(502, f"claude: arguments for {name} are not an object")
+            raise BridgeError(
+                502, f"claude: arguments for {name} are not an object", "bad_reply"
+            )
         out.append(
             {
                 "id": "call_" + uuid.uuid4().hex[:24],
@@ -349,7 +416,9 @@ def read_transcript(lines: Iterable[str]) -> str | None:
         if rec.get("isApiErrorMessage"):
             kind = str(rec.get("error") or "api_error")
             detail = _text_of(msg.get("content"))[:200]
-            raise BridgeError(_ERROR_STATUS.get(kind, 502), f"claude {kind}: {detail}")
+            raise BridgeError(
+                _ERROR_STATUS.get(kind, 502), f"claude {kind}: {detail}", kind
+            )
         for block in msg.get("content") or []:
             if isinstance(block, dict) and block.get("type") == "text":
                 texts.append(block.get("text", ""))
@@ -409,7 +478,13 @@ def _never() -> bool:
 
 
 class Runner(Protocol):
-    def run(self, prompt: str, model: str, cancelled: Cancelled = _never) -> str: ...
+    def run(
+        self,
+        prompt: str,
+        model: str,
+        cancelled: Cancelled = _never,
+        timeout: float | None = None,
+    ) -> str: ...
 
 
 class TmuxRunner:
@@ -440,31 +515,71 @@ class TmuxRunner:
         found = list(self.projects.glob(f"*/{session_id}.jsonl"))
         return found[0] if found else None
 
-    def run(self, prompt: str, model: str, cancelled: Cancelled = _never) -> str:
+    def run(
+        self,
+        prompt: str,
+        model: str,
+        cancelled: Cancelled = _never,
+        timeout: float | None = None,
+    ) -> str:
         session_id = str(uuid.uuid4())
         name = f"ccb-{session_id[:8]}"
         req = self.reqdir / session_id
         req.mkdir(mode=0o700)
-        prompt_file = req / "prompt.txt"
-        prompt_file.write_text(prompt)
-        prompt_file.chmod(0o600)
-        argv = build_command(self.claude_bin, session_id, str(prompt_file), model)
-        started = self._tmux(
-            "new-session", "-d", "-s", name, "-x", "200", "-y", "50",
-            "-c", str(self.workdir), *argv,
-        )  # fmt: skip
         try:
+            prompt_file = req / "prompt.txt"
+            prompt_file.write_text(prompt)
+            prompt_file.chmod(0o600)
+            argv = build_command(self.claude_bin, session_id, str(prompt_file), model)
+            started = self._tmux(
+                "new-session", "-d", "-s", name, "-x", "200", "-y", "50",
+                "-c", str(self.workdir), *argv,
+            )  # fmt: skip
             if started.returncode != 0:
                 raise BridgeError(502, f"tmux: {started.stderr.strip()[:200]}")
-            return self._await_reply(session_id, name, cancelled)
+            return self._await_reply(session_id, name, cancelled, timeout)
         finally:
-            self._tmux("kill-session", "-t", name)
-            shutil.rmtree(req, ignore_errors=True)
+            self._cleanup(session_id, name)
+
+    def _cleanup(self, session_id: str, name: str | None) -> None:
+        """Remove one session's traces; each step runs even if one fails."""
+        if name:
+            try:
+                self._tmux("kill-session", "-t", name)
+            except (OSError, subprocess.SubprocessError):
+                logger.warning("could not kill tmux session %s", name)
+        # The prompt file holds the whole conversation, the transcript too.
+        shutil.rmtree(self.reqdir / session_id, ignore_errors=True)
+        try:
             transcript = self._transcript(session_id)
             if transcript:
                 transcript.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("could not remove transcript for %s", session_id)
 
-    def _await_reply(self, session_id: str, name: str, cancelled: Cancelled) -> str:
+    def sweep(self) -> int:
+        """Clear what a stopped bridge left behind; return the count.
+
+        Request directories are named by session id, so each one also names
+        the transcript to delete. The bridge's tmux server has its own
+        socket, so killing it touches no other tmux session.
+        """
+        left = [d.name for d in self.reqdir.iterdir() if d.is_dir()]
+        for session_id in left:
+            self._cleanup(session_id, None)
+        try:
+            self._tmux("kill-server")
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return len(left)
+
+    def _await_reply(
+        self,
+        session_id: str,
+        name: str,
+        cancelled: Cancelled,
+        timeout: float | None = None,
+    ) -> str:
         """Poll until the transcript holds the reply.
 
         The screen is read only until the transcript exists: the trust
@@ -472,7 +587,8 @@ class TmuxRunner:
         it the reply itself is on screen, so a reply mentioning "/login"
         must not be read as the CLI asking for one.
         """
-        deadline = time.monotonic() + self.timeout
+        wait = self.timeout if timeout is None else min(timeout, self.timeout)
+        deadline = time.monotonic() + wait
         trust_sent_at = 0.0
         pane = ""
         while time.monotonic() < deadline:
@@ -504,20 +620,27 @@ class TmuxRunner:
                     trust_sent_at = now
                 if "/login" in pane:
                     raise BridgeError(
-                        503, "claude login expired: run `claude` and /login"
+                        503,
+                        "claude login expired: run `claude` and /login",
+                        "login_expired",
                     )
             time.sleep(_POLL_SECONDS)
         lines = [ln.strip() for ln in pane.splitlines() if ln.strip()]
         last = lines[-1] if lines else ""
         raise BridgeError(
-            504, f"no reply within {self.timeout:.0f}s (screen: {last[:120]})"
+            504, f"no reply within {wait:.0f}s (screen: {last[:120]})", "timeout"
         )
 
 
 # ─── HTTP ────────────────────────────────────────────────────────
 
 
-def complete(body: dict, runner: Runner, cancelled: Cancelled = _never) -> dict:
+def complete(
+    body: dict,
+    runner: Runner,
+    cancelled: Cancelled = _never,
+    timeout: float | None = None,
+) -> dict:
     """Answer one OpenAI chat-completions request body."""
     if body.get("stream"):
         raise BridgeError(400, "streaming is not supported; send stream=false")
@@ -526,7 +649,7 @@ def complete(body: dict, runner: Runner, cancelled: Cancelled = _never) -> dict:
         raise BridgeError(400, "messages must be a non-empty list")
     model = resolve_model(body.get("model"))
     prompt = render_prompt(body, secrets.token_hex(6))
-    reply = runner.run(prompt, model, cancelled)
+    reply = runner.run(prompt, model, cancelled, timeout)
     message, finish = parse_reply(reply, offered_tool_names(body))
     return {
         "id": "chatcmpl-" + uuid.uuid4().hex[:24],
@@ -538,6 +661,13 @@ def complete(body: dict, runner: Runner, cancelled: Cancelled = _never) -> dict:
     }
 
 
+# Kept back from the caller's X-Deadline-Seconds so the bridge's own error
+# reaches the caller before it gives up; below _MIN_RUN a session cannot
+# start and answer, so the request is refused rather than started.
+_DEADLINE_MARGIN = 1.5
+_MIN_RUN = 3.0
+
+
 def make_server(
     host: str,
     port: int,
@@ -545,10 +675,13 @@ def make_server(
     runner: Runner,
     concurrency: int = 2,
     slot_wait: float = 5.0,
+    slots: threading.BoundedSemaphore | None = None,
 ) -> ThreadingHTTPServer:
+    """Build one listener. Pass ``slots`` to share a concurrency limit
+    across listeners (loopback and docker0 serve the same sessions)."""
     if not token:
         raise ValueError("CLAUDE_BRIDGE_TOKEN is empty")
-    slots = threading.BoundedSemaphore(concurrency)
+    limit = slots if slots is not None else threading.BoundedSemaphore(concurrency)
     expected = f"Bearer {token}".encode()
 
     class Handler(BaseHTTPRequestHandler):
@@ -582,8 +715,15 @@ def make_server(
             except OSError:
                 return True
 
-        def _error(self, status: int, message: str) -> None:
-            self._send(status, {"error": {"message": message, "code": status}})
+        def _error(self, status: int, message: str, code: str | None = None) -> None:
+            self._send(status, {"error": {"message": message, "code": code or status}})
+
+        def _budget(self) -> float | None:
+            """Seconds the caller will wait, less the margin; None if unsaid."""
+            try:
+                return float(self.headers["X-Deadline-Seconds"]) - _DEADLINE_MARGIN
+            except (KeyError, TypeError, ValueError):
+                return None
 
         def do_GET(self) -> None:
             if self.path == "/healthz":
@@ -597,7 +737,11 @@ def make_server(
             sent = self.headers.get("Authorization", "").encode()
             if not hmac.compare_digest(sent, expected):
                 return self._error(401, "unauthorized")
-            length = int(self.headers.get("Content-Length") or 0)
+            received = time.monotonic()
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                return self._error(400, "bad Content-Length")
             if length <= 0 or length > MAX_BODY_BYTES:
                 return self._error(413 if length > 0 else 400, "bad body length")
             try:
@@ -606,23 +750,32 @@ def make_server(
                 return self._error(400, "body is not JSON")
             if not isinstance(body, dict):
                 return self._error(400, "body must be an object")
-            # 503, not 429: the proxy trips a breaker on the first 429, and a
-            # full local queue clears as soon as a session finishes.
-            if not slots.acquire(timeout=slot_wait):
-                return self._error(503, f"bridge busy ({concurrency} running)")
+            budget = self._budget()
+            if budget is not None and budget < _MIN_RUN:
+                return self._error(504, "deadline too short to start", "timeout")
+            wait = slot_wait if budget is None else min(slot_wait, budget - _MIN_RUN)
+            # 503 with code "busy", not 429: the proxy trips a breaker on the
+            # first 429, and a full local queue clears once a session ends.
+            if not limit.acquire(timeout=max(wait, 0.0)):
+                return self._error(503, "bridge busy", "busy")
             started = time.monotonic()
             status = 200
             try:
-                self._send(200, complete(body, runner, self._caller_gone))
+                left = None if budget is None else budget - (started - received)
+                if self._caller_gone():
+                    raise BridgeError(499, "caller went away")
+                if left is not None and left < _MIN_RUN:
+                    raise BridgeError(504, "deadline passed in the queue", "timeout")
+                self._send(200, complete(body, runner, self._caller_gone, left))
             except BridgeError as exc:
                 status = exc.status
-                self._error(exc.status, exc.message)
+                self._error(exc.status, exc.message, exc.code)
             except Exception:
                 status = 500
                 logger.exception("bridge request failed")
                 self._error(500, "bridge internal error")
             finally:
-                slots.release()
+                limit.release()
                 logger.info(
                     "model=%s status=%s %.1fs",
                     body.get("model"),
@@ -661,9 +814,24 @@ def main() -> int:
     docker_ip = os.environ.get("DOCKER_HOST_IP", "")
     if docker_ip and docker_ip not in hosts and docker_ip != "0.0.0.0":
         hosts.append(docker_ip)
-    servers = [make_server(h, port, token, runner, concurrency) for h in hosts]
+    slots = threading.BoundedSemaphore(concurrency)
+    servers = [
+        make_server(h, port, token, runner, concurrency, slots=slots) for h in hosts
+    ]
+    # Only once the ports are ours: a second bridge that fails to bind must
+    # not sweep the live one's sessions.
+    swept = runner.sweep()
+    if swept:
+        logger.info("removed %d request(s) left by a previous run", swept)
     for srv in servers[1:]:
         threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    def _stop(signum: int, frame: object) -> None:
+        raise KeyboardInterrupt
+
+    # systemd stops the unit with SIGTERM; without this the finally below
+    # never runs and prompt files and sessions outlive the bridge.
+    signal.signal(signal.SIGTERM, _stop)
     logger.info("listening on %s port %d", ", ".join(hosts), port)
     try:
         servers[0].serve_forever()
@@ -672,6 +840,7 @@ def main() -> int:
     finally:
         for srv in servers:
             srv.server_close()
+        runner.sweep()
     return 0
 
 
