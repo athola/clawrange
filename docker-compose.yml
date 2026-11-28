@@ -162,11 +162,17 @@ services:
       # breaks single-file bind mounts (the bind pins the old inode).
       # The host side honours OPENCLAW_STATE_DIR from .env.
       - ${OPENCLAW_STATE_DIR:-./data/openclaw-state}:/openclaw-state
+    # The claude-sub bridge listens on the host (127.0.0.1 and docker0);
+    # host-gateway is the docker0 address, so models.json can name it.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     tmpfs:
       - /tmp:size=32M
     environment:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
-      - ZAI_API_KEY=${ZAI_API_KEY}
+      # Bearer token for the host claude-sub bridge (scripts/claude_bridge.py,
+      # `make claude-bridge`). Unset disables the claude-sub tier.
+      - CLAUDE_BRIDGE_TOKEN=${CLAUDE_BRIDGE_TOKEN:-}
       # Embedding model for brain search and /v1/embeddings (OpenRouter).
       - EMBED_MODEL=${EMBED_MODEL:-openai/text-embedding-3-small}
       - EMBED_DIM=${EMBED_DIM:-1536}

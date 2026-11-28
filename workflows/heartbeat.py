@@ -508,7 +508,7 @@ def _has_recent_prefix(
     `prefix` (or equals it, with exact=True), ignoring case.
 
     For descriptions the heartbeat writes itself. Keyword overlap merged
-    distinct alerts ("tier recovery: zai-direct" matched the openrouter
+    distinct alerts ("tier recovery: claude-sub" matched the openrouter
     one) and missed the stale nudge, whose text starts with a count.
     """
     cutoff = datetime.now(UTC) - timedelta(hours=hours)
@@ -562,8 +562,8 @@ async def _gather_system_state(brain_db) -> str:
         "Tiers:\n" + "\n".join(tier_lines) + "\n"
         f"OpenRouter balance: {balance} "
         f"(floor: ${llm_proxy.OPENROUTER_BALANCE_FLOOR:.2f}). "
-        "zai-direct is a separate provider with its own quota and is not "
-        "affected by this balance.\n"
+        "claude-sub is a separate provider (the Claude subscription) with "
+        "its own quota and is not affected by this balance.\n"
         f"Last tier used: {llm_proxy._last_tier_used or 'none'}\n"
         f"Task queue: {pending} pending, {active} active, {done} done"
     )
@@ -852,7 +852,7 @@ def _status_alert_result(description: str, remaining: float | None) -> str:
             "free tiers active; paid and search held until the balance can be read"
         )
     elif remaining <= 0:
-        routing = "openrouter skipped (depleted), zai-direct carrying traffic"
+        routing = "openrouter skipped (depleted), claude-sub carrying traffic"
     elif remaining <= llm_proxy.OPENROUTER_BALANCE_FLOOR:
         routing = "free tiers active; paid and search held by the balance floor"
     else:

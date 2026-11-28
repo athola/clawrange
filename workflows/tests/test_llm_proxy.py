@@ -28,7 +28,7 @@ SUCCESSFUL_RESPONSE = {
 
 FAKE_ENV = {
     "OPENROUTER_API_KEY": "test-key",
-    "ZAI_API_KEY": "test-key",
+    "CLAUDE_BRIDGE_TOKEN": "test-key",
     "TELEGRAM_BOT_TOKEN": "",
     "TELEGRAM_CHAT_ID": "",
     "PROXY_AUTH_TOKEN": "test-token",
@@ -74,21 +74,21 @@ def _reset_state():
 # ─── Provider mock helpers ────────────────────────────────────────
 
 
-async def _all_succeed(provider, models, body, api_key):
+async def _all_succeed(provider, models, body, api_key, deadline=None):
     return _mock_response(200)
 
 
-async def _openrouter_rate_limited(provider, models, body, api_key):
+async def _openrouter_rate_limited(provider, models, body, api_key, deadline=None):
     if provider == "openrouter":
         return _mock_response(429, {"error": "rate limited"})
     return _mock_response(200)
 
 
-async def _all_rate_limited(provider, models, body, api_key):
+async def _all_rate_limited(provider, models, body, api_key, deadline=None):
     return _mock_response(429, {"error": "rate limited"})
 
 
-async def _openrouter_502(provider, models, body, api_key):
+async def _openrouter_502(provider, models, body, api_key, deadline=None):
     if provider == "openrouter":
         return _mock_response(502, {"error": "bad gateway"})
     return _mock_response(200)
@@ -139,7 +139,7 @@ class TestProxyTierFallback:
         """With concurrent dispatch, any available free tier can win the race."""
         r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
         assert r.status_code == 200
-        assert r.json()["_clawrange_tier"] in ("openrouter-free", "zai-direct")
+        assert r.json()["_clawrange_tier"] in ("openrouter-free", "claude-sub")
         # No error/rate-limit notifications — only tier-change logs are OK
         for call in mock_bg.call_args_list:
             assert "Error" not in call.args[1]
@@ -147,13 +147,13 @@ class TestProxyTierFallback:
 
     @patch("llm_proxy._background_notify")
     @patch("llm_proxy._call_provider", side_effect=_openrouter_rate_limited)
-    def test_default_routes_to_zai_skipping_openrouter(
+    def test_default_routes_to_claude_sub_skipping_openrouter(
         self, mock_call, mock_bg, client
     ):
-        """Default forces zai-direct; openrouter is never tried."""
+        """Default forces claude-sub; openrouter is never tried."""
         r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
         assert r.status_code == 200
-        assert r.json()["_clawrange_tier"] == "zai-direct"
+        assert r.json()["_clawrange_tier"] == "claude-sub"
 
     @patch("llm_proxy._background_notify")
     @patch("telegram.notify", new_callable=AsyncMock)
@@ -163,7 +163,7 @@ class TestProxyTierFallback:
         self, mock_call, mock_balance, mock_tg, _mock_bg, client
     ):
         """A zero/negative balance blocks every OpenRouter model (free
-        included) with 402s — skip the provider entirely so zai-direct
+        included) with 402s — skip the provider entirely so claude-sub
         carries traffic instead of stalling."""
         import llm_proxy
 
@@ -172,7 +172,7 @@ class TestProxyTierFallback:
         try:
             r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
             assert r.status_code == 200
-            assert r.json()["_clawrange_tier"] == "zai-direct"
+            assert r.json()["_clawrange_tier"] == "claude-sub"
             providers = [c.args[0] for c in mock_call.call_args_list]
             assert "openrouter" not in providers
         finally:
@@ -223,7 +223,7 @@ class TestProxyTierFallback:
     def test_tier1_500_falls_back(self, mock_call, _mock_bg, client):
         r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
         assert r.status_code == 200
-        assert r.json()["_clawrange_tier"] == "zai-direct"
+        assert r.json()["_clawrange_tier"] == "claude-sub"
 
     @patch("llm_proxy._background_notify")
     def test_synthetic_response_stripped_from_history(self, _mock_bg, client):
@@ -288,7 +288,7 @@ class TestProxyTierFallback:
     def test_reasoning_content_used_when_content_empty(
         self, mock_call, _mock_bg, client
     ):
-        """GLM 5.1 reasoning models put output in reasoning_content — proxy merges
+        """Reasoning models put output in reasoning_content — proxy merges
         it."""
         reasoning_body = {
             "id": "test",
@@ -318,7 +318,7 @@ class TestProxyTierFallback:
     def test_reasoning_content_used_when_content_null(
         self, mock_call, _mock_bg, client
     ):
-        """Z.AI sometimes returns content: null — proxy merges reasoning_content."""
+        """Some providers return content: null — proxy merges reasoning_content."""
         reasoning_body = {
             "id": "test",
             "object": "chat.completion",
@@ -416,7 +416,7 @@ class TestProxyTierFallback:
             ],
         }
 
-        async def mock_call(provider, models, body, api_key):
+        async def mock_call(provider, models, body, api_key, deadline=None):
             if provider == "openrouter":
                 return _mock_response(200, hallucinated_body)
             return _mock_response(200, clean_body)
@@ -425,7 +425,7 @@ class TestProxyTierFallback:
             r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
             assert r.status_code == 200
             data = r.json()
-            assert data["_clawrange_tier"] == "zai-direct"
+            assert data["_clawrange_tier"] == "claude-sub"
             assert "Stack is healthy" in data["choices"][0]["message"]["content"]
 
     @patch("llm_proxy._background_notify")
@@ -479,15 +479,15 @@ class TestProxyTierFallback:
             ],
         }
 
-        async def mock_call(provider, models, body, api_key):
+        async def mock_call(provider, models, body, api_key, deadline=None):
             if provider == "openrouter":
                 return _mock_response(200, garbled_body)
-            return _mock_response(200)  # zai returns clean response
+            return _mock_response(200)  # claude-sub returns clean response
 
         with patch("llm_proxy._call_provider", side_effect=mock_call):
             r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
             assert r.status_code == 200
-            assert r.json()["_clawrange_tier"] == "zai-direct"
+            assert r.json()["_clawrange_tier"] == "claude-sub"
 
 
 # ─── Body Allowlist ──────────────────────────────────────────────
@@ -538,49 +538,49 @@ class TestProxyCircuitBreaker:
     def test_rate_limit_trips_circuit_immediately(self, _mock_bg, client):
         """A single 429 should trip the circuit — no need for 3 failures.
 
-        With concurrent racing, OpenRouter-free still serves when ZAI is tripped.
-        The test verifies ZAI is NOT retried on subsequent requests."""
-        call_count = {"zai": 0}
+        With concurrent racing, OpenRouter-free still serves when claude-sub is tripped.
+        The test verifies claude-sub is NOT retried on subsequent requests."""
+        call_count = {"sub": 0}
 
-        async def mock_call(provider, models, body, api_key):
-            if provider == "zai":
-                call_count["zai"] += 1
+        async def mock_call(provider, models, body, api_key, deadline=None):
+            if provider == "claude-sub":
+                call_count["sub"] += 1
                 return _mock_response(429, {"error": "rate limited"})
             return _mock_response(200)
 
         with patch("llm_proxy._call_provider", side_effect=mock_call):
-            # First request: zai 429 → circuit trips, but openrouter-free succeeds
+            # First request: claude-sub 429 trips its circuit; openrouter-free serves
             r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
             assert r.status_code == 200
-            assert call_count["zai"] == 1
+            assert call_count["sub"] == 1
 
-            # Second request: zai skipped (circuit open), openrouter-free serves
+            # Second request: claude-sub skipped (circuit open), openrouter-free serves
             r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
             assert r.status_code == 200
             assert "_clawrange_tier" in r.json()  # real response, not synthetic
-            assert call_count["zai"] == 1  # NOT called again
+            assert call_count["sub"] == 1  # NOT called again
 
     @patch("llm_proxy._background_notify")
     def test_transient_errors_still_need_threshold(self, _mock_bg, client):
         """Non-rate-limit errors should require CIRCUIT_FAILURE_THRESHOLD failures.
 
-        With concurrent racing, OpenRouter-free serves while ZAI accumulates
-        failures. The test verifies ZAI is still retried (circuit not yet open)."""
-        call_count = {"zai": 0}
+        With concurrent racing, OpenRouter-free serves while claude-sub accumulates
+        failures. It checks claude-sub is still retried (circuit not yet open)."""
+        call_count = {"sub": 0}
 
-        async def mock_call(provider, models, body, api_key):
-            if provider == "zai":
-                call_count["zai"] += 1
+        async def mock_call(provider, models, body, api_key, deadline=None):
+            if provider == "claude-sub":
+                call_count["sub"] += 1
                 return _mock_response(502, {"error": "bad gateway"})
             return _mock_response(200)
 
         with patch("llm_proxy._call_provider", side_effect=mock_call):
-            # First request: zai 502 but openrouter-free succeeds
+            # First request: claude-sub 502 but openrouter-free succeeds
             client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
 
-            # Second request: zai still tried (circuit not yet open, below threshold)
+            # Second request: claude-sub still tried (below the breaker threshold)
             client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
-            assert call_count["zai"] == 2  # Still being called
+            assert call_count["sub"] == 2  # Still being called
 
 
 # ─── Balance Guard ───────────────────────────────────────────────
@@ -848,7 +848,7 @@ class TestAutoRetry:
         """When ALL free tiers 429 with short reset, proxy waits and retries."""
         attempt = {"n": 0}
 
-        async def mock_call(provider, models, body, api_key):
+        async def mock_call(provider, models, body, api_key, deadline=None):
             attempt["n"] += 1
             if attempt["n"] <= 2:
                 # First pass: all tiers rate-limited with 5s reset
@@ -868,7 +868,7 @@ class TestAutoRetry:
     def test_no_retry_when_reset_too_long(self, _mock_bg, client):
         """When reset time exceeds MAX_AUTO_RETRY_WAIT, return synthetic immediately."""
 
-        async def mock_call(provider, models, body, api_key):
+        async def mock_call(provider, models, body, api_key, deadline=None):
             return _mock_response(
                 429,
                 {"error": {"message": "exceeded daily free limit"}},
@@ -886,7 +886,7 @@ class TestAutoRetry:
     def test_retry_fails_returns_synthetic(self, mock_sleep, _mock_bg, client):
         """If retry also fails, return synthetic response (no infinite loop)."""
 
-        async def mock_call(provider, models, body, api_key):
+        async def mock_call(provider, models, body, api_key, deadline=None):
             # Always 429 — both attempts fail
             return _mock_response(
                 429, {"error": "rate limited"}, headers={"retry-after": "5"}
@@ -917,16 +917,16 @@ class TestConcurrentDispatch:
         """When one tier is slow and another is fast, the fast one wins."""
         import asyncio
 
-        async def mock_call(provider, models, body, api_key):
+        async def mock_call(provider, models, body, api_key, deadline=None):
             if provider == "openrouter":
                 await asyncio.sleep(5)  # slow
                 return _mock_response(200)
-            return _mock_response(200)  # zai is fast
+            return _mock_response(200)  # claude-sub is fast
 
         with patch("llm_proxy._call_provider", side_effect=mock_call):
             r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
             assert r.status_code == 200
-            assert r.json()["_clawrange_tier"] == "zai-direct"
+            assert r.json()["_clawrange_tier"] == "claude-sub"
 
     @patch("llm_proxy._background_notify")
     def test_request_deadline_returns_synthetic(self, _mock_bg, client):
@@ -935,7 +935,7 @@ class TestConcurrentDispatch:
 
         original_deadline = __import__("llm_proxy").REQUEST_DEADLINE
 
-        async def mock_call(provider, models, body, api_key):
+        async def mock_call(provider, models, body, api_key, deadline=None):
             await asyncio.sleep(10)  # both tiers slow
             return _mock_response(200)
 
@@ -956,7 +956,7 @@ class TestConcurrentDispatch:
     def test_one_tier_fails_other_succeeds(self, _mock_bg, client):
         """When one tier errors and another succeeds, the success wins."""
 
-        async def mock_call(provider, models, body, api_key):
+        async def mock_call(provider, models, body, api_key, deadline=None):
             if provider == "openrouter":
                 return _mock_response(502, {"error": "bad gateway"})
             return _mock_response(200)
@@ -964,7 +964,7 @@ class TestConcurrentDispatch:
         with patch("llm_proxy._call_provider", side_effect=mock_call):
             r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
             assert r.status_code == 200
-            assert r.json()["_clawrange_tier"] == "zai-direct"
+            assert r.json()["_clawrange_tier"] == "claude-sub"
 
 
 # ─── Rate Limit Detection ───────────────────────────────────────
@@ -1115,7 +1115,7 @@ class TestNonAnswerDetection:
         """If one tier returns a deferral, the other tier's response wins."""
         _reset_state()
 
-        async def mock_call(provider, models, body, api_key):
+        async def mock_call(provider, models, body, api_key, deadline=None):
             if provider == "openrouter":
                 return _mock_response(
                     200,
@@ -1139,7 +1139,7 @@ class TestNonAnswerDetection:
         with patch("llm_proxy._call_provider", side_effect=mock_call):
             r = client.post("/v1/chat/completions", json=CHAT_BODY, headers=AUTH_HEADER)
             assert r.status_code == 200
-            assert r.json()["_clawrange_tier"] == "zai-direct"
+            assert r.json()["_clawrange_tier"] == "claude-sub"
 
 
 class TestResponseSanitization:
@@ -1522,7 +1522,7 @@ class TestWrapJsonAsSse:
                 "choices": [
                     {"message": {"role": "assistant", "content": "Hello world"}}
                 ],
-                "_clawrange_tier": "zai-direct",
+                "_clawrange_tier": "claude-sub",
             }
         )
         sse_resp = _wrap_json_as_sse(json_resp)
@@ -1580,7 +1580,7 @@ class TestWrapJsonAsSse:
                 "object": "chat.completion",
                 "model": "glm-5.1",
                 "choices": [{"message": {"role": "assistant", "content": "hi"}}],
-                "_clawrange_tier": "zai-direct",
+                "_clawrange_tier": "claude-sub",
             }
         )
         sse_resp = _wrap_json_as_sse(json_resp)
@@ -1592,7 +1592,7 @@ class TestWrapJsonAsSse:
 
         raw = asyncio.run(_collect())
         first_data = json.loads(raw.split("\n")[0].removeprefix("data: "))
-        assert first_data["_clawrange_tier"] == "zai-direct"
+        assert first_data["_clawrange_tier"] == "claude-sub"
 
 
 @patch.dict("os.environ", FAKE_ENV)
@@ -1647,10 +1647,10 @@ class TestStreamingReturnsSSE:
             ],
         }
 
-        async def mock_call(provider, models, body, api_key):
+        async def mock_call(provider, models, body, api_key, deadline=None):
             if provider == "openrouter":
                 return _mock_response(200, garbled_tool_body)
-            return _mock_response(200)  # zai returns clean
+            return _mock_response(200)  # claude-sub returns clean
 
         with patch("llm_proxy._call_provider", side_effect=mock_call):
             r = client.post(
@@ -1659,7 +1659,7 @@ class TestStreamingReturnsSSE:
                 headers=AUTH_HEADER,
             )
             assert r.status_code == 200
-            # Garbled openrouter response was skipped → zai-direct used
+            # Garbled openrouter response was skipped → claude-sub used
             assert "<read>" not in r.text
             assert "data: [DONE]" in r.text
 
@@ -1772,23 +1772,25 @@ class TestDetectTierHint:
         msgs = [{"role": "user", "content": "!claude what models do you carry?"}]
         assert _detect_tier_hint(msgs) == "openrouter-paid"
 
-    def test_zai_keyword(self):
+    def test_sub_keyword(self):
         from llm_proxy import _detect_tier_hint
 
-        msgs = [{"role": "user", "content": "!zai hello"}]
-        assert _detect_tier_hint(msgs) == "zai-direct"
+        msgs = [{"role": "user", "content": "!sub hello"}]
+        assert _detect_tier_hint(msgs) == "claude-sub"
 
-    def test_z_dot_ai_keyword(self):
+    def test_retired_zai_keywords_no_longer_route(self):
+        """Z.AI is gone: its old hints fall through to the normal race."""
         from llm_proxy import _detect_tier_hint
 
-        msgs = [{"role": "user", "content": "!z.ai hello"}]
-        assert _detect_tier_hint(msgs) == "zai-direct"
+        for word in ("!z.ai", "!zai", "!glm", "!zhipu", "!bigmodel"):
+            msgs = [{"role": "user", "content": f"{word} hello"}]
+            assert _detect_tier_hint(msgs) is None, word
 
-    def test_glm_keyword(self):
+    def test_subscription_keyword(self):
         from llm_proxy import _detect_tier_hint
 
-        msgs = [{"role": "user", "content": "!glm research this"}]
-        assert _detect_tier_hint(msgs) == "zai-direct"
+        msgs = [{"role": "user", "content": "!subscription research this"}]
+        assert _detect_tier_hint(msgs) == "claude-sub"
 
     def test_no_bang_prefix_no_match(self):
         """Plain 'paid' without ! should NOT trigger routing."""
@@ -2051,7 +2053,7 @@ class TestCallProvider:
         assert payload["model"] == "model-a"
         assert payload["models"] == ["model-a", "model-b"]
 
-    def test_zai_single_model_no_models_field(self):
+    def test_claude_sub_single_model_no_models_field(self):
         import asyncio
 
         import llm_proxy
@@ -2060,11 +2062,11 @@ class TestCallProvider:
         with patch("llm_proxy.httpx.AsyncClient", return_value=mock_client):
             asyncio.run(
                 llm_proxy._call_provider(
-                    "zai", ["glm-5.1"], {"messages": []}, "key-456"
+                    "claude-sub", ["sonnet"], {"messages": []}, "key-456"
                 )
             )
         payload = mock_client.post.call_args.kwargs["json"]
-        assert payload["model"] == "glm-5.1"
+        assert payload["model"] == "sonnet"
         assert "models" not in payload
 
     def test_auth_header_set(self):
@@ -2462,17 +2464,17 @@ class TestNotifyTierChange:
         import llm_proxy
 
         llm_proxy._last_tier_used = "openrouter-free"
-        asyncio.run(llm_proxy._notify_tier_change("zai-direct"))
-        assert llm_proxy._last_tier_used == "zai-direct"
+        asyncio.run(llm_proxy._notify_tier_change("claude-sub"))
+        assert llm_proxy._last_tier_used == "claude-sub"
 
     def test_same_tier_no_notification(self):
         import asyncio
 
         import llm_proxy
 
-        llm_proxy._last_tier_used = "zai-direct"
+        llm_proxy._last_tier_used = "claude-sub"
         with patch.object(llm_proxy, "_background_notify") as mock_bg:
-            asyncio.run(llm_proxy._notify_tier_change("zai-direct"))
+            asyncio.run(llm_proxy._notify_tier_change("claude-sub"))
         mock_bg.assert_not_called()
 
     def test_different_tier_triggers_notification(self):
@@ -2482,10 +2484,10 @@ class TestNotifyTierChange:
 
         llm_proxy._last_tier_used = "openrouter-free"
         with patch.object(llm_proxy, "_background_notify") as mock_bg:
-            asyncio.run(llm_proxy._notify_tier_change("zai-direct"))
+            asyncio.run(llm_proxy._notify_tier_change("claude-sub"))
         mock_bg.assert_called_once()
         assert "openrouter-free" in mock_bg.call_args.args[1]
-        assert "zai-direct" in mock_bg.call_args.args[1]
+        assert "claude-sub" in mock_bg.call_args.args[1]
 
 
 # ─── Rate Limit Body Detection ───────────────────────────────────
@@ -3261,7 +3263,7 @@ class TestHeartbeatInterceptor:
 
         import llm_proxy
 
-        async def _hang(provider, models, body, api_key):
+        async def _hang(provider, models, body, api_key, deadline=None):
             # Far slower than the (shrunk) deadline: a hung provider. One tier
             # alone takes 5s without the cap, so the 2s bound below leaves a
             # loaded machine (parallel tests) 1.7s of scheduling headroom.
@@ -3424,8 +3426,8 @@ class TestNonWebSearchTierIteration:
 
         assert result == "hello"
         assert mock_call.call_count == 1
-        # First tier is openrouter-free
-        assert mock_call.call_args[0][0] == "openrouter"
+        # The preferred tier (the subscription) goes first
+        assert mock_call.call_args[0][0] == "claude-sub"
 
 
 class TestOpenRouterCitationExtraction:
@@ -3521,7 +3523,7 @@ class TestTaskNeedsWeb:
         """
         GIVEN a task description containing a known web-search keyword
         WHEN _task_needs_web is called
-        THEN it returns True so the work runner enables GLM web search.
+        THEN it returns True so the work runner enables web search.
         """
         from heartbeat import _task_needs_web
 
@@ -3576,7 +3578,7 @@ class TestLlmWorkTaskRouting:
     """_llm_work_task wires _task_needs_web into _llm_call with the right max_tokens."""
 
     @patch.dict("os.environ", FAKE_ENV)
-    def test_web_task_uses_1500_max_tokens_and_zai_search(self, brain_db):
+    def test_web_task_uses_1500_max_tokens_and_web_search(self, brain_db):
         """
         GIVEN a task description that triggers web search
         WHEN _llm_work_task runs
@@ -4794,7 +4796,7 @@ class TestBackgroundLlmCallFreeTiersOnly:
         )
         seen: list[list[str]] = []
 
-        async def fail(provider, models, body, api_key):
+        async def fail(provider, models, body, api_key, deadline=None):
             seen.append(list(models))
             return _mock_response(500, {"error": "boom"})
 
@@ -4805,10 +4807,10 @@ class TestBackgroundLlmCallFreeTiersOnly:
 
     @patch.dict("os.environ", FAKE_ENV)
     def test_llm_call_skips_tier_missing_from_provider_urls(self, monkeypatch):
-        monkeypatch.delitem(llm_proxy.PROVIDER_URLS, "zai")
+        monkeypatch.delitem(llm_proxy.PROVIDER_URLS, "claude-sub")
         providers: list[str] = []
 
-        async def fail(provider, models, body, api_key):
+        async def fail(provider, models, body, api_key, deadline=None):
             providers.append(provider)
             return _mock_response(500, {"error": "boom"})
 
@@ -4820,7 +4822,7 @@ class TestBackgroundLlmCallFreeTiersOnly:
 class TestLlmCallExceptionHandling:
     @patch.dict("os.environ", FAKE_ENV)
     def test_exception_logged_and_recorded(self, caplog):
-        async def boom(provider, models, body, api_key):
+        async def boom(provider, models, body, api_key, deadline=None):
             raise RuntimeError("kaput")
 
         with patch("llm_proxy._call_provider", side_effect=boom):
@@ -4831,7 +4833,7 @@ class TestLlmCallExceptionHandling:
 
     @patch.dict("os.environ", FAKE_ENV)
     def test_429_in_background_call_trips_breaker(self):
-        async def limited(provider, models, body, api_key):
+        async def limited(provider, models, body, api_key, deadline=None):
             return _mock_response(429, {"error": "rate limited"})
 
         with patch("llm_proxy._call_provider", side_effect=limited):
@@ -4839,11 +4841,13 @@ class TestLlmCallExceptionHandling:
         assert llm_proxy._circuit_open("openrouter-free", probe=False)
 
 
-# Z.AI's reply when the account has no credit left: HTTP 429, code 1113
-# ("insufficient balance or no resource package, please recharge"),
-# captured from the live proxy log.
-ZAI_NO_CREDIT = {
-    "error": {"code": "1113", "message": "余额不足或无可用资源包,请充值。"}
+# The claude bridge's reply when the subscription hits its usage limit
+# (scripts/claude_bridge.py maps the transcript's rate_limit record to 429).
+SUB_USAGE_LIMIT = {
+    "error": {
+        "message": "claude rate_limit: Claude usage limit reached",
+        "code": "rate_limit",
+    }
 }
 
 
@@ -4857,13 +4861,7 @@ class TestFailureReasons:
     @pytest.mark.parametrize(
         ("status", "body", "want"),
         [
-            (429, ZAI_NO_CREDIT, "out of credit"),
-            # The code alone decides when Z.AI rewords the message.
-            (
-                429,
-                {"error": {"code": "1113", "message": "Please recharge"}},
-                "out of credit",
-            ),
+            (429, SUB_USAGE_LIMIT, "rate-limited"),
             (402, {"error": {"message": "Insufficient credits"}}, "out of credit"),
             (429, {"error": {"message": "insufficient_quota"}}, "out of credit"),
             (429, {"error": "rate limited"}, "rate-limited"),
@@ -4876,13 +4874,13 @@ class TestFailureReasons:
 
     @patch.dict("os.environ", FAKE_ENV)
     def test_summary_names_each_tier_and_its_cause(self):
-        """GIVEN openrouter-free answers empty and Z.AI is out of credit
+        """GIVEN openrouter-free answers empty and claude-sub hit its usage limit
         WHEN a background call fails on every tier
         THEN the summary says so per tier, and that paid was not tried."""
 
-        async def fake(provider, models, body, api_key):
-            if provider == "zai":
-                return _mock_response(429, ZAI_NO_CREDIT)
+        async def fake(provider, models, body, api_key, deadline=None):
+            if provider == "claude-sub":
+                return _mock_response(429, SUB_USAGE_LIMIT)
             return _mock_response(200, {"choices": [{"message": {"content": ""}}]})
 
         with (
@@ -4892,18 +4890,18 @@ class TestFailureReasons:
             assert asyncio.run(llm_proxy._llm_call("hi")) is None
         summary = llm_proxy.describe_last_failure()
         assert "openrouter-free: empty reply" in summary
-        assert "zai-direct: out of credit" in summary
+        assert "claude-sub: rate-limited" in summary
         assert "openrouter-paid: not tried (paid is opt-in)" in summary
 
     @patch.dict("os.environ", FAKE_ENV)
     def test_open_breaker_keeps_the_cause_that_tripped_it(self):
-        """GIVEN Z.AI tripped its breaker by running out of credit
+        """GIVEN claude-sub tripped its breaker on a usage limit
         WHEN the next call skips it
-        THEN the summary still says out of credit, not just breaker open."""
+        THEN the summary still says rate-limited, not just breaker open."""
 
-        async def fake(provider, models, body, api_key):
-            if provider == "zai":
-                return _mock_response(429, ZAI_NO_CREDIT)
+        async def fake(provider, models, body, api_key, deadline=None):
+            if provider == "claude-sub":
+                return _mock_response(429, SUB_USAGE_LIMIT)
             return _mock_response(503, {"error": "upstream"})
 
         with (
@@ -4913,17 +4911,17 @@ class TestFailureReasons:
             asyncio.run(llm_proxy._llm_call("hi"))
             asyncio.run(llm_proxy._llm_call("hi"))
         summary = llm_proxy.describe_last_failure()
-        assert "zai-direct: out of credit (breaker open)" in summary
+        assert "claude-sub: rate-limited (breaker open)" in summary
 
     @patch.dict("os.environ", FAKE_ENV)
     def test_depleted_openrouter_is_named_out_of_credit(self):
-        """GIVEN the OpenRouter balance is at zero and Z.AI answers malformed
+        """GIVEN the OpenRouter balance is at zero and claude-sub answers malformed
         WHEN a background call fails
         THEN OpenRouter reads as out of credit without being called, and
-        Z.AI's reply is named malformed."""
+        claude-sub's reply is named malformed."""
         called = []
 
-        async def fake(provider, models, body, api_key):
+        async def fake(provider, models, body, api_key, deadline=None):
             called.append(provider)
             return httpx.Response(200, content=b"not json")
 
@@ -4934,15 +4932,15 @@ class TestFailureReasons:
             assert asyncio.run(llm_proxy._llm_call("hi")) is None
         summary = llm_proxy.describe_last_failure()
         assert "openrouter-free: out of credit (balance" in summary
-        assert "zai-direct: malformed reply" in summary
-        assert called == ["zai"]
+        assert "claude-sub: malformed reply" in summary
+        assert called == ["claude-sub"]
 
     @patch.dict("os.environ", FAKE_ENV)
     def test_success_clears_the_summary(self):
-        async def ok(provider, models, body, api_key):
+        async def ok(provider, models, body, api_key, deadline=None):
             return _mock_response(200)
 
-        llm_proxy._last_call_failures["zai-direct"] = "out of credit"
+        llm_proxy._last_call_failures["claude-sub"] = "out of credit"
         with (
             patch("llm_proxy._call_provider", side_effect=ok),
             patch("llm_proxy._check_openrouter_balance", AsyncMock(return_value=17.0)),
@@ -4961,9 +4959,9 @@ class TestFailureReasons:
             heartbeat._proactive_state[key] = time.monotonic()
         t = brain_db.create_task("Summarize the open deals")
 
-        async def fake(provider, models, body, api_key):
-            if provider == "zai":
-                return _mock_response(429, ZAI_NO_CREDIT)
+        async def fake(provider, models, body, api_key, deadline=None):
+            if provider == "claude-sub":
+                return _mock_response(429, SUB_USAGE_LIMIT)
             return _mock_response(200, {"choices": [{"message": {"content": ""}}]})
 
         with (
@@ -4977,7 +4975,7 @@ class TestFailureReasons:
             )
         assert brain_db.get_task(t["id"])["status"] == "pending"
         line = next(ln for ln in digest._digest_state["lines"] if t["id"] in ln)
-        assert "zai-direct: out of credit" in line
+        assert "claude-sub: rate-limited" in line
         assert "openrouter-free: empty reply" in line
         assert "unreachable" not in line.lower()
         heartbeat._llm_retry_counts.clear()
@@ -5070,7 +5068,7 @@ class TestSearchPathDeadline:
     def test_search_call_honours_deadline(self, monkeypatch):
         monkeypatch.setattr(llm_proxy, "LLM_CALL_DEADLINE", 0.05)
 
-        async def hang(provider, models, body, api_key):
+        async def hang(provider, models, body, api_key, deadline=None):
             await asyncio.sleep(10)
 
         async def run():
@@ -5095,7 +5093,7 @@ class TestAutoRetryPopsOnlyElapsedTiers:
         async def fake_sleep(_s):
             phase["retry"] = True
 
-        async def mock_call(provider, models, body, api_key):
+        async def mock_call(provider, models, body, api_key, deadline=None):
             if phase["retry"]:
                 retry_providers.append(provider)
                 return _mock_response(200)
@@ -5389,3 +5387,210 @@ class TestTierSnapshot:
         with patch("llm_proxy._check_openrouter_balance", return_value=None):
             assert client.get("/tier").status_code == 200
         assert "probe_at" not in llm_proxy._circuit_state[name]
+
+
+# ─── claude-sub bridge contract ──────────────────────────────────
+
+
+def _bridge_error(status, code, message="x"):
+    return _mock_response(status, {"error": {"message": message, "code": code}})
+
+
+class TestBridgeErrorCodes:
+    """The bridge's error.code separates a busy or confused bridge (skip the
+    tier this time, no breaker hit) from a broken one."""
+
+    def setup_method(self):
+        _reset_state()
+        llm_proxy._tier_failure_reason.clear()
+
+    @pytest.mark.parametrize(
+        ("status", "code", "want"),
+        [
+            (503, "busy", "bridge busy"),
+            (502, "bad_reply", "bad reply"),
+            (503, "login_expired", "login expired: run claude, then /login"),
+            (504, "timeout", "no reply in time"),
+        ],
+    )
+    def test_classified_by_code(self, status, code, want):
+        assert llm_proxy._classify_failure(_bridge_error(status, code)) == want
+
+    @pytest.mark.parametrize(("status", "code"), [(503, "busy"), (502, "bad_reply")])
+    @patch.dict("os.environ", FAKE_ENV)
+    def test_background_skip_is_not_a_breaker_failure(self, status, code):
+        tried: dict[str, int] = {}
+
+        async def fake(provider, models, body, api_key, deadline=None):
+            tried[provider] = tried.get(provider, 0) + 1
+            if provider == "claude-sub":
+                return _bridge_error(status, code)
+            return _mock_response(503, {"error": "upstream"})
+
+        with (
+            patch("llm_proxy._call_provider", side_effect=fake),
+            patch("llm_proxy._check_openrouter_balance", AsyncMock(return_value=17.0)),
+        ):
+            for _ in range(llm_proxy.CIRCUIT_FAILURE_THRESHOLD + 1):
+                asyncio.run(llm_proxy._llm_call("hi"))
+        assert llm_proxy._circuit_state.get("claude-sub", {}).get("failures", 0) == 0
+        assert tried["claude-sub"] > llm_proxy.CIRCUIT_FAILURE_THRESHOLD
+        assert not llm_proxy._circuit_open("claude-sub", probe=False)
+
+    @patch.dict("os.environ", FAKE_ENV)
+    @patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
+    @patch("llm_proxy._background_notify")
+    def test_chat_skip_is_not_a_breaker_failure(self, _bg, client):
+        tried: dict[str, int] = {}
+
+        async def fake(provider, models, body, api_key, deadline=None):
+            tried[provider] = tried.get(provider, 0) + 1
+            if provider == "claude-sub":
+                return _bridge_error(502, "bad_reply")
+            return _mock_response(200)
+
+        body = {"messages": [{"role": "user", "content": "!sub hi"}]}
+        with patch("llm_proxy._call_provider", side_effect=fake):
+            for _ in range(llm_proxy.CIRCUIT_FAILURE_THRESHOLD + 1):
+                client.post("/v1/chat/completions", json=body, headers=AUTH_HEADER)
+        assert llm_proxy._circuit_state.get("claude-sub", {}).get("failures", 0) == 0
+        assert tried["claude-sub"] > llm_proxy.CIRCUIT_FAILURE_THRESHOLD
+
+    @patch.dict("os.environ", FAKE_ENV)
+    @patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
+    @patch("llm_proxy._background_notify")
+    def test_chat_reason_names_the_bridge_code(self, _bg, client):
+        """The 'no tier answered' reply names an expired login, not HTTP 503."""
+
+        async def fake(provider, models, body, api_key, deadline=None):
+            return _bridge_error(503, "login_expired")
+
+        body = {"messages": [{"role": "user", "content": "!sub hi"}]}
+        with patch("llm_proxy._call_provider", side_effect=fake):
+            r = client.post("/v1/chat/completions", json=body, headers=AUTH_HEADER)
+        assert "login expired" in r.text
+        assert llm_proxy._circuit_state["claude-sub"]["failures"] == 1
+
+    @patch.dict("os.environ", FAKE_ENV)
+    def test_background_sends_its_attempt_budget(self):
+        seen = {}
+
+        async def fake(provider, models, body, api_key, deadline=None):
+            seen[provider] = deadline
+            return _mock_response(503, {"error": "upstream"})
+
+        with (
+            patch("llm_proxy._call_provider", side_effect=fake),
+            patch("llm_proxy._check_openrouter_balance", AsyncMock(return_value=17.0)),
+        ):
+            asyncio.run(llm_proxy._llm_call("hi"))
+        assert 0 < seen["claude-sub"] <= llm_proxy.BACKGROUND_ATTEMPT_TIMEOUT
+
+    def test_deadline_header_only_for_the_bridge(self, monkeypatch):
+        sent = {}
+
+        class FakeClient:
+            def __init__(self, timeout):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def post(self, url, headers, json):
+                sent[url] = headers
+                return _mock_response(200)
+
+        monkeypatch.setattr(llm_proxy.httpx, "AsyncClient", FakeClient)
+        for provider in ("claude-sub", "openrouter"):
+            asyncio.run(llm_proxy._call_provider(provider, ["m"], {}, "k", deadline=20))
+        bridge = llm_proxy.PROVIDER_URLS["claude-sub"]
+        other = llm_proxy.PROVIDER_URLS["openrouter"]
+        assert sent[bridge]["X-Deadline-Seconds"] == "20"
+        assert "X-Deadline-Seconds" not in sent[other]
+
+
+# ─── preferred tier (claude-sub first, free race as fallback) ────
+
+
+class TestPreferredTier:
+    """The subscription answers whenever it can; the free race only runs
+    when it is rate-limited, busy or failing."""
+
+    def setup_method(self):
+        _reset_state()
+
+    def _run(self, client, fake, n=1, text="hi"):
+        calls: list[str] = []
+
+        async def recording(provider, models, body, api_key, deadline=None):
+            calls.append(provider)
+            return await fake(provider)
+
+        body = {"messages": [{"role": "user", "content": text}]}
+        out = []
+        with patch("llm_proxy._call_provider", side_effect=recording):
+            for _ in range(n):
+                r = client.post("/v1/chat/completions", json=body, headers=AUTH_HEADER)
+                out.append(r.json())
+        return calls, out
+
+    def test_claude_sub_is_marked_preferred(self):
+        tier = next(t for t in llm_proxy.CONFIG["tiers"] if t["name"] == "claude-sub")
+        assert tier.get("preferred") is True
+
+    @patch.dict("os.environ", FAKE_ENV)
+    @patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
+    @patch("llm_proxy._background_notify")
+    def test_subscription_answers_alone_when_healthy(self, _bg, client):
+        async def fake(provider):
+            return _mock_response(200)
+
+        calls, out = self._run(client, fake)
+        assert calls == ["claude-sub"]
+        assert out[0]["_clawrange_tier"] == "claude-sub"
+
+    @patch.dict("os.environ", FAKE_ENV)
+    @patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
+    @patch("llm_proxy._background_notify")
+    def test_rate_limited_subscription_falls_back_then_is_skipped(self, _bg, client):
+        async def fake(provider):
+            if provider == "claude-sub":
+                return _mock_response(429, SUB_USAGE_LIMIT)
+            return _mock_response(200)
+
+        calls, out = self._run(client, fake, n=2)
+        # First message: subscription tried, rate-limited, free race answers.
+        # Second: the open breaker skips the subscription entirely.
+        assert calls == ["claude-sub", "openrouter", "openrouter"]
+        assert [o["_clawrange_tier"] for o in out] == ["openrouter-free"] * 2
+
+    @patch.dict("os.environ", FAKE_ENV)
+    @patch("llm_proxy.PROXY_AUTH_TOKEN", "test-token")
+    @patch("llm_proxy._background_notify")
+    def test_busy_subscription_falls_back_without_tripping(self, _bg, client):
+        async def fake(provider):
+            if provider == "claude-sub":
+                return _bridge_error(503, "busy")
+            return _mock_response(200)
+
+        calls, out = self._run(client, fake, n=2)
+        assert calls == ["claude-sub", "openrouter"] * 2
+        assert out[1]["_clawrange_tier"] == "openrouter-free"
+
+    @patch.dict("os.environ", FAKE_ENV)
+    def test_background_tries_the_subscription_first(self):
+        calls: list[str] = []
+
+        async def fake(provider, models, body, api_key, deadline=None):
+            calls.append(provider)
+            return _mock_response(200)
+
+        with (
+            patch("llm_proxy._call_provider", side_effect=fake),
+            patch("llm_proxy._check_openrouter_balance", AsyncMock(return_value=17.0)),
+        ):
+            assert asyncio.run(llm_proxy._llm_call("hi"))
+        assert calls == ["claude-sub"]

@@ -127,6 +127,11 @@ def _reset_proxy_globals(monkeypatch):
     monkeypatch.setattr(llm_proxy, "_balance_status", {"ok_at": None, "error": None})
     monkeypatch.setattr(llm_proxy, "_last_tier_used", None)
     monkeypatch.setattr("heartbeat._thinking_focus_index", 0)
+    # Set on the first failed balance lookup. A test that ran a heartbeat
+    # while time.monotonic was patched small left it far in the past, and
+    # a later heartbeat in the same worker then raised a "balance unknown"
+    # task that suppressed LLM thinking (test_heartbeat_llm_thinking).
+    monkeypatch.setattr("heartbeat._balance_unknown_since", None)
     # Scheduler startup errors are module state too; left over, they turned
     # a later /healthz "degraded" depending on file order.
     import scheduler

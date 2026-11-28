@@ -57,7 +57,8 @@ cp .env.example .env
 #   TAILSCALE_IP=<your tailscale ip from step 1.1>
 #   OPENCLAW_GATEWAY_TOKEN=<generate with: openssl rand -base64 32 | tr -d '/+=' | head -c 40>
 #   PROXY_AUTH_TOKEN=<generate with: python3 -c "import secrets; print(secrets.token_urlsafe(32))">
-#   ZAI_API_KEY=<your Z.AI key, optional Tier 2 fallback>
+#   CLAUDE_BRIDGE_TOKEN=<openssl rand -hex 32; optional claude-sub tier,
+#     served by `make claude-bridge` on the host>
 #   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID=<for tier alerts and task delivery>
 ```
 
@@ -65,6 +66,29 @@ cp .env.example .env
 (through `scripts/start.sh --ensure-soul`) exits with an error until it
 is set, and renders `openclaw/soul.md` from the active profile if it is
 missing.
+
+The `claude-sub` tier needs `scripts/claude_bridge.py` running on the
+host, logged in with `claude` and `/login` once. `make claude-bridge`
+serves it in the foreground. To keep it up across reboots, run it as a
+systemd user unit (needs `loginctl enable-linger $USER` to start
+without a login). Give the unit only the two values it reads, never
+the whole `.env`:
+
+```ini
+# ~/.config/clawrange/claude-bridge.env (mode 600), copied from .env:
+#   CLAUDE_BRIDGE_TOKEN=...
+#   DOCKER_HOST_IP=...
+# ~/.config/systemd/user/clawrange-claude-bridge.service, [Service]
+WorkingDirectory=%h/clawrange
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/.config/clawrange/claude-bridge.env
+ExecStart=/usr/bin/python3 scripts/claude_bridge.py
+Restart=always
+```
+
+Then `systemctl --user enable --now clawrange-claude-bridge`. Rotating
+`CLAUDE_BRIDGE_TOKEN` in `.env` means updating that file and restarting
+the unit; logs are in `journalctl --user -u clawrange-claude-bridge`.
 
 ### 1.3 Start services in production mode
 
@@ -400,7 +424,9 @@ Nothing inside OpenClaw stores the value, so a rotation is env only:
 | Heartbeat runs fail with `Automation inference account ... was removed or signed out` (or `was replaced`) | The auth profile the job was pinned to is gone. Remove the job (`openclaw automations rm <id>`) and restart the container; `sync-heartbeat.sh` creates a new one |
 | OpenClaw exits at start with `render-config: ... still has retired keys` | The state dir predates 2026.11.5. Run the doctor step in [Upgrading OpenClaw](#upgrading-openclaw) |
 | A task stays `active` | A worker claimed it and died. The heartbeat fails it after `HEARTBEAT_ACTIVE_REAP_HOURS` (default 6) with a digest line; re-create it to retry |
-| Heartbeat tasks fail with the LLM down | During an outage a task goes back to pending each heartbeat and is failed on its 6th outage cycle (about an hour), so it cannot block the queue. The digest line says why per tier, e.g. `No LLM answered (openrouter-free: empty reply; zai-direct: out of credit)`. `out of credit` will not clear by waiting: top up that provider. Z.AI sends it as HTTP 429 with code 1113 |
+| Heartbeat tasks fail with the LLM down | During an outage a task goes back to pending each heartbeat and is failed on its 6th outage cycle (about an hour), so it cannot block the queue. The digest line says why per tier, e.g. `No LLM answered (openrouter-free: empty reply; claude-sub: rate-limited)`. `out of credit` will not clear by waiting: top up that provider. A `claude-sub` usage limit reads `rate-limited` and clears when the subscription window resets |
+| A digest or alert says `claude-sub: login expired` | The subscription login lapsed. Run `claude` on the host, then `/login`; the bridge needs no restart |
+| `claude-sub: connection failed (ConnectError)` | The bridge is not running or not reachable from the container. `systemctl --user status clawrange-claude-bridge`; check `DOCKER_HOST_IP` in `~/.config/clawrange/claude-bridge.env` matches docker0 |
 | `research:tome:` tasks stay pending, a `Stale queue:` nudge lists them under the tome bridge | `journalctl --user -u clawrange-tome-bridge`. A `rejected the request` line means the bridge's `PROXY_AUTH_TOKEN` is missing or stale; see "Heavy research via tome" in `docs/research-and-marketing.md` |
 
 ## Cost Estimate

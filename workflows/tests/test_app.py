@@ -54,7 +54,7 @@ class TestTierStatus:
         new_callable=AsyncMock,
         return_value=12.50,
     )
-    @patch("llm_proxy._last_tier_used", "zai-direct")
+    @patch("llm_proxy._last_tier_used", "claude-sub")
     def test_returns_tier_list(self, _mock_balance, monkeypatch, client):
         # /tier renders llm_proxy.describe_balance(), which reads the cache
         # the (mocked) balance check would have filled.
@@ -65,7 +65,7 @@ class TestTierStatus:
         data = r.json()
         assert isinstance(data["tiers"], list)
         assert len(data["tiers"]) >= 2
-        assert data["last_used"] == "zai-direct"
+        assert data["last_used"] == "claude-sub"
         assert data["balance_remaining"] == "$12.50"
         assert data["paid_auto_fallback"] == "off"
         # Each tier has name, status, description
@@ -114,14 +114,14 @@ class TestTierNotify:
     @patch(
         "llm_proxy._check_openrouter_balance", new_callable=AsyncMock, return_value=8.00
     )
-    @patch("llm_proxy._last_tier_used", "zai-direct")
+    @patch("llm_proxy._last_tier_used", "claude-sub")
     def test_sends_notification(self, _mock_balance, mock_notify, client):
         r = client.post("/tier/notify")
         assert r.status_code == 200
         data = r.json()
         assert data["sent"] is True
         assert "Tier Status" in data["message"]
-        assert "zai-direct" in data["message"]
+        assert "claude-sub" in data["message"]
         mock_notify.assert_called_once()
 
     @patch("app.notify", new_callable=AsyncMock, return_value=False)

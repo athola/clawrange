@@ -15,7 +15,7 @@ in Python, and acting on them here duplicates their tasks.
 2. **OpenRouter balance**: read live from the OpenRouter credits API
    (`/api/v1/credits`), cached 5 minutes. Below the floor
    (`OPENROUTER_BALANCE_FLOOR`, default $10): alert task. At or below
-   $0: OpenRouter tiers are skipped entirely and zai-direct carries
+   $0: OpenRouter tiers are skipped entirely and claude-sub carries
    traffic (no stalling, no failed attempts). A balance that cannot be
    read for 30 minutes raises a `Balance unknown alert:` task.
 3. **Stuck tasks**: a task still `active` after

@@ -188,7 +188,7 @@ BODY = {"messages": [{"role": "user", "content": "hi"}]}
 @pytest.fixture()
 def keys(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
-    monkeypatch.setenv("ZAI_API_KEY", "zai-key")
+    monkeypatch.setenv("CLAUDE_BRIDGE_TOKEN", "bridge-token")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "")
     monkeypatch.setattr(llm_proxy, "_balance_status", {"ok_at": None, "error": None})
 
@@ -286,14 +286,15 @@ class TestBackgroundAttemptTimeout:
         monkeypatch.setattr(llm_proxy, "LLM_CALL_DEADLINE", 2.0)
         monkeypatch.setattr(llm_proxy, "BACKGROUND_ATTEMPT_TIMEOUT", 0.2)
 
-        async def first_hangs(provider, models, body, api_key):
-            if provider == "openrouter":
+        # claude-sub is preferred, so it is tried first.
+        async def first_hangs(provider, models, body, api_key, deadline=None):
+            if provider == "claude-sub":
                 await asyncio.sleep(5)
-            return _ok("from zai")
+            return _ok("from openrouter")
 
         with _balance(50.0), patch.object(llm_proxy, "_call_provider", first_hangs):
-            assert asyncio.run(llm_proxy._llm_call("q")) == "from zai"
-        assert llm_proxy._circuit_state["openrouter-free"]["failures"] == 1
+            assert asyncio.run(llm_proxy._llm_call("q")) == "from openrouter"
+        assert llm_proxy._circuit_state["claude-sub"]["failures"] == 1
 
     def test_overall_deadline_records_the_inflight_tier(self, keys, monkeypatch):
         monkeypatch.setattr(llm_proxy, "LLM_CALL_DEADLINE", 0.2)
@@ -329,7 +330,7 @@ class TestFailureReporting:
         with _balance(50.0), patch.object(llm_proxy, "_call_provider", call):
             assert asyncio.run(llm_proxy._llm_call("q")) is None
         log = caplog.text
-        assert "openrouter-free" in log and "zai-direct" in log
+        assert "openrouter-free" in log and "claude-sub" in log
         assert "503" in log and "upstream overloaded" in log
 
     def test_llm_call_logs_empty_reply(self, keys, caplog):
@@ -341,10 +342,10 @@ class TestFailureReporting:
 
     def test_llm_call_logs_skipped_tier(self, monkeypatch, caplog):
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-        monkeypatch.delenv("ZAI_API_KEY", raising=False)
+        monkeypatch.delenv("CLAUDE_BRIDGE_TOKEN", raising=False)
         caplog.set_level(logging.INFO, logger="clawrange.llm_proxy")
         assert asyncio.run(llm_proxy._llm_call("q")) is None
-        assert "zai-direct" in caplog.text and "ZAI_API_KEY" in caplog.text
+        assert "claude-sub" in caplog.text and "CLAUDE_BRIDGE_TOKEN" in caplog.text
 
     def test_exhausted_reply_names_the_real_failures(self, keys):
         call = AsyncMock(return_value=httpx.Response(500, text="boom"))
@@ -370,8 +371,8 @@ class TestFailureReporting:
 
     def test_background_notify_logs_every_event(self, caplog):
         caplog.set_level(logging.INFO, logger="clawrange.llm_proxy")
-        llm_proxy._background_notify("zai-direct", "*Error* on `zai-direct` (HTTP 500)")
-        llm_proxy._background_notify("zai-direct", "*Error* on `zai-direct` (HTTP 502)")
+        llm_proxy._background_notify("claude-sub", "*Error* on `claude-sub` (HTTP 500)")
+        llm_proxy._background_notify("claude-sub", "*Error* on `claude-sub` (HTTP 502)")
         assert "HTTP 500" in caplog.text and "HTTP 502" in caplog.text
 
 
@@ -401,7 +402,7 @@ class TestToolCallHistory:
         ]
         sent: list[list[dict]] = []
 
-        async def capture(provider, models, body, api_key):
+        async def capture(provider, models, body, api_key, deadline=None):
             sent.append(body["messages"])
             return _ok()
 
@@ -441,7 +442,7 @@ class TestPaidFlag:
         paid_models = next(t["models"] for t in cfg["tiers"] if t.get("paid"))
         seen: list[list[str]] = []
 
-        async def fail(provider, models, body, api_key):
+        async def fail(provider, models, body, api_key, deadline=None):
             seen.append(list(models))
             return httpx.Response(500, text="boom")
 
@@ -474,7 +475,7 @@ class TestConfigValidation:
 
     def test_provider_without_url_rejected(self):
         cfg = _config()
-        del cfg["providers"]["zai"]["base_url"]
+        del cfg["providers"]["claude-sub"]["base_url"]
         with pytest.raises(ValueError, match="base_url"):
             llm_proxy._validate_config(cfg, {})
 

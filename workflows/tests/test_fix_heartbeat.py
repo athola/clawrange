@@ -370,11 +370,11 @@ class TestAlertDedup:
         monkeypatch.setattr(
             llm_proxy,
             "_circuit_open",
-            lambda name, probe=True: name in {"openrouter-free", "zai-direct"},
+            lambda name, probe=True: name in {"openrouter-free", "claude-sub"},
         )
         _beat(brain_db=brain_db)
         descs = [t["description"] for t in db.list_tasks()]
-        assert descs.count("Investigate tier recovery: zai-direct") == 1
+        assert descs.count("Investigate tier recovery: claude-sub") == 1
         assert descs.count("Investigate tier recovery: openrouter-free") == 1
 
 

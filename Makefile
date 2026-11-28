@@ -60,7 +60,7 @@ reset: ## Stop, drop containers and the DeerFlow clone; keeps data/ (asks first)
 # ─── Testing ──────────────────────────────────────────────────────
 
 .PHONY: test test-openclaw test-workflows test-deerflow test-ollama test-research \
-	test-unit coverage validate tome-bridge tome-bridge-watch \
+	test-unit coverage validate claude-bridge tome-bridge tome-bridge-watch \
 	retrieval-eval retrieval-eval-refresh retrieval-harvest retrieval-eval-brain \
 	models-check
 
@@ -97,6 +97,23 @@ TOME_BRIDGE_ENV = if [ -f .env ]; then \
 		echo "PROXY_AUTH_TOKEN is empty or a placeholder: set a real token in .env (the task queue API requires it)." >&2; \
 		exit 1; \
 	fi
+
+# The claude-sub bridge reads only its token and DOCKER_HOST_IP from .env;
+# its claude sessions also get a fixed minimal environment (child_env).
+CLAUDE_BRIDGE_ENV = if [ -f .env ]; then \
+		tok=$$(set -a; . ./.env >/dev/null 2>&1; printf '%s' "$${CLAUDE_BRIDGE_TOKEN:-}"); \
+		ip=$$(set -a; . ./.env >/dev/null 2>&1; printf '%s' "$${DOCKER_HOST_IP:-}"); \
+		if [ -n "$$tok" ]; then CLAUDE_BRIDGE_TOKEN=$$tok; fi; \
+		if [ -n "$$ip" ]; then DOCKER_HOST_IP=$$ip; fi; \
+	fi; \
+	export CLAUDE_BRIDGE_TOKEN DOCKER_HOST_IP; \
+	if [ -z "$${CLAUDE_BRIDGE_TOKEN:-}" ]; then \
+		echo "CLAUDE_BRIDGE_TOKEN is empty: set one in .env (openssl rand -hex 32)." >&2; \
+		exit 1; \
+	fi
+
+claude-bridge: ## Serve the Claude subscription to the proxy (claude-sub tier)
+	@$(CLAUDE_BRIDGE_ENV); python3 scripts/claude_bridge.py
 
 tome-bridge: ## Run one bridge pass for research:tome tasks
 	@$(TOME_BRIDGE_ENV); uv run python scripts/tome_bridge.py

@@ -11,11 +11,12 @@
       ]
     },
     {
-      "name": "zai-direct",
-      "description": "Z.AI GLM 5.3 — direct API, separate rate limits",
-      "provider": "zai",
+      "name": "claude-sub",
+      "description": "Claude subscription — host tmux bridge (scripts/claude_bridge.py), separate quota",
+      "provider": "claude-sub",
+      "preferred": true,
       "models": [
-        "glm-5.3"
+        "sonnet"
       ]
     },
     {
@@ -34,9 +35,9 @@
       "base_url": "https://openrouter.ai/api/v1/chat/completions",
       "env_key": "OPENROUTER_API_KEY"
     },
-    "zai": {
-      "base_url": "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
-      "env_key": "ZAI_API_KEY"
+    "claude-sub": {
+      "base_url": "http://host.docker.internal:8790/v1/chat/completions",
+      "env_key": "CLAUDE_BRIDGE_TOKEN"
     }
   },
   "search": {

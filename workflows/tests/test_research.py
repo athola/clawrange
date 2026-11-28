@@ -500,7 +500,7 @@ class TestChannelHealth:
         assert set(research.channel_health()) == set(research._CHANNEL_FETCHER_NAMES)
 
     def test_triz_shares_the_llm_key_requirement(self, monkeypatch):
-        monkeypatch.delenv("ZAI_API_KEY", raising=False)
+        monkeypatch.delenv("CLAUDE_BRIDGE_TOKEN", raising=False)
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
         from research import channel_health
 

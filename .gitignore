@@ -1,5 +1,8 @@
 # Secrets — NEVER commit
 .env
+# Local .env backups hold live secrets too.
+.env.*
+!.env.example
 
 # Operator persona — rendered/edited per operator from a profile + soul.template.md.
 # The committed source is the profiles' persona and openclaw/soul.template.md;

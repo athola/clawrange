@@ -6,6 +6,7 @@ Decisions, the alternatives weighed, and what was given up. Newest first.
 
 | ID | Phase | Status | Decision |
 |----|-------|--------|----------|
+| TR-021 | execute | accepted | Z.AI replaced by `claude-sub`: tmux-driven `claude` CLI on the subscription, tools stay with OpenClaw |
 | TR-020 | specify | accepted | Homelab watch is pull-only: polls HA, Kuma and the scanner census; never logs in to the router |
 | TR-019 | specify | accepted | Homelab data stays out of brain pages and LLM prompts (own table, internal census network, `[homelab]` history strip) |
 | TR-018 | specify | accepted | HA actions: empty allowlist, hard-denied domains, out-of-band single-use code, lockout |
@@ -47,6 +48,89 @@ checked against the code when it was written here, and the
 **Changed since** lines record where the shipped design moved away from
 the plan.
 
+## TR-021: Claude subscription through a tmux bridge replaces Z.AI
+
+- **Phase**: execute
+- **Status**: accepted
+- **Decision (Y-statement)**: In the context of losing Z.AI GLM access
+  (the tier that carried most chat traffic) while the operator has a
+  Claude subscription, facing `claude -p` possibly billing API credit and
+  untrusted Telegram, scan and tool text in every prompt, we decided on
+  **a host bridge (`scripts/claude_bridge.py`) that speaks the OpenAI
+  chat API and answers each request in a throwaway interactive `claude`
+  session under tmux**, registered as the `claude-sub` provider so the
+  proxy's racing, breakers and fallbacks apply unchanged, to achieve a
+  like-for-like swap on the subscription, accepting that the tier spends
+  the same quota as the operator's own Claude Code work. It is the
+  preferred tier (see **Changed since**).
+  - The request is rendered into `--system-prompt-file`; the only typed
+    prompt is the constant `Continue.`, so the input box's `!`, `/` and
+    `@` handling never sees untrusted text (checked: `@/etc/hostname` and
+    `!touch` lines in the file stayed literal).
+  - `--tools ""`, `--safe-mode`, `--strict-mcp-config`,
+    `--permission-mode dontAsk`, `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1`
+    (the advisor is server-side and survives `--tools ""`), an empty
+    0700 workdir and a minimal env. The model did try an unavailable
+    `Bash` call in a spike; the CLI refused it.
+  - OpenClaw keeps executing its own allowlisted tools: `tools` become a
+    `<tool_calls>` JSON contract and the parsed block becomes OpenAI
+    `tool_calls`, validated against the offered names (502 otherwise).
+  - `--safe-mode` disables night-market's `sanitize_external_content`
+    hook, so its patterns run in the bridge: redacted from `role: tool`
+    turns; only structural markup (role tags, hidden-style text,
+    zero-width characters, spoofed turn delimiters) from other turns.
+  - Replies come from the session JSONL; `isApiErrorMessage` records map
+    to 429 (`rate_limit`), 503 (`authentication_failed`) or 502, so the
+    breaker sees outages as outages.
+- **Options weighed**: `claude -p` subprocess (simplest, but the
+  operator believes it bills API credit); one persistent session reset
+  with `/clear` between requests (saves ~2s start-up, but risks context
+  bleed between Telegram and heartbeat traffic and needs typed input);
+  plain `ccd` (skips permission prompts: prompt injection could run
+  commands on the host); Claude Code's own tools inside the session
+  (would run outside OpenClaw's tool policy).
+- **Why the turns sit in the system prompt**: untrusted turns get system
+  authority there, which a security review flagged. The alternatives are
+  worse here: `--input-format stream-json` needs `-p`; a data file needs
+  the Read tool; and a real user turn (the prompt argument or typed
+  input) expands `@path` mentions client-side even with `--tools ""`
+  (checked: `@/etc/hostname` was attached and echoed), so a Telegram
+  message could pull `~/.claude/.credentials.json` into a reply. The
+  boundary is instead: no tools in the session, nonce-delimited turns
+  framed as data, `tool_calls` limited to the offered names and run by
+  OpenClaw under its own allowlist, and the sanitizer as defence in
+  depth.
+- **Negative consequences**: scrapes the terminal UI for the folder-trust
+  prompt and the `/login` screen, which a CLI update can change (an
+  unknown screen times out as 504); one CLI start-up (~2-3s) per
+  request; no streaming (the proxy calls tiers non-streaming anyway);
+  the bridge must be running on the host, outside compose. Running a
+  consumer subscription as a bot backend is the operator's call under
+  Anthropic's terms. As the preferred tier it carries most traffic,
+  heartbeats included, so it draws down the same usage window as the
+  operator's own Claude Code work; when that window runs out the free
+  tiers take over until it resets. A hung bridge delays a chat reply by
+  up to the 45s deadline before the free race starts. Nothing polls the bridge's health:
+  a stopped bridge shows only as `connection failed` until its breaker
+  opens. The sanitizer's windows are bounded (256 characters) to stay
+  linear, so a longer hostile HTML comment or style attribute passes it
+  unredacted (role and turn tags are caught by their opener alone).
+- **Changed since**: a review found the contract too coarse. The bridge
+  now sends a string `error.code`, so a busy queue or an unparseable
+  model reply skips the tier without tripping its breaker, and an
+  expired login is named as such. The proxy sends
+  `X-Deadline-Seconds` (20s background, 45s chat), so the bridge's own
+  504 arrives instead of a proxy-side timeout. Trailing system messages
+  stay after the turns; the sanitizer's unbounded patterns, quadratic on
+  hostile input, are bounded; SIGTERM and start-up sweep what a stopped
+  bridge left behind.
+- **Changed since** (operator decision): the subscription wins whenever
+  it is not rate-limited. `claude-sub` is `"preferred": true` in
+  `models.json`: chat tries it alone first and races the free tiers only
+  if it fails, and background calls try it first. It used to join every
+  chat race, which spent a subscription turn on most races the free tier
+  won. A usage-limit 429 opens its breaker at once, so while the limit
+  lasts requests skip it with no wasted attempt.
 ## TR-020: Homelab watch is pull-only and reads the scanner's census
 
 - **Phase**: specify

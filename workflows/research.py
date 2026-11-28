@@ -262,8 +262,8 @@ def channel_health() -> dict[str, dict[str, Any]]:
     if not github_configured:
         report["code"]["reason"] = "GITHUB_PAT not set"
 
-    # discourse_web: the proxy's search tier (OpenRouter `:online`). Z.AI's
-    # web search is not used, so ZAI_API_KEY alone does not enable it.
+    # discourse_web: the proxy's search tier (OpenRouter `:online`). The
+    # claude-sub bridge has no tools, so it cannot stand in for search.
     web_configured = bool(os.getenv("OPENROUTER_API_KEY"))
     web_reason = "OPENROUTER_API_KEY not set (web search uses OpenRouter :online)"
     report["discourse_web"] = {

@@ -77,6 +77,8 @@ def _validate_config(cfg: dict, hints: dict[str, str]) -> None:
             )
         if not tier.get("models"):
             raise ValueError(f"models.json: tier {name!r} lists no models")
+        if tier.get("preferred") and tier.get("paid"):
+            raise ValueError(f"models.json: paid tier {name!r} cannot be preferred")
     search = cfg.get("search")
     if search and (search.get("provider") not in providers or not search.get("models")):
         raise ValueError("models.json: search block needs a known provider and models")
@@ -311,38 +313,57 @@ def _is_rate_limited(resp: httpx.Response) -> bool:
 
 
 # Out of credit, as each provider says it: OpenRouter 402 "Insufficient
-# credits", OpenAI-style insufficient_quota, Z.AI code 1113 ("余额不足" =
-# insufficient balance, sent as HTTP 429). Retrying cannot fix these, so
+# credits", OpenAI-style insufficient_quota. Retrying cannot fix these, so
 # naming them sends the operator to top up rather than wait.
-_NO_CREDIT_CODES = {"1113"}
 _NO_CREDIT_KEYWORDS = (
     "insufficient credit",
     "insufficient balance",
     "insufficient_quota",
     "insufficient quota",
     "out of credit",
-    "余额不足",
 )
+
+
+# The claude-sub bridge's error.code values (scripts/claude_bridge.py).
+# A busy queue or a model reply the bridge could not parse says nothing
+# about the tier's health, so those skip the tier without a breaker hit.
+_BRIDGE_SKIP = {"busy": "bridge busy", "bad_reply": "bad reply"}
+_BRIDGE_REASONS = {
+    **_BRIDGE_SKIP,
+    "login_expired": "login expired: run claude, then /login",
+    "timeout": "no reply in time",
+}
+
+
+def _error_code(resp: httpx.Response) -> str:
+    try:
+        error = resp.json().get("error", {})
+    except Exception:
+        return ""
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) else ""
+
+
+def _bridge_skip(resp: httpx.Response) -> str | None:
+    """Reason to skip this tier once without counting a failure, if any."""
+    return _BRIDGE_SKIP.get(_error_code(resp))
 
 
 def _classify_failure(resp: httpx.Response) -> str:
     """Short operator-facing cause for a non-200 provider reply."""
-    code = msg = ""
+    if reason := _BRIDGE_REASONS.get(_error_code(resp)):
+        return reason
+    msg = ""
     try:
         error = resp.json().get("error", {})
         if isinstance(error, dict):
-            code = str(error.get("code", ""))
             msg = str(error.get("message", ""))
         else:
             msg = str(error)
     except Exception:
         msg = resp.text[:200]
     lowered = msg.lower()
-    if (
-        resp.status_code == 402
-        or code in _NO_CREDIT_CODES
-        or any(kw in lowered for kw in _NO_CREDIT_KEYWORDS)
-    ):
+    if resp.status_code == 402 or any(kw in lowered for kw in _NO_CREDIT_KEYWORDS):
         return "out of credit"
     if _is_rate_limited(resp):
         return "rate-limited"
@@ -652,33 +673,38 @@ PROVIDER_URLS = {name: p.get("base_url", "") for name, p in CONFIG["providers"].
 
 
 async def _call_provider(
-    provider: str, models: list[str], body: dict, api_key: str
+    provider: str,
+    models: list[str],
+    body: dict,
+    api_key: str,
+    deadline: float | None = None,
 ) -> httpx.Response:
-    """Call a provider with the given body. Returns the raw response."""
+    """Call a provider with the given body. Returns the raw response.
+
+    ``deadline`` is how long the caller will wait. The claude-sub bridge is
+    told it, so it answers or fails with its own reason before the caller
+    gives up, instead of being cut off mid-session.
+    """
     url = PROVIDER_URLS[provider]
     payload = {**body, "model": models[0]}
     if provider == "openrouter" and len(models) > 1:
         payload["models"] = models
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    if provider == "claude-sub" and deadline is not None:
+        headers["X-Deadline-Seconds"] = f"{deadline:g}"
 
     async with httpx.AsyncClient(timeout=PROVIDER_TIMEOUT) as client:
-        return await client.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
+        return await client.post(url, headers=headers, json=payload)
 
 
 # ─── Tier Routing Hints ────────────────────────────────────────────
 
 TIER_HINTS = {
-    "z.ai": "zai-direct",
-    "zai": "zai-direct",
-    "zhipu": "zai-direct",
-    "glm": "zai-direct",
-    "bigmodel": "zai-direct",
+    "sub": "claude-sub",
+    "subscription": "claude-sub",
     "paid": "openrouter-paid",
     "claude": "openrouter-paid",
 }
@@ -690,7 +716,7 @@ def _detect_tier_hint(messages: list[dict]) -> str | None:
     """Check the last user message for an explicit ``!keyword`` routing command.
 
     Only matches keywords prefixed with ``!`` (e.g. ``!paid``, ``!claude``,
-    ``!zai``).  The sender metadata block is stripped first so that
+    ``!sub``).  The sender metadata block is stripped first so that
     incidental mentions of provider names in conversation context never
     trigger routing.
     """
@@ -878,8 +904,7 @@ async def _llm_call(
 
     When web_search=True, routes through CONFIG["search"] — a dedicated
     tier (OpenRouter `:online`) that performs server-side web search.
-    Z.AI's web_search MCP tool is paywalled to a separate resource
-    package the GLM Coding Plan does not unlock, so it's bypassed.
+    The claude-sub bridge runs with no tools, so it cannot search.
     """
     _last_call_failures.clear()
     if web_search:
@@ -893,7 +918,7 @@ async def _llm_call(
 
     async def _try_tiers() -> str | None:
         deadline_at = time.monotonic() + LLM_CALL_DEADLINE
-        for tier in CONFIG["tiers"]:
+        for tier in _preferred_first(CONFIG["tiers"]):
             tier_name = tier["name"]
             # The paid chat tier is never tried here: it is opt-in per chat
             # message (!paid / !claude). web_search=True does spend paid
@@ -1005,7 +1030,8 @@ async def _background_attempt(
     body = _prompt_body(prompt, max_tokens)
     try:
         resp = await asyncio.wait_for(
-            _call_provider(provider, models, body, api_key), timeout=timeout
+            _call_provider(provider, models, body, api_key, deadline=timeout),
+            timeout=timeout,
         )
     except TimeoutError:
         logger.warning("background LLM: %s: no reply within %.0fs", tier_name, timeout)
@@ -1020,6 +1046,9 @@ async def _background_attempt(
 
     if resp.status_code != 200:
         _note_failure(tier_name, _classify_failure(resp))
+        if _bridge_skip(resp):
+            logger.warning("background LLM: %s: %s", tier_name, resp.text[:200])
+            return None
         if _is_rate_limited(resp):
             _record_rate_limit(tier_name)
         else:
@@ -1242,7 +1271,13 @@ async def _try_single_tier(
         non_stream_body = {**body, "stream": False}
         try:
             resp = await asyncio.wait_for(
-                _call_provider(provider, models, non_stream_body, api_key),
+                _call_provider(
+                    provider,
+                    models,
+                    non_stream_body,
+                    api_key,
+                    deadline=PROVIDER_TIMEOUT,
+                ),
                 timeout=PROVIDER_TIMEOUT,
             )
         except TimeoutError:
@@ -1343,8 +1378,16 @@ async def _try_single_tier(
             )
             return None, (tier_name, _get_reset_seconds(resp))
 
+        if skip := _bridge_skip(resp):
+            # The tier works; this one reply did not. No breaker hit.
+            print(f"[PROXY] {tier_name}: {skip}: {resp.text[:200]}", flush=True)
+            reasons[tier_name] = skip
+            return None, None
+
         _record_failure(tier_name)
-        reasons[tier_name] = f"HTTP {resp.status_code}"
+        reasons[tier_name] = _BRIDGE_REASONS.get(
+            _error_code(resp), f"HTTP {resp.status_code}"
+        )
         _background_notify(
             tier_name,
             f"*Error* on `{tier_name}` (HTTP {resp.status_code}): {resp.text[:200]}",
@@ -1393,8 +1436,8 @@ async def create_embeddings(
 
     OpenClaw's own memory search is off (memory provider "none"), so it is
     not a built-in caller. Always uses the configured model
-    (embeddings.config) so vectors stay comparable; a GLM Coding Plan Z.AI
-    key can't embed.
+    (embeddings.config) so vectors stay comparable; the claude-sub bridge
+    serves chat only.
     """
     # Auth check — same PROXY_AUTH_TOKEN gate as chat completions
     if not auth.bearer_ok(authorization, PROXY_AUTH_TOKEN):
@@ -1639,7 +1682,10 @@ async def chat_completions(
     if forced_tier:
         print(f"[PROXY] tier hint detected: {forced_tier}", flush=True)
     else:
-        print("[PROXY] no tier hint — racing all free tiers", flush=True)
+        print(
+            "[PROXY] no tier hint — preferred tier first, then the free race",
+            flush=True,
+        )
 
     # Show typing indicator and send a transient status message
     _spawn_background(telegram.send_typing())
@@ -1673,17 +1719,25 @@ async def chat_completions(
     return result
 
 
+def _preferred_first(tiers: list[dict]) -> list[dict]:
+    """Preferred tiers (the subscription) first, the rest in config order."""
+    return sorted(tiers, key=lambda t: not t.get("preferred"))
+
+
 async def _handle_non_streaming(
     body: dict,
     forced_tier: str | None = None,
     _attempt: int = 0,
     status_msg_id: int | None = None,
 ):
-    """Handle non-streaming requests — race available tiers concurrently.
+    """Handle non-streaming requests: preferred tier first, then a race.
 
-    Instead of trying tiers sequentially (where each 45s timeout compounds),
-    all available free tiers are dispatched simultaneously. The first
-    successful response wins and the remaining requests are cancelled.
+    A preferred tier (the Claude subscription) that is available answers
+    alone, so its quota is spent only on replies it actually serves. If it
+    fails (usage limit, busy, error), the remaining free tiers race: they
+    are dispatched together and the first success wins, so their timeouts
+    do not compound. A usage limit trips the preferred tier's breaker at
+    once, so while it lasts requests go straight to the race.
     """
     # Determine which tiers are available right now
     available: list[dict] = []
@@ -1704,7 +1758,7 @@ async def _handle_non_streaming(
             remaining = await _check_openrouter_balance()
             # A zero/negative balance blocks every OpenRouter model —
             # free-tier included — with 402 payment-required errors. Skip
-            # the whole provider so zai-direct carries traffic instead of
+            # the whole provider so claude-sub carries traffic instead of
             # every request stalling through failed OpenRouter attempts.
             if remaining is not None and remaining <= 0:
                 if _should_notify("balance-guard"):
@@ -1741,7 +1795,20 @@ async def _handle_non_streaming(
             + ". Try again later."
         )
 
-    # Race all available tiers concurrently — first success wins
+    rate_limit_resets: list[tuple[str, int | None]] = []
+    tried: list[str] = []
+    for tier in [t for t in available if t.get("preferred")]:
+        available.remove(tier)
+        tried.append(tier["name"])
+        response, rl_info = await _try_single_tier(tier, body, status_msg_id, failures)
+        if response is not None:
+            await _notify_tier_change(tier["name"])
+            return response
+        if rl_info is not None:
+            rate_limit_resets.append(rl_info)
+        print(f"[PROXY] preferred {tier['name']} did not answer, racing the rest")
+
+    # Race the remaining tiers concurrently — first success wins
     tasks = {
         asyncio.create_task(
             _try_single_tier(tier, body, status_msg_id, failures),
@@ -1749,9 +1816,8 @@ async def _handle_non_streaming(
         ): tier["name"]
         for tier in available
     }
-    print(f"[PROXY] racing {len(tasks)} tiers: {list(tasks.values())}", flush=True)
-
-    rate_limit_resets: list[tuple[str, int | None]] = []
+    if tasks:
+        print(f"[PROXY] racing {len(tasks)} tiers: {list(tasks.values())}", flush=True)
 
     try:
         pending = set(tasks.keys())
@@ -1808,7 +1874,7 @@ async def _handle_non_streaming(
                 )
 
     print(f"[PROXY] all tiers exhausted: {failures}", flush=True)
-    raced = {name: failures.get(name, "failed") for name in tasks.values()}
+    raced = {name: failures.get(name, "failed") for name in [*tried, *tasks.values()]}
     retry = (
         "Try again later."
         if forced_tier
